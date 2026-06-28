@@ -49,10 +49,18 @@ dumps the trace rings while sibling cores keep writing COM1.
 **No-regression validation (2026-06-28, KVM):** `smoke-test`, `smp-smoke @ -smp 8`, and the
 4 GiB + `-smp 8` run below all boot/stress cleanly with the new panic path compiled in.
 
-> The positive "captured readable 4 GiB panic banner" demonstration is **opportunistic**:
-> the residual 4 GiB race is intermittent and there is no kernel panic-trigger to force it.
-> The diagnosability *mechanism* is in place; the next red 4 GiB panic (or step-25 CI fault)
-> will print an uninterleaved banner.
+> **Positive demonstration (deterministic):** the `panic-test-smoke` gate forces the
+> quiesce-and-print path end-to-end. It builds a kernel with a `panic-test` cargo feature
+> gating a `SYS_PANIC_TEST` (0x1151) syscall (mirroring the `kstack-overflow-test`
+> precedent), boots at `-smp 8`, forks 6 sibling-core processes that spam COM1 (`PTSPAM`),
+> then deliberately panics through the **real** `handle_panic → panic_quiesce_aps` path. The
+> captured banner is contiguous —
+> `KERNEL PANIC at kernel/src/arch/x86_64/syscall/mod.rs:19642` immediately followed by
+> `  PANICTEST_SENTINEL …` — with **0 `PTSPAM` bytes** between them (the gate asserts this);
+> a single spammer's partial `PTS` write sits right at the quiesce boundary, proving the
+> contention was real and the AP-quiesce silenced it before the banner. Run:
+> `cargo xtask panic-test-smoke` (PASS, KVM, 2026-06-28). This is also the end-to-end run
+> that exercises the panic-owner self-park-window fix (`smp::panic_should_park`).
 
 ## Track C.2 — 4 GiB residual OOM/race investigation pass
 

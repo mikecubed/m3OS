@@ -386,6 +386,11 @@ static USB_MOUNT_SMOKE_ELF: &[u8] = generated_initrd_asset!("usb-mount-smoke");
 // SIGSEGV-killed it (controlled-kill recovery, not a core wedge). Not a daemon.
 static KSTACK_OVERFLOW_TEST_ELF: &[u8] = generated_initrd_asset!("kstack-overflow-test");
 
+// Phase 99 Track C.1 — `panic-test`: forks COM1 spammers on sibling cores then
+// invokes the feature-gated SYS_PANIC_TEST so the panic AP-quiesce can be shown
+// to produce an uninterleaved banner. Not a daemon.
+static PANIC_TEST_ELF: &[u8] = generated_initrd_asset!("panic-test");
+
 // Phase 95c Track E.1 — `vfs-throughput-probe`: write + read-back + verify
 // a fixed payload on the writable ext2 data disk, bracketing each with
 // `/proc/blkstats` snapshots, and emit `VFS_THRPUT:*` sentinels.
@@ -754,6 +759,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "kstack-overflow-test",
         RamdiskNode::File {
             content: KSTACK_OVERFLOW_TEST_ELF,
+        },
+    ),
+    // Phase 99 Track C.1: panic-test — panic AP-quiesce uninterleaved-banner demo.
+    (
+        "panic-test",
+        RamdiskNode::File {
+            content: PANIC_TEST_ELF,
         },
     ),
     // Phase 95c Track E.1: vfs-throughput-probe — write+read-back+verify on

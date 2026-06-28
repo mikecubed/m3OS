@@ -496,14 +496,36 @@ static PANIC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// Bit `i` set when core `i` has acknowledged the panic-stop NMI and parked.
 static PANIC_STOP_ACK: AtomicU64 = AtomicU64::new(0);
 
+/// Sentinel for "no panic owner stamped yet".
+const PANIC_OWNER_NONE: u8 = 0xFF;
+
 /// Logical core id of the panic owner (the core printing the banner). The NMI
-/// handler must NOT park this core. Sentinel `0xFF` = no owner yet.
-static PANIC_OWNER_CORE: AtomicU8 = AtomicU8::new(0xFF);
+/// handler must NOT park this core. Sentinel [`PANIC_OWNER_NONE`] = no owner yet.
+static PANIC_OWNER_CORE: AtomicU8 = AtomicU8::new(PANIC_OWNER_NONE);
 
 /// True once a core has begun the panic-stop sequence.
 #[inline]
 pub fn panic_in_progress() -> bool {
     PANIC_IN_PROGRESS.load(Ordering::Acquire)
+}
+
+/// Whether the NMI handler should park `my_core` because a panic is in progress.
+///
+/// Parks ONLY when a panic owner has been **stamped** (`PANIC_OWNER_CORE !=
+/// PANIC_OWNER_NONE`) and it is **not** this core. This closes the self-park
+/// window: `panic_quiesce_aps` publishes `PANIC_IN_PROGRESS = true` (CAS) a few
+/// instructions BEFORE it stamps `PANIC_OWNER_CORE`. TLB shootdowns are
+/// NMI-delivered (`smp::tlb`), so the owner can take a stray shootdown NMI in
+/// that window; if the handler parked on "not yet the owner" it would wedge the
+/// owner forever and the banner would never print — strictly worse than the
+/// interleave this feature fixes. Treating "owner unknown" as do-not-park lets
+/// the owner finish stamping itself (and the bounded grace window absorbs the
+/// rare case where a sibling briefly ran an extra shootdown before its own
+/// park NMI, which is always sent AFTER the owner is stamped).
+#[inline]
+pub fn panic_should_park(my_core: u8) -> bool {
+    let owner = PANIC_OWNER_CORE.load(Ordering::Acquire);
+    owner != PANIC_OWNER_NONE && owner != my_core
 }
 
 /// True if `core_id` is the panic owner (it must not self-park on a stray NMI
@@ -538,6 +560,11 @@ pub fn panic_quiesce_aps() -> bool {
     {
         return false;
     }
+    // WINDOW: `PANIC_IN_PROGRESS` is now true but the owner is not yet stamped.
+    // A stray NMI to THIS core in this gap must NOT park it — `panic_should_park`
+    // returns false while the owner is `PANIC_OWNER_NONE`, so the owner survives
+    // the window. The store below is `Release` so any core that later observes a
+    // stamped owner also observes a consistent value.
     PANIC_OWNER_CORE.store(my_core, Ordering::Release);
 
     // Build the target mask (all online cores except self) and NMI each.
@@ -560,7 +587,9 @@ pub fn panic_quiesce_aps() -> bool {
 
     // Bounded grace window: spin until every target acks, or a fixed iteration
     // budget elapses. A genuinely-wedged core may never ack — do NOT hang the
-    // panic path on it. ~tens of ms on KVM; a panic is not latency-critical.
+    // panic path on it. 200M `pause` iterations is ~hundreds of ms to ~1 s on a
+    // multi-GHz KVM guest; a panic is not latency-critical and siblings normally
+    // ack in microseconds, so the budget is only a wedged-core backstop.
     const SPIN_BUDGET: u64 = 200_000_000;
     let mut spun: u64 = 0;
     while (PANIC_STOP_ACK.load(Ordering::Acquire) & target_mask) != target_mask {

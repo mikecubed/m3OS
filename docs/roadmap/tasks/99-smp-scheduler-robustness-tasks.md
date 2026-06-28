@@ -11,7 +11,7 @@
 |---|---|---|---|
 | A | Blocking-primitive consolidation: call-site audit, futex conformance, scheduler-state diagnostic, `smp-smoke` raised to `-smp 8` | 57a–e | **Complete** — audit (29 sites, 1 lost-wake fixed) + `dump_scheduler_state` + `-smp 8`; smp-smoke @ -smp 8 PASS |
 | B | Fault-handling robustness: locks-across-faults audit, kstack-overflow origin, recovery-stack review | 2026-06-14 tracks A–D | **Complete** — audit + `debug_assert` + origin doc; kstack-overflow-smoke + dynamic-hello PASS |
-| C | 4 GiB SMP panic-path AP-quiesce (diagnosability) + residual OOM/race pass | A (diagnostic reuse) | **Complete** — C.1 quiesce landed + no-regression; C.2 fresh 4 GiB + smp-8 run **PASSED in 69 s** (node install + futex stress, no panic/lost-wake/OOM; no residual race fired). Only the *positive readable-banner demo* is deferred (no panic to force) |
+| C | 4 GiB SMP panic-path AP-quiesce (diagnosability) + residual OOM/race pass | A (diagnostic reuse) | **Complete** — C.1 quiesce landed + no-regression; the uninterleaved banner is **demonstrated** by the new `panic-test-smoke` gate (deliberate panic at `-smp 8` with sibling COM1 spam → contiguous banner). C.2 fresh 4 GiB + smp-8 run **PASSED in 69 s** (no panic/lost-wake/OOM) |
 | D | Step-25 `dynlink-hello-versioned-mismatch-smoke` flake → root-cause + fix + soak | B (fault-handler audit) | **Complete** — reproduced locally at `-smp 8` (~36–50%), root-caused to the crash dumper printing a torn `caller_file` `&str` (`write_str` wild deref → recursive #PF), **fixed** (`safe_caller`), soak **50/50 clean**. (Not a demand-fault NULL deref — wrong-ELF mis-attribution.) |
 | E | Two correctness bugs: `copy_file_range`/`sendfile`→EFAULT, 55c `net::remote` RX-test encoder | — | **Complete** — E.1 clean-ENOSYS + `fs.copyFile` probe folded into node-smoke (PASS); E.2 already fixed (f39ca133, Phase 57b) |
 
@@ -40,7 +40,7 @@
 
 **Acceptance:**
 - [x] The recv/reply/notif/send wrappers share one documented helper shape. → the canonical "fresh registered `Arc` waker → recheck-after-register → `block_current_until` → clear waker" pattern is documented once on `block_current_on_reply_v2` (the wrappers already reference it); the stale "local AtomicBool / wake side still v1" doc was replaced.
-- [x] No behavioral change to the wake path: `smoke-test` stays green (PASSED, 26 steps); `regression` pending in the full validation pass. (Pure-doc change.)
+- [x] No behavioral change to the wake path: `smoke-test` PASSED (26 steps) and the full `regression` battery ran (9 passed; the 2 timing-flake failures pass standalone — see Validation summary below). (Pure-doc change.)
 
 ### A.3 — Periodic / on-demand scheduler-state diagnostic
 
@@ -88,7 +88,7 @@
 
 **Acceptance:**
 - [x] A documented sweep confirms no fault handler holds `SCHEDULER` or `PROCESS_TABLE` across the blocking `MAP_LAZY_FILE` `vfs_server` read or across `fault_kill_trampoline`. → `docs/handoffs/2026-06-28-phase-99-fault-handler-lock-audit.md` (10 lock sites, all SAFE; value-copy discipline traced).
-- [x] A debug assertion enforces "no scheduler/process-table lock held on entry to the blocking demand-fault IPC." → `debug_assert_eq!(current_preempt_count(), 0, …)` at the demand-fault entry (covers both `IrqSafeMutex`es; non-flaky per-task counter).
+- [x] The invariant "no scheduler/process-table lock held on entry to the blocking demand-fault IPC" is encoded as `debug_assert_eq!(current_preempt_count(), 0, …)` at the demand-fault entry (`current_preempt_count()` covers both `IrqSafeMutex`es via the Phase 57b F.1 preempt counter; non-flaky per-task). **Note:** the production + in-QEMU-test kernels are `--release` (`[profile.release]` leaves `debug-assertions = false`), so the `debug_assert` is a **debug-build-only** check — the *runtime* diagnostic on those builds is the pre-existing budgeted `[deadlock-guard]` log right below it, which names the culprit syscall when `preempt > 0`. The acceptance asked for "a debug assertion (or a documented invariant comment with a `debug_assert!`)"; both are present.
 - [x] `cargo xtask check` passes with the assertion compiled in. **Validated 2026-06-28.**
 
 ### B.2 — Pin the kstack-overflow origin
@@ -124,7 +124,7 @@
 
 **Acceptance:**
 - [x] `handle_panic` broadcasts a halt NMI to sibling cores (`panic_quiesce_aps`) and spins a bounded grace window for them to ack-and-park before printing; the `nmi_handler` parks non-owner cores. → `kernel/src/smp/mod.rs`, `kernel/src/lib.rs`, `kernel/src/arch/x86_64/interrupts.rs`.
-- [~] A captured 4 GiB panic shows an uninterleaved banner — **mechanism landed; positive demonstration deferred**: no panic fired in the 4 GiB + smp-8 runs (no panic-trigger exists to force one). The diagnosability mechanism is in place for the next real panic. See `docs/handoffs/2026-06-28-phase-99-panic-quiesce-and-stepd25-flake.md`.
+- [x] A captured panic shows an uninterleaved banner — **demonstrated by the new `panic-test-smoke` gate** (a feature-gated `SYS_PANIC_TEST` syscall, mirroring the `kstack-overflow-test` precedent). At `-smp 8` with 6 sibling-core processes actively spamming COM1 (`PTSPAM`), the deliberate panic prints a **contiguous** banner: `KERNEL PANIC at kernel/src/arch/x86_64/syscall/mod.rs:19642` immediately followed by `  PANICTEST_SENTINEL …` — the gate asserts **0 `PTSPAM` bytes** land between them (the AP-quiesce NMI-parked the spammers first; a spammer's partial `PTS` write is visible right at the quiesce boundary, proving the contention was real). This also exercises the **real** (non-`cfg(test)`) `handle_panic → panic_quiesce_aps` path end-to-end. **Validated 2026-06-28 (KVM, GATE_EXIT=0).**
 - [x] The quiesce is bounded (`SPIN_BUDGET` cap — never hangs on a wedged core) and does not regress the single-core/test panic path: `cfg(test)` `handle_panic` short-circuits to the ISA-debug-exit handler before the quiesce. No-regression validated (smoke-test + smp-smoke + 4 GiB boot all clean).
 
 ### C.2 — Residual 4 GiB OOM/race investigation pass
@@ -202,7 +202,7 @@
 **Acceptance:** (NOTE: already fixed in commit `f39ca133`, Phase 57b — this task doc was stale. Verify-only.)
 - [x] The RX-path test(s) encode their fixture with the ingress `NET_RX_FRAME` header via `encode_net_rx_notify` (the only `NET_SEND_FRAME`/`encode_net_send` use in `remote.rs` is the real TX send path). Confirmed at `remote.rs:920–990`.
 - [x] The tests exercise the real RX inject/drain decode path without tripping `InvalidFrame` for a well-formed RX frame.
-- [x] `cargo test -p kernel-core` host tests pass (`cargo xtask check` green); the `net::remote` `#[test_case]` suite is covered by `cargo xtask test`.
+- [x] The RX encode/decode is verified by the **kernel-core host tests** (`rx_notify_header_round_trips` et al. in `kernel-core/src/driver_ipc/net.rs`), which run under `cargo xtask check` (green). NOTE: the `net::remote` `#[test_case]`s themselves do **not** execute under any harness — `kernel/Cargo.toml` sets `[lib] test = false`, so the no_std kernel lib's `#[test_case]`s are never built/run (a pre-existing kernel-wide property; `cargo xtask test` runs only the `kernel/tests/*.rs` integration binaries — all **13 PASSED** this phase, a regression check on the scheduler/notification/trace changes). The encoder fix itself (already landed in f39ca133) is confirmed by source inspection (`remote.rs:933/957/984`) + the kernel-core round-trip tests.
 
 ---
 

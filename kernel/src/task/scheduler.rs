@@ -2728,7 +2728,8 @@ pub fn yield_now() {
     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::YieldNow {
         task_idx: idx as u32,
         core: my_core as u8,
-        caller_file: location.file(),
+        caller_file_ptr: location.file().as_ptr() as u64,
+        caller_file_len: location.file().len() as u32,
         caller_line: location.line(),
     });
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
@@ -3738,7 +3739,8 @@ pub fn block_current_until(
         task_idx: idx as u32,
         core,
         new_state: kind as u8,
-        caller_file: block_caller.file(),
+        caller_file_ptr: block_caller.file().as_ptr() as u64,
+        caller_file_len: block_caller.file().len() as u32,
         caller_line: block_caller.line(),
     });
 
@@ -6493,6 +6495,7 @@ fn dump_dispatch_state() {
 /// `SCHEDULER.lock`-inner invariant. `on_cpu` is an atomic read with `Relaxed`;
 /// all logging happens after the guard is dropped (log macros may allocate).
 pub fn dump_scheduler_state() {
+    #[derive(Clone, Copy)]
     struct Row {
         pid: u32,
         name: &'static str,
@@ -6503,7 +6506,15 @@ pub fn dump_scheduler_state() {
         blocked_since: u64,
     }
 
-    let mut rows: alloc::vec::Vec<Row> = alloc::vec::Vec::new();
+    // Bounded, NON-ALLOCATING snapshot (mirrors `watchdog_scan`'s fixed array):
+    // a hang diagnostic must never itself allocate. A `Vec` grown under the
+    // scheduler lock could trip the global `#[alloc_error_handler]` in exactly
+    // the memory-pressure hang this targets — obscuring the original hang. Tasks
+    // beyond `MAX_ROWS` are summarized as a truncation count.
+    const MAX_ROWS: usize = 64;
+    let mut rows = [None::<Row>; MAX_ROWS];
+    let mut n = 0usize;
+    let mut total_live = 0usize;
     {
         // Non-blocking: never deadlock the diagnostic against the dispatcher.
         let Some(sched) = try_scheduler_lock() else {
@@ -6515,26 +6526,31 @@ pub fn dump_scheduler_state() {
             if task.state == super::TaskState::Dead {
                 continue;
             }
-            rows.push(Row {
-                pid: task.pid,
-                name: task.name,
-                idx,
-                state: task.state,
-                wake_deadline: task.wake_deadline,
-                on_cpu: task.on_cpu.load(Ordering::Relaxed),
-                blocked_since: task.blocked_since_tick,
-            });
+            total_live += 1;
+            if n < MAX_ROWS {
+                rows[n] = Some(Row {
+                    pid: task.pid,
+                    name: task.name,
+                    idx,
+                    state: task.state,
+                    wake_deadline: task.wake_deadline,
+                    on_cpu: task.on_cpu.load(Ordering::Relaxed),
+                    blocked_since: task.blocked_since_tick,
+                });
+                n += 1;
+            }
         }
         // SCHEDULER.lock released here (before logging, which may allocate).
     }
 
     let now = crate::arch::x86_64::interrupts::tick_count();
     log::warn!(
-        "[sched] dump_scheduler_state: now-tick={} live-tasks={}",
+        "[sched] dump_scheduler_state: now-tick={} live-tasks={}{}",
         now,
-        rows.len()
+        total_live,
+        if total_live > n { " (truncated)" } else { "" },
     );
-    for row in &rows {
+    for row in rows[..n].iter().flatten() {
         // The canonical four fields (`pid` `state` `wake_deadline` `on_cpu`) are
         // emitted contiguously and in order so the line is greppable; `name`,
         // `idx`, and the derived `blocked_since` age trail as context.
@@ -6560,6 +6576,13 @@ pub fn dump_scheduler_state() {
                 now.saturating_sub(row.blocked_since),
             ),
         }
+    }
+    if total_live > n {
+        log::warn!(
+            "[sched] dump_scheduler_state: {} more live task(s) not shown (MAX_ROWS={})",
+            total_live - n,
+            MAX_ROWS,
+        );
     }
     log::warn!("[sched] dump_scheduler_state: end");
 }

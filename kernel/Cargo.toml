@@ -57,6 +57,13 @@ smep-smap-test = []
 # fault → SIGSEGV the offending process, core keeps running, no machine halt).
 # Absent in production (the syscall returns ENOSYS). Driven by `kstack-overflow-smoke`.
 kstack-overflow-test = []
+# Phase 99 Track C.1 — enables the `SYS_PANIC_TEST` (0x1151) syscall, which
+# deliberately `panic!()`s the calling core so the panic-path AP-quiesce
+# (`smp::panic_quiesce_aps`) can be demonstrated end-to-end: at `-smp 8` with
+# sibling cores actively spamming COM1, the quiesce must produce an UNinterleaved
+# `KERNEL PANIC at …` banner. Absent in production (the syscall returns ENOSYS).
+# Driven by `panic-test-smoke`.
+panic-test = []
 # When `sched-trace` is enabled, every block/wake/scan state transition
 # emits a structured SchedTrace entry into the per-core trace ring (Phase 43b).
 # Default OFF — zero runtime overhead in production builds.

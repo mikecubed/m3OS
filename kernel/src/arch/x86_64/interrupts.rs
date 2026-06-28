@@ -3080,7 +3080,12 @@ extern "x86-interrupt" fn nmi_handler(_stack_frame: InterruptStackFrame) {
         let my_core = crate::smp::try_per_core()
             .map(|pc| pc.core_id)
             .unwrap_or(0xFF);
-        if !crate::smp::is_panic_owner(my_core) {
+        // Park ONLY when a panic owner has been stamped and it is not this core.
+        // `panic_should_park` returns false while the owner is still unknown,
+        // which prevents the owner from self-parking on a stray shootdown NMI in
+        // the `PANIC_IN_PROGRESS`-set-before-`PANIC_OWNER_CORE`-stamped window
+        // (see `smp::panic_should_park`).
+        if crate::smp::panic_should_park(my_core) {
             crate::smp::panic_stop_ack_and_park();
         }
     }

@@ -1474,6 +1474,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "panic-test"
+version = "0.99.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
 name = "passwd"
 version = "0.99.0"
 dependencies = [
