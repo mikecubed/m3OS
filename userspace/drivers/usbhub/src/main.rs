@@ -101,6 +101,8 @@ pub fn classify_hub_interface(b_interface_class: u8) -> bool {
 #[cfg(not(test))]
 use alloc::vec::Vec;
 #[cfg(not(test))]
+use kernel_core::input::hid_poll::{HUB_POLL_BASE_NS, hub_next_backoff_ns};
+#[cfg(not(test))]
 use kernel_core::usb::hub::{
     HubDescriptor, PORT_POWER, PORT_RESET, PortTopology, clear_port_feature, get_hub_descriptor,
     get_port_status, port_status_connected, port_status_enabled, port_status_speed_code,
@@ -195,24 +197,76 @@ fn write_u8_dec(n: u8) {
     });
 }
 
+#[cfg(not(test))]
+fn write_u32_dec(n: u32) {
+    let mut buf = [0u8; 10]; // max u32 decimal is 10 digits
+    let mut i = buf.len();
+    let mut v = n;
+    if v == 0 {
+        syscall_lib::write_str(STDOUT_FILENO, "0");
+        return;
+    }
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    // SAFETY: buf[i..] is ASCII digits.
+    syscall_lib::write_str(STDOUT_FILENO, unsafe {
+        core::str::from_utf8_unchecked(&buf[i..])
+    });
+}
+
+/// Check whether any port on a hub has a pending status-change bit.
+///
+/// Reads GET_PORT_STATUS for each port (1..=nports) and inspects the
+/// `wPortChange` word (bytes 2–3 of the 4-byte response).  Any non-zero
+/// change word means the hub flagged a transition (connection, enable,
+/// reset-complete, etc.) since the last time we cleared those bits.
+///
+/// Returns `true` as soon as a change is found; short-circuits the scan.
+#[cfg(not(test))]
+fn hub_ports_have_change(usb_ep: u32, slot_id: u8, nports: u8) -> bool {
+    for port in 1..=nports {
+        let setup = setup_to_bytes(get_port_status(port));
+        if let Some(st) = control(usb_ep, slot_id, setup, 4) {
+            if st.len() >= 4 {
+                let change_word = u16::from_le_bytes([st[2], st[3]]);
+                if change_word != 0 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// How often to emit the idle-occupancy sentinel.
+/// At `HUB_POLL_MAX_IDLE_NS` (200 ms) this is approximately every 20 s.
+#[cfg(not(test))]
+const HUB_IDLE_LOG_EVERY: u32 = 100;
+
 /// Drive one hub: read its descriptor, power every downstream port, then probe
 /// each port's status and reset any port reporting a connected device. This is
 /// the standard hub power/reset sequence (USB 2.0 §11.5.1.5). Surfacing the
 /// downstream device as its own `AttachNotice` (tier-2 enumeration via the route
 /// string, A.4/A.5) is scheduled as Phase 92a.
+///
+/// Returns `Some(nports)` on success so the caller can store the port count
+/// for use in the steady-state monitoring loop (Phase 100 Track D.3).
 #[cfg(not(test))]
-fn enumerate_hub(usb_ep: u32, notice: &AttachNotice) {
+fn enumerate_hub(usb_ep: u32, notice: &AttachNotice) -> Option<u8> {
     let slot_id = notice.slot_id;
 
     // GET_DESCRIPTOR(Hub) over EP0 → bNbrPorts + bPwrOn2PwrGood.
     let setup = setup_to_bytes(get_hub_descriptor(HUB_DESC_REQ_LEN));
     let Some(desc_bytes) = control(usb_ep, slot_id, setup, HUB_DESC_REQ_LEN) else {
         syscall_lib::write_str(STDOUT_FILENO, "usbhub: GET_DESCRIPTOR(Hub) failed\n");
-        return;
+        return None;
     };
     let Some(desc) = HubDescriptor::parse(&desc_bytes) else {
         syscall_lib::write_str(STDOUT_FILENO, "usbhub: hub descriptor parse failed\n");
-        return;
+        return None;
     };
     let nports = desc.b_nbr_ports;
     syscall_lib::write_str(STDOUT_FILENO, "XHCI_HUB:enumerated ports=");
@@ -321,19 +375,26 @@ fn enumerate_hub(usb_ep: u32, notice: &AttachNotice) {
         }
     }
     syscall_lib::write_str(STDOUT_FILENO, "USB_HUB:ready\n");
+    Some(nports)
 }
 
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Hub daemon main — Phase 92 Track A.
+/// Hub daemon main — Phase 92 Track A / Phase 100 Track D.3.
 ///
 /// Logs [`BOOT_LOG_MARKER`], waits on the `usb` service, walks the `NextAttach`
 /// cursor for a `CLASS_HUB` interface, and drives each hub through its descriptor
 /// read + per-port `PORT_POWER`/`PORT_RESET` bring-up. Exits cleanly when no hub
 /// is present (the common machine) so init's `on-failure` policy marks the
 /// service stopped rather than looping.
+///
+/// Phase 100 Track D.3: after initial enumeration, enters a steady-state
+/// port-monitoring loop with adaptive backoff so the walker no longer pins a
+/// core at idle. Full notification-driven port-status changes (using the hub's
+/// interrupt-IN endpoint for status-change notifications) are deferred to
+/// Phase 103 (USB runtime power management).
 #[cfg(not(test))]
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, BOOT_LOG_MARKER);
@@ -372,10 +433,73 @@ fn program_main(_args: &[&str]) -> i32 {
         return 0;
     }
 
+    // Initial enumeration: bring up each hub and collect its port count for
+    // the steady-state monitoring loop.
+    let mut hub_nports: Vec<u8> = Vec::with_capacity(hubs.len());
     for notice in &hubs {
-        enumerate_hub(usb_ep, notice);
+        // enumerate_hub returns Some(nports) on success; fall back to 0 (no
+        // ports to monitor) on descriptor failure so we still enter the idle
+        // loop and emit idle sentinels rather than exiting.
+        hub_nports.push(enumerate_hub(usb_ep, notice).unwrap_or(0));
     }
-    0
+
+    // ----------------------------------------------------------------
+    // Phase 100 Track D.3 — steady-state port-monitoring loop.
+    //
+    // After initial enumeration the daemon no longer exits.  It wakes
+    // every `hub_next_backoff_ns(consecutive_idle)` to check whether any
+    // port's wPortChange word is non-zero (indicating a hot-plug or
+    // hot-unplug since the previous check).  On a change it re-runs
+    // `enumerate_hub` to power and reset the newly-connected port and
+    // register the downstream device with the xHCI server.
+    //
+    // Full USB interrupt-endpoint notification (blocking on the hub's
+    // status-change pipe instead of polling) is deferred to Phase 103
+    // (USB runtime power management).  This bounded-backoff polling
+    // reduces idle core-wake frequency from ~20/s (50 ms fixed) to
+    // ~5/s (200 ms cap) without any change to the xHCI server or the
+    // usb-core IPC protocol.
+    // ----------------------------------------------------------------
+    let _ = HUB_POLL_BASE_NS; // suppress unused-import lint when logging is disabled
+    let mut consecutive_idle: u32 = 0;
+    loop {
+        let sleep_ns = hub_next_backoff_ns(consecutive_idle);
+        let _ = syscall_lib::nanosleep_for(0, sleep_ns);
+
+        // Periodic idle-occupancy sentinel — falsifiable evidence that the
+        // walker is not pinning a core (Phase 100 D.3 acceptance criterion).
+        if consecutive_idle > 0 && consecutive_idle % HUB_IDLE_LOG_EVERY == 0 {
+            syscall_lib::write_str(STDOUT_FILENO, "USB_HUB:idle ticks=");
+            write_u32_dec(consecutive_idle);
+            syscall_lib::write_str(STDOUT_FILENO, " backoff_ns=");
+            write_u32_dec(sleep_ns);
+            syscall_lib::write_str(STDOUT_FILENO, "\n");
+        }
+
+        // Check each hub's ports for pending status-change bits.
+        let mut any_change = false;
+        for (notice, &nports) in hubs.iter().zip(hub_nports.iter()) {
+            if nports > 0 && hub_ports_have_change(usb_ep, notice.slot_id, nports) {
+                any_change = true;
+                break;
+            }
+        }
+
+        if any_change {
+            consecutive_idle = 0;
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "usbhub: port status change detected; re-enumerating\n",
+            );
+            for (notice, nports) in hubs.iter().zip(hub_nports.iter_mut()) {
+                if let Some(n) = enumerate_hub(usb_ep, notice) {
+                    *nports = n;
+                }
+            }
+        } else {
+            consecutive_idle = consecutive_idle.saturating_add(1);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +509,9 @@ fn program_main(_args: &[&str]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{BOOT_LOG_MARKER, classify_hub_interface};
+    use kernel_core::input::hid_poll::{
+        HUB_POLL_BASE_NS, HUB_POLL_MAX_IDLE_NS, hub_next_backoff_ns,
+    };
 
     #[test]
     fn boot_log_marker_correct() {
@@ -403,5 +530,29 @@ mod tests {
         assert!(!classify_hub_interface(0x03));
         assert!(!classify_hub_interface(0x00));
         assert!(!classify_hub_interface(0xFF));
+    }
+
+    // Phase 100 Track D.3 — hub-monitoring backoff smoke tests.
+    // Verifies the invariants documented in the monitoring loop:
+    // fast at idle-start, non-decreasing, capped at max.
+
+    #[test]
+    fn hub_backoff_starts_at_base() {
+        assert_eq!(hub_next_backoff_ns(0), HUB_POLL_BASE_NS);
+        assert_eq!(hub_next_backoff_ns(1), HUB_POLL_BASE_NS);
+        assert_eq!(hub_next_backoff_ns(3), HUB_POLL_BASE_NS);
+    }
+
+    #[test]
+    fn hub_backoff_grows_after_threshold() {
+        let base = hub_next_backoff_ns(0);
+        let grown = hub_next_backoff_ns(4);
+        assert!(grown >= base, "backoff must be non-decreasing");
+    }
+
+    #[test]
+    fn hub_backoff_capped_at_max() {
+        assert_eq!(hub_next_backoff_ns(u32::MAX), HUB_POLL_MAX_IDLE_NS);
+        assert_eq!(hub_next_backoff_ns(1_000_000), HUB_POLL_MAX_IDLE_NS);
     }
 }

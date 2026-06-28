@@ -1,25 +1,40 @@
-//! Userspace stdin feeder for m3OS (Phase 52d, Track C).
+//! Userspace stdin feeder for m3OS (Phase 52d, Track C; Phase 100 Track D.1).
 //!
-//! Obtains scancodes from the `kbd_server` service via IPC (`KBD_TRY_READ`),
-//! translates them to raw bytes using a US-QWERTY lookup table, and forwards
-//! each byte to the kernel via `push_raw_input`.
+//! Obtains input from two sources and forwards raw bytes to the kernel via
+//! `push_raw_input`:
+//!
+//! 1. **PS/2 scancodes** (`KBD_TRY_READ`, label 4) — the original path.
+//!    Translates set-1 make/break codes using the US-QWERTY table below.
+//!
+//! 2. **USB-keyboard `KeyEvent`s** (`KBD_EVENT_PULL`, label 2, Phase 100
+//!    Track D.1) — typed `KeyEvent` structs injected by `usb-hid` into
+//!    `kbd_server`'s bounded inject queue (`KBD_EVENT_INJECT`, label 5).
+//!    `stdin_feeder` drains these on the same non-blocking poll cycle as the
+//!    PS/2 path, converting each `KeyEvent` to stdin byte(s) using the same
+//!    VT100 / control-code rules as `term::input::InputHandler::translate`
+//!    (Phase 57 Track G.5) and
+//!    `kernel_core::input::hid_poll::key_event_to_stdin` (Phase 100 D.1).
 //!
 //! Uses the non-blocking `KBD_TRY_READ` label (Phase 57d) rather than the
 //! blocking `KBD_READ`, so that `display_server`'s concurrent
 //! `KBD_EVENT_PULL` requests are not starved while this feeder polls.
-//! When kbd_server reports an empty buffer (reply 0), stdin_feeder sleeps
-//! 5 ms before retrying.
+//! `KBD_EVENT_PULL` is also non-blocking on the server side
+//! (`MAX_PULL_POLLS == 1`): the server replies immediately with
+//! `KBD_EVENT_NONE` (label 3) when no event is queued.
+//!
+//! When kbd_server reports both sources empty, stdin_feeder sleeps 5 ms
+//! before retrying (matching the legacy kbd_server internal poll interval).
+//!
 //! If the `display.input-owner` service is present, stdin_feeder stands
-//! down: `display_server` registers that name only after the first
-//! Toplevel surface is mapped, so PS/2 input ownership transfers only
-//! when a real graphical client (e.g. `term`) is actually up. Boots
-//! that never reach a Toplevel — text-mode fallback or a stalled
-//! graphical bring-up — keep PS/2 routed through this bridge to the
-//! kernel line discipline.
+//! down entirely: `display_server` registers that name only after the first
+//! Toplevel surface is mapped, so input ownership transfers only when a real
+//! graphical client (e.g. `term`) is actually up.  Boots that never reach a
+//! Toplevel — text-mode fallback or a stalled graphical bring-up — keep both
+//! PS/2 and USB input routed through this bridge to the kernel line discipline.
 //!
 //! All terminal policy (canonical editing, echo, signal generation, ICRNL)
 //! is handled by the kernel-side `LineDiscipline` in `push_raw_input`.
-//! This binary is a pure scancode-to-byte bridge.
+//! This binary is a pure input-to-byte bridge.
 #![no_std]
 #![no_main]
 
@@ -101,14 +116,143 @@ syscall_lib::entry_point!(program_main);
 /// concurrent `KBD_EVENT_PULL` requests are not starved.
 const KBD_TRY_READ: u64 = 4;
 
-/// How long to sleep when kbd_server reports an empty buffer (5 ms,
-/// matching the legacy kbd_server internal poll interval).
+/// IPC operation label: typed `KeyEvent` pull (Phase 56 Track D.1).
+///
+/// kbd_server replies with label `KBD_EVENT_PULL` (2) and a 20-byte
+/// `KeyEvent` wire payload when an event is queued, or label
+/// `KBD_EVENT_NONE` (3) when the queue is empty. The server is
+/// non-blocking (`MAX_PULL_POLLS == 1`), so this call returns immediately
+/// and never stalls `display_server`'s concurrent pulls.
+const KBD_EVENT_PULL: u64 = 2;
+
+/// Reply label from kbd_server when `KBD_EVENT_PULL` finds no event.
+/// Distinct from `u64::MAX` (IPC transport error).
+const KBD_EVENT_NONE: u64 = 3;
+
+/// Wire size of a serialised `KeyEvent` (bytes).
+/// Must stay in sync with `kernel_core::input::events::KEY_EVENT_WIRE_SIZE`.
+const KEY_EVENT_WIRE_SIZE: usize = 20;
+
+/// How long to sleep when both kbd_server sources report an empty buffer
+/// (5 ms, matching the legacy kbd_server internal poll interval).
 const KBD_POLL_INTERVAL_NS: u32 = 5_000_000;
 
 /// How often to re-check for graphical display ownership while falling back
-/// to the text-mode PS/2-to-stdin bridge. The check is capability-free, so it
+/// to the text-mode input-to-stdin bridge. The check is capability-free, so it
 /// can run on every empty poll without leaking handles.
 const DISPLAY_PROBE_INTERVAL_EMPTY_POLLS: u32 = 1;
+
+// ---------------------------------------------------------------------------
+// KeyEvent wire decode (D.1)
+//
+// The full codec lives in `kernel_core::input::events::KeyEvent::decode`.
+// stdin_feeder does not link against kernel_core (no allocator), so the
+// minimal subset needed here is inlined below.  Must be kept in sync with
+// the `kernel_core::input::events::KeyEvent` wire layout.
+// ---------------------------------------------------------------------------
+
+/// `ModifierState` bit for Ctrl held.
+/// Matches `kernel_core::input::events::MOD_CTRL = 1 << 1`.
+const MOD_CTRL: u16 = 1 << 1;
+
+// Private-use KeySym values for navigation keys.
+// Must stay in sync with `kernel_core::input::keymap::KEYSYM_*`.
+const KEYSYM_UP: u32 = 0xE012;
+const KEYSYM_DOWN: u32 = 0xE013;
+const KEYSYM_RIGHT: u32 = 0xE011;
+const KEYSYM_LEFT: u32 = 0xE010;
+const KEYSYM_HOME: u32 = 0xE014;
+const KEYSYM_END: u32 = 0xE015;
+const KEYSYM_DELETE: u32 = 0xE019;
+const KEYSYM_PAGEUP: u32 = 0xE016;
+const KEYSYM_PAGEDOWN: u32 = 0xE017;
+
+/// Decode the minimal fields from a 20-byte `KeyEvent` wire payload.
+///
+/// Returns `(symbol, modifiers_bits, kind)` where `kind` is 0=Down, 1=Up,
+/// 2=Repeat.  Returns `None` if `buf` is shorter than `KEY_EVENT_WIRE_SIZE`.
+///
+/// Wire layout (LE): timestamp_ms(8) | keycode(4) | symbol(4) |
+/// modifiers(2) | kind(1) | modifier_side(1) = 20 bytes total.
+/// See `kernel_core::input::events::KeyEvent::encode` for the authoritative
+/// layout.
+fn decode_key_event_wire(buf: &[u8]) -> Option<(u32, u16, u8)> {
+    if buf.len() < KEY_EVENT_WIRE_SIZE {
+        return None;
+    }
+    let symbol = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    let mods = u16::from_le_bytes([buf[16], buf[17]]);
+    let kind = buf[18]; // 0=Down, 1=Up, 2=Repeat
+    Some((symbol, mods, kind))
+}
+
+/// Convert a decoded `KeyEvent` to raw stdin byte(s) and push each via
+/// `push_raw_input`.
+///
+/// Logic mirrors `term::input::InputHandler::translate` (Phase 57 Track G.5)
+/// and `kernel_core::input::hid_poll::key_event_to_stdin` (Phase 100 D.1).
+/// Both sources are kept in sync; do not duplicate the mapping here.
+///
+/// Rules:
+/// - Down (kind=0) and Repeat (kind=2) edges produce output; Up (kind=1) does not.
+/// - `symbol == 0`: modifier-only event, no output.
+/// - Navigation keysyms (0xE010–0xE019 range) → VT100/CSI escape sequences.
+/// - Backspace (`symbol == 0x08`) → DEL (0x7F).
+/// - Ctrl + ASCII letter → control code (0x01–0x1A).
+/// - All other 7-bit values pass through verbatim (CR, TAB, ESC, printable).
+/// - Private-use keysyms outside the navigation table produce no output.
+fn feed_key_event_to_stdin(symbol: u32, mods: u16, kind: u8) {
+    // Only Down/Repeat edges generate stdin bytes.
+    if kind != 0 && kind != 2 {
+        return;
+    }
+    // symbol==0: modifier-key-only event; no character to push.
+    if symbol == 0 {
+        return;
+    }
+
+    // Navigation keys → VT100/CSI escape sequences (matches PS/2 path below).
+    let escape_seq: Option<&[u8]> = match symbol {
+        s if s == KEYSYM_UP => Some(b"\x1b[A"),
+        s if s == KEYSYM_DOWN => Some(b"\x1b[B"),
+        s if s == KEYSYM_RIGHT => Some(b"\x1b[C"),
+        s if s == KEYSYM_LEFT => Some(b"\x1b[D"),
+        s if s == KEYSYM_HOME => Some(b"\x1b[H"),
+        s if s == KEYSYM_END => Some(b"\x1b[F"),
+        s if s == KEYSYM_DELETE => Some(b"\x1b[3~"),
+        s if s == KEYSYM_PAGEUP => Some(b"\x1b[5~"),
+        s if s == KEYSYM_PAGEDOWN => Some(b"\x1b[6~"),
+        _ => None,
+    };
+    if let Some(seq) = escape_seq {
+        for &b in seq {
+            syscall_lib::push_raw_input(b);
+        }
+        return;
+    }
+
+    // Backspace (U+0008) → DEL (0x7F).
+    if symbol == 0x08 {
+        syscall_lib::push_raw_input(0x7F);
+        return;
+    }
+
+    // Ctrl + ASCII letter → control code (0x01–0x1A).
+    if mods & MOD_CTRL != 0 && symbol <= 0x7F {
+        let lower = (symbol as u8).to_ascii_lowercase();
+        if lower.is_ascii_lowercase() {
+            syscall_lib::push_raw_input(lower - b'a' + 1);
+            return;
+        }
+        // Ctrl + non-letter: fall through to the 7-bit path.
+    }
+
+    // All 7-bit values pass through (printable ASCII, CR 0x0D, TAB 0x09, ESC 0x1B).
+    if symbol <= 0x7F {
+        syscall_lib::push_raw_input(symbol as u8);
+    }
+    // Private-use keysyms outside the navigation table produce no output.
+}
 
 fn lookup_kbd_service() -> u32 {
     loop {
@@ -147,6 +291,9 @@ fn program_main(_args: &[&str]) -> i32 {
     let mut graphical_input_owner = display_input_owner_available();
     let mut empty_polls_since_display_probe = 0u32;
 
+    // Phase 100 Track D.1 — wire buffer for KeyEvent bulk replies.
+    let mut kev_buf = [0u8; KEY_EVENT_WIRE_SIZE];
+
     loop {
         if graphical_input_owner {
             let _ = syscall_lib::nanosleep_for(0, 50_000_000);
@@ -154,98 +301,138 @@ fn program_main(_args: &[&str]) -> i32 {
             continue;
         }
 
-        // Request one scancode from kbd_server via the non-blocking probe
-        // label.  kbd_server replies 0 if the buffer is currently empty;
-        // we sleep briefly and retry rather than holding the server busy
-        // while display_server is waiting for KBD_EVENT_PULL replies.
+        // ----------------------------------------------------------------
+        // Source 1: PS/2 scancodes via the non-blocking KBD_TRY_READ probe
+        // (label 4).  Returns the scancode byte, or 0 if the ring is empty,
+        // or u64::MAX on IPC transport error.
+        // ----------------------------------------------------------------
         let sc_rc = syscall_lib::ipc_call(kbd_handle, KBD_TRY_READ, 0);
         if sc_rc == u64::MAX {
             kbd_handle = lookup_kbd_service();
             continue;
         }
-        if sc_rc == 0 {
+        let ps2_got_data = sc_rc != 0;
+
+        if ps2_got_data {
+            empty_polls_since_display_probe = 0;
+            let sc = sc_rc as u8;
+
+            // Key-release (break) codes: bit 7 set.
+            if sc >= 0x80 {
+                let make = sc & 0x7F;
+                if make == 0x2A || make == 0x36 {
+                    shift = false;
+                }
+                if make == 0x1D {
+                    ctrl = false;
+                }
+                // Fall through to USB drain below without sleeping.
+            } else {
+                // Modifier make codes.
+                if sc == 0x1D {
+                    ctrl = true;
+                } else if sc == 0x2A || sc == 0x36 {
+                    shift = true;
+                } else {
+                    // VT100 escape sequences for special keys.
+                    let escape_seq: Option<&[u8]> = match sc {
+                        0x48 => Some(b"\x1b[A"),  // Arrow Up
+                        0x50 => Some(b"\x1b[B"),  // Arrow Down
+                        0x4D => Some(b"\x1b[C"),  // Arrow Right
+                        0x4B => Some(b"\x1b[D"),  // Arrow Left
+                        0x47 => Some(b"\x1b[H"),  // Home
+                        0x4F => Some(b"\x1b[F"),  // End
+                        0x53 => Some(b"\x1b[3~"), // Delete
+                        0x49 => Some(b"\x1b[5~"), // Page Up
+                        0x51 => Some(b"\x1b[6~"), // Page Down
+                        0x01 => Some(b"\x1b"),    // Escape
+                        _ => None,
+                    };
+
+                    if let Some(seq) = escape_seq {
+                        for &b in seq {
+                            syscall_lib::push_raw_input(b);
+                        }
+                    } else {
+                        // Convert scancode to a raw byte.
+                        let byte = if sc == 0x1C {
+                            b'\r' // Enter key produces CR; kernel ICRNL translates to LF
+                        } else if sc == 0x0F {
+                            b'\t' // Tab
+                        } else if sc == 0x0E {
+                            0x7F // DEL / backspace
+                        } else if ctrl {
+                            // Ctrl + letter -> control character (0x01-0x1A).
+                            match scancode_to_char(sc, false) {
+                                Some(c) if c.is_ascii_alphabetic() => {
+                                    (c.to_ascii_uppercase() as u8) - b'A' + 1
+                                }
+                                _ => {
+                                    // Unrecognised Ctrl combo — fall through to USB drain.
+                                    0
+                                }
+                            }
+                        } else {
+                            match scancode_to_char(sc, shift) {
+                                Some(c) => {
+                                    let mut buf = [0u8; 4];
+                                    let s = c.encode_utf8(&mut buf);
+                                    s.as_bytes()[0]
+                                }
+                                None => 0,
+                            }
+                        };
+                        if byte != 0 {
+                            syscall_lib::push_raw_input(byte);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Source 2: USB-keyboard typed KeyEvents via KBD_EVENT_PULL (label 2,
+        // Phase 100 Track D.1).
+        //
+        // kbd_server drains the inject queue (populated by usb-hid via
+        // KBD_EVENT_INJECT) before the PS/2 pipeline, so a USB keypress
+        // that arrived while we were processing a PS/2 event is waiting.
+        // The server is non-blocking (MAX_PULL_POLLS == 1) and replies:
+        //   label KBD_EVENT_PULL (2) + 20-byte KeyEvent bulk — event ready.
+        //   label KBD_EVENT_NONE (3)                          — queue empty.
+        // u64::MAX indicates an IPC transport error; treat as empty (the
+        // PS/2 path's reconnect handles service restarts on the next tick).
+        // ----------------------------------------------------------------
+        let kev_label = syscall_lib::ipc_call(kbd_handle, KBD_EVENT_PULL, 0);
+        let usb_got_data = if kev_label == KBD_EVENT_PULL {
+            let n = syscall_lib::ipc_take_pending_bulk(&mut kev_buf);
+            if n as usize == KEY_EVENT_WIRE_SIZE {
+                if let Some((sym, mods, kind)) = decode_key_event_wire(&kev_buf) {
+                    feed_key_event_to_stdin(sym, mods, kind);
+                }
+                true
+            } else {
+                false // short/missing bulk — treat as no data
+            }
+        } else {
+            false // KBD_EVENT_NONE (3) or error
+        };
+
+        // ----------------------------------------------------------------
+        // If both sources were empty this iteration, sleep 5 ms to avoid
+        // spinning; also re-check for a graphical input owner so we stand
+        // down promptly once display_server takes the console.
+        // ----------------------------------------------------------------
+        if !ps2_got_data && !usb_got_data {
             empty_polls_since_display_probe = empty_polls_since_display_probe.saturating_add(1);
             if empty_polls_since_display_probe >= DISPLAY_PROBE_INTERVAL_EMPTY_POLLS {
                 empty_polls_since_display_probe = 0;
                 graphical_input_owner = display_input_owner_available();
             }
             let _ = syscall_lib::nanosleep_for(0, KBD_POLL_INTERVAL_NS);
-            continue;
-        }
-        empty_polls_since_display_probe = 0;
-        let sc = sc_rc as u8;
-
-        // Key-release (break) codes: bit 7 set.
-        if sc >= 0x80 {
-            let make = sc & 0x7F;
-            if make == 0x2A || make == 0x36 {
-                shift = false;
-            }
-            if make == 0x1D {
-                ctrl = false;
-            }
-            continue;
-        }
-
-        // Modifier make codes.
-        if sc == 0x1D {
-            ctrl = true;
-            continue;
-        }
-        if sc == 0x2A || sc == 0x36 {
-            shift = true;
-            continue;
-        }
-
-        // VT100 escape sequences for special keys — forward each byte
-        // through the kernel line discipline.
-        let escape_seq: Option<&[u8]> = match sc {
-            0x48 => Some(b"\x1b[A"),  // Arrow Up
-            0x50 => Some(b"\x1b[B"),  // Arrow Down
-            0x4D => Some(b"\x1b[C"),  // Arrow Right
-            0x4B => Some(b"\x1b[D"),  // Arrow Left
-            0x47 => Some(b"\x1b[H"),  // Home
-            0x4F => Some(b"\x1b[F"),  // End
-            0x53 => Some(b"\x1b[3~"), // Delete
-            0x49 => Some(b"\x1b[5~"), // Page Up
-            0x51 => Some(b"\x1b[6~"), // Page Down
-            0x01 => Some(b"\x1b"),    // Escape
-            _ => None,
-        };
-
-        if let Some(seq) = escape_seq {
-            for &b in seq {
-                syscall_lib::push_raw_input(b);
-            }
-            continue;
-        }
-
-        // Convert scancode to a raw byte.
-        let byte = if sc == 0x1C {
-            b'\r' // Enter key produces CR; kernel ICRNL translates to LF
-        } else if sc == 0x0F {
-            b'\t' // Tab
-        } else if sc == 0x0E {
-            0x7F // DEL / backspace
-        } else if ctrl {
-            // Ctrl + letter -> control character (0x01-0x1A).
-            match scancode_to_char(sc, false) {
-                Some(c) if c.is_ascii_alphabetic() => (c.to_ascii_uppercase() as u8) - b'A' + 1,
-                _ => continue,
-            }
         } else {
-            match scancode_to_char(sc, shift) {
-                Some(c) => {
-                    let mut buf = [0u8; 4];
-                    let s = c.encode_utf8(&mut buf);
-                    s.as_bytes()[0]
-                }
-                None => continue,
-            }
-        };
-
-        // Forward raw byte to the kernel line discipline.
-        syscall_lib::push_raw_input(byte);
+            empty_polls_since_display_probe = 0;
+        }
     }
 }
 

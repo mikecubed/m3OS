@@ -48,6 +48,7 @@ use core::alloc::Layout;
 use kernel_core::input::events::{
     KeyEvent, KeyEventKind, ModifierSide, ModifierState, PointerButton, PointerEvent,
 };
+use kernel_core::input::hid_poll::next_hid_backoff_ns;
 use kernel_core::input::keymap::{KEY_CAPSLOCK, KEY_NUMLOCK, KEY_SCROLLLOCK, Keycode, Keymap};
 use kernel_core::usb::descriptor::{CLASS_HID, SUBCLASS_HID_BOOT};
 use kernel_core::usb::hid::{
@@ -90,9 +91,20 @@ pub const READY_SENTINEL: &str = "usb-hid: polling\n";
 const KBD_EVENT_INJECT: u64 = 5;
 const MOUSE_EVENT_INJECT: u64 = 3;
 
-/// Interrupt-IN poll cadence. Boot devices report at ~10 ms (`bInterval`); a
-/// 5 ms poll keeps input latency below one report period.
+/// Fast interrupt-IN poll cadence — active while reports are arriving.
+/// Boot devices report at ~10 ms (`bInterval`); a 5 ms poll keeps input
+/// latency below one report period.  Matches `HID_POLL_FAST_NS` in
+/// `kernel_core::input::hid_poll`.
 const POLL_INTERVAL_NS: u32 = 5_000_000;
+
+/// Hot-plug reconcile interval (ms). Kept time-based so the cadence is
+/// independent of the adaptive-backoff sleep duration.
+const RECONCILE_INTERVAL_MS: u64 = 200;
+
+/// Emit an idle-occupancy sentinel every this many consecutive empty polls
+/// (after we have already reached the max-backoff plateau).  At 100 ms idle
+/// sleep this is roughly every 10 s — visible in logs without flooding them.
+const IDLE_LOG_EVERY: u32 = 100;
 
 /// How this driver decodes a bound HID interface.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -306,10 +318,12 @@ fn key_event_from_edge(
 }
 
 /// Poll one keyboard device: read its report, decode edges, inject each.
-fn poll_keyboard(usb_ep: u32, kbd_ep: u32, dev: &mut HidDevice, keymap: &Keymap) {
+/// Returns `true` if a non-empty report was received (used by the adaptive
+/// backoff state machine to snap back to the fast poll cadence).
+fn poll_keyboard(usb_ep: u32, kbd_ep: u32, dev: &mut HidDevice, keymap: &Keymap) -> bool {
     let report = match poll_report(usb_ep, dev) {
         Some(r) if r.len() >= HID_KBD_REPORT_LEN => r,
-        _ => return,
+        _ => return false,
     };
     // Bare-metal diagnostic: prove a non-empty interrupt-IN report actually
     // arrived from the keyboard. Logged only when a key/modifier byte is set, so
@@ -344,6 +358,7 @@ fn poll_keyboard(usb_ep: u32, kbd_ep: u32, dev: &mut HidDevice, keymap: &Keymap)
     // the H.2-hardened EP0 control path, interleaved with the armed interrupt-IN
     // poll above).
     maybe_update_leds(usb_ep, dev, &edges);
+    true
 }
 
 /// Boot-keyboard LED output-report bit positions (USB HID §B.1 / boot output
@@ -425,16 +440,17 @@ fn set_keyboard_leds(usb_ep: u32, dev: &HidDevice) {
 /// (`decode_pointer_report`, B.2), and inject motion + wheel + button edges into
 /// `mouse_server`. A tablet reports an absolute position; a gaming mouse reports
 /// relative deltas + a scroll wheel + extra buttons.
-fn poll_report_pointer(usb_ep: u32, mouse_ep: u32, dev: &mut HidDevice) {
+/// Returns `true` if a non-empty report was received.
+fn poll_report_pointer(usb_ep: u32, mouse_ep: u32, dev: &mut HidDevice) -> bool {
     let report = match poll_report(usb_ep, dev) {
         Some(r) => r,
-        None => return,
+        None => return false,
     };
     let p: DecodedPointer = decode_pointer_report(&dev.report_fields, &report);
     // Nothing moved and no button changed — stay quiet (an idle tablet still
     // reports its position every frame, but `any_input` gates the sentinel).
     if !p.any_input && p.buttons == dev.prev_pointer_buttons {
-        return;
+        return false;
     }
     let now = monotonic_ms();
     // Load-bearing sentinel for the I.2 Report-Protocol gate arm: a live
@@ -487,6 +503,7 @@ fn poll_report_pointer(usb_ep: u32, mouse_ep: u32, dev: &mut HidDevice) {
         }
     }
     dev.prev_pointer_buttons = p.buttons;
+    true
 }
 
 /// `HID_REPORT:pointer btn=0x<hex> abs=<0|1> moved=<0|1>` — proves a live
@@ -510,10 +527,11 @@ fn emit_report_pointer_sentinel(p: &DecodedPointer) {
 /// keys onward (`display_server` → `audio_server`). Press-edge-detected so a held
 /// key fires once. (No QEMU device emits consumer reports, so this path is
 /// bare-metal/VFIO-validated; the decode is host-tested in `kernel-core`.)
-fn poll_report_consumer(usb_ep: u32, kbd_ep: u32, dev: &mut HidDevice, keymap: &Keymap) {
+/// Returns `true` if a non-empty report was received.
+fn poll_report_consumer(usb_ep: u32, kbd_ep: u32, dev: &mut HidDevice, keymap: &Keymap) -> bool {
     let report = match poll_report(usb_ep, dev) {
         Some(r) => r,
-        None => return,
+        None => return false,
     };
     let active = decode_consumer_usages(&dev.report_fields, &report);
     let now = monotonic_ms();
@@ -537,6 +555,7 @@ fn poll_report_consumer(usb_ep: u32, kbd_ep: u32, dev: &mut HidDevice, keymap: &
         }
     }
     dev.prev_consumer = snapshot;
+    true
 }
 
 /// Inject a consumer/media keycode as a Down then Up `KeyEvent` into kbd_server
@@ -590,13 +609,14 @@ fn emit_mouse_sentinel(m: &kernel_core::usb::hid::MouseReport) {
 }
 
 /// Poll one mouse device: read its report, decode motion + button edges.
-fn poll_mouse(usb_ep: u32, mouse_ep: u32, dev: &mut HidDevice) {
+/// Returns `true` if a non-empty report was received.
+fn poll_mouse(usb_ep: u32, mouse_ep: u32, dev: &mut HidDevice) -> bool {
     let report = match poll_report(usb_ep, dev) {
         Some(r) => r,
-        None => return,
+        None => return false,
     };
     let Some(m) = parse_boot_mouse_report(&report) else {
-        return;
+        return false;
     };
     let now = monotonic_ms();
     // Load-bearing sentinel for the `usb-smoke` gate's live-mouse assertion: a
@@ -646,6 +666,7 @@ fn poll_mouse(usb_ep: u32, mouse_ep: u32, dev: &mut HidDevice) {
         }
     }
     dev.prev_buttons = m.buttons;
+    true
 }
 
 /// Read a HID interface's **Report descriptor** over EP0 and parse it into a
@@ -1044,45 +1065,94 @@ fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, READY_SENTINEL);
 
     // 4. Poll loop: each device's interrupt-IN endpoint, decode by role, inject.
-    //    Every `RECONCILE_EVERY` ticks, reconcile against the live attach table
-    //    so a hot-plugged device is bound and a hot-unplugged one is released
-    //    (C.4) without restarting the daemon. ~200 ms cadence at the 5 ms poll
-    //    period — fast enough to observe an attach/detach pair, cheap enough not
-    //    to flood the server with `NextAttach` walks.
-    const RECONCILE_EVERY: u32 = 40;
-    let mut tick: u32 = 0;
+    //
+    // Phase 100 Track D.2 — adaptive-backoff bring-up step.
+    //
+    // While reports are arriving the fast cadence (POLL_INTERVAL_NS = 5 ms) is
+    // preserved so input latency stays below one report period.  When N
+    // consecutive polls across all devices return no data the idle sleep grows
+    // (via `next_hid_backoff_ns`) up to a cap of 100 ms, reducing idle core-wake
+    // frequency from ~200/s to ~10/s without any change to the xHCI server.
+    //
+    // Hot-plug reconcile uses a monotonic timestamp so its ~200 ms cadence is
+    // independent of the adaptive sleep duration.
+    //
+    // Full xHCI transfer-event notification (blocking on the controller's
+    // IRQ-driven wakeup instead of polling) is deferred to Phase 103 (USB runtime
+    // power management).  The adaptive backoff is the Phase 100 bring-up step.
+    let mut last_reconcile_ms = monotonic_ms();
+    let mut consecutive_empty: u32 = 0;
     loop {
-        if tick.is_multiple_of(RECONCILE_EVERY) {
+        // Time-based hot-plug reconcile: stays at ~200 ms regardless of backoff.
+        let now = monotonic_ms();
+        if now.wrapping_sub(last_reconcile_ms) >= RECONCILE_INTERVAL_MS {
             reconcile_attachments(usb_ep, &mut devices);
+            last_reconcile_ms = now;
         }
-        tick = tick.wrapping_add(1);
+
+        // Poll all devices; track whether any returned a non-empty report.
+        let mut got_report = false;
         for dev in devices.iter_mut() {
-            match dev.role {
-                DeviceRole::BootKeyboard => {
-                    if let Some(kbd_ep) = kbd_ep {
-                        poll_keyboard(usb_ep, kbd_ep, dev, &keymap);
-                    }
-                }
-                DeviceRole::BootMouse => {
-                    if let Some(mouse_ep) = mouse_ep {
-                        poll_mouse(usb_ep, mouse_ep, dev);
-                    }
-                }
-                DeviceRole::ReportPointer => {
-                    if let Some(mouse_ep) = mouse_ep {
-                        poll_report_pointer(usb_ep, mouse_ep, dev);
-                    }
-                }
-                DeviceRole::ReportConsumer => {
-                    if let Some(kbd_ep) = kbd_ep {
-                        poll_report_consumer(usb_ep, kbd_ep, dev, &keymap);
-                    }
-                }
-                DeviceRole::Ignore => {}
+            let had = match dev.role {
+                DeviceRole::BootKeyboard => kbd_ep
+                    .map(|ep| poll_keyboard(usb_ep, ep, dev, &keymap))
+                    .unwrap_or(false),
+                DeviceRole::BootMouse => mouse_ep
+                    .map(|ep| poll_mouse(usb_ep, ep, dev))
+                    .unwrap_or(false),
+                DeviceRole::ReportPointer => mouse_ep
+                    .map(|ep| poll_report_pointer(usb_ep, ep, dev))
+                    .unwrap_or(false),
+                DeviceRole::ReportConsumer => kbd_ep
+                    .map(|ep| poll_report_consumer(usb_ep, ep, dev, &keymap))
+                    .unwrap_or(false),
+                DeviceRole::Ignore => false,
+            };
+            if had {
+                got_report = true;
             }
         }
-        let _ = syscall_lib::nanosleep_for(0, POLL_INTERVAL_NS);
+
+        // Update the consecutive-empty counter and choose the sleep duration.
+        if got_report {
+            consecutive_empty = 0;
+        } else {
+            consecutive_empty = consecutive_empty.saturating_add(1);
+
+            // Periodic idle-occupancy sentinel — falsifiable evidence that the
+            // driver is no longer pinning a core at idle (Phase 100 D.2 acceptance).
+            if consecutive_empty > 0 && consecutive_empty % IDLE_LOG_EVERY == 0 {
+                let sleep_ns = next_hid_backoff_ns(consecutive_empty);
+                syscall_lib::write_str(STDOUT_FILENO, "USB_HID:idle ticks=");
+                write_u32_dec(consecutive_empty);
+                syscall_lib::write_str(STDOUT_FILENO, " backoff_ns=");
+                write_u32_dec(sleep_ns);
+                syscall_lib::write_str(STDOUT_FILENO, "\n");
+            }
+        }
+
+        let sleep_ns = next_hid_backoff_ns(consecutive_empty);
+        let _ = syscall_lib::nanosleep_for(0, sleep_ns);
     }
+}
+
+/// Write a `u32` as decimal to stdout without `alloc::format!`.
+fn write_u32_dec(n: u32) {
+    let mut buf = [0u8; 10]; // max u32 decimal is 10 digits
+    let mut i = buf.len();
+    let mut v = n;
+    if v == 0 {
+        syscall_lib::write_str(STDOUT_FILENO, "0");
+        return;
+    }
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    // SAFETY: `buf[i..]` contains only ASCII digits.
+    let s = unsafe { core::str::from_utf8_unchecked(&buf[i..]) };
+    syscall_lib::write_str(STDOUT_FILENO, s);
 }
 
 /// Write a `u8` as decimal to stdout without `alloc::format!`.
