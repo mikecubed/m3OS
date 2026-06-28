@@ -138,8 +138,9 @@ const KBD_EVENT_PULL: u64 = 2;
 const KBD_EVENT_NONE: u64 = 3;
 
 /// Wire size of a serialised `KeyEvent` (bytes).
-/// Must stay in sync with `kernel_core::input::events::KEY_EVENT_WIRE_SIZE`.
-const KEY_EVENT_WIRE_SIZE: usize = 20;
+/// Sourced from the authoritative codec so the local buffer can never drift
+/// from `KeyEvent::encode`/`decode`.
+const KEY_EVENT_WIRE_SIZE: usize = kernel_core::input::events::KEY_EVENT_WIRE_SIZE;
 
 /// How long to sleep when both kbd_server sources report an empty buffer
 /// (5 ms, matching the legacy kbd_server internal poll interval).
@@ -153,31 +154,12 @@ const DISPLAY_PROBE_INTERVAL_EMPTY_POLLS: u32 = 1;
 // ---------------------------------------------------------------------------
 // KeyEvent wire decode (D.1)
 //
-// The full codec lives in `kernel_core::input::events::KeyEvent::decode`.
-// Only the minimal field subset stdin_feeder needs is decoded inline below;
-// it must stay in sync with the `kernel_core::input::events::KeyEvent` wire
-// layout. (The KeyEvent→stdin *mapping* is not duplicated — it delegates to
-// the host-tested `kernel_core::input::hid_poll::key_event_to_stdin`.)
+// Decoding delegates to the authoritative, allocation-free codec
+// `kernel_core::input::events::KeyEvent::decode` — no inline copy of the wire
+// layout is kept here, so a layout change cannot silently desync this binary.
+// The KeyEvent→stdin *mapping* likewise delegates to the host-tested
+// `kernel_core::input::hid_poll::key_event_to_stdin`.
 // ---------------------------------------------------------------------------
-
-/// Decode the minimal fields from a 20-byte `KeyEvent` wire payload.
-///
-/// Returns `(symbol, modifiers_bits, kind)` where `kind` is 0=Down, 1=Up,
-/// 2=Repeat.  Returns `None` if `buf` is shorter than `KEY_EVENT_WIRE_SIZE`.
-///
-/// Wire layout (LE): timestamp_ms(8) | keycode(4) | symbol(4) |
-/// modifiers(2) | kind(1) | modifier_side(1) = 20 bytes total.
-/// See `kernel_core::input::events::KeyEvent::encode` for the authoritative
-/// layout.
-fn decode_key_event_wire(buf: &[u8]) -> Option<(u32, u16, u8)> {
-    if buf.len() < KEY_EVENT_WIRE_SIZE {
-        return None;
-    }
-    let symbol = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
-    let mods = u16::from_le_bytes([buf[16], buf[17]]);
-    let kind = buf[18]; // 0=Down, 1=Up, 2=Repeat
-    Some((symbol, mods, kind))
-}
 
 /// Convert a decoded `KeyEvent` to raw stdin byte(s) and push each via
 /// `push_raw_input`.
@@ -347,8 +329,12 @@ fn program_main(_args: &[&str]) -> i32 {
         let usb_got_data = if kev_label == KBD_EVENT_PULL {
             let n = syscall_lib::ipc_take_pending_bulk(&mut kev_buf);
             if n as usize == KEY_EVENT_WIRE_SIZE {
-                if let Some((sym, mods, kind)) = decode_key_event_wire(&kev_buf) {
-                    feed_key_event_to_stdin(sym, mods, kind);
+                // Decode via the shared codec: it validates the `kind` tag and
+                // keeps the wire layout in one place. `modifiers`/`kind` are
+                // typed (`ModifierState(u16)` / `KeyEventKind: repr(u8)`), so
+                // unwrap them to the raw bits `key_event_to_stdin` consumes.
+                if let Ok((ev, _)) = kernel_core::input::events::KeyEvent::decode(&kev_buf) {
+                    feed_key_event_to_stdin(ev.symbol, ev.modifiers.0, ev.kind as u8);
                 }
                 true
             } else {

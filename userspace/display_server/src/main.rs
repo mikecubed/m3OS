@@ -499,12 +499,16 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     //   carried into each `RENDER_FP` sentinel so a CI boot log can
     //   confirm the compositor is advancing.
     //
-    // `fp_prev_row_hashes`: per-row FNV-1a hash from the previous
-    //   composed frame, used to compute `rows_changed` on each
-    //   subsequent frame. Empty on the first frame (rows_changed = 0).
-    //   Sized to `meta.height` u32 values ≈ 4 KiB at 1080p.
+    // `fp_prev_row_hashes` / `fp_curr_row_hashes`: double-buffered per-row
+    //   FNV-1a hashes used to compute `rows_changed`. Each compose fills
+    //   `curr` in place via `compute_fingerprint_into` (comparing against
+    //   `prev`) and then swaps the two, so after the first frame the
+    //   compositor loop allocates nothing — steady-state cursor/animation
+    //   frames reuse the same ~4 KiB (at 1080p) buffers. Both empty on the
+    //   first frame (rows_changed = 0).
     let mut fp_frame_counter: u64 = 0;
     let mut fp_prev_row_hashes: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    let mut fp_curr_row_hashes: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     // Phase 57d follow-up — post-reclaim full-screen background fill.
     // Set to `true` by the reclaim handler so the next compose tick
     // calls `fill_background` before `run_compose`. Without this, any
@@ -1267,7 +1271,9 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                     // valid after the write_pixels calls); the front MMIO
                     // half in Flip mode (updated by `present()`).
                     let pixels = owner.back_buffer_pixels();
-                    let (fp, new_hashes) = kernel_core::display::render_fp::compute_fingerprint(
+                    // Allocation-free: fill `curr` in place, then swap so
+                    // `prev` carries this frame's hashes into the next compose.
+                    let fp = kernel_core::display::render_fp::compute_fingerprint_into(
                         pixels,
                         meta.width,
                         meta.height,
@@ -1275,8 +1281,9 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                         BG_PIXEL,
                         fp_frame_counter,
                         &fp_prev_row_hashes,
+                        &mut fp_curr_row_hashes,
                     );
-                    fp_prev_row_hashes = new_hashes;
+                    core::mem::swap(&mut fp_prev_row_hashes, &mut fp_curr_row_hashes);
                     fp_frame_counter = fp_frame_counter.saturating_add(1);
                     emit_render_fingerprint(&fp);
                 }

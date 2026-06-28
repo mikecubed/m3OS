@@ -301,7 +301,14 @@ fn inject_key(kbd_ep: u32, ev: &KeyEvent) {
 fn inject_pointer(mouse_ep: u32, ev: &PointerEvent) {
     let mut buf = [0u8; kernel_core::input::events::POINTER_EVENT_WIRE_SIZE];
     if ev.encode(&mut buf).is_ok() {
-        let _ = syscall_lib::ipc_call_buf(mouse_ep, MOUSE_EVENT_INJECT, 0, &buf);
+        let reply = syscall_lib::ipc_call_buf(mouse_ep, MOUSE_EVENT_INJECT, 0, &buf);
+        // Only count injects that actually reached `mouse_server`. A failed
+        // transport returns `u64::MAX` (no endpoint, server down, or reject);
+        // counting those would let the C.1 sentinel — and `usb-smoke` — pass
+        // even when the decode→inject seam is broken, defeating its purpose.
+        if reply == u64::MAX {
+            return;
+        }
         // C.1 bare-metal sentinel: emit a greppable injected-event count so
         // that, when run on real hardware over the dock-hub topology, logs
         // capture proof of a non-zero injected count.  Emitted on the first

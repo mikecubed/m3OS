@@ -86,18 +86,20 @@ pub fn hub_next_backoff_ns(consecutive_idle: u32) -> u32 {
 
 // ---- KeyEvent→stdin translation (D.1) -------------------------------------
 
-// Private-use KeySym values for navigation keys; must stay in sync with
-// `kernel_core::input::keymap::KEYSYM_*` constants (Phase 56 Track D.1).
-const KEYSYM_LEFT: u32 = 0xE010;
-const KEYSYM_RIGHT: u32 = 0xE011;
-const KEYSYM_UP: u32 = 0xE012;
-const KEYSYM_DOWN: u32 = 0xE013;
-const KEYSYM_HOME: u32 = 0xE014;
-const KEYSYM_END: u32 = 0xE015;
-const KEYSYM_PAGEUP: u32 = 0xE016;
-const KEYSYM_PAGEDOWN: u32 = 0xE017;
-// 0xE018 = KEYSYM_INSERT (no VT100 output needed for stdin_feeder)
-const KEYSYM_DELETE: u32 = 0xE019;
+// Private-use KeySym values for navigation keys. Sourced from the single
+// authoritative definition in `crate::input::keymap` (via the `KeySym` newtype's
+// `.0`) so there is no second copy to keep in sync (Phase 56 Track D.1).
+// 0xE018 = KEYSYM_INSERT is intentionally omitted (no VT100 output needed).
+use crate::input::keymap;
+const KEYSYM_LEFT: u32 = keymap::KEYSYM_LEFT.0;
+const KEYSYM_RIGHT: u32 = keymap::KEYSYM_RIGHT.0;
+const KEYSYM_UP: u32 = keymap::KEYSYM_UP.0;
+const KEYSYM_DOWN: u32 = keymap::KEYSYM_DOWN.0;
+const KEYSYM_HOME: u32 = keymap::KEYSYM_HOME.0;
+const KEYSYM_END: u32 = keymap::KEYSYM_END.0;
+const KEYSYM_PAGEUP: u32 = keymap::KEYSYM_PAGEUP.0;
+const KEYSYM_PAGEDOWN: u32 = keymap::KEYSYM_PAGEDOWN.0;
+const KEYSYM_DELETE: u32 = keymap::KEYSYM_DELETE.0;
 
 /// `MOD_CTRL` bit in `ModifierState::0`; mirrors `kernel_core::input::events::MOD_CTRL`.
 const MOD_CTRL_BIT: u16 = 1 << 1;
