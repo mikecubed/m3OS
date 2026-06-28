@@ -582,4 +582,62 @@ mod tests {
             "graphical-stack dep graph must be acyclic; bad indices: {bad:?}"
         );
     }
+
+    // ---- Phase 100 Track A.2 — graphical-mode decision truth table ------
+    //
+    // `decide_graphical` is the pure boot-mode decision that lives in
+    // `userspace/init/src/main.rs` and gates BOTH the builtin greeter filter
+    // and the serial-autologin choice. init is a `no_std` bin with no
+    // host-testable module, so this is a byte-for-byte mirror of that
+    // function used solely to lock the truth table under host unit tests. It
+    // is `#[cfg(test)]`-scoped — kernel-core ships no new runtime logic.
+    //
+    // Keep in lock-step with init's `decide_graphical`:
+    //   1. an explicit launch override always wins, in either direction
+    //   2. else the diskless builtin-defaults path defaults to graphical
+    //   3. else the on-disk marker decides
+    fn decide_graphical(boot_override: Option<bool>, diskless: bool, marker_present: bool) -> bool {
+        if let Some(g) = boot_override {
+            return g;
+        }
+        if diskless {
+            return true;
+        }
+        marker_present
+    }
+
+    #[test]
+    fn decide_graphical_override_true_wins_over_everything() {
+        // Explicit graphical override beats diskless/marker in all combos.
+        assert!(decide_graphical(Some(true), false, false));
+        assert!(decide_graphical(Some(true), true, false));
+        assert!(decide_graphical(Some(true), false, true));
+        assert!(decide_graphical(Some(true), true, true));
+    }
+
+    #[test]
+    fn decide_graphical_override_false_wins_over_everything() {
+        // Explicit serial override forces text even on the diskless path or
+        // with the marker present — the laptop can still be pinned to serial.
+        assert!(!decide_graphical(Some(false), false, false));
+        assert!(!decide_graphical(Some(false), true, false));
+        assert!(!decide_graphical(Some(false), false, true));
+        assert!(!decide_graphical(Some(false), true, true));
+    }
+
+    #[test]
+    fn decide_graphical_diskless_defaults_to_graphical() {
+        // No override + diskless builtin path → graphical, regardless of the
+        // (absent-disk) marker probe result.
+        assert!(decide_graphical(None, true, false));
+        assert!(decide_graphical(None, true, true));
+    }
+
+    #[test]
+    fn decide_graphical_data_disk_follows_marker() {
+        // No override + data-disk path (diskless=false) → the on-disk marker
+        // decides, matching the unchanged Phase 71 behavior.
+        assert!(decide_graphical(None, false, true));
+        assert!(!decide_graphical(None, false, false));
+    }
 }
