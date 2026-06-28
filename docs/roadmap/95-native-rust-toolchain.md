@@ -373,6 +373,8 @@ recommended path for a *general* Rust toolchain.
 - **Incremental compilation, parallel codegen, and performance** — correctness
   and "it compiles at all" come first; the slow ring-3 VFS makes performance a
   Phase 87-dependent concern regardless.
-- **Remote debugging (gdb stub) for Rust programs.**
+- **Remote debugging (gdb stub) for Rust programs** — now chartered as
+  [Phase 111 — Remote Debugging](./111-remote-debugging.md) (Track D covers the
+  ring-3 `ptrace` + gdbserver path that debugs on-device Rust binaries).
 - **A userspace SIMD-enabled target** for the toolchain's own code — orthogonal;
   see Phase 86f.
