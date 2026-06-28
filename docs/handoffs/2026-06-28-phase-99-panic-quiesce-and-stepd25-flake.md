@@ -54,28 +54,33 @@ dumps the trace rings while sibling cores keep writing COM1.
 
 ## Track C.2 — 4 GiB residual OOM/race investigation pass
 
-**Run captured (2026-06-28):** `M3OS_MEM=4g M3OS_KVM=1 M3OS_SMP=8 cargo xtask smp-smoke`.
+**Boot is clean at 4 GiB / 8 cores** in every run: `[mm] buddy allocator: 1040256 free
+pages` (≈4 GiB), all 7 APs online, login reached, **no panic, no wedge, no stuck-no-waker
+watchdog** — the scheduler stays live throughout (background `dhcpv6`/`ure` heartbeats keep
+running; the only blocked task in the stall-census was a benign `fork-child` `nanosleep`
+with a live deadline).
 
-- **Boot is clean at 4 GiB / 8 cores:** `[mm] buddy allocator: 1040256 free pages` (≈4 GiB),
-  all 7 APs online, login reached, `pkg install node` succeeded, `node --version` issued.
-- **No panic, no wedge, no lost-wake watchdog.** The scheduler stays **live** the whole
-  time (background `dhcpv6`/`ure` heartbeat tasks keep running); the only blocked task in
-  the stall-census was a benign `fork-child` in `nanosleep` (`syscall_age=20s`,
-  `wake_deadline_in=26s` — it has a deadline, not a lost wake). The 30 s stuck-no-waker
-  watchdog did **not** fire.
-- **What did not complete:** the cold `node` load / 256-op futex stress did not finish in
-  the 360 s budget. With the scheduler demonstrably live and no watchdog verdict, this
-  reads as the documented **">2 GiB scales-with-RAM slowdown"** (the cold `node` binary is
-  demand-paged page-by-page from the ring-3 `vfs_server`, and at 4 GiB the demand-fault +
-  TLB-shootdown traffic is heavier) — **not** a scheduler lost-wake or wedge. The same gate
-  at the default 2 GiB passes in 68 s.
+**Methodology note (corrected):** two early 4 GiB runs used `M3OS_NODE_FAST_ITER=1` and
+failed at the `node --version` step — but the serial shows `command not found: node`: the
+shared data disk had been recreated *without* node by an intervening `cargo xtask
+smoke-test` (which builds a node-less data disk), and `FAST_ITER` skips the in-guest `pkg
+install node`. So those failures were a **disk-reuse test artifact, not a kernel hang or a
+regression** (the guest was healthy the whole time). The valid C.2 test is a **fresh** 4 GiB
+run that actually installs node in-guest (the heavy heap-grow + VFS install at 4 GiB is the
+exact stressor the 2026-06-05 OOM manifestation describes).
 
-**Conclusion (C.2):** at 4 GiB + `-smp 8` the kernel boots and schedules correctly with no
-panic and no lost-wake; the residual >2 GiB effect manifests here as cold-load *slowness*,
-not a crash. No panic fired, so there was no banner to symbolize this pass — but the C.1
-quiesce is in place for the next one. Root-causing the underlying RAM-scaling slowdown is
-explicitly **Deferred** in the Phase 99 design doc ("a full fix may spill to a follow-up");
-C.2 delivers the captured run + this hypothesis, which is the acceptance.
+**Fresh 4 GiB + KVM + -smp 8 run (real `pkg install node` + 256-op futex stress):**
+**PASSED — 18 steps in 69 s** (same wall-clock as the 2 GiB gate). Node installs from
+`.m3pkg`, `node --version` runs (cold load is *not* slow when node is actually present),
+and the 256-op futex/threadpool stress completes (`SMP_STRESS_OK 256`) with **no
+`KERNEL PANIC`, no lost-wakeup, no `process killed`, no OOM**. No serial crash dump written.
+
+**Conclusion (C.2):** at 4 GiB + `-smp 8` + KVM the kernel boots, installs node, and runs
+the futex-heavy SMP stress **cleanly and at full speed** — there is **no residual >2 GiB
+slowdown or race in this path**, and the C.1 panic AP-quiesce is no-regression-confirmed at
+4 GiB. No panic fired (nothing to symbolize); the C.1 readable-banner mechanism stands ready
+for any future 4 GiB panic. This closes C.2's "capture a 4 GiB run + record the outcome"
+acceptance with a clean result.
 
 ## Track D — step-25 demand-fault `cr2=0` NULL-deref flake
 

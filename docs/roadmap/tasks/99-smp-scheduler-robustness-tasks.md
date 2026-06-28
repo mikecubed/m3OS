@@ -11,7 +11,7 @@
 |---|---|---|---|
 | A | Blocking-primitive consolidation: call-site audit, futex conformance, scheduler-state diagnostic, `smp-smoke` raised to `-smp 8` | 57a–e | **Complete** — audit (29 sites, 1 lost-wake fixed) + `dump_scheduler_state` + `-smp 8`; smp-smoke @ -smp 8 PASS |
 | B | Fault-handling robustness: locks-across-faults audit, kstack-overflow origin, recovery-stack review | 2026-06-14 tracks A–D | **Complete** — audit + `debug_assert` + origin doc; kstack-overflow-smoke + dynamic-hello PASS |
-| C | 4 GiB SMP panic-path AP-quiesce (diagnosability) + residual OOM/race pass | A (diagnostic reuse) | **Mostly complete** — C.1 quiesce landed + no-regression; C.2 4 GiB run captured (clean boot, no panic, RAM-scaling slowness); readable-banner demo deferred (no panic to force) |
+| C | 4 GiB SMP panic-path AP-quiesce (diagnosability) + residual OOM/race pass | A (diagnostic reuse) | **Complete** — C.1 quiesce landed + no-regression; C.2 fresh 4 GiB + smp-8 run **PASSED in 69 s** (node install + futex stress, no panic/lost-wake/OOM; no residual race fired). Only the *positive readable-banner demo* is deferred (no panic to force) |
 | D | Step-25 `dynlink-hello-versioned-mismatch-smoke` demand-fault NULL-deref flake → root-cause + fix + soak | B (fault-handler audit) | **Blocked** — CI-host-correlated flake, no red artifact captured; inspection + C.1 diagnosability advance landed; definitive fix needs a red CI ELF |
 | E | Two correctness bugs: `copy_file_range`/`sendfile`→EFAULT, 55c `net::remote` RX-test encoder | — | **Complete** — E.1 clean-ENOSYS + `fs.copyFile` probe folded into node-smoke (PASS); E.2 already fixed (f39ca133, Phase 57b) |
 
@@ -134,8 +134,8 @@
 **Why it matters:** With a readable banner (C.1), one diagnostic pass at the residual >2 GiB instability can either close it or record a precise next-step, rather than leaving it permanently masked by the 2 GiB workaround.
 
 **Acceptance:**
-- [x] A 4 GiB + `--kvm` + `-smp 8` boot/stress run is captured (2026-06-28): boots clean (8 cores, ≈4 GiB), no panic, no wedge, scheduler stays live. No panic fired → nothing to symbolize this pass.
-- [x] A handoff records the result + hypothesis: the residual >2 GiB effect manifests as cold-`node`-load **slowness** (RAM-scaling demand-fault/shootdown traffic), not a lost-wake or crash; the 30 s stuck-no-waker watchdog did not fire. Full root-cause of the RAM-scaling slowdown is **Deferred** per the design doc. → `docs/handoffs/2026-06-28-phase-99-panic-quiesce-and-stepd25-flake.md`.
+- [x] A 4 GiB + `--kvm` + `-smp 8` fresh boot/stress run is captured (2026-06-28): **PASSED, 18 steps in 69 s** — boots clean (8 cores, ≈4 GiB), `pkg install node`, `node --version`, and the 256-op futex stress all complete (`SMP_STRESS_OK 256`), **no panic / lost-wake / OOM**.
+- [x] Result recorded: **no residual >2 GiB race or slowdown fired in this path** — 4 GiB runs at the same speed as 2 GiB. (Two earlier `FAST_ITER` "hangs" were a node-less-reused-disk test artifact, not a kernel issue — see handoff.) No panic → nothing to symbolize; C.1 readable-banner stands ready. → `docs/handoffs/2026-06-28-phase-99-panic-quiesce-and-stepd25-flake.md`.
 
 ---
 
