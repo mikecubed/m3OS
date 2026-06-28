@@ -1,7 +1,7 @@
 [package]
 name = "m3ctl"
-version = "0.57.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 
 # Phase 57 Track I.2: a `[lib]` target lets `cargo test -p m3ctl
 # --target x86_64-unknown-linux-gnu` exercise the verb-construction

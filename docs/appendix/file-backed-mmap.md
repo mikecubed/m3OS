@@ -1,21 +1,29 @@
-# File-Backed mmap — Design and Implementation Plan
+# File-Backed mmap — Design and Implementation
 
 **Type:** Appendix — kernel feature design  
-**Status:** Partially implemented (Strategy A — eager loading)  
+**Status:** Implemented — Strategy A (eager loading, Phase 47) **and** Strategy B (demand-paged file-backed mmap, **landed in [Phase 95b](../roadmap/95b-on-device-rustc.md)**)  
 **Depends on:** Phase 33 (buddy allocator, demand paging, mprotect/munmap) ✅  
-**Related:** Phase 47 (DOOM port) — identified WAD file mmap as root cause of zone pressure
+**Related:** Phase 47 (DOOM port) — identified WAD file mmap as root cause of zone pressure; Phase 95b — reworked the `ld-musl` loader + kernel mm from whole-file read+copy to a streaming, demand-paged file-backed `mmap` so the ~162 MB `librustc_driver.so` demand-pages instead of being read+copied in full (see the [Phase 95 completion plan](../handoffs/2026-06-24-phase-95-completion-plan.md))
 
 ---
 
 ## Background
 
-m3OS supports file-backed `mmap` via eager loading (Strategy A below). When a
-process calls `mmap(fd, len, prot, MAP_PRIVATE, offset)`, the kernel reads the
-file contents into freshly allocated frames and maps them into the caller's
-address space at `mmap` time. This is sufficient for WAD file loading, static
-data files, and other `MAP_PRIVATE | PROT_READ` use cases.
+m3OS supports file-backed `mmap` via **both** strategies described below: eager
+loading (Strategy A) since Phase 47, and demand paging (Strategy B) since
+Phase 95b. When a process calls `mmap(fd, len, prot, MAP_PRIVATE, offset)`, the
+kernel can either read the file contents into freshly allocated frames at `mmap`
+time (eager), or record the mapping and fault its pages in lazily from the
+backing file (demand). Eager mapping is sufficient for small WAD/data files;
+demand paging is what makes the multi-hundred-MB toolchain DSOs (Phase 95b's
+`librustc_driver.so` / `libLLVM.so`) load without being read+copied in full.
 
-Demand-paged file-backed mmap (Strategy B below) is not yet implemented.
+Demand-paged file-backed mmap (Strategy B below) is implemented as of Phase 95b
+behind the `MAP_LAZY_FILE` flag (`kernel_core::mm::MAP_LAZY_FILE = 1 << 32`); the
+page-fault handler services file-backed faults via `demand_map_vma_page` →
+`shared_vma_demand_file` → `demand_read_file_page` →
+`demand_map_user_page_from_buf_locked` (`kernel/src/arch/x86_64/interrupts.rs`),
+issuing a blocking `vfs_server` read from the fault handler.
 
 ### Impact on DOOM (the motivating case)
 
@@ -80,7 +88,7 @@ handling changes and works within the existing mm subsystem. The cost is that
 all mapped file bytes are loaded into RAM upfront, which is fine for small
 files (WAD files, executables) but wasteful for large sparse files.
 
-#### Strategy B — Demand paging (proper, implement second)
+#### Strategy B — Demand paging (landed in Phase 95b ✅)
 
 Instead of loading all pages eagerly, record a `VmaRegion` for the mapping and
 handle page faults:
@@ -96,8 +104,13 @@ This is how Linux and every production OS implements mmap. It enables
 memory-mapped executables (the foundation for a dynamic linker), shared
 anonymous memory, and copy-on-write fork optimisation.
 
-**Strategy A is implemented and ships with Phase 47.** Strategy B is the
-right long-term design.
+**Strategy A is implemented and shipped with Phase 47.** **Strategy B (demand
+paging) landed in [Phase 95b](../roadmap/95b-on-device-rustc.md)** behind the
+`MAP_LAZY_FILE` flag: the page-fault handler looks up the faulting address in the
+process VMA list (`demand_map_vma_page` → `shared_vma_demand_file`), reads the
+backing page via a blocking `vfs_server` IPC (`demand_read_file_page`), and maps
+it (`demand_map_user_page_from_buf_locked`) — so a multi-hundred-MB DSO
+demand-pages instead of being read+copied in full at `mmap` time.
 
 ---
 
@@ -209,10 +222,12 @@ VMA, service the fault.
 1. **Strategy A (eager)** — ✅ implemented; ships with Phase 47. Unblocks
    DOOM and all `MAP_PRIVATE | PROT_READ` use cases.
 2. **`MAP_SHARED` writeback** — needed for mmap-based IPC and databases.
-3. **Strategy B (demand paging)** — enables dynamic linking and efficient
-   large-file access; requires page-fault handler VMA lookup.
+3. **Strategy B (demand paging)** — ✅ landed in Phase 95b (`MAP_LAZY_FILE` +
+   page-fault VMA lookup + blocking `vfs_server` read); enables the streaming
+   demand-paged load of the large toolchain DSOs and efficient large-file access.
 4. **`MAP_SHARED` cross-process visibility** — requires a kernel page cache
-   and reverse mapping table so multiple processes see coherent data.
+   and reverse mapping table so multiple processes see coherent data
+   (the Phase 95c page-cache work; see [Phase 95c](../roadmap/95c-vfs-block-io-perf.md)).
 
 ---
 

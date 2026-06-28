@@ -1,7 +1,7 @@
 [package]
 name = "display_client_ffi"
-version = "0.70.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Phase 70 Track A0 — C-ABI veneer over the Phase 56 display protocol codec + SHM lifecycle. Mirror of audio_client_ffi so DOOM can speak the surface-buffer protocol from C."
 build = "build.rs"
 

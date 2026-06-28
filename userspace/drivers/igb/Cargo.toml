@@ -1,7 +1,7 @@
 [package]
 name = "igb_driver"
-version = "0.79.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Phase 79 Track B — ring-3 Intel igb (82575/82576/I210/I211/I350/I354) NIC driver."
 
 [lib]

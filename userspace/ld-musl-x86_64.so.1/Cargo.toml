@@ -1,7 +1,7 @@
 [package]
 name = "ld-musl-x86_64-so-1"
-version = "0.2.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 
 # Phase 76b: the dynamic linker now performs real bring-up work
 # (`_dlstart` self-relocation, `DT_NEEDED` resolution, four core

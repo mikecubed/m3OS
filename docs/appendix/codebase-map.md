@@ -1,114 +1,251 @@
 # Codebase Map
 
 Reference file for workspace layout, source structure, and documentation index.
-Extracted from AGENTS.md to keep active guidance lean.
+Reflects Phase 98 / kernel v0.97.0. Extracted from AGENTS.md to keep active guidance lean.
 
 ## Workspace Crates
 
-The authoritative list lives in `Cargo.toml` under `workspace.members`. The
-map below mirrors it; when the two disagree, `Cargo.toml` wins.
+**Regeneration command** — to get the authoritative list directly from `Cargo.toml`:
+
+```bash
+sed -n '/members = \[/,/\]/p' Cargo.toml | grep -oE '"[^"]+"' | tr -d '"'
+```
+
+When this file and `Cargo.toml` disagree, `Cargo.toml` wins.
+
+### Core / build crates
 
 ```
-Cargo.toml                # workspace root (default-members = ["kernel"])
-kernel/                   # main OS kernel binary (no_std)
-kernel-core/              # shared library — host-testable pure logic (no_std + std feature)
-xtask/                    # build system (host, std)
-userspace/
-  # Phase 11 userspace test binaries
-  syscall-lib/            # syscall wrapper library for userspace Rust binaries
-  exit0/                  # test binary: simple exit
-  fork-test/              # test binary: fork behavior
-  echo-args/              # test binary: argument echo
-  # Phase 20 userspace init and shell
-  init/                   # PID 1 init daemon
-  shell/                  # sh0 shell (binary name: sh0)
-  # Phase 23 userspace ping
-  ping/                   # ICMP ping utility
-  # Phase 54 validation probes
-  udp-smoke/              # UDP-path smoke probe used by the serverization validation bundle
-  smoke-runner/           # Harness that drives the smoke probes under the xtask regression command
-  # Phase 26 text editor
-  edit/                   # full-screen text editor (kibi-style)
-  # Phase 27 user accounts
-  login/                  # login authentication
-  su/                     # switch user
-  passwd/                 # change password
-  adduser/                # create user account
-  id/                     # print user/group IDs
-  whoami/                 # print current user
-  # Phase 29 PTY test
-  pty-test/               # PTY subsystem test
-  # Phase 39 Unix domain socket test
-  unix-socket-test/       # Unix domain socket test
-  # Phase 40 thread test
-  thread-test/            # Threading primitives test
-  # Phase 42 crypto
-  crypto-lib/             # Cryptography library
-  crypto-test/            # Crypto integration test
-  # Phase 43 SSH server
-  sshd/                   # SSH server daemon
-  # Phase 42b async executor
-  async-rt/               # Minimal async runtime for ring-3 services
-  # Rust coreutils (replacing C musl utilities)
-  coreutils-rs/           # Rust implementations: true, false, echo, pwd, sleep, rm, mkdir, rmdir, mv, touch, stat, wc, ar, install, meminfo, date, uptime, sha256sum, genkey, service, logger, shutdown, reboot, hostname, who, w, last, crontab
-  coreutils-tests/        # Host-side tests for coreutils-rs
-  # Phase 46 system services
-  syslogd/                # System logging daemon
-  crond/                  # Cron scheduler daemon
-  # Phase 52 extracted services (ring-3)
-  console_server/         # Console / framebuffer service
-  kbd_server/             # Keyboard input service
-  stdin_feeder/           # Stdin routing helper used by the console / keyboard split
-  # Phase 54 extracted services (ring-3)
-  vfs_server/             # VFS policy service
-  fat_server/             # FAT filesystem service backing vfs_server
-  net_server/             # UDP networking policy service
+kernel/                   # main OS kernel binary (no_std, x86_64-unknown-none)
+kernel-core/              # shared pure-logic library — host-testable (no_std + std feature)
+xtask/                    # build system and smoke harness (host, std)
+pkg-format/               # .m3pkg format: pack/unpack/verify, content key (Phase 85a)
+```
+
+### Userspace — syscall lib and test binaries
+
+```
+userspace/syscall-lib/    # syscall wrapper library for all userspace Rust binaries
+userspace/exit0/          # test binary: simple exit
+userspace/fork-test/      # test binary: fork behavior
+userspace/echo-args/      # test binary: argument echo
+```
+
+### Userspace — core daemons and tools
+
+```
+userspace/init/           # PID 1 init daemon + service supervisor
+userspace/shell/          # sh0 built-in shell (binary: sh0)
+userspace/ping/           # ICMP ping utility
+userspace/ping6/          # ICMPv6 ping utility (Phase 91)
+userspace/ipv6-smoke/     # IPv6 dual-stack smoke probe (Phase 91)
+userspace/udp-smoke/      # UDP-path smoke probe
+userspace/smoke-runner/   # drives smoke probes under xtask regression
+userspace/edit/           # full-screen text editor (kibi-style)
+userspace/login/          # login authentication daemon
+userspace/su/             # switch user
+userspace/passwd/         # change password
+userspace/adduser/        # create user account
+userspace/id/             # print user/group IDs
+userspace/whoami/         # print current user
+userspace/ktrace/         # kernel trace ring consumer (Phase 43b)
+userspace/pty-test/       # PTY subsystem test
+userspace/unix-socket-test/ # Unix domain socket test
+userspace/thread-test/    # threading primitives test
+userspace/crypto-lib/     # cryptography library (RustCrypto; AES-NI via cpufeatures)
+userspace/crypto-test/    # crypto integration test + AES-NI benchmark
+userspace/sshd/           # SSH server daemon (sunset integration)
+userspace/async-rt/       # minimal async runtime for ring-3 services
+userspace/coreutils-rs/   # Rust coreutils (echo, ls, cat, rm, mkdir, sort, sha256sum, …)
+userspace/coreutils-tests/ # host-side tests for coreutils-rs
+userspace/syslogd/        # system logging daemon
+userspace/usb-logsink/    # USB log-sink daemon + GPT ext2 mount (Phase 96)
+userspace/crond/          # cron scheduler daemon
+```
+
+### Userspace — core servers
+
+```
+userspace/console_server/ # console / framebuffer service
+userspace/kbd_server/     # keyboard input service
+userspace/stdin_feeder/   # stdin routing helper (console / keyboard split)
+userspace/vfs_server/     # VFS policy service + ext2 engine
+userspace/fat_server/     # FAT filesystem service backing vfs_server
+userspace/net_server/     # UDP networking policy service
+userspace/mouse_server/   # mouse input service
+```
+
+### Userspace — driver runtime lib and ring-3 drivers
+
+```
+userspace/lib/driver_runtime/  # shared driver IPC + DMA primitives
+userspace/drivers/nvme/        # ring-3 NVMe driver (single-queue, IOMMU-routed)
+userspace/drivers/e1000/       # ring-3 Intel 82540EM classic e1000 NIC driver
+userspace/drivers/e1000e/      # ring-3 Intel e1000e NIC driver
+userspace/drivers/igb/         # ring-3 Intel igb NIC driver
+userspace/drivers/igc/         # ring-3 Intel igc NIC driver
+userspace/drivers/r8169/       # ring-3 Realtek RTL8111/8168 NIC driver
+userspace/drivers/r8125/       # ring-3 Realtek RTL8125 2.5G NIC driver
+userspace/drivers/ure/         # ring-3 Realtek RTL8156 USB-Ethernet driver (Phase 96)
+userspace/drivers/xhci/        # ring-3 xHCI USB host driver (MSI-X, TRB/event rings, hot-plug)
+userspace/lib/usb-core/        # USB core library (enumeration, descriptors, class matching)
+userspace/drivers/usbhub/      # USB hub walker (descriptor + per-port power/reset)
+userspace/drivers/usb-hid/     # USB HID class driver (Boot + Report Protocol, LEDs)
+userspace/drivers/usb-storage/ # USB mass storage (BOT/SCSI, /mnt/usb<n> mount, unmount-on-detach)
+userspace/drivers/usb-net/     # USB CDC-ECM/NCM Ethernet class driver (Phase 92e)
+userspace/drivers/usb-audio/   # USB audio class driver (UAC isoch OUT, Phase 92c)
+userspace/drivers/usb-video/   # USB video class driver (UVC isoch IN, Phase 92c)
+userspace/drivers/ac97/        # ring-3 Intel AC'97 audio driver
+userspace/drivers/hda/         # ring-3 Intel HDA audio driver (CORB/RIRB, BDL stream)
+userspace/drivers/ahci/        # ring-3 AHCI/SATA block driver (RemoteBlockDevice, Phase 82)
+userspace/wifi-core/           # Wi-Fi policy + WPA2-PSK 4-way handshake
+userspace/drivers/mt792x/      # ring-3 MediaTek mt792x Wi-Fi driver (MT7921/7922/7925)
+```
+
+### Userspace — driver smoke probes
+
+```
+userspace/nvme-crash-smoke/           # NVMe driver crash recovery smoke test
+userspace/max-restart-smoke/          # service max-restart backoff smoke test
+userspace/e1000-crash-smoke/          # e1000 driver crash recovery smoke test
+```
+
+### Userspace — GUI stack
+
+```
+userspace/lib/surface_buffer/         # shared framebuffer surface abstraction
+userspace/display_server/             # compositor: framebuffer owner, focus dispatch, surface roles
+userspace/gfx-demo/                   # simple graphics demo client
+userspace/m3ctl/                      # OS admin tool (mitigations, display, audio, service control)
+userspace/fb-takeover/                # framebuffer takeover client (DOOM Tier 3)
+userspace/display-server-crash-smoke/ # display_server crash recovery smoke test
+userspace/display-multi-client-smoke/ # display_server multi-client smoke test
+userspace/grab-hook-smoke/            # input grab hook smoke test
+userspace/session_manager/            # graphical session orchestrator (startup/shutdown lifecycle)
+userspace/greeter/                    # GUI login client
+userspace/wallpaper/                  # wallpaper compositor client
+userspace/bar/                        # status bar compositor client
+userspace/launcher/                   # application launcher compositor client
+userspace/notifyd/                    # notification daemon compositor client
+userspace/lockscreen/                 # lockscreen compositor client
+```
+
+### Userspace — audio
+
+```
+userspace/audio_server/        # audio policy server + 32-ch DMX→S16LE mixer
+userspace/camera_server/       # camera capture server (UVC frames, Phase 92c)
+userspace/lib/audio_client/    # audio client library
+userspace/lib/audio_mixer/     # audio mixer library
+userspace/lib/audio_client_ffi/  # audio client FFI shim (C-compatible)
+userspace/audio-demo/          # audio demo / tone generator
+userspace/audio-stats/         # audio statistics display
+userspace/bell-test/           # terminal bell test
+```
+
+### Userspace — terminal
+
+```
+userspace/term/                # terminal emulator: UTF-8 + TTF/Nerd Font, ANSI, PTY client
+```
+
+### Userspace — lib crates
+
+```
+userspace/lib/shadow/          # shadow password file library
+userspace/lib/display_client_ffi/  # display_server client FFI shim
+userspace/lib/layout/          # GUI layout primitives
+userspace/lib/desktop_client/  # desktop session client library
+```
+
+### Userspace — security / policy tools
+
+```
+userspace/ld-musl-x86_64.so.1/  # from-scratch Rust PT_INTERP loader (dlopen/dlsym, PLT, TLS)
+userspace/pkg/                   # offline in-OS package manager (install/remove/upgrade/verify)
+```
+
+### Userspace — test / smoke / probe binaries
+
+```
+userspace/crash_stub/          # minimal crash fixture for restart-policy testing
+userspace/tui-smoke/           # TUI app smoke gate (ncurses apps via xtask)
+userspace/tcsmoke/             # termios/line-discipline smoke test
+userspace/winsize-bang/        # TIOCGWINSZ/TIOCSWINSZ test
+userspace/sendmsg-test/        # sys_sendmsg / sys_recvmsg test
+userspace/page-grant-test/     # IPC page-capability grant test
+userspace/wx-violation/        # W^X enforcement negative test
+userspace/pku-smoke/           # PKU alloc/fault/asym/sigframe/W^X-v2 smoke (Phase 90a)
+userspace/usb-mount-smoke/     # USB mass storage mount smoke test
+userspace/kstack-overflow-test/ # kernel stack overflow controlled-kill test (Track D)
+userspace/epoll-smoke/         # epoll/eventfd smoke test
+userspace/doom-concurrent/     # DOOM concurrent input stress test
+userspace/vfs-throughput-probe/ # VFS I/O throughput probe (Phase 95c)
 ```
 
 ### Non-member crates on disk
 
-These directories exist under `userspace/` but are deliberately **not**
-listed in `workspace.members` — they build through a different path or are
-retained as legacy fixtures. Do not expect `cargo build` or `cargo xtask
-check` to exercise them unless their dedicated entry point is invoked.
-
 ```
 userspace/
-  # Phase 30 legacy telnet daemon — retained on disk; not currently built
-  telnetd/                # Telnet server daemon
-  # C-based legacy test binaries and ports — built through xtask-specific paths
-  coreutils/              # C implementations of cat/cp/echo/... (superseded by coreutils-rs)
-  demo-project/           # Multi-file C demo project for make testing (Phase 32)
-  hello-c/                # C hello world test
-  signal-test/            # C signal handling test
-  stdin-test/             # C stdin test
-  tmpfs-test/             # C tmpfs test
-  mmap-leak-test/         # Memory-map leak regression
-  doom/                   # Ported game (build via its own flow)
-  # Phase 44 musl-linked Rust std programs — cross-compiled via xtask musl path
-  hello-rust/             # Rust std hello world
-  sysinfo-rust/           # System info via std::fs
-  httpd-rust/             # Minimal HTTP server via std::net
-  calc-rust/              # Interactive calculator via std::io
-  todo-rust/              # Persistent todo list via std::fs
+  telnetd/              # Telnet server daemon (retained; not in workspace.members)
+  coreutils/            # C musl coreutils (superseded by coreutils-rs)
+  demo-project/         # Multi-file C demo (Phase 32 make testing)
+  hello-c/              # C hello world fixture
+  signal-test/          # C signal handling fixture
+  stdin-test/           # C stdin fixture
+  tmpfs-test/           # C tmpfs fixture
+  mmap-leak-test/       # memory-map leak regression
+  doom/                 # DOOM port (built via xtask-specific path)
+  hello-rust/           # musl Rust std hello world (Phase 44)
+  sysinfo-rust/         # musl Rust std sysinfo (Phase 44)
+  httpd-rust/           # musl Rust std HTTP server (Phase 44)
+  calc-rust/            # musl Rust std calculator (Phase 44)
+  todo-rust/            # musl Rust std todo list (Phase 44)
 ```
 
-## Ports Tree Layout (Phase 45)
+## Ports Tree Layout
+
+Regeneration: `ls ports/*/` to see all categories and port names.
 
 ```
 ports/
-  port.sh                 # port command (installed at /usr/bin/port)
-  lang/lua/               # Lua 5.4.7 scripting language port
-  lib/zlib/               # zlib 1.3.1 compression library port
-  math/bc/                # bc calculator port
-  core/sbase/             # suckless Unix tools port (basename, seq, rev, etc.)
-  doc/mandoc/             # man page formatter port
-  util/minizip/           # zlib-dependent test port
+  port.sh               # port command (installed at /usr/bin/port)
+  core/
+    sbase/              # suckless Unix tools (basename, seq, rev, …)
+  lang/
+    go/                 # Go 1.24 static runtime (Phase 86d)
+    llvm/               # LLVM/Clang/LLD — reused sysroot for clang + rustc ports
+    lua/                # Lua 5.4.7 scripting language
+    node/               # Node.js 22 LTS jitless + JIT variants (Phase 89/90a)
+    python/             # CPython 3.12 fully-static (Phase 85c)
+    python-dynamic/     # CPython 3.12 dynamic (Phase 93; DEPS=musl)
+    rust/               # rustc 1.96.0 dynamic musl (Phase 95; DEPS=musl)
+  lib/
+    ca-certificates/    # Mozilla CA bundle (Phase 86a)
+    libevent/           # libevent (tmux dependency)
+    libffi/             # libffi (dynamic Python ctypes, Phase 93)
+    mbedtls/            # mbedTLS 3.6.2 static (Phase 86c)
+    musl/               # musl 1.2.5 --enable-shared libc.so (Phase 93)
+    ncurses/            # ncurses wide (tmux/htop/less dependency)
+    zlib/               # zlib 1.3.1 compression library
+  math/
+    bc/                 # bc arbitrary-precision calculator
+  util/
+    claude-code/        # @anthropic-ai/claude-code@2.1.112 .m3pkg (Phase 90b)
+    coreutils/          # uutils/coreutils 0.9.0 musl static multicall (Phase 94)
+    curl/               # libcurl 8.15.0 --with-mbedtls static (Phase 86c)
+    dropbear/           # Dropbear SSH client dbclient (Phase 86b)
+    gh/                 # GitHub CLI gh 2.82.1 static Go (Phase 86e)
+    git/                # git (local-only 85b; HTTPS-capable 86c via curl/mbedtls)
+    htop/               # htop process monitor (ncurses)
+    less/               # less pager (ncurses)
+    minizip/            # minizip (zlib test port)
+    tmux/               # tmux terminal multiplexer (ncurses + libevent)
   <category>/<program>/
-    Portfile              # metadata: NAME, VERSION, DESCRIPTION, CATEGORY, DEPS
-    Makefile              # targets: fetch, patch, build, install, clean
-    src/                  # bundled source code
-    patches/              # m3OS-specific patches
+    Portfile            # metadata: NAME, VERSION, DESCRIPTION, CATEGORY, DEPS
+    Makefile            # targets: fetch, patch, build, install, clean
+    src/                # bundled source (or fetched)
+    patches/            # m3OS-specific patches
 ```
 
 ## Kernel Source Layout
@@ -116,26 +253,39 @@ ports/
 ```
 kernel/src/
   main.rs              # entry point, boot sequence
-  serial.rs            # serial I/O + log backend
+  lib.rs               # crate root (no_std)
+  serial.rs            # serial I/O + log backend (COM1)
   pipe.rs              # inter-process pipes
-  pty.rs               # PTY pair table and lifecycle (Phase 29)
-  rtc.rs               # CMOS real-time clock driver (Phase 34)
-  signal.rs            # POSIX-style signal handling
+  pty.rs               # PTY pair table and lifecycle
+  rtc.rs               # CMOS real-time clock driver
+  signal.rs            # POSIX-style signal handling (sigaction, sigframe, sigreturn)
   stdin.rs             # stdin abstraction
   tty.rs               # TTY/terminal subsystem
-  testing.rs           # QEMU test framework
-  arch/x86_64/         # GDT, IDT (APIC-based), paging, syscall gate
-  acpi/                # ACPI table parsing (RSDP, MADT)
-  blk/                 # block devices: VirtIO-blk, MBR parsing
+  epoll.rs             # epoll (EPOLLET, EPOLLRDHUP, epoll_pwait)
+  eventfd.rs           # eventfd2
+  timerfd.rs           # timerfd (CLOCK_MONOTONIC, CLOCK_REALTIME)
+  flock.rs             # advisory file locking (flock/fcntl F_SETLK)
+  mitigations.rs       # Spectre/Meltdown mitigation policy (mitigations=off|auto|full)
+  trace.rs             # per-core lock-free kernel trace ring
+  fwcfg.rs             # QEMU fw_cfg device (test exit, debug)
+  panic_diag.rs        # enriched panic / fault handler diagnostics
+  testing.rs           # QEMU ISA-debug-exit test framework
+  test_prelude.rs      # test prelude (no_std test helpers)
+  arch/x86_64/         # GDT, IDT, APIC, syscall gate, XSAVE, SMEP/SMAP, PKU, PAT, microcode
+  acpi/                # ACPI table parsing (RSDP, MADT, MCFG, DMAR/IVRS)
+  blk/                 # block devices: virtio-blk, MBR, remote block façade
   fb/                  # framebuffer console driver
-  fs/                  # VFS layer, FAT32, tmpfs, ramdisk, protocol
-  ipc/                 # endpoints, capabilities, messages, notifications, registry
-  mm/                  # buddy frame allocator, paging, heap, slab caches, user_space, ELF loader
-  net/                 # IPv4, ARP, Ethernet, ICMP, TCP, UDP, Unix domain sockets, VirtIO-net, dispatch
-  pci/                 # PCI device enumeration
-  process/             # process management (fork, exec, exit, wait, threads, futex)
-  smp/                 # AP boot, IPI, TLB shootdown
-  task/                # scheduler (SMP-aware round-robin)
+  fs/                  # VFS layer, ext2 engine, FAT32, tmpfs, ramdisk, procfs, metacache
+  iommu/               # IOMMU substrate: VT-d (intel.rs), AMD-Vi (amd.rs), fault ISRs, per-device registry
+  ipc/                 # endpoints, capabilities, messages, notifications, page grants, registry
+  mm/                  # frame allocator, paging, heap, slab, shm, DMA, ELF loader, PKU (pkey.rs), user_space
+  net/                 # IPv4/IPv6, ARP, NDP, ICMP/ICMPv6, TCP, UDP, DHCP/DHCPv6, AF_UNIX, dispatch
+  pci/                 # PCI/PCIe enumeration, BAR mapping
+  process/             # process management: fork, exec, exit, wait, threads, futex
+  smp/                 # AP boot (boot.rs), IPI (ipi.rs), TLB shootdown (tlb.rs)
+  syscall/             # syscall dispatch (mod.rs), device-host gate (device_host.rs), network (net.rs)
+  task/                # scheduler (SMP-aware), blocking mutex, kstack, wait queues, watchdog
+  time/                # CLOCK_MONOTONIC/REALTIME, TSC calibration
 kernel/initrd/           # static initrd assets checked into source
 target/generated-initrd/ # xtask-staged generated binaries embedded by ramdisk
 ```
@@ -146,16 +296,59 @@ target/generated-initrd/ # xtask-staged generated binaries embedded by ramdisk
 kernel-core/src/
   lib.rs               # module declarations
   types.rs             # shared types
-  buddy.rs             # buddy frame allocator (Phase 33)
-  slab.rs              # slab cache allocator (Phase 33)
-  time.rs              # time conversion library (Phase 34)
+  buddy.rs             # buddy frame allocator
+  slab.rs              # slab cache + magazine layer
+  size_class.rs        # size-class allocator
+  time.rs              # time conversion
   fb.rs                # framebuffer abstractions
   pipe.rs              # pipe abstractions
-  pty.rs               # PTY pair state, ring buffers (Phase 29)
+  pty.rs               # PTY pair state, ring buffers
   tty.rs               # TTY abstractions
-  fs/                  # FAT32, MBR, tmpfs abstractions
-  ipc/                 # capability, message, registry abstractions
-  net/                 # ARP, Ethernet, ICMP, IPv4, TCP, UDP abstractions
+  epoll.rs             # epoll model
+  eventfd.rs           # eventfd model
+  timerfd.rs           # timerfd model
+  pkey.rs              # PKU pkey model
+  trace_ring.rs        # trace ring model
+  log_ring.rs          # log ring
+  address_space.rs     # typed AddressSpace abstraction
+  cred.rs              # credentials (UID/GID)
+  csprng.rs            # CSPRNG (RDRAND/RDSEED seeded, Phase 86a)
+  spectre.rs           # Spectre mitigation model
+  kpti.rs              # KPTI model / scaffold
+  e1000.rs             # e1000 NIC model
+  r8169.rs             # r8169 NIC model
+  nic_ids.rs           # NIC device-ID registry
+  nvme.rs              # NVMe command model
+  pci.rs               # PCI model
+  preempt_frame.rs     # preemption trap-frame model
+  preempt_model.rs     # preemption model
+  sched_model.rs       # scheduler model
+  xsave_model.rs       # XSAVE component model
+  watchdog_policy.rs   # watchdog policy
+  utf8.rs              # UTF-8 stream decoder
+  mm.rs                # memory model helpers
+  user_range.rs        # user-space address range validation
+  cross_cpu_free.rs    # cross-CPU slab free
+  magazine.rs          # magazine allocator
+  microcode.rs         # CPU microcode model
+  audio/               # audio IPC protocol (driver_ipc::audio)
+  device_host/         # device-host capability model
+  display/             # display protocol model
+  driver_ipc/          # driver IPC seams (audio, NIC, block)
+  driver_runtime/      # driver runtime model
+  elf/                 # ELF model
+  font/                # font model
+  fs/                  # ext2, FAT32, MBR, tmpfs, VFS protocol, LRU cache
+  hda/                 # HDA codec model
+  init/                # init protocol model
+  input/               # input event model
+  iommu/               # IOMMU model
+  ipc/                 # capability, message, registry, bound-notification model
+  mt792x/              # mt792x Wi-Fi model
+  net/                 # IPv4/IPv6, ARP, NDP, ICMP/ICMPv6, DHCP/DHCPv6, TCP, UDP, msghdr
+  session/             # session model
+  storage/             # AHCI, ATA model
+  usb/                 # USB model: xHCI, HID Report, hub, CDC, mass-storage, UAC, UVC, enumerate
 ```
 
 ## Documentation Index

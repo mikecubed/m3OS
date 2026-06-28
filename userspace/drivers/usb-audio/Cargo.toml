@@ -1,7 +1,7 @@
 [package]
 name = "usb_audio"
-version = "0.92.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Phase 92c — ring-3 USB Audio Class (UAC) isochronous PCM-out driver."
 
 [[bin]]

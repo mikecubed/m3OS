@@ -1,7 +1,7 @@
 [package]
 name = "term"
-version = "0.57.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Phase 57 Track G — graphical terminal emulator (display_server client + PTY host)."
 
 # Phase 57 Track G: a `[lib]` target lets `cargo test -p term --target

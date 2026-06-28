@@ -1,7 +1,7 @@
 [package]
 name = "hda_driver"
-version = "0.80.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Phase 80b — ring-3 Intel HDA audio hardware driver (out-of-process)."
 
 # The library target exposes the driver-internal modules for host-side

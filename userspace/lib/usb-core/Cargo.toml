@@ -1,7 +1,7 @@
 [package]
 name = "usb-core"
-version = "0.78.2"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Phase 78b Track A — host↔class IPC protocol types for USB class drivers."
 
 [dependencies]

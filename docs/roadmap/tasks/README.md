@@ -181,7 +181,7 @@ flowchart TD
 |---|---|---|---|---|
 | 11 | ELF loader and process model | Complete | `phase-11` | [Phase 11 Tasks](./11-process-model-tasks.md) |
 | 12 | POSIX compatibility layer | Complete | `phase-12` | [Phase 12 Tasks](./12-posix-compat-tasks.md) |
-| 13 | Writable filesystem | Complete | `phase-13` | *not yet created* |
+| 13 | Writable filesystem | Complete | `phase-13` | [Tasks](./13-writable-fs-tasks.md) |
 | 14 | Shell and userspace tools | Complete | `phase-14` | [Phase 14 Tasks](./14-shell-and-tools-tasks.md) |
 | 15 | Hardware discovery (ACPI + PCI) | Complete | `phase-15` | [Phase 15 Tasks](./15-hardware-discovery-tasks.md) |
 | 16 | Network stack | Complete | `phase-16` | [Phase 16 Tasks](./16-network-tasks.md) |
@@ -258,7 +258,7 @@ flowchart TD
 
 | Phase | Focus | Status | Source Ref | Task List |
 |---|---|---|---|---|
-| 51 | Service model maturity (contract, restart, shutdown, admin) | In Progress | `phase-51` | [Tasks](./51-service-model-maturity-tasks.md) |
+| 51 | Service model maturity (contract, restart, shutdown, admin) | Complete (folded into Phase 46) | `phase-51` | [Tasks](./46-system-services-tasks.md) |
 | 52 | First service extractions (console, keyboard to ring 3) | In Progress | `phase-52` | [Tasks](./52-first-service-extractions-tasks.md) |
 | 52a | Kernel reliability fixes | Complete | `phase-52a` | [Tasks](./52a-kernel-reliability-fixes-tasks.md) |
 | 52b | Kernel structural hardening | Complete | `phase-52b` | [Tasks](./52b-kernel-structural-hardening-tasks.md) |
@@ -273,18 +273,10 @@ flowchart TD
 | 55c | Ring-3 Driver Correctness Closure (bound notifications, IOMMU BAR identity coverage, userspace `EAGAIN` visibility) | Planned | `phase-55c` | [Tasks](./55c-ring-3-driver-correctness-closure-tasks.md) |
 | 56 | Display and Input Architecture | Complete | `phase-56` | [Tasks](./56-display-and-input-architecture-tasks.md) |
 
-### Future Task Docs
-Task docs for Phases **57 and later** are intentionally deferred until closer to implementation time.
+### Phases 57 and Later
 
-The main roadmap phases now define:
-
-- explicit evaluation gates
-- critical and non-deferrable items
-- learning-documentation requirements
-- related documentation / README update requirements
-
-When a future phase moves into active implementation planning, add its task doc in this
-directory using the phase task template from `docs/appendix/doc-templates.md`.
+Task docs exist for all phases through Phase 110. When adding a new phase doc, use the
+phase task template from `docs/appendix/doc-templates.md`.
 
 ## Suggested Usage
 

@@ -1,7 +1,7 @@
 [package]
 name = "ac97_driver"
-version = "0.80.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Phase 80 Track A.5 — ring-3 AC'97 audio hardware driver (out-of-process)."
 
 # The library target exposes the AC'97 logic for integration tests on

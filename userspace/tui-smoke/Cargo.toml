@@ -1,7 +1,7 @@
 [package]
 name = "tui-smoke"
-version = "0.69.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Phase 69 Track H — byte-level validator for the m3os-term terminal contract. Runs from the post-login shell; each subcommand exercises one Phase 69 capability against the term lib and prints TUI_SMOKE:<name>:ok or TUI_SMOKE:<name>:fail <reason>."
 
 [[bin]]

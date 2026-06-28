@@ -1,7 +1,7 @@
 [package]
 name = "greeter"
-version = "0.71.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Phase 71 — GUI login manager (display_server client + passwd_lib auth gate)."
 
 # Phase 71: a `[lib]` target lets `cargo test -p greeter --target

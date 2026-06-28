@@ -275,9 +275,44 @@ flowchart TD
     P78 --> P96["Phase 96<br/>Bare-Metal Networking<br/>USB bulk + RTL8156 ure"]
     P79 --> P96
     P96 -.-> P90
+
+    %% Phase 97 + the GUI-workstation re-charter arc (Phases 98 → 110)
+    P96 --> P97["Phase 97<br/>dlopen DT_RELR<br/>loader fix"]
+    P97 --> P98["Phase 98<br/>Roadmap Audit<br/>& Re-Charter"]
+    P98 --> P99["Phase 99<br/>SMP & Scheduler<br/>Robustness"]
+    P99 --> P100["Phase 100<br/>Bare-Metal GUI<br/>Session (Dell)"]
+    P100 --> P101["Phase 101<br/>ACPI Platform<br/>Foundation"]
+    P101 --> P102["Phase 102<br/>I2C-HID Touchpad"]
+    P101 --> P103["Phase 103<br/>Laptop Power<br/>Management"]
+    P100 --> P104["Phase 104<br/>Wi-Fi AX201<br/>+ Supplicant"]
+    P100 --> P105["Phase 105<br/>GUI Toolkit<br/>& Core Apps"]
+    P103 --> P105
+    P104 --> P105
+    P105 --> P106["Phase 106<br/>USB Installer<br/>& NVMe Install"]
+    P106 --> P107["Phase 107<br/>Networked &<br/>Signed Packages"]
+    P107 --> P108["Phase 108<br/>HP OmniBook<br/>AMD Strix Point"]
+    P108 --> P109["Phase 109<br/>Bare-Metal Audio"]
+    P108 --> P110["Phase 110<br/>Real-Hardware<br/>Security"]
 ```
 
 ## Milestone Summary
+
+### Status-marker legend
+
+The `Status` column accreted several visually-distinct markers over the roadmap's life; they carry **no** semantic difference in tier — all of `Complete`, `**Complete**`, `Complete ✅`, and `✅ Complete` mean the same "done" state (the emphasis/emoji are era-stylistic). The status words used in the tables:
+
+| Marker | Meaning |
+|---|---|
+| `Complete` / `**Complete**` / `Complete ✅` / `✅ Complete` | Done. (Bold/emoji are cosmetic era-variants — no tier difference.) |
+| `🟢 Landed` | Done and validated by an always-on gate (later-phase house style for `Complete`). |
+| `🟡 Implemented` | Core landed + CI-validated; some live/hardware arms are credential-gated or skip-with-reason (honest hedge — not a bare "Complete"). |
+| `Partial` | Some tracks landed, others planned/rejected — explicitly scoped (e.g. Phase 95c). |
+| `Deferred` | Consciously not pursued; a post-mortem/disposition is cited (e.g. Phase 57e). |
+| `Superseded` | Closed by being absorbed into / replaced by another phase, or re-scoped as a non-goal (e.g. 51→46, 59, 65). |
+| `Planned` | Chartered, not yet started (the entire 99–110 arc). |
+| `Validated-on-HW (run N, date)` | Hardware-only phase validated per the [bare-metal validation strategy](../appendix/bare-metal-validation.md) — not a bare "Complete" (the 99–110 HW arc convention). |
+
+Per-phase **Validated / Claimed-unvalidated / Regressed** evidence verdicts (Phase 1→97) live in the [re-charter audit matrix](../appendix/audit-status/09-recharter-audit-2026-06.md#per-phase-verdict-matrix-phases-1--97).
 
 ### Foundation Phases (complete)
 
@@ -382,7 +417,7 @@ flowchart TD
 | 53a | Kernel Memory Modernization | Per-CPU page cache, magazine-based slab allocator, size-class GlobalAlloc, SMP-scalable allocation | Complete | `phase-53a` | [Phase 53a](./53a-kernel-memory-modernization.md) | [Tasks](./tasks/53a-kernel-memory-modernization-tasks.md) |
 | 53 | Headless Hardening | Define the supported headless/reference workflow and release gates | Complete | `phase-53` | [Phase 53](./53-headless-hardening.md) | [Tasks](./tasks/53-headless-hardening-tasks.md) |
 | 54 | Deep Serverization | Move meaningful storage/VFS and UDP policy slices into supervised ring-3 services with explicit degraded-mode fallbacks | Complete | `phase-54` | [Phase 54](./54-deep-serverization.md) | [Tasks](./tasks/54-deep-serverization-tasks.md) |
-| 54a | Post-Serverization Kernel Hygiene | Close the CLOEXEC/NONBLOCK plumbing gap and relocate arch-syscall cleanup wrappers into their owning subsystems | Planned | `phase-54a` | [Phase 54a](./54a-post-serverization-kernel-hygiene.md) | [Tasks](./tasks/54a-post-serverization-kernel-hygiene-tasks.md) |
+| 54a | Post-Serverization Kernel Hygiene | Close the CLOEXEC/NONBLOCK plumbing gap and relocate arch-syscall cleanup wrappers into their owning subsystems | Complete (via [Phase 66](./66-security-hygiene-closeout.md)) | `phase-54a` | [Phase 54a](./54a-post-serverization-kernel-hygiene.md) | [Tasks](./tasks/54a-post-serverization-kernel-hygiene-tasks.md) |
 
 ### Hardware, Local-System, and Release Phases (55, 55a, 55b complete; 55c+ planned)
 
@@ -407,14 +442,14 @@ These phases were drafted 2026-05-08 in response to the phase-completion audit (
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
 | 58 | Documentation Reconciliation Pass | Walk every phase doc, flip Status fields to match reality, write the missing task docs (Phases 13, 22b, 42b), close Phases 51 and 52, retire/refresh stale legacy docs, consolidate handoff dirs | **Complete** | `phase-58` | [Phase 58](./58-documentation-reconciliation.md) | [Tasks](./tasks/58-documentation-reconciliation-tasks.md) |
-| 59 | Validation Backlog | Run every "manual QEMU test" deferred from Phases 30/31/32/43/22b/24/57b/34/39/10; record results; flip task-doc checkboxes | Planned | `phase-59` | [Phase 59](./59-validation-backlog.md) | [Tasks](./tasks/59-validation-backlog-tasks.md) |
+| 59 | Validation Backlog | Run every "manual QEMU test" deferred from Phases 30/31/32/43/22b/24/57b/34/39/10; record results; flip task-doc checkboxes | Superseded (per-phase gates 63+ & the Phase 83 gate bundle; residual Secure-Boot → [Phase 110](./110-real-hardware-security.md); see [audit A.4](../appendix/audit-status/09-recharter-audit-2026-06.md#a4--10--versioning-posture-reconciliation)) | `phase-59` | [Phase 59](./59-validation-backlog.md) | [Tasks](./tasks/59-validation-backlog-tasks.md) |
 | 60 | Phase 33 Slab Migration Closeout | Audit kernel `Box::new`/`Arc::new` sites; migrate the two genuinely heap-allocated hot kernel object families (Task, XSaveArea) onto the slab-cache infrastructure that landed in Phase 33 but was never used; document the inline-slot-array families that turned out not to be migration candidates. Closes audit Red Flag #4 | **Complete** | `phase-60` | [Phase 60](./60-slab-migration-closeout.md) | [Tasks](./tasks/60-slab-migration-closeout-tasks.md) |
 | 61 | Phase 35 SMP Load Balancing Closeout | Audit closeout for Phase 35 SMP load balancing and Phase 25 P25-T033 TLB-shootdown deferral. Verifies `maybe_load_balance()` + `tlb_shootdown_range` from `sys_linux_munmap` + object-attached pipe / IPC wait queues; replaces pipe `yield_now()` polling with `WaitQueue` blocking; adds per-tick user/system tick split, child `tms_cutime` / `tms_cstime`, `sys_wait4` + `sys_getrusage`. Closes audit Red Flag #3 + Phase 25 P25-T033 | **Complete** | `phase-61` | [Phase 61](./61-smp-load-balancing-closeout.md) | [Tasks](./tasks/61-smp-load-balancing-closeout-tasks.md) |
 | 62 | Phase 57a Pi-Lock Closeout | Land pi_lock + with_block_state at the four `TODO(57a-C/D)` scheduler sites via `with_block_state_locked_scheduler` (Shape β); kernel-wide Bug #9 audit returns zero LEAK verdicts; Track D guard-leak regression test pinned. Pending 30-minute soak. | Complete (pending soak) | `phase-62` | [Phase 62](./62-phase-57a-pi-lock-closeout.md) | [Tasks](./tasks/62-phase-57a-pi-lock-closeout-tasks.md) |
 | 63 | Phase 57 Audio Stack Implementation | Real PCM emission for `audio_server` (replace accounting-only `Ac97Backend`); audio-smoke gate asserts `frames_consumed > 0` via `GetStats` + non-silent WAV; `bell-smoke` verifies BEL → Bell::ring → audible output. Closes audit § B1 / F1 | **Complete** | `phase-63` | [Phase 63](./63-audio-stack-implementation.md) | [Tasks](./tasks/63-audio-stack-implementation-tasks.md) |
 | 63a | DOOM Audio Wiring | DOOM SFX + Tier 2a square/triangle synth music play through `audio_server` via two new userspace crates (`audio_mixer`, `audio_client_ffi`) and three new doomgeneric platform-layer C files; honors single-client `EBUSY` policy with silent-fallback; `doom-audio-smoke` gate asserts non-silent WAV plus two consecutive `frames_consumed > 0` runs and BEL re-arm; kernel patch-bumps to `0.63.1` (userspace-only phase) | **Complete** | `phase-63a` | [Phase 63a](./63a-doom-audio-wiring.md) | [Tasks](./tasks/63a-doom-audio-wiring-tasks.md) |
 | 64 | Phase 57 Session Manager Lifecycle | Real `start/stop/restart` (replace unconditional-Ack stubs); kill-probe-based lifecycle; restart budget; text-fallback motion. Closes audit § B2 / F2 | **Complete** | `phase-64` | [Phase 64](./64-session-manager-lifecycle.md) | [Tasks](./tasks/64-session-manager-lifecycle-tasks.md) |
-| 65 | Phase 54 fat_server Implementation | Real FAT32 operations in `fat_server` (replace permanent ENOSYS stub); routed via `vfs_server`. Closes audit Red Flag #14 (Phase 54 dimension) | Planned | `phase-65` | [Phase 65](./65-fat-server-implementation.md) | [Tasks](./tasks/65-fat-server-implementation-tasks.md) |
+| 65 | Phase 54 fat_server Implementation | Real FAT32 operations in `fat_server` (replace permanent ENOSYS stub); routed via `vfs_server`. Closes audit Red Flag #14 (Phase 54 dimension) | Superseded (FAT32 writes are a 1.0 non-goal — `fat_server` stays ENOSYS; ext2 is the supported FS; see [audit A.4](../appendix/audit-status/09-recharter-audit-2026-06.md#a4--10--versioning-posture-reconciliation)) | `phase-65` | [Phase 65](./65-fat-server-implementation.md) | [Tasks](./tasks/65-fat-server-implementation-tasks.md) |
 | 66 | Security & Hygiene Closeout | `/tmp` sticky-bit, atomic shadow writes, CLOEXEC plumbing on `open`/`openat`, four `*_pub` wrapper relocations, pre-seeded image hash format upgrade. Closes audit § F4/F5/C6 + Phase 54a | **Complete** | `phase-66` | [Phase 66](./66-security-hygiene-closeout.md) | [Tasks](./tasks/66-security-hygiene-closeout-tasks.md) |
 | 67 | Phase 55a IOMMU Substrate Completion | AMD-Vi fault ISR, VT-d scalable mode, VT-d queued invalidation, AMD-Vi multi-BDF domains, replace 4 `todo!()` isolation tests with real harness. Closes audit § C7/E3 | **Complete** | `phase-67` | [Phase 67](./67-iommu-substrate-completion.md) | [Tasks](./tasks/67-iommu-substrate-completion-tasks.md) |
 | 68 | Phase 56 Display Server Closeout | Subscription event push (`flush_subscriber_ring` + 2 new event kinds), compositor `DamageTracker` with cursor-only fast path, `ModifierSide` field with global `PROTOCOL_VERSION` 1→2 bump + v1 compatibility shim, extracted `kernel_core::init::{manifest,supervisor}` with `Vec<String>` `depends=` and typed `on-restart=` directive, static `mouse_server.conf` declaring `depends=kbd_server`. Closes audit § C5 | **Complete** | `phase-68` | [Phase 68](./68-display-server-closeout.md) | [Tasks](./tasks/68-display-server-closeout-tasks.md) |
@@ -492,7 +527,7 @@ These phases were drafted 2026-05-08 in response to the phase-completion audit (
 | 95c | VFS / Block-I/O Performance (unblock the rust build) | ⚠️ **REFRAMED (2026-06-24, see the [completion plan](../handoffs/2026-06-24-phase-95-completion-plan.md)):** under **KVM** the FS is fast (install ~25 s, cold-load ~9.6 s) — the slow-VFS figures below are a TCG artifact, so 95c is the path to a **TCG-runnable** `rustc-smoke` gate, **not** the `RUSTC_OK` correctness blocker (that is the `rustc hello.rs` compile stall). The **supply-side** complement to 95b's demand-side lazy loader, and the subphase that *finishes* the 95-series goal. 95b instrumentation showed the ring-3 VFS runs at only ~100–200 KB/s effective (per-read IPC round-trips), so the 368 MB rust install is ~40 min of I/O — at/over the install-step timeout (the immediate `RUSTC_OK` blocker) — and cold loads crawl. 95c makes the VFS path fast the **microkernel-idiomatic** way — keeping `vfs_server` the sole ext2 authority, not moving ext2 into the kernel: **zero-copy + readahead demand-fill** (A — the server fills a kernel-granted page, no IPC-payload copy, and serves a large readahead cluster per round-trip), a **kernel page cache for file-backed pages** (B — the external-pager amortizer à la Mach memory objects / Zircon VMOs / L4Re; re-faults, shared maps, and a second run hit the cache with zero server IPC), **evicting ext2 block caches** (C), **installer coalescing** (D), and a throughput + **per-IPC-cost** gate (E). The in-kernel ext2 read fast path (F) is **REJECTED** by an architecture decision (microkernel-boundary departure; conflicts with the ext2-engine-unification) — fix perf in the ring-3 driver; reconsidered only if A+B+D + a recorded measurement prove IPC itself is the wall. `pkg install rust` then completes inside the timeout and the Phase 95b `rustc-smoke` arm flips to PASS (`RUSTC_OK`, G). Speeds clang/node/python/claude installs + cold loads too. | **Partial** — A (zero-copy+readahead) / C (LRU) / E (gate) landed; B (page cache) + D (installer) planned; **F rejected**. Reframed: not the `RUSTC_OK` blocker under KVM. | `phase-95c` | [Phase 95c](./95c-vfs-block-io-perf.md) | [Tasks](./tasks/95c-vfs-block-io-perf-tasks.md) |
 | 96 | Bare-Metal Networking: USB Bulk Endpoints + RTL8156 USB-Ethernet (`ure`) | First **real-hardware** NIC: add USB **bulk** endpoints to the xHCI host stack (the transfer type Phase 78c deferred; also the groundwork Phase 90 Track D.1 Mass Storage needs), then ship a Realtek RTL815x (`0bda:8156` 2.5GbE class) USB-Ethernet driver `ure` — re-expressed from BSD `ure(4)`, OCP register tunnel + RX/TX descriptor framing — that registers on the bus-agnostic Phase 79 `RemoteNic` facade, so the in-kernel TCP/IP stack does DHCP/HTTP over a physical dongle with no network-layer change. Also lands the reusable bare-metal bring-up workflow (`xtask run --usb-passthrough`, AMT Serial-over-LAN capture, network log sink to a second machine) that the deferred touchpad/Wi-Fi phases reuse. Motivated by the bare-metal port to a Tiger Lake laptop (Intel CNVi Wi-Fi unsupported, no Ethernet port). | ✅ **Complete (2026-06-26)** — Stages 1a/1b/2 HW-validated via passthrough (claim → MAC → control-OUT init → `link up 2500M` → `RemoteNic`), `ure-smoke` + DHCP client landed, and the **RX datapath validated on bare metal** (real laptop bound a DHCP lease `ip=192.168.1.221`, which requires RX — clearing the QEMU-passthrough RX wall). Bare-metal bring-up follow-on (boot rescue, USB log persistence, PS/2 keyboard, framebuffer write-combining) landed on `docs/96-bare-metal-usb-ethernet`. | `phase-96` | [Phase 96](./96-bare-metal-usb-ethernet.md) | [Tasks](./tasks/96-bare-metal-usb-ethernet-tasks.md) |
 | 97 | `dlopen-test-smoke` flake → `DT_RELR` loader fix (debugging) | Root-cause + fix the `smoke-test` **step 26** (`dlopen-test-smoke`) failure. **Confirmed cause (NOT the "TCG stall" the title implies): the `ld-musl` loader had no `DT_RELR` support.** `libhello_fini.so`'s sole relocation — its `DT_FINI_ARRAY` destructor pointer — is `.relr.dyn`-encoded (`readelf`: `RELASZ: 0`, `RELR: 0x1070`), so it was never relocated; `dlclose` → `run_destructors_for` jumped to the unrelocated in-file vaddr `0x2a0` → near-NULL `INSTRUCTION_FETCH` → `process killed`. The design doc's blocking-`vfs` AND cross-core TLB-shootdown hypotheses were **both refuted** (zero `[tlb]` lines in the reproduced dump); the failure is *toolchain-deterministic* (modern linkers emit `.relr.dyn`, older emit `.rela.dyn` which the loader already handled) and only *looked* like an intermittent stall because the gate had no FAIL pattern. Fix: host-tested `reloc::apply_relr` wired into the loader's `Dyn` parser + all three relocation sites, plus an honest `WaitPassOrFail` gate and a hoisted kernel-fatal scan. | ✅ **Complete (PR #268)** — kernel `v0.97.0`; validated by `ldso_core` host tests + a 232-iteration on-device soak + a full `smoke-test` pass | `phase-97` | [Phase 97](./97-dlopen-smoke-tcg-stall.md) | [Tasks](./tasks/97-dlopen-smoke-tcg-stall-tasks.md) / [Learning](../97-dlopen-smoke-tcg-stall.md) |
-| 98 | Roadmap Audit & Re-Charter (toward a real-hardware GUI workstation) | End-of-roadmap inflection that produces a trustworthy map + a sequenced next arc. **(A) Audit:** reconcile every Phase 1→97 Status against a passing gate / recorded HW run / host test (the evidence convention is time-stratified — ~50 pre-Phase-63 rows are "Complete" with no inline evidence) into a per-phase **Validated / Claimed-unvalidated / Regressed** matrix ([`audit-status/09`](../appendix/audit-status/09-recharter-audit-2026-06.md)), and repair the rotted **index layer** (`codebase-map.md` frozen at ~Phase 55; stale `tasks/README`; `file-backed-mmap.md` contradicting 95b) + the Phase-83 1.0-gate-atop-incomplete-deps inconsistency. **(B) Re-charter** the GUI-workstation arc as Phases **99–110** (SMP-robustness → bare-metal GUI session → ACPI → I2C-HID touchpad / power → Wi-Fi+supplicant → GUI toolkit & apps → USB installer → networked+signed packaging → AMD/OmniBook → bare-metal audio → security hardening), scheduling every open deferral + the 7 open handoffs. **(C)** specify a **single unified workspace version** (kill phase-encoded per-crate versions that conflict in parallel) and **(D)** a slimmed `AGENTS.md` (−63%), both executed in follow-on PRs. Defines the [bare-metal validation strategy](../appendix/bare-metal-validation.md) the un-CI-able HW arc needs. | **Planned** | `phase-98` | [Phase 98](./98-roadmap-audit-and-recharter.md) | [Tasks](./tasks/98-roadmap-audit-and-recharter-tasks.md) |
+| 98 | Roadmap Audit & Re-Charter (toward a real-hardware GUI workstation) | End-of-roadmap inflection that produces a trustworthy map + a sequenced next arc. **(A) Audit:** reconcile every Phase 1→97 Status against a passing gate / recorded HW run / host test (the evidence convention is time-stratified — ~50 pre-Phase-63 rows are "Complete" with no inline evidence) into a per-phase **Validated / Claimed-unvalidated / Regressed** matrix ([`audit-status/09`](../appendix/audit-status/09-recharter-audit-2026-06.md)), and repair the rotted **index layer** (`codebase-map.md` frozen at ~Phase 55; stale `tasks/README`; `file-backed-mmap.md` contradicting 95b) + the Phase-83 1.0-gate-atop-incomplete-deps inconsistency. **(B) Re-charter** the GUI-workstation arc as Phases **99–110** (SMP-robustness → bare-metal GUI session → ACPI → I2C-HID touchpad / power → Wi-Fi+supplicant → GUI toolkit & apps → USB installer → networked+signed packaging → AMD/OmniBook → bare-metal audio → security hardening), scheduling every open deferral + the 7 open handoffs. **(C)** a **single unified workspace version** (kill phase-encoded per-crate versions that conflict in parallel) and **(D)** a slimmed `AGENTS.md` (−63%), **both executed in this PR**. Defines the [bare-metal validation strategy](../appendix/bare-metal-validation.md) the un-CI-able HW arc needs. | **Complete** | `phase-98` | [Phase 98](./98-roadmap-audit-and-recharter.md) | [Tasks](./tasks/98-roadmap-audit-and-recharter-tasks.md) |
 
 ### Next Arc — GUI Workstation on Real Hardware (Phases 99–110, chartered by Phase 98)
 
@@ -640,13 +675,37 @@ gantt
     Dynamic Linker            :p76, after p75, 1
 
     section Release Gate
-    Release 1.0 Gate          :p77, after p73, 1
+    Release 1.0 Gate          :done, p83, after p73, 1
 
-    section Post-1.0 Platform Growth (planned)
-    Cross-Compiled Toolchains :p78, after p77, 1
-    Networking and GitHub     :p79, after p78, 1
-    Node.js                   :p80, after p79, 1
-    Claude Code               :p81, after p80, 1
+    section Post-1.0 Platform Growth (complete)
+    Spectre / KPTI Mitigations    :done, p84, after p83, 1
+    Cross-Compiled Toolchains     :done, p85, after p83, 1
+    Networking and GitHub         :done, p86, after p85, 1
+    VFS Bulk-I/O + stat Conformance :done, p88, after p85, 1
+    Node.js                       :done, p89, after p86, 1
+    Memory Protection Keys (PKU)  :done, p90a, after p89, 1
+    Claude Code                   :done, p90b, after p89, 1
+    IPv6 / DHCPv6                 :done, p91, after p83, 1
+    USB Class Expansion           :done, p92, after p83, 1
+    Dynamic C Runtime (libc.so)   :done, p93, after p85, 1
+    Rust-Cargo + uutils           :done, p94, after p85, 1
+    Native Rust Toolchain         :done, p95, after p94, 1
+    Bare-Metal Networking (ure)   :done, p96, after p83, 1
+    dlopen DT_RELR loader fix     :done, p97, after p96, 1
+
+    section Next Arc — GUI Workstation on Real Hardware (planned, Phase 98 re-charter)
+    SMP & Scheduler Robustness    :p99, after p97, 1
+    Bare-Metal GUI Session (Dell) :p100, after p99, 1
+    ACPI Platform Foundation      :p101, after p100, 1
+    I2C-HID Touchpad              :p102, after p101, 1
+    Laptop Power Management       :p103, after p101, 1
+    Wi-Fi AX201 + Supplicant      :p104, after p100, 1
+    GUI Toolkit & Core Apps       :p105, after p104, 1
+    USB Installer & NVMe Install  :p106, after p105, 1
+    Networked & Signed Packages   :p107, after p106, 1
+    HP OmniBook / AMD Strix       :p108, after p107, 1
+    Bare-Metal Audio              :p109, after p108, 1
+    Real-Hardware Security        :p110, after p108, 1
 ```
 
 ## Required Documentation for Every Phase

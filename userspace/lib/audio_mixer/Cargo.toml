@@ -1,7 +1,7 @@
 [package]
 name = "audio_mixer"
-version = "0.63.1"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Phase 63a Track A — pure-logic Rust mixer with a C-ABI surface, reused by DOOM (m3os_sound / m3os_music) and any future system-mixer service."
 build = "build.rs"
 

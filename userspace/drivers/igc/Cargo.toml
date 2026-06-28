@@ -1,7 +1,7 @@
 [package]
 name = "igc_driver"
-version = "0.79.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Phase 79 Track B.2 — ring-3 Intel igc (I225/I226 discrete Foxville 2.5GbE) NIC driver."
 
 [lib]
