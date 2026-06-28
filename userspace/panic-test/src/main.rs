@@ -67,6 +67,16 @@ fn panic_test_main() -> ! {
     // Fork sibling-core COM1 spammers so the AP-quiesce has something to silence.
     for _ in 0..SPAMMERS {
         let pid = unsafe { syscall0(SYS_FORK) } as i64;
+        if pid < 0 {
+            // fork() failed (e.g. task table full / resource exhaustion). Fail
+            // fast with a clear sentinel + non-zero exit, mirroring
+            // kstack-overflow-test's `if child < 0 { fail(...) }`. Silently
+            // continuing on the parent path would run the panic with fewer (or
+            // zero) sibling spammers — making the gate's COM1 contention
+            // non-deterministic and hiding the real failure reason.
+            emit(b"PANICTEST:fork-failed\n");
+            exit(2);
+        }
         if pid == 0 {
             // Child: spam COM1 forever. These run on sibling cores; the kernel
             // panic below NMI-parks those cores, freezing this loop — which is

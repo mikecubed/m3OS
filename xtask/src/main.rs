@@ -1612,12 +1612,45 @@ fn main() {
         // deliberately panics, and asserts the AP-quiesce produced an
         // uninterleaved `KERNEL PANIC at …` banner.
         Some("panic-test-smoke") => {
-            let smoke_args =
-                parse_smoke_boot_args("panic-test-smoke", &args[2..]).unwrap_or_else(|err| {
-                    eprintln!("Error: {err}");
-                    eprintln!("Usage: {}", usage());
-                    std::process::exit(1);
-                });
+            // `usage()` advertises `--kvm` and `-m`/`--memory` for this gate, but
+            // the shared `parse_smoke_boot_args` only understands
+            // `--display`/`--timeout` (it is reused by ~30 other smoke commands
+            // whose contract must not change). Translate the two extra flags into
+            // the `M3OS_KVM` / `M3OS_MEM` env vars that `cmd_panic_test_smoke`
+            // already honors (`M3OS_KVM` directly; `M3OS_MEM` via
+            // `apply_memory_env_fallback`), then forward the rest to the shared
+            // parser so the advertised flags actually work.
+            let parse_fail = |err: String| -> ! {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            };
+            let rest = &args[2..];
+            let mut forwarded: Vec<String> = Vec::new();
+            let mut index = 0;
+            while index < rest.len() {
+                match try_take_memory_arg(rest, &mut index) {
+                    Ok(Some(mib)) => {
+                        // SAFETY: xtask is single-threaded here; the child
+                        // build/QEMU steps read the env. A bare MiB number is a
+                        // valid `M3OS_MEM` spec (`parse_memory_spec`).
+                        unsafe { std::env::set_var("M3OS_MEM", mib.to_string()) };
+                        index += 1;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => parse_fail(e),
+                }
+                if rest[index] == "--kvm" {
+                    // SAFETY: single-threaded; the QEMU launch reads the env.
+                    unsafe { std::env::set_var("M3OS_KVM", "1") };
+                } else {
+                    forwarded.push(rest[index].clone());
+                }
+                index += 1;
+            }
+            let smoke_args = parse_smoke_boot_args("panic-test-smoke", &forwarded)
+                .unwrap_or_else(|err| parse_fail(err));
             cmd_panic_test_smoke(&smoke_args);
         }
         // Phase 85a Track B.3 — zero-rebuild assertion gate.
