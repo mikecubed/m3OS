@@ -476,6 +476,19 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     // composer would race the takeover program on FB pages it no
     // longer owns.
     let mut fb_yielded = false;
+
+    // Phase 100 Track E.1 — render fingerprint state.
+    //
+    // `fp_frame_counter`: monotonic count of compose-with-writes frames;
+    //   carried into each `RENDER_FP` sentinel so a CI boot log can
+    //   confirm the compositor is advancing.
+    //
+    // `fp_prev_row_hashes`: per-row FNV-1a hash from the previous
+    //   composed frame, used to compute `rows_changed` on each
+    //   subsequent frame. Empty on the first frame (rows_changed = 0).
+    //   Sized to `meta.height` u32 values ≈ 4 KiB at 1080p.
+    let mut fp_frame_counter: u64 = 0;
+    let mut fp_prev_row_hashes: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     // Phase 57d follow-up — post-reclaim full-screen background fill.
     // Set to `true` by the reclaim handler so the next compose tick
     // calls `fill_background` before `run_compose`. Without this, any
@@ -1224,6 +1237,32 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                 Ok(_writes) => {
                     record_frame_sample(&mut frame_stats, frame_index_counter, compose_micros);
                     frame_index_counter = frame_index_counter.saturating_add(1);
+
+                    // Phase 100 Track E.1 — render fingerprint sentinel.
+                    //
+                    // Emitted on every damage-driven compose that wrote at
+                    // least one pixel.  A static greeter composes its first
+                    // frame then goes quiet (no more damage → no more
+                    // sentinel lines), matching the spec's "do not emit
+                    // unconditionally on every vsync" requirement.
+                    //
+                    // `back_buffer_pixels()` returns the just-composed
+                    // frame: the heap back-buffer in Memcpy mode (always
+                    // valid after the write_pixels calls); the front MMIO
+                    // half in Flip mode (updated by `present()`).
+                    let pixels = owner.back_buffer_pixels();
+                    let (fp, new_hashes) = kernel_core::display::render_fp::compute_fingerprint(
+                        pixels,
+                        meta.width,
+                        meta.height,
+                        meta.stride_bytes,
+                        BG_PIXEL,
+                        fp_frame_counter,
+                        &fp_prev_row_hashes,
+                    );
+                    fp_prev_row_hashes = new_hashes;
+                    fp_frame_counter = fp_frame_counter.saturating_add(1);
+                    emit_render_fingerprint(&fp);
                 }
                 Err(_) => {
                     syscall_lib::write_str(STDOUT_FILENO, "display_server: compose failed\n");
@@ -2098,6 +2137,69 @@ fn write_u32(mut value: u32) {
     if let Ok(s) = core::str::from_utf8(&buf[idx..]) {
         syscall_lib::write_str(STDOUT_FILENO, s);
     }
+}
+
+/// Phase 100 Track E.1 — write a `u64` decimal value to STDOUT.
+fn write_u64(mut value: u64) {
+    let mut buf = [0u8; 20];
+    let mut idx = buf.len();
+    if value == 0 {
+        idx -= 1;
+        buf[idx] = b'0';
+    } else {
+        while value != 0 {
+            idx -= 1;
+            buf[idx] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+    }
+    if let Ok(s) = core::str::from_utf8(&buf[idx..]) {
+        syscall_lib::write_str(STDOUT_FILENO, s);
+    }
+}
+
+/// Phase 100 Track E.1 — write a `u32` as exactly 8 lowercase hex digits
+/// to STDOUT (no `0x` prefix; caller supplies it).
+fn write_hex_u32(value: u32) {
+    const HEX: &[u8] = b"0123456789abcdef";
+    let mut buf = [0u8; 8];
+    for i in 0..8usize {
+        buf[7 - i] = HEX[((value >> (i * 4)) & 0xF) as usize];
+    }
+    if let Ok(s) = core::str::from_utf8(&buf) {
+        syscall_lib::write_str(STDOUT_FILENO, s);
+    }
+}
+
+/// Phase 100 Track E.1 — emit one `RENDER_FP` sentinel line.
+///
+/// ## Format (stable, greppable)
+///
+/// ```text
+/// RENDER_FP frame=<n> rows_nonblank=<R> rows_changed=<C> hash=0x<8hex>
+/// ```
+///
+/// ## Threshold that distinguishes "rendered" from "blank"
+///
+/// - `rows_nonblank = 0` → compositor ran `fill_background` but no
+///   client has painted any non-background pixel yet (blank state).
+/// - `rows_nonblank >= 50` → something is rendered (conservative gate).
+/// - `rows_nonblank >= 200` on a 1080p panel → strong signal that the
+///   greeter login dialog is visible (the dialog is ~400 px tall,
+///   covering ~37 % of 1080 rows). The coordinator should accept any
+///   value ≥ 200 as proof the greeter rendered.
+/// - `rows_nonblank ≈ height` → full-screen content (a game, or the
+///   compositor's own background image covering every row).
+fn emit_render_fingerprint(fp: &kernel_core::display::render_fp::RenderFingerprint) {
+    syscall_lib::write_str(STDOUT_FILENO, "RENDER_FP frame=");
+    write_u64(fp.frame);
+    syscall_lib::write_str(STDOUT_FILENO, " rows_nonblank=");
+    write_u32(fp.rows_nonblank);
+    syscall_lib::write_str(STDOUT_FILENO, " rows_changed=");
+    write_u32(fp.rows_changed);
+    syscall_lib::write_str(STDOUT_FILENO, " hash=0x");
+    write_hex_u32(fp.hash);
+    syscall_lib::write_str(STDOUT_FILENO, "\n");
 }
 
 /// Map the kernel's reported pixel-format tag onto

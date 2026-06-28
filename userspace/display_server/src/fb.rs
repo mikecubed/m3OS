@@ -499,6 +499,52 @@ impl FramebufferOwner for KernelFramebufferOwner {
     }
 }
 
+impl KernelFramebufferOwner {
+    /// Phase 100 Track E.1 — return a read-only view of the compositor's
+    /// most-recently-composed frame buffer, used by the render-fingerprint
+    /// probe to emit the `RENDER_FP` sentinel.
+    ///
+    /// **Memcpy mode**: returns the heap-backed back buffer. It is always
+    /// valid after a compose pass (the compose writes here; `present()`
+    /// memcpys it to MMIO but does NOT clear it).
+    ///
+    /// **Flip mode**: returns the MMIO half that was just flipped to the
+    /// front — i.e. `base + front_y_offset × stride_bytes`. After
+    /// `present()`, `front_y_offset` points to the half we just rendered
+    /// into, so this gives the current composed frame.
+    ///
+    /// # Safety of the Flip slice
+    ///
+    /// The kernel mapping covers `2 × byte_len_visible` bytes starting at
+    /// `self.base`. `front_y_offset` is either `0` or `visible_height`;
+    /// multiplied by `stride_bytes` both land at the start of a valid
+    /// half. The raw slice read is therefore bounded inside the kernel
+    /// mapping. Reading framebuffer DRAM through a non-volatile `&[u8]`
+    /// is safe: it is ordinary mapped RAM, not a volatile hardware register.
+    pub fn back_buffer_pixels(&self) -> &[u8] {
+        let dest_stride = self.metadata.stride_bytes as usize;
+        match &self.backend {
+            Backend::Memcpy { back_buffer, .. } => back_buffer.as_slice(),
+            Backend::Flip { front_y_offset, .. } => {
+                // After `present()`, `front_y_offset` was updated to the
+                // half we just rendered into. That half now holds the
+                // current composed frame.
+                let byte_off = (*front_y_offset as usize).saturating_mul(dest_stride);
+                // SAFETY: see method doc. `byte_off + byte_len_visible`
+                // ≤ `2 × byte_len_visible` because `front_y_offset` is
+                // 0 or `visible_height`, and both halves are
+                // `byte_len_visible` bytes long.
+                unsafe {
+                    core::slice::from_raw_parts(
+                        self.base.add(byte_off) as *const u8,
+                        self.byte_len_visible,
+                    )
+                }
+            }
+        }
+    }
+}
+
 /// Clip a rectangle to `[0, width) × [0, height)`. Returns `None` if the
 /// clipped rect has zero area. Math is in i64 to defend against
 /// adversarial inputs near `i32::MAX`.
