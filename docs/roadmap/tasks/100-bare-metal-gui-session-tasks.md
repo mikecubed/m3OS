@@ -1,6 +1,6 @@
 # Phase 100 — Bare-Metal GUI Session (Dell Tiger Lake): Task List
 
-**Status:** Planned
+**Status:** In progress (target: `Implemented (HW-unvalidated)` — see Track E; terminal `Validated-on-HW` requires a recorded run on the physical Dell Precision 5560)
 **Source Ref:** phase-100
 **Depends on:** Phase 99 (SMP & Scheduler Robustness Hardening) ✅, Phase 56/68/71/72/73 (display_server / compositor clients / greeter / session_manager) ✅, Phase 96 (Bare-Metal Bring-up + console-FB write-combining) ✅
 **Goal:** Boot the physical Dell Precision 5560 (Tiger Lake) to a usable graphical session — `display_server` takes the framebuffer, `greeter` renders the login, an interim USB mouse moves the cursor with focus following, and the keyboard works — by (A) spawning the existing-but-unspawned graphical stack on init's diskless bare-metal boot path, (B) finishing the Phase 96 write-combining work for the *userspace* framebuffer in `sys_framebuffer_mmap`, (C) bare-metal-validating the `usb-hid → mouse_server → InputDispatcher` pointer datapath, (D) folding in the open Phase 96 input-polish handoff (USB text-mode keyboard + de-busy-polling `usb-hid`/`usbhub`), and (E) defining the on-metal "the screen shows the greeter" validation method. HW-only: there is no QEMU model for the real panel/MMIO-FB/pointer behavior, so validation follows `docs/appendix/bare-metal-validation.md` and the status convention is **Validated-on-HW (run N, date)**, not a bare "Complete."
@@ -9,8 +9,8 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Spawn `display_server`/`mouse_server`/`session_manager`/`greeter` (+`audio_server`/`term`) on init's bare-metal `BUILTIN_CONFIGS` path + resolve the graphical skip-filter so init yields the tty to the greeter | — | Planned |
-| B | Write-combining user framebuffer — WC PAT attribute on the `sys_framebuffer_mmap` VMA + present-path `sfence` + blit-latency measurement | — | Planned |
+| A | Spawn `display_server`/`mouse_server`/`session_manager`/`greeter` (+`audio_server`/`term`) on init's bare-metal `BUILTIN_CONFIGS` path + resolve the graphical skip-filter so init yields the tty to the greeter | — | In progress |
+| B | Write-combining user framebuffer — WC PAT attribute on the `sys_framebuffer_mmap` VMA + present-path `sfence` + blit-latency measurement | — | In progress |
 | C | Interim USB-mouse pointer — bare-metal-validate `usb-hid` PointerEvent → `mouse_server` → `InputDispatcher` focus routing on the dock-hub topology | A, B | Planned |
 | D | Input polish — `stdin_feeder` USB-keyboard text-mode drain + convert `usb-hid`/`usbhub` busy-poll to notification-driven waits | A | Planned |
 | E | Bare-metal validation method ("the screen shows the greeter") — on-device render assertion over the log sink + photo evidence convention | A, C | Planned |
