@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.98.0**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
+**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.99.0**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
 
 Capabilities now present in the tree:
 
@@ -127,7 +127,8 @@ This sets `core.hooksPath` to `.githooks/`. **pre-commit** runs `cargo xtask che
 | `userspace-simd-smoke` | `M3OS_SIMD_REGRESSION=1` | AES-NI + SSE binary runs fault-free in ring-3; kernel ELF confirmed to contain no XMM. |
 | `pku-smoke` | `M3OS_PKU_REGRESSION=1` | PKU alloc/deny-fault/sigframe/W^X-v2 matrix passes; SKIPs on a no-PKU CPU. |
 | `kstack-overflow-smoke` | `M3OS_KSTACK_OVERFLOW_REGRESSION=1` | Kernel-stack overflow kills the offending child via SIGSEGV; parent keeps running. |
-| `smp-smoke` | `M3OS_SMP_REGRESSION=1` | 256 futex-heavy async ops complete across 4 cores; no TLB-shootdown panics or lost wakeups. |
+| `panic-test-smoke` | `M3OS_PANIC_TEST_REGRESSION=1` | Deliberate panic at `-smp 8` with sibling-core COM1 spam prints an **uninterleaved** banner (panic-path AP-quiesce; `panic-test` kernel feature). |
+| `smp-smoke` | `M3OS_SMP_REGRESSION=1` | 256 futex-heavy async ops complete across 8 cores (Phase 99 default, `M3OS_SMP=<N≥2>`-overridable; CI 2-vCPU runners set `M3OS_SMP=2`); no TLB-shootdown panics or lost wakeups. |
 | `node-jit-smoke` | `M3OS_NODE_JIT_REGRESSION=1` | JIT Node: V8 TurboFan + WASM execute under W^X v2 PKU guard (requires KVM + PKU CPU). |
 | `claude-smoke` | `M3OS_CLAUDE_REGRESSION=1` | claude-code 2.1.112 installs (DEPS=node), CLI runs; TUI render arm requires KVM + JIT node. |
 | `vfs-throughput-smoke` | `M3OS_VFS_THROUGHPUT_REGRESSION=1` | 8 MiB VFS write+read IPC-call count stays under coalescing-path regression ceilings. |

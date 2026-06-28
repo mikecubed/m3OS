@@ -2728,7 +2728,8 @@ pub fn yield_now() {
     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::YieldNow {
         task_idx: idx as u32,
         core: my_core as u8,
-        caller_file: location.file(),
+        caller_file_ptr: location.file().as_ptr() as u64,
+        caller_file_len: location.file().len() as u32,
         caller_line: location.line(),
     });
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
@@ -3738,7 +3739,8 @@ pub fn block_current_until(
         task_idx: idx as u32,
         core,
         new_state: kind as u8,
-        caller_file: block_caller.file(),
+        caller_file_ptr: block_caller.file().as_ptr() as u64,
+        caller_file_len: block_caller.file().len() as u32,
         caller_line: block_caller.line(),
     });
 
@@ -3849,31 +3851,35 @@ pub fn block_current_until(
 /// v2 helper: block the current task (as `BlockedOnReply`) until a message is
 /// delivered into its pending slot.
 ///
-/// This is the v2 replacement for `block_current_on_reply_unless_message`.
-/// It wraps [`block_current_until`] using a **local** `AtomicBool` as the
-/// `woken` flag. The flag starts `false`; the caller is responsible for the
-/// condition being rechecked via `take_message` after this returns.
+/// # The canonical v2 IPC block-wrapper pattern (Phase 99 Track A.2)
 ///
-/// **Why a local `AtomicBool`?** During the Track C migration window the wake
-/// side (`wake_task`) still uses the v1 path and does not set any per-call
-/// flag.  The self-revert path in [`block_current_until`] checks
-/// `pending_msg.is_some()` via the `woken` flag — but because the wake side
-/// has not been migrated to the v2 protocol (Track D), the flag will always
-/// be `false` at the step-3 recheck.  The function therefore always goes to
-/// step 4 (yield) unless `pending_msg` is already set at entry (the early
-/// `AlreadyTrue` return).  Once Track D migrates `wake_task`, wakers will set
-/// the flag, enabling the no-yield fast path.
+/// This function is the **reference shape** for the IPC block wrappers; the
+/// recv / notif / send variants ([`block_current_on_recv_v2`],
+/// [`block_current_on_notif_v2`], [`block_current_on_send_v2`], and their
+/// deadline forms) all follow it identically, so the wake/recheck/block
+/// sequence is documented **once, here**, instead of re-derived per site (the
+/// Phase 99 call-site audit, `docs/handoffs/2026-06-28-phase-99-block-wake-callsite-audit.md`,
+/// confirmed all six wrappers conform to it):
+///
+/// 1. **Register a fresh waker flag.** `let woken = Arc::new(AtomicBool::new(false));`
+///    then `register_reply_waker(task, woken.clone())` — a *fresh* `Arc<AtomicBool>`
+///    per call, never a latched/static flag. The wake side
+///    (`deliver_message` / `complete_send`) stores `true` into this exact flag
+///    **before** calling `wake_task_v2`.
+/// 2. **Recheck the condition AFTER registering** (`has_pending_message` /
+///    `send_completed`). Registering before the recheck is the Phase 57e Bug
+///    #8.1 fix: a delivery that races into the window between the recheck and
+///    `block_current_until`'s state write still sets `woken`, so step-3
+///    self-reverts instead of parking after an `AlreadyAwake` `wake_task_v2`.
+/// 3. **Block** via [`block_current_until`] with that registered flag. Its
+///    step-3 `woken.load()` recheck closes the lost-wake window; on resume the
+///    flag distinguishes a real wake from a deadline.
+/// 4. **Clear the waker** (`clear_reply_waker`) after return; the IPC layer's
+///    `take_message` is the source of truth for whether a message arrived.
 ///
 /// Returns `true` if the task was woken with a message (`Woken` or
-/// `AlreadyTrue`), `false` on a spurious or deadline wake (the latter is not
-/// possible on this path since no deadline is set, but is included for
-/// type-safety).
-///
-/// # Call-site migration contract
-///
-/// Under `cfg(feature = "sched-v2")`, `call_msg` in `endpoint.rs` calls this
-/// function instead of `block_current_on_reply_unless_message`.  The semantic
-/// outcome is identical: the caller resumes when a reply is delivered.
+/// `AlreadyTrue`), `false` on a deadline wake (no deadline is set on this path,
+/// so that arm is currently unreachable but kept for type-safety).
 pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
     let woken = Arc::new(AtomicBool::new(false));
     if !register_reply_waker(caller, woken.clone()) {
@@ -4109,9 +4115,9 @@ pub fn has_pending_message(id: TaskId) -> bool {
 /// delivered into its pending slot.
 ///
 /// This is the v2 replacement for `block_current_on_recv_unless_message` used
-/// in `recv_msg`. It wraps [`block_current_until`] using a stack-allocated
-/// `AtomicBool` as the `woken` flag, mirroring the pattern established by
-/// [`block_current_on_reply_v2`] (Track C.4).
+/// in `recv_msg`. It follows the canonical v2 block-wrapper pattern documented
+/// on [`block_current_on_reply_v2`] (a fresh registered `Arc<AtomicBool>` waker
+/// → recheck-after-register → [`block_current_until`] → clear waker).
 ///
 /// **Condition recheck (approach c):** The pending_msg pre-check is performed
 /// in the IPC layer (endpoint.rs) before calling this function, and
@@ -6466,6 +6472,121 @@ fn dump_dispatch_state() {
     log::warn!("[sched] dispatch-dump: end");
 }
 
+/// Phase 99 (Track A.3) — on-demand / watchdog scheduler-state dump.
+///
+/// Emits ONE `[sched] task pid=X state=Y wake_deadline=Z on_cpu=W` line per
+/// live task in the scheduler table — the diagnostic the 2026-04-25
+/// scheduler-design handoff (recommendation #3) asked for. It turns a "task
+/// stuck in `Blocked*` forever" symptom into direct per-task evidence at the
+/// moment of hang, which is exactly what the prior lost-wake debugging
+/// (Phase 89/90b/95, the 2026-06-14 cross-core lost-wake) lacked.
+///
+/// Unlike [`dump_dispatch_state`] (which only covers `Ready`/`Running` tasks for
+/// the fairness-failure fingerprint), this covers **every** non-`Dead` task —
+/// the whole point is to surface the blocked waiters whose wake never arrived.
+///
+/// # Lock discipline (ISR-safe / lock-aware)
+///
+/// Uses the **non-blocking** [`try_scheduler_lock`]: if `SCHEDULER.lock` is
+/// already held (a raced dispatcher, or a caller that holds it), it logs a
+/// note and returns rather than deadlocking or panicking — mirroring the
+/// existing `try_lock_scheduler` usage elsewhere. It acquires ONLY
+/// `SCHEDULER.lock`, never `pi_lock`, so it cannot invert the `pi_lock`-outer /
+/// `SCHEDULER.lock`-inner invariant. `on_cpu` is an atomic read with `Relaxed`;
+/// all logging happens after the guard is dropped (log macros may allocate).
+pub fn dump_scheduler_state() {
+    #[derive(Clone, Copy)]
+    struct Row {
+        pid: u32,
+        name: &'static str,
+        idx: usize,
+        state: super::TaskState,
+        wake_deadline: Option<u64>,
+        on_cpu: bool,
+        blocked_since: u64,
+    }
+
+    // Bounded, NON-ALLOCATING snapshot (mirrors `watchdog_scan`'s fixed array):
+    // a hang diagnostic must never itself allocate. A `Vec` grown under the
+    // scheduler lock could trip the global `#[alloc_error_handler]` in exactly
+    // the memory-pressure hang this targets — obscuring the original hang. Tasks
+    // beyond `MAX_ROWS` are summarized as a truncation count.
+    const MAX_ROWS: usize = 64;
+    let mut rows = [None::<Row>; MAX_ROWS];
+    let mut n = 0usize;
+    let mut total_live = 0usize;
+    {
+        // Non-blocking: never deadlock the diagnostic against the dispatcher.
+        let Some(sched) = try_scheduler_lock() else {
+            log::warn!("[sched] dump_scheduler_state: SCHEDULER.lock busy — skipped (best-effort)");
+            return;
+        };
+        for (idx, task) in sched.tasks.iter().enumerate() {
+            // Recycled dead slots carry no wait state worth printing.
+            if task.state == super::TaskState::Dead {
+                continue;
+            }
+            total_live += 1;
+            if n < MAX_ROWS {
+                rows[n] = Some(Row {
+                    pid: task.pid,
+                    name: task.name,
+                    idx,
+                    state: task.state,
+                    wake_deadline: task.wake_deadline,
+                    on_cpu: task.on_cpu.load(Ordering::Relaxed),
+                    blocked_since: task.blocked_since_tick,
+                });
+                n += 1;
+            }
+        }
+        // SCHEDULER.lock released here (before logging, which may allocate).
+    }
+
+    let now = crate::arch::x86_64::interrupts::tick_count();
+    log::warn!(
+        "[sched] dump_scheduler_state: now-tick={} live-tasks={}{}",
+        now,
+        total_live,
+        if total_live > n { " (truncated)" } else { "" },
+    );
+    for row in rows[..n].iter().flatten() {
+        // The canonical four fields (`pid` `state` `wake_deadline` `on_cpu`) are
+        // emitted contiguously and in order so the line is greppable; `name`,
+        // `idx`, and the derived `blocked_since` age trail as context.
+        match row.wake_deadline {
+            Some(d) => log::warn!(
+                "[sched] task pid={} state={:?} wake_deadline={} on_cpu={} name={} idx={} (deadline in {}ms, blocked~{}ms)",
+                row.pid,
+                row.state,
+                d,
+                row.on_cpu,
+                row.name,
+                row.idx,
+                d as i64 - now as i64,
+                now.saturating_sub(row.blocked_since),
+            ),
+            None => log::warn!(
+                "[sched] task pid={} state={:?} wake_deadline=none on_cpu={} name={} idx={} (blocked~{}ms)",
+                row.pid,
+                row.state,
+                row.on_cpu,
+                row.name,
+                row.idx,
+                now.saturating_sub(row.blocked_since),
+            ),
+        }
+    }
+    if total_live > n {
+        log::warn!(
+            "[sched] dump_scheduler_state: {} more live task(s) not shown (MAX_ROWS={})",
+            total_live - n,
+            MAX_ROWS,
+        );
+    }
+    log::warn!("[sched] dump_scheduler_state: end");
+}
+
 /// Periodic stuck-task watchdog scan.
 ///
 /// Called from the BSP's scheduler dispatch loop on every iteration.
@@ -6612,6 +6733,14 @@ pub fn watchdog_scan() {
                 // without holding scheduler locks across the dump.
                 if !TRACE_DUMP_FIRED.swap(true, Ordering::AcqRel) {
                     TRACE_DUMP_PENDING.store(true, Ordering::Release);
+                    // Phase 99 (Track A.3) — emit the per-task scheduler-state
+                    // census exactly at the stuck-no-waker verdict, so the
+                    // lost-wake forensic (which task is parked on what state,
+                    // with what deadline / on_cpu) is captured at the moment of
+                    // hang. Safe here: SCHEDULER.lock is released (the snapshot
+                    // loop above dropped it), so the non-blocking
+                    // `dump_scheduler_state` re-take cannot self-deadlock.
+                    dump_scheduler_state();
                     // Dump notification waiter/pending/signal state to classify
                     // a BlockedOnNotif strand (lost-wakeup-after-register vs a
                     // never-fired device IRQ). Safe here: SCHEDULER.lock is

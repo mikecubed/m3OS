@@ -566,8 +566,25 @@ pub fn signal(notif_id: NotifId, bits: u64) {
     if let Some(task) = waiter {
         // D.3: route through wake_task_v2 under sched-v2 so all wake paths
         // use the CAS primitive and no v1 deferred-enqueue flag is set.
-        {
-            let _ = scheduler::wake_task_v2(task);
+        let outcome = scheduler::wake_task_v2(task);
+
+        // Phase 99 (Track A.1) — lost-wake guard for the task-context signal
+        // path. `AlreadyAwake` means the CAS found `task` still `Running`: it is
+        // in the narrow gap between `wait()`'s `WAITERS`-unlock and
+        // `block_current_until`'s `BlockedOnNotif` commit, so this wake was a
+        // no-op and the task is about to park. Unlike `signal_irq` — which
+        // leaves `WAITERS[idx] = Some` so the BSP `drain_pending_waiters` safety
+        // net (scheduler dispatch loop) rescues the task once it commits — we
+        // already `take()`-d the slot above, which would strand the waiter with
+        // `PENDING` set but no rescuer (the very lost-wake the Phase 99 call-site
+        // audit flagged). Re-register the slot (the `PENDING` bits we set are
+        // still pending) so the same safety net wakes it. The `is_none()` guard
+        // avoids clobbering a slot the task re-took by looping through `wait()`.
+        if matches!(outcome, scheduler::WakeOutcome::AlreadyAwake) {
+            let mut waiters = WAITERS.lock();
+            if waiters[idx].is_none() {
+                waiters[idx] = Some(task);
+            }
         }
     }
     // Also trigger reschedule in case the waiter wasn't in WAITERS yet
@@ -920,6 +937,16 @@ pub fn wait(waiter: TaskId, notif_id: NotifId) -> u64 {
         // transitions the task to Ready via CAS.  On resume the outer loop
         // re-drains `PENDING[idx]`, so the woken-flag value is irrelevant.
         // No deadline is passed (notifications have no built-in timeout).
+        //
+        // Lost-wake closure (Phase 99 Track A.1): the dummy flag does NOT close
+        // the window where a wake lands in the gap between the `WAITERS`-unlock
+        // above and the `BlockedOnNotif` state write below. Both wake paths
+        // keep the `PENDING` bits set and ensure a registered `WAITERS` slot
+        // survives that gap, so the BSP's `drain_pending_waiters` safety net
+        // re-wakes this task once it commits: `signal_irq` never takes the slot,
+        // and the task-context `signal` re-registers it on an `AlreadyAwake`
+        // CAS (see `signal`). With the slot present and `PENDING != 0`, the
+        // next dispatch tick rescues the waiter.
         //
         // Under v1 the original `block_current_on_notif()` path is retained.
         {

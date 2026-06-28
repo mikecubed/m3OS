@@ -396,6 +396,11 @@ const SMOKE_EXIT_VFS_THROUGHPUT_FAILED: i32 = 92;
 /// PASS-or-SKIP `WaitEither` that timed out at 120 s when the `dlclose`
 /// destructor faulted (the DT_RELR-relocation bug fixed in this phase).
 const SMOKE_EXIT_DLOPEN_SMOKE_FAILED: i32 = 93;
+/// Phase 99 Track C.1 — the `panic-test-smoke` gate failed: the deliberate panic
+/// did not fire through `handle_panic`, the banner/sentinel was absent, or the
+/// banner was byte-interleaved with sibling-core COM1 spam (the AP-quiesce did
+/// not silence the spammers before printing).
+const SMOKE_EXIT_PANIC_TEST_FAILED: i32 = 94;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
@@ -1602,6 +1607,52 @@ fn main() {
                 });
             cmd_kstack_overflow_smoke(&smoke_args);
         }
+        // Phase 99 Track C.1 — `panic-test-smoke`: builds a kernel with the
+        // `panic-test` feature, boots at -smp 8, forks sibling-core COM1 spammers,
+        // deliberately panics, and asserts the AP-quiesce produced an
+        // uninterleaved `KERNEL PANIC at …` banner.
+        Some("panic-test-smoke") => {
+            // `usage()` advertises `--kvm` and `-m`/`--memory` for this gate, but
+            // the shared `parse_smoke_boot_args` only understands
+            // `--display`/`--timeout` (it is reused by ~30 other smoke commands
+            // whose contract must not change). Translate the two extra flags into
+            // the `M3OS_KVM` / `M3OS_MEM` env vars that `cmd_panic_test_smoke`
+            // already honors (`M3OS_KVM` directly; `M3OS_MEM` via
+            // `apply_memory_env_fallback`), then forward the rest to the shared
+            // parser so the advertised flags actually work.
+            let parse_fail = |err: String| -> ! {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            };
+            let rest = &args[2..];
+            let mut forwarded: Vec<String> = Vec::new();
+            let mut index = 0;
+            while index < rest.len() {
+                match try_take_memory_arg(rest, &mut index) {
+                    Ok(Some(mib)) => {
+                        // SAFETY: xtask is single-threaded here; the child
+                        // build/QEMU steps read the env. A bare MiB number is a
+                        // valid `M3OS_MEM` spec (`parse_memory_spec`).
+                        unsafe { std::env::set_var("M3OS_MEM", mib.to_string()) };
+                        index += 1;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => parse_fail(e),
+                }
+                if rest[index] == "--kvm" {
+                    // SAFETY: single-threaded; the QEMU launch reads the env.
+                    unsafe { std::env::set_var("M3OS_KVM", "1") };
+                } else {
+                    forwarded.push(rest[index].clone());
+                }
+                index += 1;
+            }
+            let smoke_args = parse_smoke_boot_args("panic-test-smoke", &forwarded)
+                .unwrap_or_else(|err| parse_fail(err));
+            cmd_panic_test_smoke(&smoke_args);
+        }
         // Phase 85a Track B.3 — zero-rebuild assertion gate.
         // Builds a port once to warm the pkgcache, removes the stage so the
         // same-machine `.stamp` fast-path cannot short-circuit, then builds
@@ -1626,7 +1677,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm.\n\
      USB passthrough: --usb-passthrough <vid:pid> (e.g. `--usb-passthrough 0bda:8156`) passes a physical USB device into the guest's emulated xHCI (qemu-xhci,id=xhci_pt). The QEMU process must have access to the USB device node — add a udev rule granting the user/group read-write on the device, or run with sudo. The device is claimed from the host kernel while QEMU runs and is released on exit."
@@ -1950,6 +2001,10 @@ fn build_userspace_bins() {
         // kernel SIGSEGV-killed it (recovery, not a core wedge). Pure syscall +
         // fork + write — no allocator.
         ("kstack-overflow-test", "kstack-overflow-test", false),
+        // Phase 99 Track C.1 — `panic-test`: forks COM1 spammers on sibling cores
+        // then invokes the feature-gated `SYS_PANIC_TEST` to demonstrate the panic
+        // AP-quiesce produces an uninterleaved banner. Pure syscall+fork+write.
+        ("panic-test", "panic-test", false),
         // Phase 77 Track F.1 — epoll_* verification smoke test.
         // Pure syscall+write against a pipe; no allocator.
         ("epoll-smoke", "epoll-smoke", false),
@@ -15595,6 +15650,204 @@ fn cmd_kstack_overflow_smoke(args: &SmokeBootArgs) {
     }
 }
 
+/// Phase 99 Track C.1 — smoke steps for `cargo xtask panic-test-smoke`.
+///
+/// Boots, logs in, runs the `panic-test` ramdisk binary (which forks COM1
+/// spammers on sibling cores then triggers `SYS_PANIC_TEST`), then waits for the
+/// panic banner. The final `Wait` on a never-printed marker is deliberate: the
+/// machine HALTS after the panic, so that wait times out — which makes the smoke
+/// harness flush the full serial to `M3OS_SMOKE_SERIAL_DUMP`, where
+/// `cmd_panic_test_smoke` analyzes it for an UNinterleaved banner.
+fn panic_test_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/panic-test: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "panic-test\n",
+        label: "guest/panic-test: run panic-test binary",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "PANICTEST:triggering",
+        timeout_secs: 60,
+        label: "guest/panic-test: spammers running, parent about to panic",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "KERNEL PANIC at",
+        timeout_secs: 30,
+        label: "guest/panic-test: panic reached handle_panic (banner printed)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "PANICTEST_SENTINEL",
+        timeout_secs: 30,
+        label: "guest/panic-test: panic message printed (banner + message landed)",
+    });
+    // Machine is halted now; this marker never prints → the wait times out, which
+    // flushes M3OS_SMOKE_SERIAL_DUMP for the post-run uninterleave analysis.
+    steps.push(SmokeStep::Wait {
+        pattern: "__PANICTEST_HALT_MARKER_NEVER_PRINTED__",
+        timeout_secs: 6,
+        label: "guest/panic-test: drain serial after halt (expected timeout → dump)",
+    });
+    steps
+}
+
+/// `cargo xtask panic-test-smoke` — Phase 99 Track C.1 demo gate. Builds a kernel
+/// with the `panic-test` feature, boots at `-smp 8`, forks sibling-core COM1
+/// spammers, deliberately panics, and asserts the panic-path AP-quiesce produced
+/// an **uninterleaved** banner (no `PTSPAM` between `KERNEL PANIC at …` and the
+/// `PANICTEST_SENTINEL` message). Honors `M3OS_KVM=1` and `M3OS_MEM=<spec>`.
+fn cmd_panic_test_smoke(args: &SmokeBootArgs) {
+    // Build the kernel WITH the `panic-test` feature so SYS_PANIC_TEST (0x1151)
+    // is live. Merge with any pre-set M3OS_KERNEL_FEATURES.
+    // SAFETY: xtask is single-threaded here; the child build step reads the env.
+    let merged = match std::env::var("M3OS_KERNEL_FEATURES") {
+        Ok(existing) if !existing.trim().is_empty() => format!("{},panic-test", existing.trim()),
+        _ => "panic-test".to_string(),
+    };
+    // Capture the full serial for the uninterleave analysis (the harness flushes
+    // it on the expected post-halt timeout).
+    let dump_path = std::env::temp_dir().join("m3os-panic-test-serial.log");
+    let _ = fs::remove_file(&dump_path);
+    // SAFETY: single-threaded; child build/QEMU read the env.
+    unsafe {
+        std::env::set_var("M3OS_KERNEL_FEATURES", merged);
+        std::env::set_var("M3OS_SMOKE_SERIAL_DUMP", &dump_path);
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let kvm = std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty());
+    let mut qemu_args = qemu_args_with_devices(
+        &uefi_image,
+        &ovmf,
+        display_mode,
+        DeviceSet {
+            kvm,
+            ..DeviceSet::default()
+        },
+    );
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // FORCE multi-core — the whole point is sibling-core COM1 contention that the
+    // AP-quiesce must silence. Default 8 (the Phase 99 laptop core count);
+    // M3OS_SMP=<N≥2> overrides for fewer-vCPU runners.
+    let cores = std::env::var("M3OS_SMP")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|n| *n >= 2)
+        .unwrap_or(8);
+    for i in 0..qemu_args.len() {
+        if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
+            qemu_args[i + 1] = cores.to_string();
+        }
+    }
+    append_ac97_audio_flags_headless(&mut qemu_args);
+    let steps = panic_test_smoke_steps();
+
+    println!(
+        "panic-test-smoke: launching QEMU (timeout {}s, -smp {cores}, {})",
+        args.timeout_secs,
+        if kvm { "KVM" } else { "TCG" }
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("panic-test-smoke: failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    // The terminal halt-marker wait is EXPECTED to time out (the machine halted
+    // after the panic), which is what flushes the serial dump. So we ignore the
+    // run_smoke_script result and base the verdict entirely on analyzing the
+    // captured serial.
+    let _ = run_smoke_script(&mut child, &steps, global_timeout);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let serial = std::fs::read_to_string(&dump_path).unwrap_or_default();
+    let fail = |reason: &str| -> ! {
+        eprintln!("panic-test-smoke: FAILED — {reason}");
+        // Surface the panic region for debugging.
+        if let Some(off) = serial.find("KERNEL PANIC at") {
+            let end = (off + 600).min(serial.len());
+            eprintln!("--- serial around banner ---\n{}", &serial[off..end]);
+        } else {
+            let tail = &serial[serial.len().saturating_sub(600)..];
+            eprintln!("--- serial tail ---\n{tail}");
+        }
+        std::process::exit(SMOKE_EXIT_PANIC_TEST_FAILED);
+    };
+
+    // 1) The probe actually ran its spammers + reached the trigger.
+    if !serial.contains("PTSPAM") {
+        fail(
+            "no PTSPAM seen — the sibling-core COM1 spammers never ran (contention absent → a clean banner would be vacuous)",
+        );
+    }
+    if !serial.contains("PANICTEST:triggering") {
+        fail("PANICTEST:triggering absent — the probe never reached the deliberate panic");
+    }
+    // 2) The panic fired through handle_panic and printed its banner + message.
+    let banner_off = match serial.find("KERNEL PANIC at") {
+        Some(o) => o,
+        None => {
+            fail("no 'KERNEL PANIC at' banner — the deliberate panic did not reach handle_panic")
+        }
+    };
+    let sentinel_off = match serial[banner_off..].find("PANICTEST_SENTINEL") {
+        Some(o) => banner_off + o,
+        None => fail("no 'PANICTEST_SENTINEL' after the banner — the panic message did not print"),
+    };
+    // 3) THE KEY ASSERTION — uninterleaving: between the banner and its message,
+    //    there must be NO sibling spam. If the AP-quiesce failed, the spammers
+    //    would still be writing COM1 and PTSPAM bytes would land inside the
+    //    banner/message region.
+    let banner_region = &serial[banner_off..sentinel_off];
+    if banner_region.contains("PTSPAM") {
+        fail(
+            "PTSPAM interleaved between 'KERNEL PANIC at' and the panic message — the AP-quiesce did NOT silence the sibling cores before printing",
+        );
+    }
+
+    println!(
+        "panic-test-smoke: PASS — deliberate panic at -smp {cores} produced an UNinterleaved banner \
+         (spammers ran [PTSPAM present], then were quiesced: 0 PTSPAM bytes between the \
+         'KERNEL PANIC at …' banner and the 'PANICTEST_SENTINEL' message)."
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Phase 63 Track E.1 — bell-smoke step list, QEMU arg builder, and command
 // ---------------------------------------------------------------------------
@@ -18441,7 +18694,7 @@ fn smp_smoke_steps(fast_iter: bool) -> Vec<SmokeStep> {
 }
 
 /// `cargo xtask smp-smoke` — permanent multi-core SMP regression gate. Boots Node
-/// on **multiple cores** (default `-smp 4`; `M3OS_SMP=<N≥2>` overrides) and runs
+/// on **multiple cores** (default `-smp 8`; `M3OS_SMP=<N≥2>` overrides) and runs
 /// the futex-heavy threadpool stress above. Honors `M3OS_KVM=1` (near-native; also
 /// exposes real PKU so the JIT/W^X-v2 paths are covered) and
 /// `M3OS_NODE_FAST_ITER=1` (reuse an installed disk). SKIPs cleanly when the host
@@ -18529,14 +18782,17 @@ fn cmd_smp_smoke(args: &SmokeBootArgs) {
             *arg = "user,id=net0".to_string();
         }
     }
-    // FORCE multi-core — the whole point of the gate. Default 4; M3OS_SMP=<N≥2>
-    // overrides (a value < 2 is ignored, since a single core cannot exercise the
-    // cross-core races this gate guards).
+    // FORCE multi-core — the whole point of the gate. Default 8 (Phase 99: the
+    // Dell Tiger Lake laptop the bare-metal GUI arc targets is 8-core/16-thread
+    // and cannot pin `-smp 1`, so the futex WAIT/WAKE handshake must be proven at
+    // that core count). `M3OS_SMP=<N≥2>` overrides — CI's 2-vCPU runners set
+    // `M3OS_SMP=2` (a value < 2 is ignored, since a single core cannot exercise
+    // the cross-core races this gate guards).
     let cores = std::env::var("M3OS_SMP")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|n| *n >= 2)
-        .unwrap_or(4);
+        .unwrap_or(8);
     for i in 0..qemu_args.len() {
         if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
             qemu_args[i + 1] = cores.to_string();
@@ -18945,6 +19201,21 @@ fn node_smoke_steps(attempt_net: bool, fast_iter: bool, egress_url: &str) -> Vec
         pattern: "ENVCATMARKER_OK",
         timeout_secs: 60,
         label: "node-smoke: /usr/bin/env shebang resolves + finds cat (ENVCATMARKER_OK)",
+    });
+
+    // Phase 99 (Track E.1) — `fs.copyFile` probe. `fs.copyFileSync` probes
+    // `copy_file_range`(326) then `sendfile`(40); both must return a clean
+    // `-ENOSYS` (or a working copy) so libuv's userspace read/write fallback
+    // succeeds — never a spurious `EFAULT`. Writes a ~5 KiB file, copies it, and
+    // byte-compares; the sentinel is concat-built so the Wait keys on real output.
+    steps.push(SmokeStep::Send {
+        input: "node -e \"const fs=require('fs');const s='/tmp/cfsrc',d='/tmp/cfdst';const b=Buffer.alloc(5000);for(let i=0;i<b.length;i++)b[i]=(i*7+3)&255;fs.writeFileSync(s,b);try{fs.copyFileSync(s,d);const x=fs.readFileSync(s),y=fs.readFileSync(d);console.log(x.equals(y)?('COPYFILE'+'_OK '+y.length):'COPYFILE'+'_MISMATCH');}catch(e){console.log('COPYFILE'+'_ERR '+(e.code||e.message));}\"\n",
+        label: "node-smoke: fs.copyFile probe (Track E.1 — no EFAULT)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "COPYFILE_OK",
+        timeout_secs: 120,
+        label: "node-smoke: fs.copyFile succeeds + byte-verified (COPYFILE_OK)",
     });
 
     // 7. Opt-in network arms (M3OS_NODE_NET=1): a real HTTPS cert-validate +

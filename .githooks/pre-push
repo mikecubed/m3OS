@@ -779,6 +779,23 @@ if [ "${M3OS_KSTACK_OVERFLOW_REGRESSION:-0}" = "1" ]; then
     fi
 fi
 
+# Phase 99 Track C.1 — panic-path AP-quiesce uninterleaved-banner gate. Gated
+# behind M3OS_PANIC_TEST_REGRESSION=1. Builds a kernel with the `panic-test`
+# feature, boots at -smp 8, forks sibling-core COM1 spammers, then triggers
+# SYS_PANIC_TEST and asserts the deliberate panic's banner lands UNinterleaved
+# (no PTSPAM between `KERNEL PANIC at …` and the panic message) — proving
+# `smp::panic_quiesce_aps` silenced the siblings first. A regression that breaks
+# the quiesce (or re-introduces the owner self-park window) shreds the banner or
+# never prints it → the gate fails. Set this on branches touching the panic path
+# / smp panic-stop / the NMI handler. KVM-accelerated when /dev/kvm is present.
+if [ "${M3OS_PANIC_TEST_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask panic-test-smoke..."
+    if ! cargo xtask panic-test-smoke --timeout 220; then
+        echo "pre-push: cargo xtask panic-test-smoke failed" >&2
+        exit 1
+    fi
+fi
+
 # Permanent multi-core SMP regression gate
 # (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md). Gated behind
 # M3OS_SMP_REGRESSION=1. Boots Node on MULTIPLE cores (-smp 4) and runs a

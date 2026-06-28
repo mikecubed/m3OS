@@ -470,6 +470,151 @@ pub fn core_count() -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 99 (Track C.1) — panic-path AP quiesce
+// ---------------------------------------------------------------------------
+//
+// At 4 GiB + KVM + SMP an intermittent panic's banner is unreadable because
+// `handle_panic` prints + dumps the trace rings while sibling cores keep
+// scheduling and writing to COM1 → byte-interleaved garbage
+// (docs/handoffs/2026-06-05-4gib-smp-panic-corrupted-output.md). The panicking
+// core broadcasts a halt NMI to its siblings and waits a BOUNDED grace window
+// for them to park BEFORE it prints, so the banner lands on a quiet bus. NMI
+// (not a fixed IPI) is used so an IF=0 sibling still stops; the sibling's NMI
+// handler (`arch::x86_64::interrupts::nmi_handler`) sees `panic_in_progress`
+// and, if it is not the panic owner, acks + parks in `hlt_loop` on its clean
+// NMI IST stack (NMI-on-IST landed 2026-06-14).
+//
+// Re-entrancy: the first panicker wins `PANIC_IN_PROGRESS` via CAS and owns all
+// output; any core that panics afterward (or is mid-`handle_panic` when the NMI
+// lands) parks without printing, so a second panic during the dump cannot
+// re-corrupt the banner. Mirrors Linux `panic_smp_self_stop` / `smp_send_stop`.
+
+/// Set once the first panicking core wins the panic race; read by the NMI
+/// handler to decide whether to park.
+static PANIC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// Bit `i` set when core `i` has acknowledged the panic-stop NMI and parked.
+static PANIC_STOP_ACK: AtomicU64 = AtomicU64::new(0);
+
+/// Sentinel for "no panic owner stamped yet".
+const PANIC_OWNER_NONE: u8 = 0xFF;
+
+/// Logical core id of the panic owner (the core printing the banner). The NMI
+/// handler must NOT park this core. Sentinel [`PANIC_OWNER_NONE`] = no owner yet.
+static PANIC_OWNER_CORE: AtomicU8 = AtomicU8::new(PANIC_OWNER_NONE);
+
+/// True once a core has begun the panic-stop sequence.
+#[inline]
+pub fn panic_in_progress() -> bool {
+    PANIC_IN_PROGRESS.load(Ordering::Acquire)
+}
+
+/// Whether the NMI handler should park `my_core` because a panic is in progress.
+///
+/// Parks ONLY when a panic owner has been **stamped** (`PANIC_OWNER_CORE !=
+/// PANIC_OWNER_NONE`) and it is **not** this core. This closes the self-park
+/// window: `panic_quiesce_aps` publishes `PANIC_IN_PROGRESS = true` (CAS) a few
+/// instructions BEFORE it stamps `PANIC_OWNER_CORE`. TLB shootdowns are
+/// NMI-delivered (`smp::tlb`), so the owner can take a stray shootdown NMI in
+/// that window; if the handler parked on "not yet the owner" it would wedge the
+/// owner forever and the banner would never print — strictly worse than the
+/// interleave this feature fixes. Treating "owner unknown" as do-not-park lets
+/// the owner finish stamping itself (and the bounded grace window absorbs the
+/// rare case where a sibling briefly ran an extra shootdown before its own
+/// park NMI, which is always sent AFTER the owner is stamped).
+#[inline]
+pub fn panic_should_park(my_core: u8) -> bool {
+    let owner = PANIC_OWNER_CORE.load(Ordering::Acquire);
+    owner != PANIC_OWNER_NONE && owner != my_core
+}
+
+/// True if `core_id` is the panic owner (it must not self-park on a stray NMI
+/// while it is printing the banner).
+#[inline]
+pub fn is_panic_owner(core_id: u8) -> bool {
+    PANIC_OWNER_CORE.load(Ordering::Acquire) == core_id
+}
+
+/// Quiesce sibling cores before the panic banner prints (Track C.1).
+///
+/// Returns `true` if THIS core won the panic race and should proceed to print;
+/// `false` if another core is already the panic owner (the caller must then
+/// just `hlt_loop` without printing, to avoid re-corrupting the banner).
+///
+/// On a win: stamps this core as the owner, broadcasts a halt NMI to every
+/// other online core, and spins a BOUNDED grace window for them to ack-and-park
+/// — a wedged core that never acks does NOT hang this, the window times out and
+/// we print anyway. Single-core / pre-SMP boot returns `true` immediately with
+/// no NMIs sent. Never allocates; safe from the panic handler.
+pub fn panic_quiesce_aps() -> bool {
+    // Pre-SMP boot: no siblings, and `send_nmi_to_core` would no-op.
+    let my_core = match try_per_core() {
+        Some(pc) => pc.core_id,
+        None => return true,
+    };
+
+    // First panicker wins; everyone else parks without printing.
+    if PANIC_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    // WINDOW: `PANIC_IN_PROGRESS` is now true but the owner is not yet stamped.
+    // A stray NMI to THIS core in this gap must NOT park it — `panic_should_park`
+    // returns false while the owner is `PANIC_OWNER_NONE`, so the owner survives
+    // the window. The store below is `Release` so any core that later observes a
+    // stamped owner also observes a consistent value.
+    PANIC_OWNER_CORE.store(my_core, Ordering::Release);
+
+    // Build the target mask (all online cores except self) and NMI each.
+    let n = core_count();
+    let mut target_mask: u64 = 0;
+    for core_id in 0..n {
+        if core_id == my_core {
+            continue;
+        }
+        if let Some(data) = get_core_data(core_id)
+            && data.is_online.load(Ordering::Acquire)
+        {
+            target_mask |= 1u64 << core_id;
+            ipi::send_nmi_to_core(core_id);
+        }
+    }
+    if target_mask == 0 {
+        return true; // nobody to wait for
+    }
+
+    // Bounded grace window: spin until every target acks, or a fixed iteration
+    // budget elapses. A genuinely-wedged core may never ack — do NOT hang the
+    // panic path on it. 200M `pause` iterations is ~hundreds of ms to ~1 s on a
+    // multi-GHz KVM guest; a panic is not latency-critical and siblings normally
+    // ack in microseconds, so the budget is only a wedged-core backstop.
+    const SPIN_BUDGET: u64 = 200_000_000;
+    let mut spun: u64 = 0;
+    while (PANIC_STOP_ACK.load(Ordering::Acquire) & target_mask) != target_mask {
+        core::hint::spin_loop();
+        spun += 1;
+        if spun >= SPIN_BUDGET {
+            break;
+        }
+    }
+    true
+}
+
+/// Acknowledge the panic-stop NMI and park forever. Called from the NMI handler
+/// on a sibling core when a panic is in progress and this core is not the owner.
+pub fn panic_stop_ack_and_park() -> ! {
+    if let Some(pc) = try_per_core() {
+        PANIC_STOP_ACK.fetch_or(1u64 << pc.core_id, Ordering::Release);
+    }
+    // `hlt_loop` marks this core offline (so any later shootdown from the owner
+    // excludes it) and halts. In NMI context this never IRETQs — exactly what we
+    // want: the core stays frozen and quiet on COM1 while the owner prints.
+    crate::hlt_loop()
+}
+
+// ---------------------------------------------------------------------------
 // Per-core access via gs_base (T004)
 // ---------------------------------------------------------------------------
 

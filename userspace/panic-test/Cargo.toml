@@ -1,0 +1,11 @@
+[package]
+name = "panic-test"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "panic-test"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib" }

@@ -2480,6 +2480,9 @@ pub extern "C" fn syscall_handler(
         // -- Track D debug probe (feature `kstack-overflow-test`; absent → ENOSYS) --
         #[cfg(feature = "kstack-overflow-test")]
         SYS_KSTACK_OVERFLOW_TEST => sys_kstack_overflow_test(),
+        // -- Track C.1 panic-quiesce demo (feature `panic-test`; absent → ENOSYS) --
+        #[cfg(feature = "panic-test")]
+        SYS_PANIC_TEST => sys_panic_test(),
         _ => {
             // Rate-limit to ONCE per syscall number per boot. A real userspace
             // runtime (Node) probes unsupported syscalls (capget=125,
@@ -19611,6 +19614,35 @@ pub(super) fn sys_kstack_overflow_test() -> u64 {
         crate::process::current_pid(),
     );
     core::hint::black_box(kstack_overflow_recurse(core::hint::black_box(0)))
+}
+
+// ---------------------------------------------------------------------------
+// Track C.1 panic-quiesce demo — SYS_PANIC_TEST (0x1151)
+// ---------------------------------------------------------------------------
+//
+// Feature-gated (`panic-test`); absent in production (the number falls through
+// to the default dispatch arm → `NEG_ENOSYS`). Deliberately `panic!()`s the
+// calling core so the panic-path AP-quiesce (`smp::panic_quiesce_aps`, Phase 99
+// Track C.1) can be demonstrated end-to-end: with sibling cores actively writing
+// COM1, the quiesce must halt them BEFORE the banner prints so it lands
+// uninterleaved. Used by the `panic-test-smoke` gate.
+
+/// m3OS-native Track C.1 demo syscall. Never returns (the panic halts this core
+/// after the AP-quiesce + banner print).
+#[cfg(feature = "panic-test")]
+pub const SYS_PANIC_TEST: u64 = 0x1151;
+
+/// `SYS_PANIC_TEST` handler — never returns (panics through the real
+/// `handle_panic` → `panic_quiesce_aps` path; not a `cfg(test)` build, so the
+/// quiesce-and-print code actually runs).
+#[cfg(feature = "panic-test")]
+pub(super) fn sys_panic_test() -> u64 {
+    // The sentinel is what `panic-test-smoke` asserts appears CONTIGUOUS with the
+    // `KERNEL PANIC at …` banner (proof the sibling COM1 spam was quiesced first).
+    panic!(
+        "PANICTEST_SENTINEL deliberate Track-C.1 panic from pid {}",
+        crate::process::current_pid()
+    );
 }
 
 // ---------------------------------------------------------------------------

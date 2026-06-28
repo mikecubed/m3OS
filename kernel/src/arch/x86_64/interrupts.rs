@@ -902,6 +902,30 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
         return false;
     }
 
+    // Phase 99 (Track B.1) — INVARIANT: no `SCHEDULER`/`PROCESS_TABLE` lock (nor
+    // any other `IrqSafeMutex`) is held on entry to the blocking lazy-file
+    // demand-fault IPC. Holding one across the blocking `vfs_server` read is the
+    // `2026-04-21-scheduler-lock-isr-deadlock` class (it strands the lock across
+    // a task switch, wedging every core that later contends it). Both `SCHEDULER`
+    // and `PROCESS_TABLE` are `IrqSafeMutex`es whose `lock()` raises
+    // `preempt_count` (Phase 57b F.1), so `current_preempt_count() == 0` is the
+    // exact, non-flaky encoding of "no such lock held on THIS core" — it is a
+    // per-task counter, unaffected by sibling cores. The audit
+    // (docs/handoffs/2026-06-28-phase-99-fault-handler-lock-audit.md) confirmed
+    // every fault-handler path drops `PROCESS_TABLE` (value-copy in
+    // `shared_vma_demand_file`) before this point; the assertion enforces it in
+    // debug builds, and the existing budgeted log below names the culprit syscall
+    // in release builds.
+    debug_assert_eq!(
+        crate::task::scheduler::current_preempt_count(),
+        0,
+        "[demand-fault] B.1 invariant violated: entered the blocking lazy-file \
+         demand-fault path while holding an IrqSafeMutex (SCHEDULER/PROCESS_TABLE) \
+         — preempt_count != 0; pid={} vaddr={:#x}",
+        pid,
+        vaddr,
+    );
+
     // Deadlock-guard (Phase 95b lazy-file-fault-under-lock hunt) — placed at
     // ENTRY, before `shared_vma_demand_file` (which re-takes PROCESS_TABLE) and
     // before the blocking lazy-file read below. A legitimate ring-3 fault holds no
@@ -3045,6 +3069,26 @@ extern "x86-interrupt" fn tlb_shootdown_ipi_handler(stack_frame: InterruptStackF
 /// NMI does **not** require `lapic_eoi()` — NMI is delivered out of
 /// band of the LAPIC ISR/IRR machinery.
 extern "x86-interrupt" fn nmi_handler(_stack_frame: InterruptStackFrame) {
+    // Phase 99 (Track C.1) — panic AP-quiesce. When a sibling core has begun a
+    // panic, every other core parks HERE (on the clean per-core NMI IST stack)
+    // so the panic owner prints the banner + crash dump on a quiet COM1 instead
+    // of SMP-interleaved garbage. The panic owner itself must NOT park — it
+    // falls through to keep running and print. Checked before the (idempotent,
+    // fault-free) TLB-shootdown service so a panic-stop NMI is never mistaken
+    // for a shootdown.
+    if crate::smp::panic_in_progress() {
+        let my_core = crate::smp::try_per_core()
+            .map(|pc| pc.core_id)
+            .unwrap_or(0xFF);
+        // Park ONLY when a panic owner has been stamped and it is not this core.
+        // `panic_should_park` returns false while the owner is still unknown,
+        // which prevents the owner from self-parking on a stray shootdown NMI in
+        // the `PANIC_IN_PROGRESS`-set-before-`PANIC_OWNER_CORE`-stamped window
+        // (see `smp::panic_should_park`).
+        if crate::smp::panic_should_park(my_core) {
+            crate::smp::panic_stop_ack_and_park();
+        }
+    }
     crate::smp::tlb::handle_tlb_shootdown_ipi();
 }
 

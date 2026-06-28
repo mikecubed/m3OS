@@ -86,22 +86,29 @@ pub enum TraceEvent {
     YieldNow {
         task_idx: u32,
         core: u8,
-        /// Source file of the `yield_now()` call site.  Populated via
-        /// `#[track_caller]` / `core::panic::Location::caller()` so a
-        /// repeated yield-loop fingerprint identifies the exact kernel
-        /// function that's busy-yielding.  Phase 57e Bug #12 follow-up
-        /// after the eager-yield-removal regression.
-        caller_file: &'static str,
+        /// Raw `(ptr, len)` of the `yield_now()` call-site file string (a
+        /// `Location::caller().file()` `&'static str` in kernel `.rodata`).
+        ///
+        /// Stored as raw integers — NOT a `&'static str` — deliberately: the
+        /// per-core rings are written lock-free and read torn by the crash
+        /// dumper, and *materializing* a `&str` from torn bytes is UB even
+        /// without dereferencing it. The dumper reconstructs + validates the
+        /// pointer (supervisor-mapped, bounded) before forming any `&str`
+        /// (`trace::safe_caller`). `caller_file_len == 0` / `ptr == 0` is the
+        /// "no caller" sentinel.
+        caller_file_ptr: u64,
+        caller_file_len: u32,
         caller_line: u32,
     },
     BlockCurrent {
         task_idx: u32,
         core: u8,
         new_state: u8,
-        /// Call site that parked the task (via `#[track_caller]` on
-        /// `block_current_until`). Distinguishes the block kind — poll vs IPC
-        /// recv vs reply vs PTY/socket read — when hunting a lost wake.
-        caller_file: &'static str,
+        /// Raw `(ptr, len)` of the `block_current_until()` call-site file string
+        /// — see [`TraceEvent::YieldNow`]'s `caller_file_ptr` for why this is raw
+        /// integers rather than a `&'static str` (lock-free torn-read soundness).
+        caller_file_ptr: u64,
+        caller_file_len: u32,
         caller_line: u32,
     },
     WakeTask {

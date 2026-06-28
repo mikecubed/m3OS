@@ -1275,6 +1275,17 @@ pub fn handle_panic(info: &core::panic::PanicInfo) -> ! {
 
     #[cfg(not(test))]
     {
+        // Phase 99 (Track C.1) — quiesce sibling cores before printing so the
+        // banner + crash dump land on a quiet COM1 instead of SMP-interleaved
+        // garbage (docs/handoffs/2026-06-05-4gib-smp-panic-corrupted-output.md).
+        // If another core already owns the panic, park without printing so a
+        // second panic during the dump cannot re-corrupt the banner. Bounded:
+        // a wedged sibling that never acks times the grace window out rather
+        // than hanging the panic path. Single-core / pre-SMP boot is a no-op
+        // (returns `true` immediately, no NMIs sent).
+        if !crate::smp::panic_quiesce_aps() {
+            hlt_loop();
+        }
         if let Some(location) = info.location() {
             serial::_panic_print(format_args!(
                 "KERNEL PANIC at {}:{}\n",

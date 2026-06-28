@@ -47,8 +47,13 @@ pub fn trace_event(_event: kernel_core::trace_ring::TraceEvent) {}
 /// core has halted interrupts. Other cores may still be running and writing
 /// to their rings. The UnsafeCell permits this access, and TraceRing uses
 /// plain (non-atomic) fields, so a concurrent write could produce a torn
-/// entry. This is acceptable in crash diagnostics — a single torn entry
-/// is bounded and the timeline is best-effort.
+/// entry. The timeline is therefore best-effort — but the caller file is stored
+/// as raw `(caller_file_ptr, caller_file_len)` integers (NOT a `&'static str`),
+/// precisely so a torn entry never *materializes* an invalid `&str` (which is UB
+/// even un-dereferenced). The dumper funnels those integers through
+/// [`safe_caller`], which validates the range is mapped + supervisor-only and
+/// UTF-8 before constructing any `&str` — so a torn entry can never deref a wild
+/// or user pointer and cascade to a recursive #PF halt (Phase 99 Track D).
 ///
 /// Compiles to nothing when the `trace` feature is off.
 #[cfg(feature = "trace")]
@@ -110,6 +115,78 @@ pub fn dump_trace_rings_recent(max_per_core: usize) {
 #[cfg(not(feature = "trace"))]
 pub fn dump_trace_rings() {}
 
+/// Reconstruct + validate a trace event's call-site file string from its raw
+/// `(ptr, len)` before the crash dumper interprets it (Phase 99 Track D).
+///
+/// The per-core trace rings are written lock-free from *running* cores, and the
+/// crash dump reads them while those cores may still be writing (the doc on
+/// [`dump_trace_rings_recent`] notes the torn-entry possibility). The caller file
+/// is therefore stored as raw integers (`caller_file_ptr`/`caller_file_len`), NOT
+/// a `&'static str` — *materializing* a `&str` from torn bytes is UB even without
+/// dereferencing it (PR #271 review). A torn `(ptr, len)` can be a garbage
+/// near-null pointer (`cr2` = 0x0 / 0x8 / 0x29) or a mapped USERSPACE pointer
+/// (`0x7ffffeffe100`); printing either would deref a wild/user page **inside the
+/// crash dumper itself**, re-faulting to a `RECURSIVE KERNEL PAGE FAULT` halt —
+/// the root cause of the `dynlink-hello-versioned-mismatch-smoke` step-25 CI
+/// flake (docs/handoffs/2026-06-25-flaky-dynlink-mismatch-demand-fault-kernel-fault.md).
+///
+/// So we validate BEFORE constructing any `&str`: bound the length, reject the
+/// null page + non-canonical addresses, confirm both the first and last bytes are
+/// mapped AND **supervisor-only** (a legit `Location::caller().file()` is always
+/// kernel `.rodata`; `USER_ACCESSIBLE` would `#PF` a ring-0 read under SMAP) via a
+/// read-only `translate` page-table walk (which never reads `ptr` itself, so it
+/// cannot fault), then `from_utf8` (rejects supervisor bytes that aren't valid
+/// UTF-8). Only then is the slice formed. A failing string yields a placeholder.
+///
+/// `#[cfg(feature = "trace")]`-gated to match its only callers — `print_trace_event`
+/// and the `focus` submodule dump (`super::safe_caller`), both trace-gated.
+#[cfg(feature = "trace")]
+fn safe_caller(ptr: u64, len: usize) -> &'static str {
+    if len == 0 || ptr == 0 {
+        return "";
+    }
+    // Reject the null page and an implausibly long path (a torn `caller_file_len`
+    // can be garbage-large) before touching the page tables.
+    if ptr < 0x1000 || len > 256 {
+        return "<corrupt-caller>";
+    }
+    // `VirtAddr::try_new` (NOT `::new`, which *panics* on a non-canonical address
+    // — a torn pointer can be non-canonical, and a panic here would itself wreck
+    // the crash dump) rejects non-canonical garbage. Compute the last byte with a
+    // checked add so a near-`u64::MAX` garbage pointer can't overflow.
+    let Some(end) = ptr.checked_add(len as u64 - 1) else {
+        return "<corrupt-caller>";
+    };
+    let (Ok(start_va), Ok(end_va)) = (
+        x86_64::VirtAddr::try_new(ptr),
+        x86_64::VirtAddr::try_new(end),
+    ) else {
+        return "<corrupt-caller>";
+    };
+    use x86_64::structures::paging::{PageTableFlags, Translate as _, mapper::TranslateResult};
+    // SAFETY: `get_mapper` yields a read-only view over the active page tables via
+    // the phys-offset map; `translate` walks those tables and never reads `ptr`
+    // itself, so it cannot fault on a wild `ptr`.
+    let mapper = unsafe { crate::mm::paging::get_mapper() };
+    let supervisor_mapped = |va| {
+        matches!(
+            mapper.translate(va),
+            TranslateResult::Mapped { flags, .. } if !flags.contains(PageTableFlags::USER_ACCESSIBLE)
+        )
+    };
+    if !(supervisor_mapped(start_va) && supervisor_mapped(end_va)) {
+        return "<corrupt-caller>";
+    }
+    // Only now — range confirmed mapped, supervisor-only, and bounded — form the
+    // slice. The source was a `Location::caller().file()` `&'static str` in kernel
+    // `.rodata` (never freed), so the `'static` lifetime is sound when `ptr` is
+    // valid; `from_utf8` rejects a torn pointer into non-UTF-8 rodata (never
+    // panics).
+    // SAFETY: `[ptr, ptr+len)` validated mapped + readable above.
+    let bytes: &'static [u8] = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    core::str::from_utf8(bytes).unwrap_or("<corrupt-caller>")
+}
+
 /// Print a trace event directly to serial without heap allocation.
 #[cfg(feature = "trace")]
 fn print_trace_event(event: &TraceEvent) {
@@ -132,19 +209,23 @@ fn print_trace_event(event: &TraceEvent) {
         TraceEvent::YieldNow {
             task_idx,
             core,
-            caller_file,
+            caller_file_ptr,
+            caller_file_len,
             caller_line,
         } => _panic_print(format_args!(
-            "YieldNow {{ task_idx: {task_idx}, core: {core}, caller={caller_file}:{caller_line} }}"
+            "YieldNow {{ task_idx: {task_idx}, core: {core}, caller={}:{caller_line} }}",
+            safe_caller(*caller_file_ptr, *caller_file_len as usize)
         )),
         TraceEvent::BlockCurrent {
             task_idx,
             core,
             new_state,
-            caller_file,
+            caller_file_ptr,
+            caller_file_len,
             caller_line,
         } => _panic_print(format_args!(
-            "BlockCurrent {{ task_idx: {task_idx}, core: {core}, new_state: {new_state}, caller={caller_file}:{caller_line} }}"
+            "BlockCurrent {{ task_idx: {task_idx}, core: {core}, new_state: {new_state}, caller={}:{caller_line} }}",
+            safe_caller(*caller_file_ptr, *caller_file_len as usize)
         )),
         TraceEvent::WakeTask {
             task_idx,
@@ -444,7 +525,8 @@ pub mod focus {
             }
             TraceEvent::YieldNow {
                 core,
-                caller_file,
+                caller_file_ptr,
+                caller_file_len,
                 caller_line,
                 ..
             } => {
@@ -455,14 +537,15 @@ pub mod focus {
                     pid,
                     name,
                     core,
-                    caller_file,
+                    super::safe_caller(caller_file_ptr, caller_file_len as usize),
                     caller_line
                 );
             }
             TraceEvent::BlockCurrent {
                 core,
                 new_state,
-                caller_file,
+                caller_file_ptr,
+                caller_file_len,
                 caller_line,
                 ..
             } => {
@@ -474,7 +557,7 @@ pub mod focus {
                     name,
                     core,
                     new_state,
-                    caller_file,
+                    super::safe_caller(caller_file_ptr, caller_file_len as usize),
                     caller_line
                 );
             }
