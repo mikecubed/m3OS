@@ -637,6 +637,15 @@ impl InputWiring {
                     effects.push(InputEffect::Outbound(target_id, ServerMessage::Pointer(ev)));
                 }
                 if let Some(target) = decision.focus_change {
+                    // C.2 bare-metal sentinel: greppable evidence that a
+                    // pointer event changed compositor focus, proving
+                    // focus-follows-click over the dock-hub topology.
+                    syscall_lib::write_str(
+                        syscall_lib::STDOUT_FILENO,
+                        "INPUT:pointer-focus-change surface=",
+                    );
+                    write_surface_id_dec(target.0);
+                    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
                     effects.push(InputEffect::FocusChanged(target));
                 }
             }
@@ -644,6 +653,27 @@ impl InputWiring {
 
         effects
     }
+}
+
+/// Write a `u32` surface id as decimal digits to STDOUT using the existing
+/// `syscall_lib::write_str` idiom.  Used by the C.2 pointer-focus-change
+/// sentinel.  No `alloc::format!` or new formatting machinery required.
+fn write_surface_id_dec(mut value: u32) {
+    let mut buf = [0u8; 10]; // u32::MAX is 10 decimal digits
+    let mut idx = buf.len();
+    if value == 0 {
+        idx -= 1;
+        buf[idx] = b'0';
+    } else {
+        while value != 0 {
+            idx -= 1;
+            buf[idx] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+    }
+    // SAFETY: buf[idx..] contains only ASCII digit bytes.
+    let s = unsafe { core::str::from_utf8_unchecked(&buf[idx..]) };
+    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, s);
 }
 
 // NB: `display_server` is a `no_std` + `no_main` binary crate, so the

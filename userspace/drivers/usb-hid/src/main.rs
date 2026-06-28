@@ -44,6 +44,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::alloc::Layout;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use kernel_core::input::events::{
     KeyEvent, KeyEventKind, ModifierSide, ModifierState, PointerButton, PointerEvent,
@@ -105,6 +106,13 @@ const RECONCILE_INTERVAL_MS: u64 = 200;
 /// (after we have already reached the max-backoff plateau).  At 100 ms idle
 /// sleep this is roughly every 10 s — visible in logs without flooding them.
 const IDLE_LOG_EVERY: u32 = 100;
+
+/// C.1 bare-metal sentinel — cumulative count of `PointerEvent`s successfully
+/// injected into `mouse_server` via [`inject_pointer`] since startup.
+/// Emitted as `USB_HID:pointer-injected count=<n>` on the first inject and
+/// every 64th inject thereafter, providing greppable evidence that a non-zero
+/// injected-event count accumulated over the dock-hub topology.
+static INJECTED_PTR_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// How this driver decodes a bound HID interface.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -294,6 +302,18 @@ fn inject_pointer(mouse_ep: u32, ev: &PointerEvent) {
     let mut buf = [0u8; kernel_core::input::events::POINTER_EVENT_WIRE_SIZE];
     if ev.encode(&mut buf).is_ok() {
         let _ = syscall_lib::ipc_call_buf(mouse_ep, MOUSE_EVENT_INJECT, 0, &buf);
+        // C.1 bare-metal sentinel: emit a greppable injected-event count so
+        // that, when run on real hardware over the dock-hub topology, logs
+        // capture proof of a non-zero injected count.  Emitted on the first
+        // successful inject and then every 64th inject to coalesce output.
+        let n = INJECTED_PTR_COUNT
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        if n == 1 || n % 64 == 0 {
+            syscall_lib::write_str(STDOUT_FILENO, "USB_HID:pointer-injected count=");
+            write_u32_dec(n);
+            syscall_lib::write_str(STDOUT_FILENO, "\n");
+        }
     }
 }
 
