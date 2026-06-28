@@ -39,6 +39,14 @@
 #![no_main]
 
 use syscall_lib::STDOUT_FILENO;
+use syscall_lib::heap::BrkAllocator;
+
+// Phase 100 D.1 — linking `kernel-core` for the host-tested
+// `key_event_to_stdin` mapping pulls in `alloc`, so this binary now needs a
+// global allocator. The `KeyEvent`→stdin path itself never allocates; the
+// allocator is present only to satisfy the link.
+#[global_allocator]
+static ALLOCATOR: BrkAllocator = BrkAllocator::new();
 
 // ---------------------------------------------------------------------------
 // Scancode translation (US-QWERTY, ported from kernel/src/main.rs)
@@ -146,26 +154,11 @@ const DISPLAY_PROBE_INTERVAL_EMPTY_POLLS: u32 = 1;
 // KeyEvent wire decode (D.1)
 //
 // The full codec lives in `kernel_core::input::events::KeyEvent::decode`.
-// stdin_feeder does not link against kernel_core (no allocator), so the
-// minimal subset needed here is inlined below.  Must be kept in sync with
-// the `kernel_core::input::events::KeyEvent` wire layout.
+// Only the minimal field subset stdin_feeder needs is decoded inline below;
+// it must stay in sync with the `kernel_core::input::events::KeyEvent` wire
+// layout. (The KeyEvent→stdin *mapping* is not duplicated — it delegates to
+// the host-tested `kernel_core::input::hid_poll::key_event_to_stdin`.)
 // ---------------------------------------------------------------------------
-
-/// `ModifierState` bit for Ctrl held.
-/// Matches `kernel_core::input::events::MOD_CTRL = 1 << 1`.
-const MOD_CTRL: u16 = 1 << 1;
-
-// Private-use KeySym values for navigation keys.
-// Must stay in sync with `kernel_core::input::keymap::KEYSYM_*`.
-const KEYSYM_UP: u32 = 0xE012;
-const KEYSYM_DOWN: u32 = 0xE013;
-const KEYSYM_RIGHT: u32 = 0xE011;
-const KEYSYM_LEFT: u32 = 0xE010;
-const KEYSYM_HOME: u32 = 0xE014;
-const KEYSYM_END: u32 = 0xE015;
-const KEYSYM_DELETE: u32 = 0xE019;
-const KEYSYM_PAGEUP: u32 = 0xE016;
-const KEYSYM_PAGEDOWN: u32 = 0xE017;
 
 /// Decode the minimal fields from a 20-byte `KeyEvent` wire payload.
 ///
@@ -189,69 +182,16 @@ fn decode_key_event_wire(buf: &[u8]) -> Option<(u32, u16, u8)> {
 /// Convert a decoded `KeyEvent` to raw stdin byte(s) and push each via
 /// `push_raw_input`.
 ///
-/// Logic mirrors `term::input::InputHandler::translate` (Phase 57 Track G.5)
-/// and `kernel_core::input::hid_poll::key_event_to_stdin` (Phase 100 D.1).
-/// Both sources are kept in sync; do not duplicate the mapping here.
-///
-/// Rules:
-/// - Down (kind=0) and Repeat (kind=2) edges produce output; Up (kind=1) does not.
-/// - `symbol == 0`: modifier-only event, no output.
-/// - Navigation keysyms (0xE010–0xE019 range) → VT100/CSI escape sequences.
-/// - Backspace (`symbol == 0x08`) → DEL (0x7F).
-/// - Ctrl + ASCII letter → control code (0x01–0x1A).
-/// - All other 7-bit values pass through verbatim (CR, TAB, ESC, printable).
-/// - Private-use keysyms outside the navigation table produce no output.
+/// This is a thin adapter over the single source of truth,
+/// `kernel_core::input::hid_poll::key_event_to_stdin` (Phase 100 D.1) — the
+/// same host-tested mapping used by the kernel-side line-discipline path. The
+/// rules (Down/Repeat-only edges, navigation keysyms → VT100/CSI, Backspace →
+/// DEL, Ctrl+letter → control code, 7-bit pass-through) all live there and are
+/// covered by its unit tests; this binary no longer carries a hand-synced copy.
 fn feed_key_event_to_stdin(symbol: u32, mods: u16, kind: u8) {
-    // Only Down/Repeat edges generate stdin bytes.
-    if kind != 0 && kind != 2 {
-        return;
-    }
-    // symbol==0: modifier-key-only event; no character to push.
-    if symbol == 0 {
-        return;
-    }
-
-    // Navigation keys → VT100/CSI escape sequences (matches PS/2 path below).
-    let escape_seq: Option<&[u8]> = match symbol {
-        s if s == KEYSYM_UP => Some(b"\x1b[A"),
-        s if s == KEYSYM_DOWN => Some(b"\x1b[B"),
-        s if s == KEYSYM_RIGHT => Some(b"\x1b[C"),
-        s if s == KEYSYM_LEFT => Some(b"\x1b[D"),
-        s if s == KEYSYM_HOME => Some(b"\x1b[H"),
-        s if s == KEYSYM_END => Some(b"\x1b[F"),
-        s if s == KEYSYM_DELETE => Some(b"\x1b[3~"),
-        s if s == KEYSYM_PAGEUP => Some(b"\x1b[5~"),
-        s if s == KEYSYM_PAGEDOWN => Some(b"\x1b[6~"),
-        _ => None,
-    };
-    if let Some(seq) = escape_seq {
-        for &b in seq {
-            syscall_lib::push_raw_input(b);
-        }
-        return;
-    }
-
-    // Backspace (U+0008) → DEL (0x7F).
-    if symbol == 0x08 {
-        syscall_lib::push_raw_input(0x7F);
-        return;
-    }
-
-    // Ctrl + ASCII letter → control code (0x01–0x1A).
-    if mods & MOD_CTRL != 0 && symbol <= 0x7F {
-        let lower = (symbol as u8).to_ascii_lowercase();
-        if lower.is_ascii_lowercase() {
-            syscall_lib::push_raw_input(lower - b'a' + 1);
-            return;
-        }
-        // Ctrl + non-letter: fall through to the 7-bit path.
-    }
-
-    // All 7-bit values pass through (printable ASCII, CR 0x0D, TAB 0x09, ESC 0x1B).
-    if symbol <= 0x7F {
-        syscall_lib::push_raw_input(symbol as u8);
-    }
-    // Private-use keysyms outside the navigation table produce no output.
+    kernel_core::input::hid_poll::key_event_to_stdin(symbol, mods, kind, |b| {
+        syscall_lib::push_raw_input(b);
+    });
 }
 
 fn lookup_kbd_service() -> u32 {

@@ -53,31 +53,27 @@ timed blit into the WC-mapped framebuffer and prints the elapsed nanoseconds ove
 serial/log sink.  Two runs are needed: one with the WC mapping (this phase) and one
 with the write-back baseline (revert `NO_CACHE` from the PTE flags, rebuild, reboot).
 
-### 1a. In `display_server` — emit the timing sentinel
+### 1a. The timing sentinel (already emitted by `display_server`)
 
-In the compositor's page-fill / damage-blit path (the code path that writes
-full-screen pixels before calling `sys_framebuffer_pageflip`), bracket the write loop
-with timing calls:
+`display_server` already emits this sentinel — no instrumentation needs to be
+added at HW-iteration time. It brackets its initial whole-screen `fill_background`
+with `monotonic_nanos()` (the ring-3 `CLOCK_MONOTONIC` `sys_clock_gettime` path)
+and prints, once per boot:
 
-```rust
-// Pseudocode — adapt to the actual blit loop location
-let t0 = crate::time::monotonic_ns(); // or sys_clock_gettime
-for y in 0..height {
-    let row = &mut fb[y * stride .. y * stride + width * 4];
-    row.fill(color);                  // the full-screen fill
-}
-let elapsed = crate::time::monotonic_ns() - t0;
-// Emit over log sink — visible in usb-logsink/AMT SOL/network sink:
-log::info!("[fb-blit] full-screen fill elapsed_ns={} pixels={}", elapsed, width * height);
+```text
+[fb-blit] full-screen fill elapsed_ns=<N> pixels=<P>
 ```
 
-The sentinel line `[fb-blit] full-screen fill elapsed_ns=<N>` is captured over the
-`usb-logsink` boot.log and the network sink.
+The implementation is the initial-fill block in
+`userspace/display_server/src/main.rs` (look for `monotonic_nanos()` bracketing
+`fill_background`). The sentinel is printed to stdout/syslog, captured over the
+`usb-logsink` boot.log and the network sink, and its **presence** is gate-checked
+by `compositor-stress` so it cannot silently regress.
 
-> **Note:** the compositor is a ring-3 process; use the `sys_clock_gettime`
-> syscall (`CLOCK_MONOTONIC_RAW`) for the timing, not any kernel-internal
-> monotonic path.  The sentinel is printed to stdout/syslog, which `usb-logsink`
-> captures.
+> **Note:** the absolute `elapsed_ns` is meaningful only on real MMIO. On QEMU the
+> framebuffer is host RAM, so the WC and write-back numbers are indistinguishable
+> — the line still prints (and is asserted present), but the WC-vs-WB *ratio*
+> below is the Dell-only measurement.
 
 ### 1b. On the reference machine
 
@@ -148,13 +144,13 @@ These assertions are verifiable in QEMU and must pass before bare-metal iteratio
 
 | Track | Sentinel (greppable) | Proves | CI status |
 |---|---|---|---|
-| B | `[fb-wc] user FB leaf flags: PCD=1 PWT=0 PAT=0 (WC idx2)` | user FB mapped Write-Combining (PAT idx 2) | ✅ QEMU (`compositor-stress`) |
-| B | `[fb-blit] full-screen fill elapsed_ns=<N>` (WC vs WB builds — see §1) | WC blit faster than write-back | ⏳ HW-only (QEMU RAM-FB makes WC≈WB) |
-| E.1 | `RENDER_FP frame=<n> rows_nonblank=<R> rows_changed=<C> hash=0x<hex>` | the panel actually rendered (`rows_nonblank≥50`, ≥200 @1080p) vs black (`=0`) | ✅ QEMU (`rows_nonblank=1072` observed) |
-| C.1 | `USB_HID:pointer-injected count=<n>` | a real USB mouse's reports were decoded + injected (non-zero count) | ✅ path via `usb-smoke`; dock-hub topology HW |
+| B | `[fb-wc] user FB leaf flags: PCD=1 PWT=0 PAT=0 (WC idx2)` | user FB mapped Write-Combining (PAT idx 2) | ✅ **gated** (`compositor-stress` waits; fails on any other PCD/PWT/PAT) |
+| B | `[fb-blit] full-screen fill elapsed_ns=<N> pixels=<P>` (WC vs WB builds — see §1) | WC blit faster than write-back | ✅ **presence-gated** (`compositor-stress`); WC-vs-WB **ratio** ⏳ HW-only (QEMU RAM-FB≈WB) |
+| E.1 | `RENDER_FP frame=<n> rows_nonblank=<R> rows_changed=<C> hash=0x<hex>` | the panel rendered content (`rows_nonblank>0`) vs background-only/black (`=0`); `≥200` @1080p signals the greeter dialog | ✅ **gated** (`compositor-stress` requires the line **and** `rows_nonblank>0` content); `≥200` greeter-dialog magnitude is the HW arm |
+| C.1 | `USB_HID:pointer-injected count=<n>` | a real USB mouse's reports were decoded + injected (non-zero count) | ✅ **gated** (`usb-smoke` waits after `USB_HID:mouse`); dock-hub topology HW |
 | C.2 | `INPUT:pointer-focus-change surface=<id>` | focus follows a button-down over a `Toplevel` (focus-on-click) | dispatch host-tested; real-click firing HW |
 | D.2 | `USB_HID:idle ticks=<n> backoff_ns=<n>` | `usb-hid` reached the idle-backoff plateau (no busy-spin) | ⏳ HW/long-run idle measurement |
-| D.3 | `USB_HUB:idle ticks=<n> backoff_ns=<n>` | the hub walker reached the idle-backoff plateau | ⏳ HW/long-run idle measurement |
+| D.3 | `USB_HUB:idle ticks=<n> backoff_ns=<n>` | the hub walker reached the idle-backoff plateau (change bits acked → backoff engages) | ✅ **gated** (`usb-hub-smoke` waits `USB_HUB:idle` on a populated hub); long-run flat-CPU ⏳ HW |
 
 ### Photo evidence convention (E.2)
 

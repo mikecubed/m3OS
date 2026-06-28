@@ -115,6 +115,21 @@ use usb_core::protocol::{
     AttachNotice, USB_MSG_MAX, USB_REQ_LABEL, USB_SERVICE_NAME, UsbReply, UsbRequest,
 };
 
+/// `CLEAR_FEATURE` selectors for the per-port change bits (USB 2.0 §11.24.2,
+/// Table 11-17). These are `PORT_xxx + 16`: clearing them is RW1C, so a hub
+/// holds a change bit set until the host explicitly acknowledges it. The hub
+/// walker must clear the change bits it has observed, otherwise `wPortChange`
+/// stays non-zero forever and the steady-state monitor (D.3) never idles —
+/// re-enumerating on every poll and pinning a core (the exact failure D.3
+/// exists to remove).
+#[cfg(not(test))]
+const C_PORT_CONNECTION: u16 = 16;
+#[cfg(not(test))]
+const C_PORT_ENABLE: u16 = 17;
+#[cfg(not(test))]
+const C_PORT_SUSPEND: u16 = 18;
+#[cfg(not(test))]
+const C_PORT_OVER_CURRENT: u16 = 19;
 /// `CLEAR_FEATURE` selector for the C_PORT_RESET change bit (USB 2.0 §11.24.2).
 #[cfg(not(test))]
 const C_PORT_RESET: u16 = 20;
@@ -246,6 +261,27 @@ fn hub_ports_have_change(usb_ep: u32, slot_id: u8, nports: u8) -> bool {
 #[cfg(not(test))]
 const HUB_IDLE_LOG_EVERY: u32 = 100;
 
+/// Acknowledge (RW1C) every standard per-port change bit for `port`, so the
+/// hub's `wPortChange` word returns to zero once we have observed and acted on
+/// the current status. Without this the connect-change bit (`C_PORT_CONNECTION`)
+/// stays set on a populated port forever, `hub_ports_have_change` reports a
+/// change on every steady-state poll, and the D.3 backoff never engages. A
+/// genuine later hot-plug / hot-unplug re-sets the relevant bit and re-triggers
+/// enumeration. `C_PORT_RESET` is cleared on the reset path, so it is not
+/// repeated here.
+#[cfg(not(test))]
+fn clear_port_change_bits(usb_ep: u32, slot_id: u8, port: u8) {
+    for selector in [
+        C_PORT_CONNECTION,
+        C_PORT_ENABLE,
+        C_PORT_SUSPEND,
+        C_PORT_OVER_CURRENT,
+    ] {
+        let setup = setup_to_bytes(clear_port_feature(selector, port));
+        let _ = control(usb_ep, slot_id, setup, 0);
+    }
+}
+
 /// Drive one hub: read its descriptor, power every downstream port, then probe
 /// each port's status and reset any port reporting a connected device. This is
 /// the standard hub power/reset sequence (USB 2.0 §11.5.1.5). Surfacing the
@@ -294,6 +330,11 @@ fn enumerate_hub(usb_ep: u32, notice: &AttachNotice) -> Option<u8> {
         let Some(st) = control(usb_ep, slot_id, setup, 4) else {
             continue;
         };
+        // Acknowledge the change bits we just read (RW1C) so the steady-state
+        // monitor's `wPortChange` returns to zero and the D.3 backoff can idle.
+        // Done for every probed port (connected or not) so a disconnect-change
+        // on an empty port is cleared too.
+        clear_port_change_bits(usb_ep, slot_id, port);
         if !port_status_connected(&st) {
             continue;
         }
@@ -466,9 +507,14 @@ fn program_main(_args: &[&str]) -> i32 {
         let sleep_ns = hub_next_backoff_ns(consecutive_idle);
         let _ = syscall_lib::nanosleep_for(0, sleep_ns);
 
-        // Periodic idle-occupancy sentinel — falsifiable evidence that the
-        // walker is not pinning a core (Phase 100 D.3 acceptance criterion).
-        if consecutive_idle > 0 && consecutive_idle % HUB_IDLE_LOG_EVERY == 0 {
+        // Idle-occupancy sentinel — falsifiable evidence that the walker is not
+        // pinning a core (Phase 100 D.3 acceptance criterion). Emitted on the
+        // FIRST idle tick (so `usb-hub-smoke` can assert the walker reaches idle
+        // within the smoke window — it never would while the C_PORT_CONNECTION
+        // re-enumeration bug was live) and then periodically thereafter.
+        if consecutive_idle == 1
+            || (consecutive_idle > 0 && consecutive_idle % HUB_IDLE_LOG_EVERY == 0)
+        {
             syscall_lib::write_str(STDOUT_FILENO, "USB_HUB:idle ticks=");
             write_u32_dec(consecutive_idle);
             syscall_lib::write_str(STDOUT_FILENO, " backoff_ns=");

@@ -286,11 +286,27 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     // any subsequent context reset; running it once here covers the
     // pre-first-frame interval where a slow client still hasn't
     // committed any surface.
-    if let Err(_e) = fill_background(&mut owner) {
+    //
+    // Phase 100 Track B.3 — time this full-screen fill and emit the
+    // `[fb-blit]` sentinel. On real MMIO the WC user-FB mapping (Track B)
+    // should make this materially faster than a write-back baseline; on QEMU's
+    // RAM framebuffer WC≈WB so the absolute number is uninteresting, but
+    // emitting it here makes the bare-metal WC-vs-WB measurement a boot-and-grep
+    // (see scripts/phase-100-bare-metal-validate.md §1).
+    let blit_t0 = monotonic_nanos();
+    let initial_fill = fill_background(&mut owner);
+    let blit_elapsed_ns = monotonic_nanos().saturating_sub(blit_t0);
+    if initial_fill.is_err() {
         syscall_lib::write_str(
             STDOUT_FILENO,
             "display_server: initial background fill failed\n",
         );
+    } else {
+        syscall_lib::write_str(STDOUT_FILENO, "[fb-blit] full-screen fill elapsed_ns=");
+        write_u64(blit_elapsed_ns);
+        syscall_lib::write_str(STDOUT_FILENO, " pixels=");
+        write_u64((meta.width as u64).saturating_mul(meta.height as u64));
+        syscall_lib::write_str(STDOUT_FILENO, "\n");
     }
 
     // ----- Input wiring (D.3) --------------------------------------------
@@ -2227,6 +2243,20 @@ fn monotonic_micros() -> u64 {
     let sec_us = (sec as u64).saturating_mul(1_000_000);
     let nsec_us = (nsec as u64) / 1_000;
     sec_us.saturating_add(nsec_us)
+}
+
+/// Read the monotonic clock and return the time as nanoseconds. Used by the
+/// Track B.3 `[fb-blit]` full-screen-fill timing sentinel (the WC-vs-write-back
+/// blit-latency measurement recorded on bare metal). Saturates rather than
+/// panicking on overflow or syscall error so the fill path stays panic-free.
+fn monotonic_nanos() -> u64 {
+    let (sec, nsec) = syscall_lib::clock_gettime(syscall_lib::CLOCK_MONOTONIC);
+    if sec < 0 {
+        return 0;
+    }
+    (sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nsec as u64)
 }
 
 /// Phase 56 Track E.4 — diff the previous and current snapshot of

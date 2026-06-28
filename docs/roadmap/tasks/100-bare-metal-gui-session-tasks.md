@@ -1,6 +1,6 @@
 # Phase 100 — Bare-Metal GUI Session (Dell Tiger Lake): Task List
 
-**Status:** Implemented (HW-unvalidated) — all five tracks' CI-testable surface is green (per-track acceptance below). Terminal `Validated-on-HW (run N, date)` awaits a recorded run on the physical Dell Precision 5560 for the un-modelable arms (panel render, real USB pointer + focus-on-click, WC blit-latency ratio, USB-kbd text login, flat idle-CPU).
+**Status:** Implemented (HW-unvalidated) — all five tracks' CI-testable surface is green and now **gate-enforced** (the `[fb-wc]` WC-flag readback, `[fb-blit]` timing, and `RENDER_FP` content sentinels are asserted by `compositor-stress`; `USB_HID:pointer-injected` by `usb-smoke`; `USB_HUB:idle` by `usb-hub-smoke` — per-track acceptance below). Terminal `Validated-on-HW (run N, date)` awaits a recorded run on the physical Dell Precision 5560 for the un-modelable arms (panel render, real USB pointer + focus-on-click, WC blit-latency ratio, USB-kbd text login, flat idle-CPU).
 **Source Ref:** phase-100
 **Depends on:** Phase 99 (SMP & Scheduler Robustness Hardening) ✅, Phase 56/68/71/72/73 (display_server / compositor clients / greeter / session_manager) ✅, Phase 96 (Bare-Metal Bring-up + console-FB write-combining) ✅
 **Goal:** Boot the physical Dell Precision 5560 (Tiger Lake) to a usable graphical session — `display_server` takes the framebuffer, `greeter` renders the login, an interim USB mouse moves the cursor with focus following, and the keyboard works — by (A) spawning the existing-but-unspawned graphical stack on init's diskless bare-metal boot path, (B) finishing the Phase 96 write-combining work for the *userspace* framebuffer in `sys_framebuffer_mmap`, (C) bare-metal-validating the `usb-hid → mouse_server → InputDispatcher` pointer datapath, (D) folding in the open Phase 96 input-polish handoff (USB text-mode keyboard + de-busy-polling `usb-hid`/`usbhub`), and (E) defining the on-metal "the screen shows the greeter" validation method. HW-only: there is no QEMU model for the real panel/MMIO-FB/pointer behavior, so validation follows `docs/appendix/bare-metal-validation.md` and the status convention is **Validated-on-HW (run N, date)**, not a bare "Complete."
@@ -10,9 +10,9 @@
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
 | A | Spawn `display_server`/`mouse_server`/`session_manager`/`greeter` (+`audio_server`/`term`) on init's bare-metal `BUILTIN_CONFIGS` path + resolve the graphical skip-filter so init yields the tty to the greeter | — | Implemented (CI-green) |
-| B | Write-combining user framebuffer — WC PAT attribute on the `sys_framebuffer_mmap` VMA + present-path `sfence` + blit-latency measurement | — | Implemented (CI-green; B.3 blit-ratio HW-pending) |
-| C | Interim USB-mouse pointer — bare-metal-validate `usb-hid` PointerEvent → `mouse_server` → `InputDispatcher` focus routing on the dock-hub topology | A, B | Sentinels in place (CI-green decode/inject + dispatch host tests); cursor-on-panel + focus-on-real-click HW-pending |
-| D | Input polish — `stdin_feeder` USB-keyboard text-mode drain + convert `usb-hid`/`usbhub` busy-poll to notification-driven waits | A | Implemented (CI-green; idle-CPU + USB-kbd-echo HW-pending; full notification → Phase 103) |
+| B | Write-combining user framebuffer — WC PAT attribute on the `sys_framebuffer_mmap` VMA + present-path `sfence` + blit-latency measurement | — | Implemented (CI-gated: `[fb-wc]` WC-flag + `[fb-blit]` presence asserted in `compositor-stress`; B.3 WC-vs-WB ratio HW-pending) |
+| C | Interim USB-mouse pointer — bare-metal-validate `usb-hid` PointerEvent → `mouse_server` → `InputDispatcher` focus routing on the dock-hub topology | A, B | Implemented (CI-gated: `usb-smoke` asserts `USB_HID:pointer-injected`; dispatch host-tested); cursor-on-panel + focus-on-real-click HW-pending |
+| D | Input polish — `stdin_feeder` USB-keyboard text-mode drain + convert `usb-hid`/`usbhub` busy-poll to notification-driven waits | A | Implemented (CI-gated: usbhub change-bit-clear + `USB_HUB:idle` in `usb-hub-smoke`; `stdin_feeder` calls host-tested `key_event_to_stdin`; idle-CPU long-run + USB-kbd-echo HW-pending; full notification → Phase 103) |
 | E | Bare-metal validation method ("the screen shows the greeter") — on-device render assertion over the log sink + photo evidence convention | A, C | E.1 Implemented (CI-green); E.2 photo + recorded HW run pending |
 
 ---
@@ -67,7 +67,7 @@
 **Acceptance:**
 - [x] The `sys_framebuffer_mmap` PTE flags include `PageTableFlags::NO_CACHE` (PCD set), with `WRITE_THROUGH`/PWT **clear** and the PAT bit **clear**, so a 4 KiB leaf selects PAT index 2 (= WC after `pat::init`).
 - [x] The recorded `MemoryMapping` for the FB VMA is unchanged in `prot`/`flags` semantics (the `1 | FB_MAPPING_FLAG` line is untouched); the mapping still survives the existing `tlb_shootdown_range` + `bump_generation`.
-- [x] **Validated in QEMU**: the readback sentinel `[fb-wc] user FB leaf flags: PCD=1 PWT=0 PAT=0 (WC idx2)` appears in the `compositor-stress` serial log — confirms PCD=1 / PWT=0 / PAT=0 (WC index 2).
+- [x] **Gate-enforced in QEMU**: `compositor-stress` now waits on the readback sentinel `[fb-wc] user FB leaf flags: PCD=1 PWT=0 PAT=0 (WC idx2)` and fails on any other PCD/PWT/PAT combination — confirms PAT index 2 (WC) and guards against a `NO_CACHE`-flag regression in `sys_framebuffer_mmap`.
 
 ### B.2 — Confirm per-core PAT programming + present-path ordering
 
@@ -90,7 +90,7 @@
 
 **Acceptance:**
 - [ ] **HW-pending**: a recorded full-screen-fill (or representative blit) timing on the laptop shows the WC mapping is materially faster than a write-back baseline (target order-of-magnitude on real MMIO; the exact ratio recorded). QEMU's RAM-FB makes WC≈WB, so this ratio is a Dell-only measurement.
-- [x] The measurement method (how the timing is taken and emitted over `usb-logsink`/network sink) is documented in `scripts/phase-100-bare-metal-validate.md` so the run is reproducible.
+- [x] The `[fb-blit] full-screen fill elapsed_ns=<N> pixels=<P>` timing sentinel is emitted by `display_server` on the initial full-screen fill (every boot, QEMU included) and its presence is gate-checked in `compositor-stress`; only the WC-vs-WB *ratio* (above) stays a Dell-only measurement. The capture method is documented in `scripts/phase-100-bare-metal-validate.md`, so the bare-metal run is boot-and-grep rather than write-instrumentation-first.
 
 ---
 
@@ -106,7 +106,7 @@
 **Why it matters:** The decode + inject path has only ever run against an emulated PS/2 mouse under QEMU; the laptop's pointer is a USB mouse behind the dock/`usbhub` walker, so this is the first time the path runs against a real pointer through a real hub on bare metal.
 
 **Acceptance:**
-- [x] `usb-hid` decodes pointer reports into `PointerEvent`s and injects them; the `USB_HID:pointer-injected count=<n>` sentinel fires in `usb-smoke` (serial: `USB_HID:mouse … moved=1` → `USB_HID:pointer-injected count=`). The inject path is CI-exercised; the **dock-hub topology** specificity is the HW arm.
+- [x] `usb-hid` decodes pointer reports into `PointerEvent`s and injects them; `usb-smoke` now **gates** the `USB_HID:pointer-injected count=<n>` sentinel (waited on right after the `USB_HID:mouse … moved=1` decode), so a decode-OK-but-inject-broken regression fails CI — not just the decode step. The **dock-hub topology** specificity remains the HW arm.
 - [x] `mouse_server` serves injected events ahead of its PS/2 pipeline (Phase 78c `PendingEdges` injected-first drain, unchanged) and `display_server`'s pointer source pulls them on `MOUSE_EVENT_PULL` — exercised end-to-end by `usb-smoke` (mouse decoded → injected → served → rendered at the term prompt).
 
 ### C.2 — Cursor motion + focus-follows-pointer on the panel
@@ -139,7 +139,7 @@
 **Why it matters:** `stdin_feeder` only drains PS/2 scancodes (`KBD_TRY_READ`); a USB keyboard's input reaches `kbd_server` as typed `KeyEvent`s via `usb-hid`'s `KBD_EVENT_INJECT`, which `stdin_feeder` never reads — so a USB keyboard is dead at the text login on a machine with no PS/2 keyboard.
 
 **Acceptance:**
-- [x] `stdin_feeder` also drains typed `KeyEvent`s on `KBD_EVENT_PULL` (honoring the `KBD_EVENT_NONE` empty/timeout sentinel) and converts them to stdin bytes (`kernel_core::input::hid_poll::key_event_to_stdin`, host-tested), alongside the existing PS/2 `KBD_TRY_READ` path. `termios-smoke` PASS confirms the PS/2 line-discipline path is unregressed.
+- [x] `stdin_feeder` also drains typed `KeyEvent`s on `KBD_EVENT_PULL` (honoring the `KBD_EVENT_NONE` empty/timeout sentinel) and converts them to stdin bytes by calling the host-tested `kernel_core::input::hid_poll::key_event_to_stdin` **directly** — `stdin_feeder` now links `kernel-core` (`default-features = false`, like the `usb-hid` class driver) instead of carrying a hand-synced copy, so the host tests cover the executed code path. This runs alongside the existing PS/2 `KBD_TRY_READ` path; `termios-smoke` PASS confirms the PS/2 line-discipline path is unregressed.
 - [x] The two drains do not starve `display_server`'s concurrent `KBD_EVENT_PULL` requests — `stdin_feeder` keeps the non-blocking probe and stands down entirely once `display.input-owner` is registered.
 - [ ] **HW/passthrough-pending**: on the laptop (or via `--usb-passthrough` of a USB keyboard), typing on a USB keyboard echoes at the framebuffer text login before the compositor takes the FB.
 
@@ -161,7 +161,7 @@
 **Why it matters:** The hub walker similarly spins; combined with `usb-hid` it keeps cores hot at idle on the laptop.
 
 **Acceptance:**
-- [x] `usbhub` uses a bounded steady-state monitoring loop (50 ms → 200 ms backoff via host-tested `hub_next_backoff_ns`) rather than a tight walk once enumeration is steady; a `wPortChange` on `GET_PORT_STATUS` still triggers prompt (re)enumeration — `usb-hub-smoke` PASS (tier-2 enumeration via route string works).
+- [x] `usbhub` uses a bounded steady-state monitoring loop (50 ms → 200 ms backoff via host-tested `hub_next_backoff_ns`) rather than a tight walk once enumeration is steady. It now acknowledges (RW1C-clears via `CLEAR_FEATURE`) the per-port change bits (`C_PORT_CONNECTION`/`ENABLE`/`SUSPEND`/`OVER_CURRENT`) after each probe so `wPortChange` returns to 0 and the backoff actually engages — without this, a populated downstream port (its `C_PORT_CONNECTION` set on connect and previously never cleared) re-enumerated every 50 ms forever and never idled. A genuine later `wPortChange` still triggers prompt (re)enumeration. `usb-hub-smoke` now **gates** `USB_HUB:idle ticks=` on its populated-hub topology (a downstream usb-mouse on port 3.1), which can only fire once the walker reaches idle — a falsifiable guard that fails against the pre-fix re-enumeration bug.
 - [ ] **HW/long-run-pending**: recorded idle-CPU evidence shows the hub walker no longer pins a core. The `USB_HUB:idle ticks=<n> backoff_ns=<n>` sentinel is in place.
 
 ---
@@ -178,7 +178,7 @@
 **Why it matters:** There is no QMP/PPM screendump on bare metal (the QEMU-only path the `less-render-probe`/`claude_tui_render_arm` gates use), so "the screen shows the greeter" needs a falsifiable on-metal substitute — the on-device analog of the PPM band-diff.
 
 **Acceptance:**
-- [x] The compositor computes and prints a cheap render fingerprint (changed-scanline count + sampled FNV hash) over the log sink on each damage-driven compose. Sentinel: **`RENDER_FP frame=<n> rows_nonblank=<R> rows_changed=<C> hash=0x<8hex>`**. Falsifiable: a blank/background frame yields `rows_nonblank=0` (host test `all_background_yields_zero_nonblank`); rendered content yields a non-trivial value — confirmed in QEMU (`compositor-stress` log: `RENDER_FP frame=2 rows_nonblank=1072 rows_changed=1064 …`, `rows_changed=0` when static). Threshold: `rows_nonblank ≥ 50` (≥ 200 on 1080p) distinguishes "rendered" from "black."
+- [x] The compositor computes and prints a cheap render fingerprint (changed-scanline count + sampled FNV hash) over the log sink on each damage-driven compose. Sentinel: **`RENDER_FP frame=<n> rows_nonblank=<R> rows_changed=<C> hash=0x<8hex>`**. Falsifiable: a background-only frame yields `rows_nonblank=0` (host test `all_background_yields_zero_nonblank`); content yields a non-trivial value — confirmed in QEMU (`compositor-stress` log: `RENDER_FP frame=2 rows_nonblank=1072 rows_changed=1064 …`, `rows_changed=0` when static). `compositor-stress` now **gates** both the sentinel's presence **and** that some frame carries rendered content (`rows_nonblank > 0` — the exact blank-vs-content boundary the `all_background_yields_zero_nonblank` host test pins; a black/blank compositor yields 0 and fails the gate). The stronger `rows_nonblank ≥ 200` "greeter dialog visible" threshold is asserted on the HW greeter boot, not this term-path stress gate.
 - [x] The sentinel string `RENDER_FP … rows_changed=<C>` is quoted here and reused for the Track C cursor-motion delta (a small `rows_changed` value on pointer motion).
 
 ### E.2 — Photo evidence convention + recorded HW run
