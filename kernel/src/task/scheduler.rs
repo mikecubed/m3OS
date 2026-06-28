@@ -3849,31 +3849,35 @@ pub fn block_current_until(
 /// v2 helper: block the current task (as `BlockedOnReply`) until a message is
 /// delivered into its pending slot.
 ///
-/// This is the v2 replacement for `block_current_on_reply_unless_message`.
-/// It wraps [`block_current_until`] using a **local** `AtomicBool` as the
-/// `woken` flag. The flag starts `false`; the caller is responsible for the
-/// condition being rechecked via `take_message` after this returns.
+/// # The canonical v2 IPC block-wrapper pattern (Phase 99 Track A.2)
 ///
-/// **Why a local `AtomicBool`?** During the Track C migration window the wake
-/// side (`wake_task`) still uses the v1 path and does not set any per-call
-/// flag.  The self-revert path in [`block_current_until`] checks
-/// `pending_msg.is_some()` via the `woken` flag — but because the wake side
-/// has not been migrated to the v2 protocol (Track D), the flag will always
-/// be `false` at the step-3 recheck.  The function therefore always goes to
-/// step 4 (yield) unless `pending_msg` is already set at entry (the early
-/// `AlreadyTrue` return).  Once Track D migrates `wake_task`, wakers will set
-/// the flag, enabling the no-yield fast path.
+/// This function is the **reference shape** for the IPC block wrappers; the
+/// recv / notif / send variants ([`block_current_on_recv_v2`],
+/// [`block_current_on_notif_v2`], [`block_current_on_send_v2`], and their
+/// deadline forms) all follow it identically, so the wake/recheck/block
+/// sequence is documented **once, here**, instead of re-derived per site (the
+/// Phase 99 call-site audit, `docs/handoffs/2026-06-28-phase-99-block-wake-callsite-audit.md`,
+/// confirmed all six wrappers conform to it):
+///
+/// 1. **Register a fresh waker flag.** `let woken = Arc::new(AtomicBool::new(false));`
+///    then `register_reply_waker(task, woken.clone())` — a *fresh* `Arc<AtomicBool>`
+///    per call, never a latched/static flag. The wake side
+///    (`deliver_message` / `complete_send`) stores `true` into this exact flag
+///    **before** calling `wake_task_v2`.
+/// 2. **Recheck the condition AFTER registering** (`has_pending_message` /
+///    `send_completed`). Registering before the recheck is the Phase 57e Bug
+///    #8.1 fix: a delivery that races into the window between the recheck and
+///    `block_current_until`'s state write still sets `woken`, so step-3
+///    self-reverts instead of parking after an `AlreadyAwake` `wake_task_v2`.
+/// 3. **Block** via [`block_current_until`] with that registered flag. Its
+///    step-3 `woken.load()` recheck closes the lost-wake window; on resume the
+///    flag distinguishes a real wake from a deadline.
+/// 4. **Clear the waker** (`clear_reply_waker`) after return; the IPC layer's
+///    `take_message` is the source of truth for whether a message arrived.
 ///
 /// Returns `true` if the task was woken with a message (`Woken` or
-/// `AlreadyTrue`), `false` on a spurious or deadline wake (the latter is not
-/// possible on this path since no deadline is set, but is included for
-/// type-safety).
-///
-/// # Call-site migration contract
-///
-/// Under `cfg(feature = "sched-v2")`, `call_msg` in `endpoint.rs` calls this
-/// function instead of `block_current_on_reply_unless_message`.  The semantic
-/// outcome is identical: the caller resumes when a reply is delivered.
+/// `AlreadyTrue`), `false` on a deadline wake (no deadline is set on this path,
+/// so that arm is currently unreachable but kept for type-safety).
 pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
     let woken = Arc::new(AtomicBool::new(false));
     if !register_reply_waker(caller, woken.clone()) {
@@ -4109,9 +4113,9 @@ pub fn has_pending_message(id: TaskId) -> bool {
 /// delivered into its pending slot.
 ///
 /// This is the v2 replacement for `block_current_on_recv_unless_message` used
-/// in `recv_msg`. It wraps [`block_current_until`] using a stack-allocated
-/// `AtomicBool` as the `woken` flag, mirroring the pattern established by
-/// [`block_current_on_reply_v2`] (Track C.4).
+/// in `recv_msg`. It follows the canonical v2 block-wrapper pattern documented
+/// on [`block_current_on_reply_v2`] (a fresh registered `Arc<AtomicBool>` waker
+/// → recheck-after-register → [`block_current_until`] → clear waker).
 ///
 /// **Condition recheck (approach c):** The pending_msg pre-check is performed
 /// in the IPC layer (endpoint.rs) before calling this function, and

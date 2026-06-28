@@ -18950,6 +18950,21 @@ fn node_smoke_steps(attempt_net: bool, fast_iter: bool, egress_url: &str) -> Vec
         label: "node-smoke: /usr/bin/env shebang resolves + finds cat (ENVCATMARKER_OK)",
     });
 
+    // Phase 99 (Track E.1) — `fs.copyFile` probe. `fs.copyFileSync` probes
+    // `copy_file_range`(326) then `sendfile`(40); both must return a clean
+    // `-ENOSYS` (or a working copy) so libuv's userspace read/write fallback
+    // succeeds — never a spurious `EFAULT`. Writes a ~5 KiB file, copies it, and
+    // byte-compares; the sentinel is concat-built so the Wait keys on real output.
+    steps.push(SmokeStep::Send {
+        input: "node -e \"const fs=require('fs');const s='/tmp/cfsrc',d='/tmp/cfdst';const b=Buffer.alloc(5000);for(let i=0;i<b.length;i++)b[i]=(i*7+3)&255;fs.writeFileSync(s,b);try{fs.copyFileSync(s,d);const x=fs.readFileSync(s),y=fs.readFileSync(d);console.log(x.equals(y)?('COPYFILE'+'_OK '+y.length):'COPYFILE'+'_MISMATCH');}catch(e){console.log('COPYFILE'+'_ERR '+(e.code||e.message));}\"\n",
+        label: "node-smoke: fs.copyFile probe (Track E.1 — no EFAULT)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "COPYFILE_OK",
+        timeout_secs: 120,
+        label: "node-smoke: fs.copyFile succeeds + byte-verified (COPYFILE_OK)",
+    });
+
     // 7. Opt-in network arms (M3OS_NODE_NET=1): a real HTTPS cert-validate +
     //    an `npm install` over real egress. Both need actual outbound internet
     //    (example.com:443, registry.npmjs.org) which repo CI does not have, so

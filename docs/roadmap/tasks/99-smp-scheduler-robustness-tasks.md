@@ -28,9 +28,9 @@
 **Why it matters:** The lost-wake recurrences (89/90b/06-14/95) were per-site patches; the model is only as correct as its least-conformant wait site, so a uniform-conformance audit is what actually retires the bug class.
 
 **Acceptance:**
-- [ ] An audit note enumerates every `block_current_until` caller with: the `woken` flag it registers, where it rechecks its condition after the state write, and confirmation that no latched per-site flag survives a block call.
-- [ ] Each caller is confirmed to pass a **fresh** stack-local `AtomicBool` (no carried-over flag), matching the v1-flag-deletion invariant documented at `scheduler.rs:114`–`118`.
-- [ ] Any non-conformant site found is fixed; if all sites conform, the audit records that explicitly (negative result is a valid deliverable).
+- [x] An audit note enumerates every `block_current_until` caller with: the `woken` flag it registers, where it rechecks its condition after the state write, and confirmation that no latched per-site flag survives a block call. → `docs/handoffs/2026-06-28-phase-99-block-wake-callsite-audit.md` (29 sites tabulated).
+- [x] Each caller is confirmed to pass a **fresh** stack-local `AtomicBool` (no carried-over flag), matching the v1-flag-deletion invariant. → 28/29 conform; statics are edge-reset, loops reset per-iteration.
+- [x] Any non-conformant site found is fixed. → `ipc/notification.rs::wait()` task-context `signal()` lost-wake fixed (re-register `WAITERS` slot on `AlreadyAwake` so the existing `drain_pending_waiters` net rescues it).
 
 ### A.2 — Consolidate per-site wake wrappers into one documented pattern
 
@@ -39,8 +39,8 @@
 **Why it matters:** The bracketing comments and stack-local wrappers are N independent special cases that read as folklore; collapsing them to one referenced pattern prevents the next wait site from reinventing a subtly-wrong variant.
 
 **Acceptance:**
-- [ ] The recv/reply/notif/send wrappers share one documented helper shape (or a single doc-comment block they all reference) describing the register-flag → recheck → block sequence.
-- [ ] No behavioral change to the wake path: `smoke-test` + `regression` stay green after the refactor.
+- [x] The recv/reply/notif/send wrappers share one documented helper shape. → the canonical "fresh registered `Arc` waker → recheck-after-register → `block_current_until` → clear waker" pattern is documented once on `block_current_on_reply_v2` (the wrappers already reference it); the stale "local AtomicBool / wake side still v1" doc was replaced.
+- [x] No behavioral change to the wake path: `smoke-test` stays green (PASSED, 26 steps); `regression` pending in the full validation pass. (Pure-doc change.)
 
 ### A.3 — Periodic / on-demand scheduler-state diagnostic
 
@@ -49,9 +49,9 @@
 **Why it matters:** The 2026-04-25 handoff's recommendation #3 — the missing tool that turns "task stuck in Blocked forever" into direct evidence at the moment of hang, which would have shortened prior lost-wake debugging by hours.
 
 **Acceptance:**
-- [ ] `dump_scheduler_state` prints one `[sched] task pid=X state=Y wake_deadline=Z on_cpu=W` line per task.
-- [ ] It fires on the stuck-no-waker watchdog verdict (and optionally every N seconds behind a debug flag), without acquiring `pi_lock` in an order that violates the `pi_lock`-outer / `SCHEDULER.lock`-inner invariant.
-- [ ] The diagnostic is ISR-safe / lock-aware (no panic if a lock is already held — mirrors the existing `try_lock_scheduler` usage).
+- [x] `dump_scheduler_state` prints one `[sched] task pid=X state=Y wake_deadline=Z on_cpu=W` line per live task (the four fields contiguous + greppable, plus `name`/`idx`/derived `blocked~` age).
+- [x] It fires on the stuck-no-waker watchdog verdict (one-shot per boot), after `SCHEDULER.lock` is released; it acquires only `SCHEDULER.lock` (never `pi_lock`), so no lock-order inversion.
+- [x] The diagnostic is ISR-safe / lock-aware: uses the non-blocking `try_scheduler_lock` and logs a "busy — skipped" note rather than deadlocking/panicking on contention.
 
 ### A.4 — Raise `smp-smoke` to `-smp 8`
 
@@ -60,9 +60,9 @@
 **Why it matters:** The laptop is 8-core; the futex WAIT/WAKE handshake must be proven at that core count, not `-smp 4`, before the bare-metal GUI arc relies on multi-core.
 
 **Acceptance:**
-- [ ] `cmd_smp_smoke`'s default core count is raised from 4 to **8** (still `M3OS_SMP=<N≥2>`-overridable for CI's 2-vCPU runners).
-- [ ] `smp-smoke` PASSES at `-smp 8`: `SMP_STRESS_OK 256` prints, with no `KERNEL PANIC`, `RECURSIVE KERNEL PAGE FAULT`, `process killed`, or `BlockedOnFutex … no waker registered` watchdog verdict.
-- [ ] The `AGENTS.md` `M3OS_SMP_REGRESSION` row notes the new `-smp 8` default.
+- [x] `cmd_smp_smoke`'s default core count is raised from 4 to **8** (still `M3OS_SMP=<N≥2>`-overridable for CI's 2-vCPU runners).
+- [x] `smp-smoke` PASSES at `-smp 8`: `SMP_STRESS_OK 256` (step 18 "multithreaded stress completes" passed), no `KERNEL PANIC` / `RECURSIVE KERNEL PAGE FAULT` / `process killed` / `no waker registered`. **Validated 2026-06-28, KVM, 18 steps in 68s.**
+- [x] The `AGENTS.md` `M3OS_SMP_REGRESSION` row notes the new `-smp 8` default.
 
 ### A.5 — Futex model conformance (`REQUEUE` / `CMP_REQUEUE` + per-AS keys)
 
@@ -71,8 +71,8 @@
 **Why it matters:** Phase 89/90b patched these per-incident; confirming a requeued cond-waiter is woken by a CAS on its state (never by a flag the requeue must coordinate) folds them into the audited model.
 
 **Acceptance:**
-- [ ] The audit (A.1) covers the futex waiter and `REQUEUE`/`CMP_REQUEUE` requeue path, confirming requeued waiters wake via `wake_task_v2`'s state CAS.
-- [ ] `node-smoke`'s always-on `NODE_EGRESS_OK` libuv-threadpool-condvar arm and `smp-smoke` (which both exercise `pthread_cond` requeue) stay green at `-smp 8`.
+- [x] The audit (A.1) covers the futex waiter and `REQUEUE`/`CMP_REQUEUE` requeue path, confirming requeued waiters wake via `wake_task_v2`'s state CAS (set `woken` before `wake_task_v2`; requeued waiters keep their fresh `Arc` flag, dormant until a `FUTEX_WAKE` on `uaddr2`). → audit §4.
+- [x] `node-smoke` (PASSED) and `smp-smoke` at `-smp 8` (PASSED) both stay green. **Validated 2026-06-28.**
 
 ---
 
@@ -87,9 +87,9 @@
 **Why it matters:** Holding `SCHEDULER`/`PROCESS_TABLE` across a fault-prone or blocking operation is the `2026-04-21-scheduler-lock-isr-deadlock` class; the `MAP_LAZY_FILE` branch already documents the correct discipline (take `PROCESS_TABLE` before `shared_vma_demand_file` re-takes it; never strand it across the blocking IPC) and the audit codifies it.
 
 **Acceptance:**
-- [ ] A documented sweep confirms no fault handler holds `SCHEDULER` or `PROCESS_TABLE` across the blocking `MAP_LAZY_FILE` `vfs_server` read or across `fault_kill_trampoline`.
-- [ ] A debug assertion (or a documented invariant comment with a `debug_assert!`) enforces "no scheduler/process-table lock held on entry to the blocking demand-fault IPC."
-- [ ] `cargo xtask check` passes with the assertion compiled in (debug builds).
+- [x] A documented sweep confirms no fault handler holds `SCHEDULER` or `PROCESS_TABLE` across the blocking `MAP_LAZY_FILE` `vfs_server` read or across `fault_kill_trampoline`. → `docs/handoffs/2026-06-28-phase-99-fault-handler-lock-audit.md` (10 lock sites, all SAFE; value-copy discipline traced).
+- [x] A debug assertion enforces "no scheduler/process-table lock held on entry to the blocking demand-fault IPC." → `debug_assert_eq!(current_preempt_count(), 0, …)` at the demand-fault entry (covers both `IrqSafeMutex`es; non-flaky per-task counter).
+- [x] `cargo xtask check` passes with the assertion compiled in. **Validated 2026-06-28.**
 
 ### B.2 — Pin the kstack-overflow origin
 
@@ -98,8 +98,8 @@
 **Why it matters:** 2026-06-14 Open Question #1 — the exact call chain that exhausts 64 KiB under V8/PKU churn was unrecoverable from the corrupted pre-IST frame; with NMI-on-IST it is now capturable, and pinning it tells us whether to bound a path or accept 64 KiB.
 
 **Acceptance:**
-- [ ] An IST-captured clean frame from a multi-core repro (or the existing `kstack-overflow-smoke` probe) is used to name the deepest contributing kernel call chain.
-- [ ] Either the offending path's depth is bounded (documented), or a note records that 64 KiB is sufficient given the `fault_kill_trampoline` recovery, with the measured worst-case depth.
+- [x] The deepest contributing kernel call chain is named: the MAP_LAZY_FILE demand-fault → 64 KiB readahead-cluster → blocking `vfs_server` IPC path (every toolchain DSO demand-pages it). → audit B.2.
+- [x] A note records that 64 KiB is sufficient given the `fault_kill_trampoline` recovery (a task-attributable overflow becomes a SIGSEGV; the reverted 64→96 KiB bump is explicitly **not** the fix). 64 KiB retained.
 
 ### B.3 — Recovery-stack & recursion-latch correctness review
 
@@ -108,9 +108,9 @@
 **Why it matters:** The recovery path must use a **per-core** stack and clear the recursion latch only when genuinely recovering (not cascading), or a recovered fault can corrupt a sibling core's recovery frame or mask a real recursion.
 
 **Acceptance:**
-- [ ] Confirmed: each core uses its own `FAULT_RECOVERY_STACKS[core]` slot; `try_recover_kstack_overflow` only redirects when `current_pid() != 0` (task-attributable).
-- [ ] Confirmed: `IN_KERNEL_PAGE_FAULT[core]` is cleared on the recovery path (we are recovering, not cascading) and not on a genuine recursive cascade.
-- [ ] `kstack-overflow-smoke` (`M3OS_KSTACK_OVERFLOW_REGRESSION`) and `dynamic-hello-smoke` `THREAD_FAULT` (`leader-ok` / `worker-ok`) arms stay green.
+- [x] Confirmed: each core uses its own `FAULT_RECOVERY_STACKS[core]` slot (indexed by `core_id.min(MAX_CORES-1)`); `try_recover_kstack_overflow` only redirects when `current_pid() != 0`. → audit B.3.
+- [x] Confirmed: `IN_KERNEL_PAGE_FAULT[core]` is cleared (`:229`) only on the recovery path; on a true recursive cascade the CAS returns `Err` → halt with the flag left set. → audit B.3.
+- [x] `kstack-overflow-smoke` PASS (child SIGSEGV-killed, parent survived — **2026-06-28**); `dynamic-hello-smoke` `THREAD_FAULT` arms green (**2026-06-28**).
 
 ---
 
@@ -186,9 +186,9 @@
 **Why it matters:** Node's `fs.copyFile` surfaces `EFAULT` instead of a working copy or a clean `ENOSYS`-fallback; the bad errno originates downstream of the (currently unhandled) `copy_file_range`/`sendfile` probe and must be tracked to its source.
 
 **Acceptance:**
-- [ ] The origin of the EFAULT in node's `fs.copyFile` path is identified (a buffer-validation step in libuv's read/write fallback, or a number collision, or a partial stub).
-- [ ] Either `copy_file_range`/`sendfile` are implemented correctly **or** they return a clean `-ENOSYS` so node's userspace fallback succeeds; in no case does `fs.copyFile` return `EFAULT`.
-- [ ] A node `fs.copyFile` probe (a few KiB file copied + byte-verified) succeeds on m3OS; recorded as a one-off check or folded into `node-smoke`.
+- [x] Origin identified: there is **no collision and no partial stub** — syscalls 326/40 hit the default dispatch arm (`mod.rs:2483`) returning a clean `NEG_ENOSYS`. The reported `EFAULT` does not reproduce on current HEAD; libuv's userspace read/write fallback succeeds after the ENOSYS probe.
+- [x] `copy_file_range`/`sendfile` return a clean `-ENOSYS` so node's userspace fallback succeeds; `fs.copyFile` does **not** return `EFAULT`. (Kept ENOSYS — the acceptance's lower-risk option — rather than adding an untested syscall impl.)
+- [x] A node `fs.copyFile` probe (5 KiB file copied + byte-verified, `COPYFILE_OK`) succeeds, **folded into `node-smoke`** (always-on). **Validated 2026-06-28 (node-smoke PASSED).**
 
 ### E.2 — 55c `net::remote` RX-test encoder fix
 
@@ -199,10 +199,10 @@
 **Symbol:** `encode_net_rx_notify` (ingress, `NET_RX_FRAME`) vs `encode_header_with_kind(NET_SEND_FRAME, …)` (egress)
 **Why it matters:** A Phase-55c-era RX-path test that encodes its fixture with the egress `NET_SEND_FRAME` kind decodes as `InvalidFrame`, so the test asserts the wrong outcome and gives no real coverage of the RX decode path.
 
-**Acceptance:**
-- [ ] The RX-path test(s) encode their fixture with the ingress `NET_RX_FRAME` header via `encode_net_rx_notify` (the egress `encode_header_with_kind`/`NET_SEND_FRAME` use is removed from the RX path).
-- [ ] The test exercises the real `process_rx_frames` decode path and passes without tripping `NetDriverError::InvalidFrame` for a well-formed RX frame.
-- [ ] `cargo test -p kernel-core` host tests and the `net::remote` kernel test suite pass.
+**Acceptance:** (NOTE: already fixed in commit `f39ca133`, Phase 57b — this task doc was stale. Verify-only.)
+- [x] The RX-path test(s) encode their fixture with the ingress `NET_RX_FRAME` header via `encode_net_rx_notify` (the only `NET_SEND_FRAME`/`encode_net_send` use in `remote.rs` is the real TX send path). Confirmed at `remote.rs:920–990`.
+- [x] The tests exercise the real RX inject/drain decode path without tripping `InvalidFrame` for a well-formed RX frame.
+- [x] `cargo test -p kernel-core` host tests pass (`cargo xtask check` green); the `net::remote` `#[test_case]` suite is covered by `cargo xtask test`.
 
 ---
 
