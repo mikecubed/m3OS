@@ -1,10 +1,12 @@
 ---
-status: IN PROGRESS — Phase 99 Tracks C + D. C.1 (panic AP-quiesce) implemented and
-  no-regression-validated; C.2 (4 GiB residual race) investigation pass recorded.
-  Track D (step-25 demand-fault cr2=0 flake) is CI-host-correlated and does not
-  reproduce locally — root-cause-by-inspection narrowed the candidates, C.1 makes the
-  next red run's banner readable, but a definitive fix is BLOCKED on capturing + ELF-
-  symbolizing a red CI artifact (D.1 acceptance).
+status: COMPLETE — Phase 99 Tracks C + D. C.1 (panic AP-quiesce) implemented and
+  no-regression-validated; C.2 (4 GiB residual race) investigation pass recorded clean.
+  Track D (the step-25 flake) is **ROOT-CAUSED & FIXED**: reproduced locally at -smp 8
+  (~36–50%/run, where -smp 4 only flakes ~12%), symbolized against the matching local ELF
+  to `SerialPort::write_str` reading a torn `caller_file` `&str`, and fixed by validating
+  the pointer is mapped before the crash dumper prints it (`safe_caller`). The original
+  "cr2=0 demand-fault NULL deref" framing was a wrong-ELF mis-attribution. Fix-validation
+  soak: 50/50 clean at the same -smp 8 config that failed ~36–50%.
 date: 2026-06-28
 phase: phase-99
 component: kernel/lib.rs (handle_panic), kernel/smp (panic_stop), kernel/arch/x86_64
@@ -82,74 +84,86 @@ slowdown or race in this path**, and the C.1 panic AP-quiesce is no-regression-c
 for any future 4 GiB panic. This closes C.2's "capture a 4 GiB run + record the outcome"
 acceptance with a clean result.
 
-## Track D — step-25 demand-fault `cr2=0` NULL-deref flake
+## Track D — step-25 flake: **ROOT-CAUSED & FIXED** (the crash dumper faulting on itself)
 
-The 2026-06-25 handoff documents an OPEN ~11–15% CI flake: `dynlink-hello-versioned-
-mismatch-smoke` (smoke-test step 25) intermittently hits a kernel `#PF rip=…b5de71
-cr2=0x0 err=0x0` (kernel-mode read of NULL) in the Phase 95b `MAP_LAZY_FILE` demand-fault
-chain. It is host-correlated, low-rate, and **does not reproduce locally**.
+The 2026-06-25 handoff framed this as a `cr2=0` NULL deref in the `MAP_LAZY_FILE`
+demand-fault chain. That was a **mis-attribution** — the misleading local `addr2line`
+(`0xb5de71` → `parse_device_scopes`) was a wrong-ELF symbol. The real bug is unrelated to
+the demand-fault chain.
 
-### D.1 — capture + symbolize: BLOCKED on a red CI artifact
+### D.1 — local reproduction (the breakthrough)
 
-D.1 requires `gh run download <red-run-id> -n pr-regression-artifacts` then `addr2line`
-against the **CI-built** ELF (the kernel is not bit-reproducible, so a local ELF gives a
-*misleading* symbol — local addr2line of `0xb5de71` returns `parse_device_scopes`, an
-IOMMU boot parser that cannot run during step 25). No red run has been captured with the
-artifact infra in place; the flake is probabilistic and external. **This is the gating
-blocker for a definitive root-cause** and cannot be forced from the dev box.
+The flake **does** reproduce locally — the prior attempts used `-smp 4`. At **`-smp 8` +
+KVM** (max cross-core trace-ring write contention) it reproduces **~36–50% per
+`smoke-test` run** (4 hits in the first 8 non-other-flake iterations of a soak). That gives
+a **matching local ELF** (no CI round-trip) and — via the Track C.1 quiesce — a readable
+banner.
 
-### D.2 — root-cause-by-inspection (no speculative fix)
+### D.2 — root cause (symbolized against the matching local ELF)
 
-The faulting `rip` is in kernel `.text` (a kernel NULL-deref), so it is **not** a kstack
-guard-page fault — `fault_kill_trampoline` will not recover it; it panics. Candidates
-examined in the chain `page_fault_handler → demand_map_vma_page → shared_vma_demand_file
-→ blocking vfs_server read`:
+Every repro has the **same faulting `rip`** with a **wildly varying `cr2`**:
 
-- `current_addr_space()` (re-derived after the blocking read, `interrupts.rs:1015/1075`)
-  **cannot return `Some(null)`** — it null-checks the per-core cached pointer and falls
-  back to a `PROCESS_TABLE` lookup, returning `None` or a valid pointer. Not the `cr2=0`.
-- `vfs_read_window_slice()` returns `Option<&[u8]>` guarded by `?`; `&window[..]` indexing
-  is bounds-checked (would panic with a different signature, not `cr2=0`).
-- The B.1 audit confirmed the chain holds **no** `SCHEDULER`/`PROCESS_TABLE` lock across
-  the blocking IPC, so it is not a lock-state corruption.
+```
+KERNEL #PF rip=0x10000b701f1 cr2=0x29   (soak 1)
+KERNEL #PF rip=0x10000b701f1 cr2=0x0    (soak 2 — matches the CI handoff's Run B exactly)
+KERNEL #PF rip=0x10000b701f1 cr2=0x8    (soak 6)
+KERNEL #PF rip=0x10000b701f1 cr2=0x7ffffeffe100  (soak 7)
+```
 
-No unchecked NULL deref is evident from inspection of the current tree, and **D.2's
-acceptance explicitly forbids a speculative fix** ("grounded in the symbolized faulting
-function from D.1 — not a speculative kstack bump"). The most likely shape remains a
-teardown race specific to the versioned-mismatch test (pid resolves a versioned symbol to
-`jmp 0` → SIGSEGV → thread-group teardown concurrent with a demand-fault), but pinning the
-exact NULL read needs the CI ELF.
+`file_vaddr = 0x10000b701f1 − 0x10000000000 (load base, from "Jumping to kernel entry
+point at 0x100009ab4c0") = 0xb701f1`. `addr2line` + `objdump` →
+`<uart_16550::port::SerialPort as core::fmt::Write>::write_str`, exact instruction
+`movzbl (%rsi),%r9d` — the char-loop reading the `&str`'s data byte at **`RSI`**. The
+varying small/garbage `cr2` is the varying value of `RSI` (the string data pointer).
 
-**Track D delivers two concrete advances toward closing it:**
-1. **Diagnosability (via C.1):** the next red CI run — which on a multi-core CI guest would
-   previously interleave the panic banner — now prints an uninterleaved banner + crash
-   dump, making the `rip`/`cr2` reliably extractable.
-2. **A larger local repro surface:** see the soak below.
+**The mechanism — the crash dumper faults on itself:**
+1. step 25's process `jmp`s to `0` (unresolved versioned symbol) → an **expected** userspace
+   `#PF rip=0x0` → process killed. The kernel dumps `CRASH DIAGNOSTICS` + the per-core
+   **trace rings** for that kill (every run).
+2. `dump_trace_rings` reads the **lock-free** per-core rings while sibling cores are still
+   writing them. A `YieldNow`/`BlockCurrent` event read mid-write reconstructs its
+   `caller_file: &'static str` from another field's bytes (a `task_idx` / `rsp` / line
+   number) → a **garbage near-null data pointer**.
+3. Printing `caller={caller_file}` **dereferences that wild pointer inside the dumper**
+   (`write_str`), which re-faults → `RECURSIVE KERNEL PAGE FAULT … cascade halted` → the
+   machine halts → the `:PASS` sentinel never prints → the gate times out.
 
-### D.3 — local soak (best-effort; CI proof still required)
+The handoff's "single primary fault with a varying secondary manifestation" was right; the
+secondary is `write_str` on a torn `caller_file`, and "stack overflow" vs "NULL deref" were
+two faces of the same wild-pointer read.
 
-The N≥50-iteration flake=0 proof is, by the flake's own nature, **not achievable on the dev
-box**: the 2026-06-25 handoff already records two independent local sweeps passing 5/5 plus
-an 8-run flake-hunt that never re-captured a red — the trigger is a CI-host condition not
-present locally. A local soak therefore only ever confirms what is already known (local
-non-repro); it cannot prove the CI flake fixed.
+### D.3 — the fix + validation
 
-What *was* exercised cleanly during Phase 99 validation (2026-06-28, KVM):
+A crash dumper must **never** deref an unvalidated pointer. The fix (`kernel/src/trace.rs`)
+routes every `caller_file` through a `safe_caller` validator before printing: it bounds the
+length, rejects the null page + non-canonical addresses (`VirtAddr::try_new`, not `::new`
+which *panics*), and confirms the string's first+last bytes are **mapped** via a read-only
+`translate_addr` page-table probe (which never reads the wild pointer itself). A failing
+string prints `<corrupt-caller>` instead of faulting. Applied at all four print sites
+(`print_trace_event` + the always-compiled `focus` dump, `YieldNow` + `BlockCurrent`).
 
-- `smoke-test` (which **contains step 25**, `dynlink-hello-versioned-mismatch-smoke`) —
-  PASSED.
-- `dynamic-hello-smoke` (the dynamic loader + `THREAD_FAULT` + `DYNAMIC_TLS` arms) — PASSED.
-- `smp-smoke @ -smp 8` — PASSED (heavy SMP demand-fault churn, the same `MAP_LAZY_FILE`
-  chain).
+**Validation (fix-validation soak, same `-smp 8` + KVM config that failed ~36–50% before):**
+**50/50 consecutive `smoke-test` runs PASS — 0 step-25 cascades, 0 other flakes** (the D.3
+literal "N≥50 with 0 kernel faults" target). At a ~50% pre-fix per-run failure rate, 50
+clean runs is overwhelming proof; even the first 15 alone were ~1-in-32,000 if the fix were
+ineffective — far stronger than 50 clean CI runs at the ~12% `-smp 4` rate.
+
+> Note `-smp 8` is the right local repro vehicle: CI's `smoke-test` defaults to `-smp 4`
+> (`qemu_smp_count()`), which only flakes ~11–15%; doubling the cores widens the cross-core
+> trace-ring write window that produces the torn `caller_file`, lifting the local rate to
+> ~36–50% and making the bug reliably catchable + the fix conclusively provable.
 
 These give local stability evidence at `-smp 8`, but are **not** the CI proof. The genuine
 D.3 proof remains pending a captured red CI run (D.1).
 
 ## Verdict
 
-- **C.1:** done + no-regression-validated. C.2: investigation pass recorded (below).
-- **D:** advanced (inspection + diagnosability) but **not closed** — definitive root-cause
-  + the N≥50 flake=0 proof are gated on a red CI artifact, which is probabilistic and
-  cannot be produced on demand from the dev box. Recommend: when CI next flakes step 25 red,
-  `gh run download` the artifact and `addr2line` against the uploaded ELF; the C.1 readable
-  banner now makes that capture actionable.
+- **C.1:** done + no-regression-validated. **C.2:** clean — fresh 4 GiB + `-smp 8` run PASS
+  (no panic / lost-wake / OOM; no residual race fired).
+- **D: CLOSED — root-caused and fixed.** The step-25 flake was the crash dumper
+  dereferencing a torn `caller_file` `&str` in `dump_trace_rings` (not a demand-fault NULL
+  deref — that was a wrong-ELF mis-attribution). Reproduced locally at `-smp 8` (~36–50%/run),
+  symbolized to `SerialPort::write_str`, fixed by `safe_caller` (validate the pointer is
+  mapped before printing), and proven by a 50/50 clean fix-validation
+  soak at the same config that failed ~36–50% before. The C.1 readable-banner mechanism was
+  the enabler that made the symbolization actionable.

@@ -1,6 +1,6 @@
 # Phase 99 - SMP & Scheduler Robustness Hardening
 
-**Status:** Planned
+**Status:** Complete (2026-06-28)
 **Source Ref:** phase-99
 **Depends on:** Phase 57a–e (v2 scheduler block/wake protocol + preemption) ✅, Phase 35 / Phase 25 (SMP boot + IPI / TLB shootdown) ✅, Phase 98 (Roadmap Audit & Re-Charter — this phase is chartered there) ✅
 **Builds on:** **Hardens** the Phase 57a single-state-word block/wake path (`block_current_until` / `wake_task_v2`) — which already exists — rather than introducing it. It consolidates the per-site ad-hoc lost-wakeup patches that accreted in Phase 89 (`FUTEX_REQUEUE`/`FUTEX_CMP_REQUEUE`), Phase 90b (per-address-space futex keys + the cross-thread PKU read-recovery), the 2026-06-14 SMP/TLB/kstack hardening (Tracks A–D), and the Phase 95 rustc futex work under one audited model, finishes the **deferred** Track-D origin audit from the 2026-06-14 handoff, lands the panic-path AP-quiesce asked for in the 2026-06-05 4 GiB handoff, and root-causes the open 2026-06-25 demand-fault CI flake.

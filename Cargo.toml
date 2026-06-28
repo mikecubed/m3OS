@@ -250,7 +250,7 @@ panic = "abort"
 
 # Phase 42: RustCrypto workspace dependencies
 [workspace.package]
-version = "0.98.0"
+version = "0.99.0"
 edition = "2024"
 
 [workspace.dependencies]

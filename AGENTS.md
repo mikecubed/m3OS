@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.98.0**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
+**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.99.0**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
 
 Capabilities now present in the tree:
 
