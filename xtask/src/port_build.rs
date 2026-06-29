@@ -2103,6 +2103,85 @@ fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), St
     };
     let src = src.as_path();
 
+    // 1b. Disable the host's zlib in the cross LLVM build. rust's bootstrap
+    //     hardcodes `LLVM_ENABLE_ZLIB=ON` for every non-MSVC target
+    //     (src/bootstrap/src/core/build_steps/llvm.rs), and our cross-build has no
+    //     cmake find-root isolation, so LLVM's `find_package(ZLIB)` resolves to the
+    //     *host glibc* zlib (`/usr/include` + `/usr/lib/libz.so`). That breaks the
+    //     build two ways: (a) cmake injects `-isystem /usr/include` into every LLVM
+    //     C++ compile, which shadows the libc++/musl sysroot headers and makes
+    //     `<cstdint>` pull glibc's `stdint.h` (the fatal "<cstdint> tried including
+    //     <stdint.h> but didn't find libc++'s <stdint.h>" + glibc `__gnuc_va_list`
+    //     errors), and (b) it would `DT_NEEDED libz.so.1` (a glibc .so) into the
+    //     musl rustc, making it unloadable on m3OS. LLVM only uses zlib for optional
+    //     ELF-section compression / profdata merging — none of which on-device
+    //     codegen needs — so we force it off. Bootstrap exposes no config.toml/env
+    //     knob for this (`[llvm] cxxflags` can't remove a find_package, and a
+    //     bootstrap `-DLLVM_ENABLE_ZLIB=ON` overrides any pre-seeded cmake cache), so
+    //     we patch the staged bootstrap source directly. Idempotent (the source tree
+    //     persists across runs); errors loudly if the upstream define moves so a
+    //     version bump can't silently re-enable the host-zlib cross-link.
+    {
+        let bootstrap_llvm = src.join("src/bootstrap/src/core/build_steps/llvm.rs");
+        let body = fs::read_to_string(&bootstrap_llvm)
+            .map_err(|e| format!("rust: read bootstrap llvm.rs: {e}"))?;
+        if !body.contains("\"LLVM_ENABLE_ZLIB\"") {
+            return Err(format!(
+                "rust: no `LLVM_ENABLE_ZLIB` define found in {} — cannot disable the \
+                 host-zlib cross-link. Upstream bootstrap layout changed for rust \
+                 {RUST_VERSION}; re-audit the zlib cross-build patch in build_rust.",
+                bootstrap_llvm.display()
+            ));
+        }
+        let on = "\"LLVM_ENABLE_ZLIB\", \"ON\"";
+        let off = "\"LLVM_ENABLE_ZLIB\", \"OFF\"";
+        if body.contains(on) {
+            fs::write(&bootstrap_llvm, body.replace(on, off))
+                .map_err(|e| format!("rust: patch bootstrap llvm.rs (zlib off): {e}"))?;
+            println!("rust: patched bootstrap to disable host zlib in the cross LLVM build");
+        } else {
+            println!("rust: bootstrap host-zlib already disabled (cached source)");
+        }
+    }
+
+    // 1c. Force the musl `rustc_llvm` to link libc++ (`-lc++`), not libstdc++.
+    //     `rustc_llvm`'s build.rs decides the C++ runtime to link from
+    //     `llvm-config --cxxflags`: it emits `-lc++` only if those flags contain
+    //     `-stdlib=libc++`, else `-lstdc++` (compiler/rustc_llvm/build.rs). For a
+    //     cross build, bootstrap hands the build script a *host-runnable*
+    //     llvm-config — i.e. the **gnu** one (`build/x86_64-unknown-linux-gnu/llvm`)
+    //     — even when building the **musl** rustc. That gnu llvm-config reports no
+    //     `-stdlib=libc++` (only the musl llvm-config does, via our `CXXFLAGS_<triple>`
+    //     trick — but build.rs never queries it), so build.rs picks `-lstdc++`, which
+    //     does not exist in our libc++-only musl sysroot → `ld.lld: unable to find
+    //     library -lstdc++` linking `librustc_driver.so`. We patch build.rs to select
+    //     `c++` for musl targets. Scoped to musl ON PURPOSE: the stage1 **gnu**
+    //     rustc_llvm links a libstdc++-built gnu LLVM and must keep `-lstdc++`
+    //     (a global `LLVM_USE_LIBCXX=1` / `[llvm] use-libcxx` would wrongly force it
+    //     to `-lc++` and break the stage1 link). Idempotent; errors loudly if the
+    //     upstream selector moves so a version bump can't silently regress the link.
+    {
+        let llvm_build_rs = src.join("compiler/rustc_llvm/build.rs");
+        let body = fs::read_to_string(&llvm_build_rs)
+            .map_err(|e| format!("rust: read rustc_llvm build.rs: {e}"))?;
+        let on = "} else if llvm_use_libcxx.is_some() {";
+        let off = "} else if llvm_use_libcxx.is_some() || target.contains(\"musl\") {";
+        if body.contains(off) {
+            println!("rust: rustc_llvm libc++ link selection already patched (cached source)");
+        } else if body.contains(on) {
+            fs::write(&llvm_build_rs, body.replace(on, off))
+                .map_err(|e| format!("rust: patch rustc_llvm build.rs (musl -> libc++): {e}"))?;
+            println!("rust: patched rustc_llvm to link libc++ (not libstdc++) for the musl target");
+        } else {
+            return Err(format!(
+                "rust: could not find the C++-runtime selector in {} to force libc++ for \
+                 musl. Upstream rustc_llvm build.rs changed for rust {RUST_VERSION}; \
+                 re-audit the musl libc++ link patch in build_rust.",
+                llvm_build_rs.display()
+            ));
+        }
+    }
+
     // 2. Build a `-fPIC` musl C++ runtime (libc++/libc++abi/libunwind + compiler-rt
     //    builtins) into `sysroot`, if not already present. The libcxx/libcxxabi
     //    SOURCE comes from the `llvm` port's llvm-project tree (the rustc-src tarball
@@ -2299,6 +2378,15 @@ fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), St
     //    libc.so) that runs on m3OS via the Phase 93 `libc.so` + Rust loader — which
     //    is exactly why Phase 93 is a Phase 95 dependency. `rust.m3pkg` carries
     //    `DEPS=musl` so the solver installs `/usr/lib/libc.so` first.
+    //
+    //    `[llvm] link-shared = true`: rust's bootstrap defaults a from-source LLVM
+    //    (`download-ci-llvm = false`) to a STATIC libLLVM
+    //    (`llvm_link_shared()` returns false for non-CI LLVM). That bakes all of
+    //    LLVM into `librustc_driver.so` and `rust-lld` and emits NO `libLLVM.so` —
+    //    which step 8 below requires to stage for the bundled `rust-lld`
+    //    (`$ORIGIN/../lib` RUNPATH), and which keeps the toolchain inside the
+    //    Portfile's 200–500 MB budget instead of duplicating LLVM into every tool.
+    //    So we force a shared `libLLVM.so` (`LLVM_LINK_LLVM_DYLIB=ON`) here.
     let config = format!(
         "profile = \"compiler\"\n\
          change-id = \"ignore\"\n\
@@ -2323,6 +2411,7 @@ fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), St
          debug = false\n\
          \n[llvm]\n\
          download-ci-llvm = false\n\
+         link-shared = true\n\
          targets = \"X86\"\n\
          ninja = true\n\
          \n[target.{TARGET}]\n\
@@ -2337,6 +2426,38 @@ fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), St
     );
     fs::write(src.join("config.toml"), &config).map_err(|e| format!("write config.toml: {e}"))?;
 
+    // 5b. Self-heal a stale cached LLVM after the `link-shared` toggle. Bootstrap
+    //     does NOT rebuild LLVM when only `config.toml`'s `[llvm]` options change —
+    //     it reuses any previously-built LLVM whose build dir still exists. A cross
+    //     tree first built by an OLDER revision of this recipe (before
+    //     `link-shared = true`) holds a STATIC LLVM with no `libLLVM.so`; reusing it
+    //     makes `rustc_llvm`'s `llvm-config --link-shared` abort with
+    //     `libLLVM-*.so is missing`. Detect the mismatch (cached
+    //     `LLVM_LINK_LLVM_DYLIB:BOOL=OFF`) and wipe that LLVM build dir so bootstrap
+    //     rebuilds it shared. No-op on a clean machine (no cache to heal).
+    {
+        let build_dir = src.join("build");
+        if let Ok(entries) = fs::read_dir(&build_dir) {
+            for entry in entries.flatten() {
+                let llvm_dir = entry.path().join("llvm");
+                let cache = llvm_dir.join("build/CMakeCache.txt");
+                let stale = fs::read_to_string(&cache)
+                    .map(|c| c.contains("LLVM_LINK_LLVM_DYLIB:BOOL=OFF"))
+                    .unwrap_or(false);
+                if stale {
+                    println!(
+                        "rust: wiping stale static-LLVM build {} (recipe now requires a \
+                         shared libLLVM.so; forcing rebuild)",
+                        llvm_dir.display()
+                    );
+                    fs::remove_dir_all(&llvm_dir).map_err(|e| {
+                        format!("rust: wipe stale llvm dir {}: {e}", llvm_dir.display())
+                    })?;
+                }
+            }
+        }
+    }
+
     // 6. The heavy build: rustc (stage 2) + std. x.py self-downloads its stage0
     //    bootstrap compiler. This cross-builds LLVM-for-musl then rustc — the
     //    multi-tens-of-MB dynamic toolchain. (x.py warns harmlessly about `not a
@@ -2345,17 +2466,19 @@ fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), St
         "rust: building dynamic musl rustc + std (x.py, {} jobs) — the heavy cross-build",
         jobs
     );
-    // PER-TARGET C++ stdlib selection (the crux of the cross build): the C++ LLVM
-    // code is compiled against libc++ (`std::__1`), but `rustc_llvm`'s build.rs picks
-    // the stdlib to link from `llvm-config --cxxflags` — it links `-lc++` iff that
-    // contains `-stdlib=libc++`, else the absent `-lstdc++`. cc-rs reads
-    // `CXXFLAGS_<triple>` into bootstrap's per-target LLVM cmake flags, so setting it
-    // ONLY for the musl triple bakes `-stdlib=libc++` into the MUSL llvm-config (→
-    // the musl stage2 rustc_llvm links `-lc++`, which resolves to our static
-    // `libc++.a` in the sysroot — no .so shipped) while the gnu stage1 keeps the
-    // host's gcc/libstdc++ (a GLOBAL `[llvm] cxxflags` would break the gnu LLVM build,
-    // which gcc compiles). A single `--stage 2` builds the whole stage0→stage1(gnu)→
-    // stage2(musl) chain.
+    // PER-TARGET C++ stdlib selection (the crux of the cross build): the musl C++
+    // LLVM code is compiled against libc++ (`std::__1`). `CXXFLAGS_x86_64_unknown_linux_musl`
+    // is read by cc-rs into bootstrap's per-target LLVM cmake flags ONLY for the musl
+    // triple, baking `-stdlib=libc++` into the MUSL llvm-config + the `rustc_llvm`
+    // shim's own .cpp compile, while the gnu stage1 keeps the host gcc/libstdc++ (a
+    // GLOBAL `[llvm] cxxflags` would break the gnu LLVM build, which gcc compiles).
+    // NOTE: this env does NOT by itself make the musl `rustc_llvm` *link* `-lc++`:
+    // build.rs derives that from `llvm-config --cxxflags`, but bootstrap hands the
+    // build script the host-runnable **gnu** llvm-config (which reports no
+    // `-stdlib=libc++`), so it would default to the absent `-lstdc++`. The step-1c
+    // build.rs patch above forces `-lc++` for musl targets; this env only governs how
+    // the C++ is *compiled*. A single `--stage 2` builds the whole
+    // stage0→stage1(gnu)→stage2(musl) chain.
     run(
         Command::new("python3")
             .current_dir(src)
