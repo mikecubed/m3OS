@@ -83,7 +83,13 @@ baseline build):
 ```bash
 # Build and write the image (WC build — this phase):
 cargo xtask image
-sudo dd if=target/disk.img of=/dev/sdX bs=4M status=progress && sync
+# Write the UEFI *boot* image (boot-uefi-m3os.img — NOT the secondary data
+# disk.img) to the USB key. Recommended: the helper script, which validates the
+# target device (whole-disk, removable, not the root disk) before writing:
+scripts/phase-100-write-usb.sh /dev/sdX
+# ...or run dd directly against the boot image produced by `cargo xtask image`:
+sudo dd if=target/x86_64-unknown-none/release/boot-uefi-m3os.img \
+        of=/dev/sdX bs=4M conv=fsync status=progress && sync
 
 # Boot the laptop from the USB key (UEFI boot menu: F12 on Dell).
 # Capture logs:
