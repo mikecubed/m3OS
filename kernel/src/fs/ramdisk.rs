@@ -493,6 +493,17 @@ static LOCKSCREEN_ELF: &[u8] = generated_initrd_asset!("lockscreen");
 // Not a daemon: no `.conf` (invoked from the shell, one-shot CLI).
 static PKG_ELF: &[u8] = generated_initrd_asset!("pkg");
 
+// Phase 100 (bare-metal GUI) — the terminal's JetBrainsMono Nerd Font,
+// embedded in the ramdisk so `term`'s glyph atlas loads on a diskless boot
+// (which has no ext2 data disk to stage `/usr/share/fonts/m3os/term.ttf`).
+// Without it term falls back to the static 8×16 bitmap, which renders blocky
+// and gappy in the Phase 73 24×48 cell. ~2.1 MiB; sourced from the committed,
+// sha256-pinned asset (see xtask `term.ttf.sha256`).
+static TERM_TTF: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../xtask/assets/fonts/term.ttf"
+));
+
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
 // ---------------------------------------------------------------------------
@@ -1306,12 +1317,38 @@ static USR_LIB_ENTRIES: &[(&str, RamdiskNode)] = &[
     ),
 ];
 
-static USR_ENTRIES: &[(&str, RamdiskNode)] = &[(
-    "lib",
+// /usr/share/fonts/m3os/term.ttf — embedded Nerd Font for the terminal atlas
+// on diskless boots (see TERM_TTF). Nested dirs mirror the on-disk layout that
+// `term`'s FONT_PATH (`/usr/share/fonts/m3os/term.ttf`) resolves against.
+static FONTS_M3OS_ENTRIES: &[(&str, RamdiskNode)] =
+    &[("term.ttf", RamdiskNode::File { content: TERM_TTF })];
+static FONTS_ENTRIES: &[(&str, RamdiskNode)] = &[(
+    "m3os",
     RamdiskNode::Dir {
-        children: USR_LIB_ENTRIES,
+        children: FONTS_M3OS_ENTRIES,
     },
 )];
+static SHARE_ENTRIES: &[(&str, RamdiskNode)] = &[(
+    "fonts",
+    RamdiskNode::Dir {
+        children: FONTS_ENTRIES,
+    },
+)];
+
+static USR_ENTRIES: &[(&str, RamdiskNode)] = &[
+    (
+        "lib",
+        RamdiskNode::Dir {
+            children: USR_LIB_ENTRIES,
+        },
+    ),
+    (
+        "share",
+        RamdiskNode::Dir {
+            children: SHARE_ENTRIES,
+        },
+    ),
+];
 
 // Phase 55b Tracks D.1 / E.1 — hardware driver ELFs. Ring-3 drivers live
 // under `/drivers/<name>` so init's service registration (Track F.1) and
