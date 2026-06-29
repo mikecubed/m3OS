@@ -129,7 +129,7 @@ const SHELL_DEPENDENCY_SERVICE: &str = "vfs";
 /// where `vfs_server` cannot run (no ext2 disk to mount) — does not block term
 /// forever. On timeout term proceeds with the kernel's ramdisk/ext2 fallback.
 #[cfg(not(test))]
-const SHELL_DEPENDENCY_WAIT_MS: u64 = 5000;
+const SHELL_DEPENDENCY_WAIT_MS: u64 = 2000;
 
 #[cfg(not(test))]
 fn program_main(_args: &[&str]) -> i32 {

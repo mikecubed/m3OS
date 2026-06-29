@@ -785,13 +785,26 @@ fn blit_glyph_view(
     cell_view: &mut [u32],
     stride_pixels: usize,
     fg: u32,
-    bg: u32,
+    _bg: u32,
 ) {
     let w = glyph.width as usize;
     let h = glyph.height as usize;
     if w == 0 || h == 0 {
         return;
     }
+    // Scale a smaller-than-cell glyph up to fill the cell. The static IBM VGA
+    // fallback is 8×16; in the Phase 73 24×48 cell it would otherwise be
+    // stranded in the top-left corner, leaving a wide background gap after
+    // every character (the "spaces between characters" seen on diskless boots
+    // where the TTF atlas asset is absent). Integer nearest-neighbour: 8×16
+    // scales 3× to exactly fill 24×48. An atlas glyph already rasterised at
+    // cell size scales 1× (unchanged). The cell background was already painted
+    // by `fill_cell_bg`, so only set ("on") bits are written here.
+    let cw = CELL_WIDTH as usize;
+    let ch = CELL_HEIGHT as usize;
+    let scale = core::cmp::max(1, core::cmp::min(cw / w, ch / h));
+    let off_x = cw.saturating_sub(w * scale) / 2;
+    let off_y = ch.saturating_sub(h * scale) / 2;
     let bytes_per_row = w.div_ceil(8);
     for row in 0..h {
         let row_start = row * bytes_per_row;
@@ -801,12 +814,21 @@ fn blit_glyph_view(
                 break;
             }
             let bit_idx = 7 - (col % 8);
-            let bit_set = (glyph.bitmap[byte_idx] >> bit_idx) & 1 == 1;
-            let dst = row * stride_pixels + col;
-            if dst >= cell_view.len() {
-                return;
+            if (glyph.bitmap[byte_idx] >> bit_idx) & 1 != 1 {
+                continue; // background already filled
             }
-            cell_view[dst] = if bit_set { fg } else { bg };
+            // Paint a `scale × scale` block for this glyph pixel.
+            for dy in 0..scale {
+                let py = off_y + row * scale + dy;
+                let row_off = py * stride_pixels + off_x + col * scale;
+                for dx in 0..scale {
+                    let dst = row_off + dx;
+                    if dst >= cell_view.len() {
+                        break;
+                    }
+                    cell_view[dst] = fg;
+                }
+            }
         }
     }
 }
