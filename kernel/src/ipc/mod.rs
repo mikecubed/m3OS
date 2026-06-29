@@ -569,6 +569,23 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
                 _ => u64::MAX,
             }
         }
+        30 => {
+            // ipc_call_buf_timeout(ep_cap, label, data0, buf_ptr, buf_len, deadline_ns)
+            // — the bulk variant of opcode 26 (ipc_call_timeout). Like
+            // ipc_call_buf (opcode 14) but blocks for the reply with an absolute
+            // CLOCK_MONOTONIC-ns deadline; returns NEG_ETIMEDOUT on expiry so the
+            // caller can retry instead of parking forever on a monopolised
+            // server. deadline_ns is the 6th syscall arg (r9), read from the
+            // per-task snapshot (mirrors opcode 16's r9 read).
+            match cap {
+                Capability::Endpoint(ep_id) => {
+                    let msg = message::Message::with2(arg1, arg2, 0);
+                    let deadline_ns = crate::task::current_task_syscall_snapshot().user_r9;
+                    ipc_call_buf_timeout(task_id, ep_id, msg, arg3, arg4, deadline_ns)
+                }
+                _ => u64::MAX,
+            }
+        }
         _ => u64::MAX,
     }
 }
@@ -1665,6 +1682,63 @@ fn ipc_call_timeout(
 ) -> u64 {
     let deadline_ticks = deadline_ns_to_ticks(deadline_ns);
     endpoint::call_msg_with_deadline(task_id, ep_id, msg, Some(deadline_ticks)).label
+}
+
+/// `sys_ipc_call_buf_timeout(ep_cap, label, data0, buf_ptr, buf_len, deadline_ns)`.
+///
+/// The bulk-bearing variant of [`ipc_call_timeout`]: stages the request buffer
+/// into the caller's `pending_bulk` slot (like `ipc_call_buf` →
+/// [`ipc_send_with_bulk`]), then blocks for the reply with an absolute
+/// CLOCK_MONOTONIC-ns deadline ([`endpoint::call_msg_with_deadline`], which
+/// transfers the request bulk, registers a waker, and removes the caller's
+/// `PendingSend` on timeout). Returns the reply label, `NEG_ETIMEDOUT` (-110)
+/// on deadline expiry, or `u64::MAX` on transport error.
+///
+/// Motivation: a single-threaded shared server (the xHCI driver) can be
+/// monopolised by another client's work (dock-hub re-enumeration) long enough
+/// that an unbounded `ipc_call_buf` parks the caller in `BlockedOnReply` with
+/// no waker, tripping the stuck-task watchdog. A bounded deadline lets the
+/// caller (usb-hid) give up and retry instead of wedging forever.
+fn ipc_call_buf_timeout(
+    task_id: crate::task::TaskId,
+    ep_id: endpoint::EndpointId,
+    mut msg: message::Message,
+    buf_ptr: u64,
+    buf_len: u64,
+    deadline_ns: u64,
+) -> u64 {
+    use crate::task::scheduler;
+    const NEG_ETIMEDOUT: u64 = (-110_i64) as u64;
+
+    let len = buf_len as usize;
+    if len == 0 || len > MAX_BULK_LEN {
+        return u64::MAX;
+    }
+    // Drain any stale reply bulk a previous *timed-out* call may have left in
+    // our slot (a late server reply after we gave up). Mirrors
+    // `call_msg_with_deadline`'s stale `pending_msg` drain so a leftover does
+    // not corrupt this request's bulk transfer.
+    let _ = scheduler::take_bulk_data(task_id);
+
+    let mut bulk = alloc::vec![0u8; len];
+    if UserSliceRo::new(buf_ptr, bulk.len())
+        .and_then(|s| s.copy_to_kernel(&mut bulk))
+        .is_err()
+    {
+        return u64::MAX;
+    }
+    // Encode the bulk length in data[1] so the receiver knows how much to read.
+    msg.data[1] = len as u64;
+    scheduler::deliver_bulk(task_id, bulk);
+
+    let deadline_ticks = deadline_ns_to_ticks(deadline_ns);
+    let label = endpoint::call_msg_with_deadline(task_id, ep_id, msg, Some(deadline_ticks)).label;
+    // On timeout / transport error the staged request bulk may still sit in our
+    // slot (no receiver consumed it). Drain it so the next call starts clean.
+    if label == NEG_ETIMEDOUT || label == u64::MAX {
+        let _ = scheduler::take_bulk_data(task_id);
+    }
+    label
 }
 
 /// Phase 74 Track C.1 — `sys_ipc_recv_timeout(ep_cap, deadline_ns)`.

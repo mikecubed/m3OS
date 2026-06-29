@@ -221,11 +221,37 @@ fn monotonic_ms() -> u64 {
         .saturating_add((nsec as u64) / 1_000_000)
 }
 
+fn monotonic_ns() -> u64 {
+    let (sec, nsec) = syscall_lib::clock_gettime(syscall_lib::CLOCK_MONOTONIC);
+    if sec < 0 {
+        return 0;
+    }
+    (sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nsec as u64)
+}
+
+/// Per-RPC budget for a synchronous call to the shared, single-threaded xHCI
+/// server. Comfortably above the server's worst-case per-request bound (~400 ms
+/// command / ~200 ms control) so a legitimately slow-but-completing call is
+/// never aborted, yet finite so a monopolised server (a dock-hub re-enumeration
+/// storm from `usbhub` keeps the single-threaded `usb` server out of `recv`)
+/// can never park usb-hid forever in `BlockedOnReply` with no waker.
+const USB_CALL_TIMEOUT_NS: u64 = 1_000_000_000; // 1 s
+
 /// Issue a `UsbRequest` to the xHCI server and decode the `UsbReply`.
+///
+/// Uses the deadline-bounded `ipc_call_buf_timeout`: if the (shared,
+/// single-threaded) server does not reply within [`USB_CALL_TIMEOUT_NS`], the
+/// call returns `NEG_ETIMEDOUT` instead of parking forever, and we surface
+/// `None` so the caller's poll loop treats it as "no report" and retries (with
+/// adaptive backoff) on the next tick.
 fn usb_call(usb_ep: u32, req: &UsbRequest) -> Option<UsbReply> {
+    const NEG_ETIMEDOUT: u64 = (-110_i64) as u64;
     let req_bytes = req.encode();
-    let rc = syscall_lib::ipc_call_buf(usb_ep, USB_REQ_LABEL, 0, &req_bytes);
-    if rc == u64::MAX {
+    let deadline_ns = monotonic_ns().saturating_add(USB_CALL_TIMEOUT_NS);
+    let rc = syscall_lib::ipc_call_buf_timeout(usb_ep, USB_REQ_LABEL, 0, &req_bytes, deadline_ns);
+    if rc == u64::MAX || rc == NEG_ETIMEDOUT {
         return None;
     }
     let mut reply_buf = [0u8; USB_MSG_MAX];

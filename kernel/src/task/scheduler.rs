@@ -6304,6 +6304,17 @@ const REPLY_STALL_LOSTWAKE_AGE_TICKS: u64 = 1_500;
 static TRACE_DUMP_FIRED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Rate-limit for the `StuckNoWaker` warning. The watchdog scans several times
+/// per second, so a persistently-stuck task (e.g. usb-hid parked on a
+/// monopolised xHCI server) would otherwise re-log every scan and flood the
+/// dmesg ring — drowning every other line and making the ring useless for
+/// diagnosis. Emit at most once per [`STUCK_WARN_INTERVAL_TICKS`] across all
+/// stuck tasks; the condition is still surfaced periodically. Holds the tick of
+/// the last emitted warning (0 = never).
+static LAST_STUCK_WARN_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// ~10 s at 1000 ticks/s (1 tick = 1 ms).
+const STUCK_WARN_INTERVAL_TICKS: u64 = 10_000;
+
 /// Phase 57e Bug #6 diagnostic — set from inside scheduler-locked contexts to
 /// request the dispatch loop to emit a trace-ring dump on its next iteration.
 /// The dump itself runs OUTSIDE of any scheduler-context lock to avoid
@@ -6720,13 +6731,19 @@ pub fn watchdog_scan() {
             WatchdogVerdict::Ok => {}
             WatchdogVerdict::StuckNoWaker => {
                 let stuck_ms = now.saturating_sub(*blocked_since);
-                log::warn!(
-                    "[sched] task pid={} name={} state={:?} stuck-since={}ms (no waker registered)",
-                    pid,
-                    name,
-                    state,
-                    stuck_ms,
-                );
+                // Rate-limited: a persistently-stuck task would re-log every
+                // watchdog scan and flood the ring (see LAST_STUCK_WARN_TICK).
+                let last = LAST_STUCK_WARN_TICK.load(Ordering::Relaxed);
+                if last == 0 || now.saturating_sub(last) >= STUCK_WARN_INTERVAL_TICKS {
+                    LAST_STUCK_WARN_TICK.store(now, Ordering::Relaxed);
+                    log::warn!(
+                        "[sched] task pid={} name={} state={:?} stuck-since={}ms (no waker registered)",
+                        pid,
+                        name,
+                        state,
+                        stuck_ms,
+                    );
+                }
                 // Phase 57e Bug #6 diagnostic: on the FIRST stuck-no-waker
                 // hit per boot, defer a trace-ring dump to the dispatch
                 // loop so we get the lost-wake protocol violation on serial

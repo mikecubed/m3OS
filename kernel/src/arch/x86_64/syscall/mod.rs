@@ -1669,7 +1669,11 @@ mod syscall_nr {
     // Phase 87: `ipc_recv_msg_timeout` (0x111C, dispatch opcode 29) is the
     // deadline-capable bulk-message receive — `ipc_recv_msg` + a deadline — so a
     // request server (vfs_server) can wake to flush deferred state when idle.
-    pub const IPC_LAST: u64 = 0x111C;
+    // Phase 100 (bare-metal GUI): `ipc_call_buf_timeout` (0x111D, dispatch
+    // opcode 30) is the deadline-capable bulk *call* — `ipc_call_buf` + a
+    // deadline — so a client (usb-hid) of a monopolised single-threaded server
+    // gives up and retries instead of parking forever in BlockedOnReply.
+    pub const IPC_LAST: u64 = 0x111D;
 
     // -- device host (Phase 55b Track B) --
     //
