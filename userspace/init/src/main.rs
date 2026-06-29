@@ -1474,6 +1474,19 @@ impl ServiceManager {
             // (mirrors GREETER_ONLY_SKIPPED_CONFS on the dir-scan path): greeter
             // is added only when graphical mode is active.
             b"name=greeter\ncommand=/bin/greeter\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display,kbd,mouse_server,audio_server\n",
+
+            // Desktop-session compositor clients (Phase 100 follow-up).
+            // These mirror the data-disk wallpaper/bar/notifyd manifests
+            // (xtask populate_ext2_files) so the diskless bare-metal boot
+            // brings up the same desktop as a data-disk boot: the wallpaper
+            // (Background), the status/workspace bar (Top), and the
+            // notification daemon (Overlay). All depend only on `display`
+            // and claim no keyboard focus. Gated by the graphical filter
+            // below (skipped on a serial/text boot) exactly like greeter —
+            // otherwise they would paint over the text console.
+            b"name=wallpaper\ncommand=/bin/wallpaper\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n",
+            b"name=bar\ncommand=/bin/bar\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n",
+            b"name=notifyd\ncommand=/bin/notifyd\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n",
         ];
         let mut i = 0;
         while i < BUILTIN_CONFIGS.len() {
@@ -1494,10 +1507,20 @@ impl ServiceManager {
                 //   - graphical mode  → add greeter
                 //   - non-graphical   → skip greeter so init does not start a
                 //     competing text login on the framebuffer console
-                if bytes_eq(svc.name.as_bytes(), b"greeter") && !graphical {
+                // Graphical-only clients (the GUI login + the desktop-session
+                // compositor clients) are skipped on a non-graphical boot so
+                // init does not start a competing text login or paint over the
+                // framebuffer text console.
+                let graphical_only = bytes_eq(svc.name.as_bytes(), b"greeter")
+                    || bytes_eq(svc.name.as_bytes(), b"wallpaper")
+                    || bytes_eq(svc.name.as_bytes(), b"bar")
+                    || bytes_eq(svc.name.as_bytes(), b"notifyd");
+                if graphical_only && !graphical {
+                    write_str(STDOUT_FILENO, "init: skipped ");
+                    write(STDOUT_FILENO, svc.name.as_bytes());
                     write_str(
                         STDOUT_FILENO,
-                        "init: skipped greeter (greeter disabled in default boot; serial path active)\n",
+                        " (graphical client; serial/text path active)\n",
                     );
                 } else {
                     self.services[self.count] = svc;

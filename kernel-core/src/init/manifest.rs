@@ -560,6 +560,40 @@ mod tests {
     }
 
     #[test]
+    fn builtin_wallpaper_parses() {
+        // wallpaper: Background-layer compositor client; depends on display.
+        let cfg = "name=wallpaper\ncommand=/bin/wallpaper\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n";
+        let (m, warns) = parse(cfg).expect("wallpaper builtin must parse");
+        assert_eq!(m.name, "wallpaper");
+        assert_eq!(m.command, "/bin/wallpaper");
+        assert_eq!(m.service_type, ServiceType::Daemon);
+        assert_eq!(m.depends, ["display"]);
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn builtin_bar_parses() {
+        // bar: Top-layer status/workspace bar; depends on display.
+        let cfg = "name=bar\ncommand=/bin/bar\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n";
+        let (m, warns) = parse(cfg).expect("bar builtin must parse");
+        assert_eq!(m.name, "bar");
+        assert_eq!(m.command, "/bin/bar");
+        assert_eq!(m.depends, ["display"]);
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn builtin_notifyd_parses() {
+        // notifyd: Overlay notification daemon; depends on display.
+        let cfg = "name=notifyd\ncommand=/bin/notifyd\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n";
+        let (m, warns) = parse(cfg).expect("notifyd builtin must parse");
+        assert_eq!(m.name, "notifyd");
+        assert_eq!(m.command, "/bin/notifyd");
+        assert_eq!(m.depends, ["display"]);
+        assert!(warns.is_empty());
+    }
+
+    #[test]
     fn builtin_graphical_stack_dep_graph_has_no_cycles() {
         // Feed all five graphical-stack BUILTIN_CONFIGS entries into
         // detect_cycles together with their upstream dependencies. The dep
@@ -575,6 +609,9 @@ mod tests {
                 "greeter",
                 &["display", "kbd", "mouse_server", "audio_server"],
             ),
+            manifest("wallpaper", &["display"]),
+            manifest("bar", &["display"]),
+            manifest("notifyd", &["display"]),
         ];
         let bad = detect_cycles(&ms);
         assert!(

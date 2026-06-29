@@ -203,6 +203,11 @@ fn program_main(_args: &[&str]) -> i32 {
     //    AudioClientBellSink; on first AudioUnavailable we swap
     //    permanently to the warn-once stub so noisy bell-loops do
     //    not retry the audio path forever.
+    // Capture the clamped initial surface size before `display` is moved into
+    // the renderer. `DisplayClient::connect` clamps the surface to the real
+    // framebuffer, so on a panel shorter than the 80×25 default's 1200 px
+    // (e.g. 1080p) this is the panel height, not 1200.
+    let (init_surface_w, init_surface_h) = (display.width(), display.height());
     let mut screen = Screen::new();
     let mut renderer = Renderer::new(display);
     // Phase 69c Track E.1 — try to load the Nerd Font asset and
@@ -216,6 +221,22 @@ fn program_main(_args: &[&str]) -> i32 {
     // keep the fallback path reachable. See the docstring on
     // `build_atlas` for the full contract.
     build_atlas(&mut renderer);
+
+    // Re-derive the initial cell grid + PTY winsize from the actual (clamped)
+    // surface size. `Screen::new()` starts at the 80×25 default whose pixel
+    // area (1920×1200) can exceed a shorter panel; the surface was clamped to
+    // the framebuffer at `connect`, so sync the grid down to match here. This
+    // keeps the cell grid within the surface buffer (the renderer would
+    // otherwise write rows past a clamped buffer) and gives the shell a correct
+    // winsize immediately instead of waiting for the compositor's first
+    // `SurfaceResized`.
+    handle_surface_resize(
+        primary_fd,
+        &mut screen,
+        &mut renderer,
+        init_surface_w,
+        init_surface_h,
+    );
     let mut input_handler = InputHandler::new();
     let mut mouse_reporter = MouseReporter::new();
 

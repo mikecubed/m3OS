@@ -14,7 +14,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 
-use desktop_client::{DisplayConnection, SharedSurface, draw_text, fill, fill_rect, stroke_rect};
+use desktop_client::{
+    DisplayConnection, SharedSurface, draw_text_scaled, fill, fill_rect, stroke_rect,
+};
 use kernel_core::display::protocol::{BufferId, ServerMessage};
 use kernel_core::input::events::KeyEventKind;
 use kernel_core::input::keymap::{KEY_BACKSPACE, KEY_DOWN, KEY_ENTER, KEY_ESC, KEY_UP};
@@ -39,10 +41,31 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 syscall_lib::entry_point!(program_main);
 
 const BUFFER_ID: BufferId = BufferId(1);
-const WIDTH_PX: u32 = 600;
-const HEIGHT_PX: u32 = 400;
-const MAX_VISIBLE: usize = 18;
+/// Base launcher surface size at 1× scale. The surface is scaled up on HiDPI
+/// panels via [`ui_scale`] so the launcher stays legible at 1080p+ — it
+/// previously rendered as a fixed 600×400 box of tiny 8×16 text regardless of
+/// panel size.
+const BASE_WIDTH_PX: u32 = 600;
+const BASE_HEIGHT_PX: u32 = 400;
+/// Base list-row height and list top offset (1×); scaled with the surface.
+const BASE_ROW_H: i32 = 18;
+const BASE_LIST_TOP: i32 = 32;
+/// Upper bound on visible rows regardless of panel size.
+const MAX_VISIBLE_CAP: usize = 64;
 const SERVICE_NAME: &str = "launcher";
+
+/// Integer UI scale chosen from the panel height: 1× below ~1000 px, 2× at
+/// 1080p/1200p, 3× on ≥2000 px (4K) panels. Matches the bar's 2×-at-1080p
+/// choice so the launcher's 8×16 font renders at a comparable density.
+fn ui_scale(out_h: u32) -> u32 {
+    if out_h >= 2000 {
+        3
+    } else if out_h >= 1000 {
+        2
+    } else {
+        1
+    }
+}
 
 const BG_COLOR: u32 = 0xFF_18_18_18;
 const FG_COLOR: u32 = 0xFF_E8_E8_E8;
@@ -93,7 +116,22 @@ fn program_main(_args: &[&str]) -> i32 {
         return 3;
     }
 
-    let surface = match SharedSurface::allocate(WIDTH_PX, HEIGHT_PX) {
+    // Size the launcher to the panel: base size × UI scale, clamped so the
+    // surface never exceeds the framebuffer. On a 1080p panel this is a 2×
+    // 1200×800 surface with a 2×-scaled font, instead of a fixed 600×400 box
+    // of tiny text.
+    let (out_w, out_h) = desktop_client::output_size();
+    let scale = ui_scale(out_h);
+    let width_px = (BASE_WIDTH_PX * scale).min(out_w.max(BASE_WIDTH_PX));
+    let height_px = (BASE_HEIGHT_PX * scale).min(out_h.max(BASE_HEIGHT_PX));
+    // Rows that fit below the prompt at this scale (kept in lock-step with the
+    // row_h/list_top render() uses, so the KEY_DOWN clamp matches what's drawn).
+    let row_h = (BASE_ROW_H * scale as i32).max(1);
+    let list_top = BASE_LIST_TOP * scale as i32;
+    let max_visible =
+        (((height_px as i32 - list_top) / row_h).max(1) as usize).min(MAX_VISIBLE_CAP);
+
+    let surface = match SharedSurface::allocate(width_px, height_px) {
         Some(s) => s,
         None => return 3,
     };
@@ -102,8 +140,17 @@ fn program_main(_args: &[&str]) -> i32 {
     let mut query = String::new();
     let mut selected = 0usize;
     let mut filtered = filter(&candidates, &query);
-    render(pixels, &query, &filtered, selected);
-    if !conn.attach_damage_commit(BUFFER_ID, surface.shm_id, WIDTH_PX, HEIGHT_PX) {
+    render(
+        pixels,
+        width_px,
+        height_px,
+        scale,
+        max_visible,
+        &query,
+        &filtered,
+        selected,
+    );
+    if !conn.attach_damage_commit(BUFFER_ID, surface.shm_id, width_px, height_px) {
         surface.release();
         return 5;
     }
@@ -144,7 +191,7 @@ fn program_main(_args: &[&str]) -> i32 {
                     continue;
                 }
                 if kc == KEY_DOWN.0 {
-                    let max_idx = filtered.len().min(MAX_VISIBLE).saturating_sub(1);
+                    let max_idx = filtered.len().min(max_visible).saturating_sub(1);
                     if selected < max_idx {
                         selected += 1;
                         dirty = true;
@@ -167,9 +214,18 @@ fn program_main(_args: &[&str]) -> i32 {
             Some(_) => {}
             None => {
                 if dirty {
-                    render(pixels, &query, &filtered, selected);
+                    render(
+                        pixels,
+                        width_px,
+                        height_px,
+                        scale,
+                        max_visible,
+                        &query,
+                        &filtered,
+                        selected,
+                    );
                     let _ =
-                        conn.attach_damage_commit(BUFFER_ID, surface.shm_id, WIDTH_PX, HEIGHT_PX);
+                        conn.attach_damage_commit(BUFFER_ID, surface.shm_id, width_px, height_px);
                     dirty = false;
                 }
                 let _ = syscall_lib::nanosleep_for(0, 10_000_000);
@@ -306,38 +362,68 @@ fn score(name: &str, query: &str) -> Option<i32> {
     None
 }
 
-fn render(pixels: &mut [u32], query: &str, filtered: &[&String], selected: usize) {
+#[allow(clippy::too_many_arguments)]
+fn render(
+    pixels: &mut [u32],
+    width_px: u32,
+    height_px: u32,
+    scale: u32,
+    max_visible: usize,
+    query: &str,
+    filtered: &[&String],
+    selected: usize,
+) {
+    let s = scale.max(1);
+    let si = s as i32;
     fill(pixels, BG_COLOR);
     stroke_rect(
         pixels,
-        WIDTH_PX,
-        HEIGHT_PX,
+        width_px,
+        height_px,
         0,
         0,
-        WIDTH_PX,
-        HEIGHT_PX,
+        width_px,
+        height_px,
         BORDER_COLOR,
     );
+    // Prompt row.
     fill_rect(
         pixels,
-        WIDTH_PX,
-        HEIGHT_PX,
-        4,
-        4,
-        WIDTH_PX - 8,
-        24,
+        width_px,
+        height_px,
+        4 * si,
+        4 * si,
+        width_px - 8 * s,
+        24 * s,
         PROMPT_BG,
     );
-    draw_text(
-        pixels, WIDTH_PX, HEIGHT_PX, 12, 8, "> ", FG_COLOR, PROMPT_BG,
+    let prompt_y = 8 * si;
+    let prompt_w = draw_text_scaled(
+        pixels,
+        width_px,
+        height_px,
+        12 * si,
+        prompt_y,
+        "> ",
+        FG_COLOR,
+        PROMPT_BG,
+        s,
     );
-    draw_text(
-        pixels, WIDTH_PX, HEIGHT_PX, 30, 8, query, FG_COLOR, PROMPT_BG,
+    draw_text_scaled(
+        pixels,
+        width_px,
+        height_px,
+        12 * si + prompt_w,
+        prompt_y,
+        query,
+        FG_COLOR,
+        PROMPT_BG,
+        s,
     );
 
-    let row_h: i32 = 18;
-    let list_top: i32 = 32;
-    let visible = filtered.iter().take(MAX_VISIBLE);
+    let row_h: i32 = BASE_ROW_H * si;
+    let list_top: i32 = BASE_LIST_TOP * si;
+    let visible = filtered.iter().take(max_visible);
     for (i, entry) in visible.enumerate() {
         let y = list_top + (i as i32) * row_h;
         let bg = if i == selected {
@@ -347,23 +433,24 @@ fn render(pixels: &mut [u32], query: &str, filtered: &[&String], selected: usize
         };
         fill_rect(
             pixels,
-            WIDTH_PX,
-            HEIGHT_PX,
-            4,
-            y - 2,
-            WIDTH_PX - 8,
+            width_px,
+            height_px,
+            4 * si,
+            y - 2 * si,
+            width_px - 8 * s,
             row_h as u32,
             bg,
         );
-        draw_text(
+        draw_text_scaled(
             pixels,
-            WIDTH_PX,
-            HEIGHT_PX,
-            12,
+            width_px,
+            height_px,
+            12 * si,
             y,
             file_name(entry),
             FG_COLOR,
             bg,
+            s,
         );
     }
 }
