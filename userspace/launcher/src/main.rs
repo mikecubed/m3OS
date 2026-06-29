@@ -15,9 +15,9 @@ use alloc::vec::Vec;
 use core::alloc::Layout;
 
 use desktop_client::{
-    DisplayConnection, SharedSurface, draw_text_scaled, fill, fill_rect, stroke_rect,
+    DisplayConnection, SharedSurface, anchor, draw_text_scaled, fill, fill_rect, stroke_rect,
 };
-use kernel_core::display::protocol::{BufferId, ServerMessage};
+use kernel_core::display::protocol::{BufferId, KeyboardInteractivity, Layer, ServerMessage};
 use kernel_core::input::events::KeyEventKind;
 use kernel_core::input::keymap::{KEY_BACKSPACE, KEY_DOWN, KEY_ENTER, KEY_ESC, KEY_UP};
 use syscall_lib::STDOUT_FILENO;
@@ -112,7 +112,20 @@ fn program_main(_args: &[&str]) -> i32 {
             return 2;
         }
     };
-    if !conn.set_toplevel_role() {
+    // Float the launcher centered as an Overlay Layer rather than a Toplevel.
+    // A Toplevel is inserted into the dwindle tile set, so the launcher would
+    // shrink into the next tile slot; a centered Overlay layer is composited
+    // above all tiles (and the bar) and positioned at its intrinsic buffer
+    // size in the middle of the screen. `KeyboardInteractivity::Exclusive` is
+    // required so the input dispatcher routes keystrokes to the launcher
+    // (Layer surfaces do not receive Toplevel focus) — the same path the
+    // lockscreen uses. `exclusive_zone = 0` so it reserves no edge space.
+    if !conn.set_layer_role(
+        Layer::Overlay,
+        anchor::ANCHOR_CENTER,
+        0,
+        KeyboardInteractivity::Exclusive,
+    ) {
         return 3;
     }
 

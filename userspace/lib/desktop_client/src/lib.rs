@@ -399,7 +399,7 @@ fn draw_glyph_alpha(
 /// kernel-core in two places.
 pub mod anchor {
     pub use kernel_core::display::protocol::{
-        ANCHOR_BOTTOM, ANCHOR_LEFT, ANCHOR_RIGHT, ANCHOR_TOP,
+        ANCHOR_BOTTOM, ANCHOR_CENTER, ANCHOR_LEFT, ANCHOR_RIGHT, ANCHOR_TOP,
     };
 }
 

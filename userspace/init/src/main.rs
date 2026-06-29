@@ -137,6 +137,13 @@ const GRAPHICAL_ONLY_MARKER_PATH: &[u8] = b"/etc/m3os-graphical-only\0";
 // scheduler stall).
 const STATUS_FILE: &[u8] = b"/run/services.status\0";
 const CMD_FILE: &[u8] = b"/run/init.cmd\0";
+/// Runtime "graphical (greeter) boot" marker. The data-disk path ships
+/// `/etc/m3os-graphical-only`; the diskless builtin path has no such file, so
+/// init publishes the equivalent signal at this writable runtime path when it
+/// brings up the graphical stack. Session compositor clients (bar/wallpaper/
+/// notifyd) poll it to learn a greeter is running and hold their surfaces off
+/// the login screen until `/run/m3os-current-session` appears.
+const GRAPHICAL_RUN_MARKER: &[u8] = b"/run/m3os-graphical-only\0";
 
 // Phase 56 Track F.3: text-mode-fallback marker.
 //
@@ -1385,6 +1392,13 @@ impl ServiceManager {
         self.diskless_builtin = true;
         let graphical = self.effective_graphical_mode();
 
+        // Diskless graphical boot has no /etc/m3os-graphical-only (data-disk
+        // artifact); publish the runtime equivalent so the session compositor
+        // clients hold their surfaces off the greeter until login.
+        if graphical {
+            Self::create_graphical_run_marker();
+        }
+
         const BUILTIN_CONFIGS: &[&[u8]] = &[
             // console + kbd: the PS/2 and USB keyboard input pipeline to the
             // kernel framebuffer console / login tty.
@@ -2405,6 +2419,16 @@ impl ServiceManager {
             return;
         }
         let fd = open(&path_buf[..len], O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+        if fd >= 0 {
+            close(fd as i32);
+        }
+    }
+
+    /// Publish the diskless graphical-boot marker `/run/m3os-graphical-only`
+    /// (see [`GRAPHICAL_RUN_MARKER`]). Best-effort: a failure just means the
+    /// session clients fall back to their `/etc/m3os-graphical-only` check.
+    fn create_graphical_run_marker() {
+        let fd = open(GRAPHICAL_RUN_MARKER, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
         if fd >= 0 {
             close(fd as i32);
         }
