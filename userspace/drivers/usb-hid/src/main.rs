@@ -138,34 +138,57 @@ enum DeviceRole {
 /// controls), so a tablet drives `mouse_server` and a media-key strip routes
 /// consumer keys — without either being mistaken for the other.
 fn classify_role(notice: &usb_core::protocol::AttachNotice, fields: &[ReportField]) -> DeviceRole {
-    // Per USB HID §4.2/§4.3 the boot protocol field (1 = keyboard, 2 = mouse) is
-    // only meaningful when the interface declares the Boot subclass. A
-    // Report-Protocol interface (subclass 0) that happens to advertise protocol
-    // 1/2 must NOT be driven as a boot device — that would issue boot-only
-    // SET_PROTOCOL/SET_IDLE and pick the fixed-format boot decoder over the
-    // parsed `ReportField` layout. Honor the boot protocol only under the Boot
-    // subclass; otherwise classify by the layout the descriptor actually carries.
+    // Boot keyboard/mouse: under the Boot subclass the boot protocol field
+    // (1 = keyboard, 2 = mouse) is authoritative — keep the fixed-format boot
+    // decode.
     let is_boot = notice.interface_sub_class == SUBCLASS_HID_BOOT;
     match notice.interface_protocol {
-        PROTOCOL_HID_KEYBOARD if is_boot => DeviceRole::BootKeyboard,
-        PROTOCOL_HID_MOUSE if is_boot => DeviceRole::BootMouse,
-        _ => {
-            if notice.interface_class != CLASS_HID || fields.is_empty() {
-                return DeviceRole::Ignore;
-            }
-            if fields_have_pointer(fields) {
-                DeviceRole::ReportPointer
-            } else if fields.iter().any(|f| f.usage_page == USAGE_PAGE_CONSUMER) {
-                DeviceRole::ReportConsumer
-            } else {
-                DeviceRole::Ignore
-            }
-        }
+        PROTOCOL_HID_KEYBOARD if is_boot => return DeviceRole::BootKeyboard,
+        PROTOCOL_HID_MOUSE if is_boot => return DeviceRole::BootMouse,
+        _ => {}
+    }
+    // Everything past here must be a HID-class interface with a usable layout.
+    if notice.interface_class != CLASS_HID {
+        return DeviceRole::Ignore;
+    }
+    // A non-boot interface that still declares the Keyboard protocol (1) is a
+    // keyboard (USB HID §4.3) — many modern keyboards default to Report Protocol
+    // (subclass 0). Drive it as a boot keyboard regardless of subclass:
+    // `boot_protocol_init` issues SET_PROTOCOL(0), which makes a Report-only
+    // keyboard emit the fixed 8-byte boot report `BootKeyboardDecoder` already
+    // handles (virtually every keyboard supports boot protocol). This relaxation
+    // is deliberately keyboard-only — the mouse path stays Boot-subclass-gated
+    // above, because a Report-Protocol pointer (tablet/touchpad/gaming mouse) has
+    // a richer layout the `ReportPointer` path decodes and must NOT be collapsed
+    // to the 3-byte boot mouse decode (the Phase 92 caution).
+    if notice.interface_protocol == PROTOCOL_HID_KEYBOARD {
+        return DeviceRole::BootKeyboard;
+    }
+    if fields.is_empty() {
+        return DeviceRole::Ignore;
+    }
+    // Classify the remaining Report-Protocol interfaces by the usages their
+    // parsed layout actually carries. Pointer is tested before keyboard so a
+    // combo device that exposes both axes and a keyboard collection on one
+    // interface (e.g. a touchpad with hotkeys) keeps driving `mouse_server`
+    // rather than being forced into the boot-keyboard decode.
+    if fields_have_pointer(fields) {
+        DeviceRole::ReportPointer
+    } else if fields_have_keyboard(fields) {
+        // Subclass 0, protocol 0, but the descriptor carries Keyboard-page
+        // usages and no pointer axes — a Report-only keyboard. Boot-protocol it.
+        DeviceRole::BootKeyboard
+    } else if fields.iter().any(|f| f.usage_page == USAGE_PAGE_CONSUMER) {
+        DeviceRole::ReportConsumer
+    } else {
+        DeviceRole::Ignore
     }
 }
 
 /// HID Usage Page 0x01 — Generic Desktop (pointer axes live here).
 const USAGE_PAGE_GENERIC_DESKTOP: u16 = 0x01;
+/// HID Usage Page 0x07 — Keyboard / Keypad.
+const USAGE_PAGE_KEYBOARD: u16 = 0x07;
 /// HID Usage Page 0x09 — Button.
 const USAGE_PAGE_BUTTON: u16 = 0x09;
 /// HID Usage Page 0x0C — Consumer (media/volume/brightness controls).
@@ -179,6 +202,14 @@ fn fields_have_pointer(fields: &[ReportField]) -> bool {
         f.usage_page == USAGE_PAGE_BUTTON
             || (f.usage_page == USAGE_PAGE_GENERIC_DESKTOP && matches!(f.usage, 0x30 | 0x31))
     })
+}
+
+/// True if the parsed layout carries Keyboard-page usages — i.e. a keyboard that
+/// declared neither the Boot subclass nor the Keyboard protocol but still emits
+/// keystrokes. Such an interface is driven as a boot keyboard (see
+/// [`classify_role`]): `SET_PROTOCOL(0)` switches it to the fixed boot report.
+fn fields_have_keyboard(fields: &[ReportField]) -> bool {
+    fields.iter().any(|f| f.usage_page == USAGE_PAGE_KEYBOARD)
 }
 
 /// One bound HID device the daemon polls.
