@@ -146,24 +146,36 @@ const INPUT_CONTEXT_ENTRIES: usize = DEVICE_CONTEXT_ENTRIES + 1;
 /// controller that stalled the *single-threaded* driver for minutes before it
 /// reached `server::run`. Every other ring-3 task (the NIC's `ure`, the HID
 /// driver) blocks on its first `NextAttach` IPC until then, so the whole USB
-/// subsystem looks hung. `poll_yield` instead sleeps 100µs per iteration:
+/// subsystem looks hung. `poll_yield` instead sleeps 1 ms per iteration:
 /// the CPU is released to those tasks, and the worst case is a bounded
 /// wall-clock timeout rather than a multi-second spin. 1 s covers the slow
 /// CNR-clear after `HCRST` (xHCI allows the controller to stay Not-Ready for a
 /// while); 250 ms covers a USB2 port reset's PRC latch.
-const POLL_ITERS_1S: u32 = 10_000;
-const POLL_ITERS_250MS: u32 = 2_500;
+///
+/// The per-iteration sleep MUST be ≥ 1 ms (one scheduler tick): the kernel
+/// services a sub-millisecond `nanosleep` as a TSC busy-spin that never
+/// deschedules (a context switch would cost more than the sleep), so the
+/// previous 100 µs sleep did NOT release the CPU — `poll_yield(POLL_ITERS_1S)`
+/// pinned a core for a full second per call. With two xHCI controllers on a
+/// laptop, back-to-back bring-up waits surfaced as the multi-second
+/// `cpu-hog …/drivers/xhci …Running` storm in the bare-metal log, which starved
+/// the HID class driver's `NextAttach` (it then exited "no HID devices"). At
+/// 1 ms the iteration counts shrink so the wall-clock budgets are unchanged.
+const POLL_ITERS_1S: u32 = 1_000;
+const POLL_ITERS_250MS: u32 = 250;
 
-/// Poll `ready` every 100µs, yielding the CPU, until it returns `true` or
-/// `max_iters` elapse. Returns whether `ready` ultimately held. Unlike a tight
-/// fixed-iteration spin, each iteration sleeps so a wedged register cannot starve
-/// the other ring-3 tasks waiting on this driver's IPC server.
+/// Poll `ready` every 1 ms, yielding the CPU, until it returns `true` or
+/// `max_iters` elapse. Returns whether `ready` ultimately held. Each iteration
+/// blocks for a full scheduler tick (a real deschedule, not a busy-spin) so a
+/// wedged register cannot starve the other ring-3 tasks waiting on this driver's
+/// IPC server.
 fn poll_yield(max_iters: u32, mut ready: impl FnMut() -> bool) -> bool {
     for _ in 0..max_iters {
         if ready() {
             return true;
         }
-        let _ = syscall_lib::nanosleep_for(0, 100_000);
+        // 1 ms ≥ one tick → kernel uses block_current_until (real yield).
+        let _ = syscall_lib::nanosleep_for(0, 1_000_000);
     }
     ready()
 }
