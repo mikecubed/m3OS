@@ -2468,12 +2468,24 @@ impl Controller {
         let off = self.portsc(portnum);
         let raw = self.op_u32(off);
         let p = port::Portsc(raw);
-        // Acknowledge the connect-status change (RW1C) so the edge is not
-        // re-reported, then classify connect vs disconnect.
-        if p.csc() {
-            let cleared = port::portsc_clear_change(raw, port::PORTSC_CSC);
-            self.op_write_u32(off, cleared);
-            if p.ccs() {
+        // Classify connect vs disconnect from the connect-status edge BEFORE we
+        // clear anything.
+        let connect_change = p.csc();
+        let connected = p.ccs();
+        // Acknowledge EVERY pending RW1C change bit (CSC | PEC | WRC | OCC | PRC
+        // | PLC | CEC), not just CSC. A SuperSpeed dock hub asserts PLC (Port
+        // Link State Change) continuously as its USB3 link cycles U0/U1/U2 for
+        // power management, and may also raise PEC/CEC; leaving any change bit
+        // set keeps the controller re-asserting Port Status Change against the
+        // single-threaded server, which on Intel/Tiger-Lake silicon manifests
+        // as the server pinning a core (a ~2 s cpu-hog in the bare-metal log)
+        // and starving the HID class driver. Clearing the full RW1C mask in one
+        // RW1C write quiesces the port — standard xHCI driver discipline
+        // (`portsc_clear_change` preserves PED and the non-change status bits).
+        let acked = port::portsc_clear_change(raw, port::PORTSC_RW1C_MASK);
+        self.op_write_u32(off, acked);
+        if connect_change {
+            if connected {
                 // A real connect: drive the A.7 reset path (decoding speed) and
                 // queue the connect for the server's enumeration (Track C.1/C.3).
                 if let Some(speed) = self.reset_port_with_speed(portnum) {
