@@ -60,12 +60,22 @@ fi
   Build it first with:  cargo xtask image"
 [[ -s "$IMAGE" ]] || die "image is empty: $IMAGE"
 
-# Validate the device.
-[[ -b "$DEVICE" ]] || die "not a block device: $DEVICE  (run '$0 --list')"
+# Validate the device. lsblk is the source of truth for "is this a whole disk".
+# A bare `[[ -b ]]` test has been observed to report false under `sudo` on some
+# setups (a mount-namespaced sudo, snap/flatpak bash, or udev still settling)
+# even when the node is a real block device that `dd` writes to fine — so do not
+# reject solely on `-b`. Accept when EITHER `-b` passes OR lsblk can describe the
+# node; reject only when neither sees a block device there.
 DEV_BASE="$(basename -- "$DEVICE")"
-
 DEV_TYPE="$(lsblk -dno TYPE "$DEVICE" 2>/dev/null || true)"
-[[ "$DEV_TYPE" == "disk" ]] || die "$DEVICE is type '${DEV_TYPE:-unknown}', not a whole disk.
+if [[ ! -b "$DEVICE" && -z "$DEV_TYPE" ]]; then
+  die "$DEVICE is not a block device and lsblk cannot see it (run '$0 --list').
+  If lsblk DOES list it as a disk and only the script disagrees, dd directly:
+    sudo dd if=\"$IMAGE\" of=\"$DEVICE\" bs=4M conv=fsync status=progress && sync"
+fi
+# Reject a partition (TYPE=part). An empty TYPE means lsblk couldn't classify it
+# but `-b` passed, so trust the node and proceed.
+[[ "$DEV_TYPE" == "disk" || -z "$DEV_TYPE" ]] || die "$DEVICE is type '${DEV_TYPE}', not a whole disk.
   Pass the whole disk (e.g. /dev/sdb), not a partition (e.g. /dev/sdb1)."
 
 # Refuse the disk that hosts the running root filesystem.
@@ -76,9 +86,16 @@ if [[ -n "$ROOT_SRC" ]]; then
   [[ "$DEV_BASE" != "$ROOT_DISK" ]] || die "$DEVICE hosts the running root filesystem (/). Refusing."
 fi
 
-# Removable check (override with --force).
+# Removable check (override with --force). Prefer sysfs; fall back to lsblk's
+# RM/HOTPLUG columns when /sys isn't directly readable in this context (same
+# robustness concern as the device-type check above).
 REMOVABLE=0
-[[ -r "/sys/block/$DEV_BASE/removable" ]] && REMOVABLE="$(cat "/sys/block/$DEV_BASE/removable")"
+if [[ -r "/sys/block/$DEV_BASE/removable" ]]; then
+  REMOVABLE="$(cat "/sys/block/$DEV_BASE/removable")"
+else
+  REMOVABLE="$(lsblk -dno RM "$DEVICE" 2>/dev/null | tr -d '[:space:]' || true)"
+  [[ "$REMOVABLE" == "1" ]] || REMOVABLE="$(lsblk -dno HOTPLUG "$DEVICE" 2>/dev/null | tr -d '[:space:]' || true)"
+fi
 if [[ "$REMOVABLE" != "1" && "$FORCE_NONREMOVABLE" != "1" ]]; then
   die "$DEVICE is not marked removable — it may be an internal disk.
   If you are certain this is your USB key, re-run with --force."
