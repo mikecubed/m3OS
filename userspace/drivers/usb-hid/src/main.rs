@@ -284,6 +284,20 @@ fn monotonic_ns() -> u64 {
 /// can never park usb-hid forever in `BlockedOnReply` with no waker.
 const USB_CALL_TIMEOUT_NS: u64 = 1_000_000_000; // 1 s
 
+/// Total wall-clock budget for the boot-time enumeration retry. The
+/// single-threaded xHCI server can be busy bringing up one or more controllers
+/// (each bring-up wait is bounded but several seconds in aggregate on a laptop
+/// with two xHCI controllers) when usb-hid first asks for the attach table, so a
+/// single timed-out `NextAttach` does NOT mean "no devices". Retry until the
+/// server answers — but bounded, so a machine with a genuinely absent/wedged
+/// controller still exits instead of spinning forever.
+const INITIAL_ENUM_BUDGET_MS: u64 = 15_000;
+
+/// Sleep between enumeration retries while the server is busy. Each timed-out
+/// `NextAttach` already consumed up to `USB_CALL_TIMEOUT_NS`, so this only adds
+/// a little slack to avoid hammering a busy server.
+const ENUM_RETRY_SLEEP_NS: u32 = 500_000_000; // 500 ms
+
 /// Issue a `UsbRequest` to the xHCI server and decode the `UsbReply`.
 ///
 /// Uses the deadline-bounded `ipc_call_buf_timeout`: if the (shared,
@@ -292,19 +306,44 @@ const USB_CALL_TIMEOUT_NS: u64 = 1_000_000_000; // 1 s
 /// `None` so the caller's poll loop treats it as "no report" and retries (with
 /// adaptive backoff) on the next tick.
 fn usb_call(usb_ep: u32, req: &UsbRequest) -> Option<UsbReply> {
+    match usb_call_status(usb_ep, req) {
+        CallStatus::Reply(r) => Some(r),
+        CallStatus::TimedOut | CallStatus::Failed => None,
+    }
+}
+
+/// Outcome of one `usb_call`, distinguishing a **server timeout** (the
+/// single-threaded server was too busy to reply within the budget — e.g. still
+/// busy-spinning controller bring-up — and the request is worth retrying) from a
+/// transport **failure** and from a decoded **reply**. The boot enumeration uses
+/// this to wait out a busy server instead of declaring "no HID devices" on the
+/// first timed-out `NextAttach`.
+enum CallStatus {
+    Reply(UsbReply),
+    TimedOut,
+    Failed,
+}
+
+fn usb_call_status(usb_ep: u32, req: &UsbRequest) -> CallStatus {
     const NEG_ETIMEDOUT: u64 = (-110_i64) as u64;
     let req_bytes = req.encode();
     let deadline_ns = monotonic_ns().saturating_add(USB_CALL_TIMEOUT_NS);
     let rc = syscall_lib::ipc_call_buf_timeout(usb_ep, USB_REQ_LABEL, 0, &req_bytes, deadline_ns);
-    if rc == u64::MAX || rc == NEG_ETIMEDOUT {
-        return None;
+    if rc == NEG_ETIMEDOUT {
+        return CallStatus::TimedOut;
+    }
+    if rc == u64::MAX {
+        return CallStatus::Failed;
     }
     let mut reply_buf = [0u8; USB_MSG_MAX];
     let n = syscall_lib::ipc_take_pending_bulk(&mut reply_buf);
     if n == u64::MAX {
-        return None;
+        return CallStatus::Failed;
     }
-    UsbReply::decode(&reply_buf[..n as usize])
+    match UsbReply::decode(&reply_buf[..n as usize]) {
+        Some(r) => CallStatus::Reply(r),
+        None => CallStatus::Failed,
+    }
 }
 
 /// Put a HID interface into Boot Protocol and stop duplicate reports by issuing
@@ -1061,6 +1100,43 @@ fn reconcile_attachments(usb_ep: u32, devices: &mut Vec<HidDevice>) {
     }
 }
 
+/// One full `NextAttach` walk. Returns every attached HID interface as a built
+/// [`HidDevice`], plus whether the walk was cut short by a server **timeout**
+/// (`true`) rather than reaching the end of the attach table (`false`). The boot
+/// path retries while the result is empty *and* a timeout occurred — i.e. the
+/// server was merely busy (controller bring-up) rather than reporting no devices.
+fn enumerate_once(usb_ep: u32) -> (Vec<HidDevice>, bool) {
+    let mut devices: Vec<HidDevice> = Vec::new();
+    let mut cursor = 0u8;
+    loop {
+        match usb_call_status(usb_ep, &UsbRequest::NextAttach { cursor }) {
+            CallStatus::TimedOut => return (devices, true),
+            CallStatus::Reply(UsbReply::Attach {
+                notice: Some(notice),
+            }) => {
+                let idx = cursor;
+                cursor = match cursor.checked_add(1) {
+                    Some(c) => c,
+                    None => return (devices, false),
+                };
+                // A boot enumeration only surfaces attached devices, but guard
+                // the flag so the walk is correct if it sees a stale detached one.
+                if !notice.attached {
+                    continue;
+                }
+                syscall_lib::write_str(STDOUT_FILENO, "usb-hid: bound HID device (proto ");
+                write_u8_dec(notice.interface_protocol);
+                syscall_lib::write_str(STDOUT_FILENO, ")\n");
+                devices.push(build_device(usb_ep, notice, idx));
+            }
+            // End of the attach table (`Attach { notice: None }`), a transport
+            // failure, or any other reply: the walk is done and the server was
+            // responsive enough to answer — not a "busy" timeout.
+            CallStatus::Reply(_) | CallStatus::Failed => return (devices, false),
+        }
+    }
+}
+
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, BOOT_LOG_MARKER);
     klog("usb-hid: spawned\n");
@@ -1082,30 +1158,24 @@ fn program_main(_args: &[&str]) -> i32 {
         return 0;
     };
 
-    // 2. Enumerate attached HID devices via the NextAttach cursor. `idx` is the
-    //    table index this device is bound from — passed to `build_device` as its
-    //    stable `source_cursor` for the C.4 reconcile.
-    let mut devices: Vec<HidDevice> = Vec::new();
-    let mut cursor = 0u8;
-    while let Some(UsbReply::Attach {
-        notice: Some(notice),
-    }) = usb_call(usb_ep, &UsbRequest::NextAttach { cursor })
-    {
-        let idx = cursor;
-        cursor = match cursor.checked_add(1) {
-            Some(c) => c,
-            None => break,
-        };
-        // A boot enumeration only surfaces attached devices, but guard the flag
-        // so the same walk is correct if it ever sees a stale detached entry.
-        if !notice.attached {
-            continue;
+    // 2. Enumerate attached HID devices via the NextAttach cursor, retrying while
+    //    the server is still too busy to answer. A multi-controller bring-up can
+    //    keep the single-threaded xHCI server out of `recv` for several seconds —
+    //    longer than one `USB_CALL_TIMEOUT_NS` — so a single timed-out
+    //    `NextAttach` means "busy, try again", NOT "no devices". A clean empty
+    //    reply means the server is responsive and there genuinely are no HID
+    //    devices (the QEMU-without-HID path), so exit promptly. The retry is
+    //    bounded by `INITIAL_ENUM_BUDGET_MS` so a wedged/absent controller still
+    //    exits instead of looping forever.
+    let enum_deadline_ms = monotonic_ms().saturating_add(INITIAL_ENUM_BUDGET_MS);
+    let mut devices: Vec<HidDevice> = loop {
+        let (found, timed_out) = enumerate_once(usb_ep);
+        if !found.is_empty() || !timed_out || monotonic_ms() >= enum_deadline_ms {
+            break found;
         }
-        syscall_lib::write_str(STDOUT_FILENO, "usb-hid: bound HID device (proto ");
-        write_u8_dec(notice.interface_protocol);
-        syscall_lib::write_str(STDOUT_FILENO, ")\n");
-        devices.push(build_device(usb_ep, notice, idx));
-    }
+        klog("usb-hid: 'usb' server busy (controller bring-up?); retrying enumeration\n");
+        let _ = syscall_lib::nanosleep_for(0, ENUM_RETRY_SLEEP_NS);
+    };
 
     if devices.is_empty() {
         klog("usb-hid: no HID devices attached — exiting cleanly\n");
