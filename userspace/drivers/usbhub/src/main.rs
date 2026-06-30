@@ -155,20 +155,93 @@ fn setup_to_bytes(s: SetupPacket) -> [u8; 8] {
     ]
 }
 
-/// Issue a `UsbRequest` to the xHCI server and decode the `UsbReply`.
+/// Mirror a short diagnostic line into the kernel dmesg ring (via
+/// `sys_debug_print` → `[userspace] …`). A ring-3 driver's stdout (fd 1) is not
+/// captured by `dmesg`/`/proc/kmsg`, so on a bare-metal GUI boot — where the
+/// only off-box channel is `dmesg` over SSH — these lines are how the hub
+/// daemon's tier-2 enumeration of devices behind a dock hub becomes observable.
 #[cfg(not(test))]
-fn usb_call(usb_ep: u32, req: &UsbRequest) -> Option<UsbReply> {
+fn klog(msg: &str) {
+    syscall_lib::serial_print(msg);
+}
+
+#[cfg(not(test))]
+fn monotonic_ns() -> u64 {
+    let (sec, nsec) = syscall_lib::clock_gettime(syscall_lib::CLOCK_MONOTONIC);
+    if sec < 0 {
+        return 0;
+    }
+    (sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nsec as u64)
+}
+
+#[cfg(not(test))]
+fn monotonic_ms() -> u64 {
+    monotonic_ns() / 1_000_000
+}
+
+/// Per-RPC budget for a synchronous call to the shared, single-threaded xHCI
+/// server. Generous (3 s) — comfortably above any single legitimate operation
+/// (an `EnumerateChild` runs a full Enable-Slot/Address-Device/descriptor
+/// sequence) — but finite, so a server monopolised at boot can never park usbhub
+/// forever in `BlockedOnReply` with no waker (the a90aa2ca wedge that usb-hid was
+/// hardened against but usbhub was not; on bare metal it left the tier-2
+/// keyboard/mouse behind a dock hub unenumerated).
+#[cfg(not(test))]
+const USB_CALL_TIMEOUT_NS: u64 = 3_000_000_000; // 3 s
+
+/// Total wall-clock budget for the boot-time hub-enumeration retry. The server
+/// can be busy bringing up controllers for several seconds when usbhub first
+/// asks for the attach table, so a single timed-out `NextAttach` does NOT mean
+/// "no hub". Bounded so a machine with genuinely no hub still exits.
+#[cfg(not(test))]
+const INITIAL_ENUM_BUDGET_MS: u64 = 15_000;
+
+/// Sleep between hub-enumeration retries while the server is busy.
+#[cfg(not(test))]
+const ENUM_RETRY_SLEEP_NS: u32 = 500_000_000; // 500 ms
+
+/// Outcome of one `usb_call`: a decoded reply, a server **timeout** (busy —
+/// worth retrying), or a transport **failure**.
+#[cfg(not(test))]
+enum CallStatus {
+    Reply(UsbReply),
+    TimedOut,
+    Failed,
+}
+
+#[cfg(not(test))]
+fn usb_call_status(usb_ep: u32, req: &UsbRequest) -> CallStatus {
+    const NEG_ETIMEDOUT: u64 = (-110_i64) as u64;
     let req_bytes = req.encode();
-    let rc = syscall_lib::ipc_call_buf(usb_ep, USB_REQ_LABEL, 0, &req_bytes);
+    let deadline_ns = monotonic_ns().saturating_add(USB_CALL_TIMEOUT_NS);
+    let rc = syscall_lib::ipc_call_buf_timeout(usb_ep, USB_REQ_LABEL, 0, &req_bytes, deadline_ns);
+    if rc == NEG_ETIMEDOUT {
+        return CallStatus::TimedOut;
+    }
     if rc == u64::MAX {
-        return None;
+        return CallStatus::Failed;
     }
     let mut reply_buf = [0u8; USB_MSG_MAX];
     let n = syscall_lib::ipc_take_pending_bulk(&mut reply_buf);
     if n == u64::MAX {
-        return None;
+        return CallStatus::Failed;
     }
-    UsbReply::decode(&reply_buf[..n as usize])
+    match UsbReply::decode(&reply_buf[..n as usize]) {
+        Some(r) => CallStatus::Reply(r),
+        None => CallStatus::Failed,
+    }
+}
+
+/// Issue a `UsbRequest` to the xHCI server and decode the `UsbReply`. Bounded by
+/// [`USB_CALL_TIMEOUT_NS`] so a monopolised server can never wedge usbhub.
+#[cfg(not(test))]
+fn usb_call(usb_ep: u32, req: &UsbRequest) -> Option<UsbReply> {
+    match usb_call_status(usb_ep, req) {
+        CallStatus::Reply(r) => Some(r),
+        CallStatus::TimedOut | CallStatus::Failed => None,
+    }
 }
 
 /// Run a control transfer for `setup` on the hub's EP0, returning the data stage
@@ -308,6 +381,11 @@ fn enumerate_hub(usb_ep: u32, notice: &AttachNotice) -> Option<u8> {
     syscall_lib::write_str(STDOUT_FILENO, "XHCI_HUB:enumerated ports=");
     write_u8_dec(nports);
     syscall_lib::write_str(STDOUT_FILENO, "\n");
+    klog(&alloc::format!(
+        "usbhub: hub slot={} has {} downstream ports\n",
+        slot_id,
+        nports
+    ));
 
     // SET_FEATURE(PORT_POWER) on every downstream port.
     for port in 1..=nports {
@@ -341,6 +419,7 @@ fn enumerate_hub(usb_ep: u32, notice: &AttachNotice) -> Option<u8> {
         syscall_lib::write_str(STDOUT_FILENO, "usbhub: port ");
         write_u8_dec(port);
         syscall_lib::write_str(STDOUT_FILENO, " device connected\n");
+        klog(&alloc::format!("usbhub: port {port} device connected\n"));
 
         // SET_FEATURE(PORT_RESET) and poll until the port enables.
         let setup = setup_to_bytes(set_port_feature(PORT_RESET, port));
@@ -358,6 +437,7 @@ fn enumerate_hub(usb_ep: u32, notice: &AttachNotice) -> Option<u8> {
                 syscall_lib::write_str(STDOUT_FILENO, "usbhub: port ");
                 write_u8_dec(port);
                 syscall_lib::write_str(STDOUT_FILENO, " reset+enabled\n");
+                klog(&alloc::format!("usbhub: port {port} reset+enabled\n"));
 
                 // Tier-2 enumeration (A.4/A.5): compute the route string for a
                 // device on this downstream port (the hub sits directly on the
@@ -390,14 +470,31 @@ fn enumerate_hub(usb_ep: u32, notice: &AttachNotice) -> Option<u8> {
                                 syscall_lib::write_str(STDOUT_FILENO, " class=");
                                 write_u8_dec(child.interface_class);
                                 syscall_lib::write_str(STDOUT_FILENO, "\n");
+                                klog(&alloc::format!(
+                                    "usbhub: child enumerated port={} slot={} class={} sub={} proto={}\n",
+                                    port,
+                                    child.slot_id,
+                                    child.interface_class,
+                                    child.interface_sub_class,
+                                    child.interface_protocol
+                                ));
                             }
-                            _ => {
+                            other => {
                                 syscall_lib::write_str(
                                     STDOUT_FILENO,
                                     "usbhub: child enumerate failed port=",
                                 );
                                 write_u8_dec(port);
                                 syscall_lib::write_str(STDOUT_FILENO, "\n");
+                                klog(&alloc::format!(
+                                    "usbhub: child enumerate FAILED port={} (reply={})\n",
+                                    port,
+                                    match other {
+                                        Some(UsbReply::Attach { notice: None }) => "empty-attach",
+                                        Some(_) => "wrong-reply",
+                                        None => "timeout/transport",
+                                    }
+                                ));
                             }
                         }
                     }
@@ -437,6 +534,38 @@ fn enumerate_hub(usb_ep: u32, notice: &AttachNotice) -> Option<u8> {
 /// interrupt-IN endpoint for status-change notifications) are deferred to
 /// Phase 103 (USB runtime power management).
 #[cfg(not(test))]
+/// One full `NextAttach` walk collecting hub-class interfaces. Returns the hubs
+/// found plus whether the walk was cut short by a server **timeout** (busy —
+/// retry) rather than reaching the end of the attach table.
+#[cfg(not(test))]
+fn enumerate_hubs_once(usb_ep: u32) -> (Vec<AttachNotice>, bool) {
+    let mut hubs: Vec<AttachNotice> = Vec::new();
+    let mut cursor = 0u8;
+    loop {
+        match usb_call_status(usb_ep, &UsbRequest::NextAttach { cursor }) {
+            CallStatus::TimedOut => return (hubs, true),
+            CallStatus::Reply(UsbReply::Attach {
+                notice: Some(notice),
+            }) => {
+                cursor = match cursor.checked_add(1) {
+                    Some(c) => c,
+                    None => return (hubs, false),
+                };
+                if notice.attached && classify_hub_interface(notice.interface_class) {
+                    klog("usbhub: bound hub\n");
+                    syscall_lib::write_str(STDOUT_FILENO, "usbhub: bound hub slot=");
+                    write_u8_dec(notice.slot_id);
+                    syscall_lib::write_str(STDOUT_FILENO, "\n");
+                    hubs.push(notice);
+                }
+            }
+            // End of the attach table, a transport failure, or any other reply:
+            // the walk is done and the server was responsive (not a busy timeout).
+            CallStatus::Reply(_) | CallStatus::Failed => return (hubs, false),
+        }
+    }
+}
+
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, BOOT_LOG_MARKER);
 
@@ -453,26 +582,28 @@ fn program_main(_args: &[&str]) -> i32 {
         h as u32
     };
 
-    // Walk the NextAttach cursor for hub-class interfaces (A.1).
-    let mut hubs: Vec<AttachNotice> = Vec::new();
-    let mut cursor = 0u8;
-    while let Some(UsbReply::Attach {
-        notice: Some(notice),
-    }) = usb_call(usb_ep, &UsbRequest::NextAttach { cursor })
-    {
-        cursor = cursor.saturating_add(1);
-        if notice.attached && classify_hub_interface(notice.interface_class) {
-            syscall_lib::write_str(STDOUT_FILENO, "usbhub: bound hub slot=");
-            write_u8_dec(notice.slot_id);
-            syscall_lib::write_str(STDOUT_FILENO, "\n");
-            hubs.push(notice);
+    // Walk the NextAttach cursor for hub-class interfaces (A.1), retrying while
+    // the server is still busy with controller bring-up: a single timed-out
+    // NextAttach means "busy, try again", NOT "no hub". A clean empty reply means
+    // the server is responsive and there genuinely is no hub → exit. Bounded by
+    // INITIAL_ENUM_BUDGET_MS so a hub-less machine still exits.
+    klog("usbhub: spawned\n");
+    let enum_deadline_ms = monotonic_ms().saturating_add(INITIAL_ENUM_BUDGET_MS);
+    let hubs: Vec<AttachNotice> = loop {
+        let (found, timed_out) = enumerate_hubs_once(usb_ep);
+        if !found.is_empty() || !timed_out || monotonic_ms() >= enum_deadline_ms {
+            break found;
         }
-    }
+        klog("usbhub: 'usb' server busy (controller bring-up?); retrying hub scan\n");
+        let _ = syscall_lib::nanosleep_for(0, ENUM_RETRY_SLEEP_NS);
+    };
 
     if hubs.is_empty() {
+        klog("usbhub: no hub attached — exiting cleanly\n");
         syscall_lib::write_str(STDOUT_FILENO, "usbhub: no hub attached — exiting cleanly\n");
         return 0;
     }
+    klog("usbhub: hub(s) found; enumerating downstream ports\n");
 
     // Initial enumeration: bring up each hub and collect its port count for
     // the steady-state monitoring loop.
