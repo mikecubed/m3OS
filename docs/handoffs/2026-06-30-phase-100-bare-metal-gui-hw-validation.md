@@ -1,111 +1,92 @@
-# Handoff — Phase 100 Bare-Metal GUI Session: hardware validation & bring-up fixes
+# Handoff — Phase 100 Bare-Metal GUI Session: USB-HID bring-up on real hardware
 
 **Date:** 2026-06-30
 **Branch:** `feat/phase-100-bare-metal-gui-session` → PR **#272** (base `main`)
-**HEAD at handoff:** `a90aa2ca` (local == origin; tree clean)
-**Reference machine:** Dell Precision 5560 / Tiger Lake. USB mouse + 2 USB keyboards behind a **dock hub**; built-in keyboard is **PS/2** (kernel-serviced, independent of usb-hid).
+**HEAD at handoff:** `d094d87a` (local == origin; tree clean)
+**Reference machine:** Dell Precision 5560 / Tiger Lake. **Two xHCI controllers.** USB mouse + 2 USB keyboards behind a **dock hub**; the built-in trackpad is **I2C-HID serviced via the kernel PS/2 path** (NOT usb-hid); the built-in keyboard is **PS/2** (kernel-serviced). Boots **diskless from a USB stick**; network comes up (DHCP) and `sshd` is the only off-box channel.
 **Acceptance runbook:** `scripts/phase-100-bare-metal-validate.md` (§4 = the five-arm checklist).
 
-This session took Phase 100 from "boots to a greeter" to a **usable bare-metal GUI session** by fixing a string of diskless-only bugs found on real hardware, and resolving all PR #272 review threads. One functional bug remains open (USB keyboard input in the GUI) with the diagnosis done and a single data point pending.
+This session chased one symptom — *the USB keyboard does not type in the GUI* — down through five layered root causes, fixing each with the bare-metal log as the oracle. The work is **not finished**: usb-hid now enumerates correctly, but the keyboard/mouse are **tier-2 devices behind the dock hub** and the **usbhub** fix that should surface them is built and pushed but **not yet HW-confirmed** — a capture is pending (§1).
 
 ---
 
-## 1. RESUME HERE — open issue: USB keyboard does not type in the GUI
+## 1. RESUME HERE — open issue: tier-2 (behind-hub) keyboard/mouse not yet enumerated
 
-**Symptom:** In GUI mode, the **built-in PS/2 keyboard types into the terminal, but USB keyboards do not** (both of two USB keyboards; their LED lights, but no keys echo). Mouse works (cursor + click-focus).
+**State of the chain (HW-confirmed up to here):** usb-hid spawns, waits out the busy server, and enumerates the **root-level** devices — but those are only the **dock hub** (`class=9`), the **RTL8156 USB-Ethernet** dongle (`vid=0x0bda pid=0x8156`), and a **mass-storage** device (`class=8`, the boot stick). The keyboard (HID `class=3`) and mouse are plugged **into** the dock hub = **tier-2**, and were never surfaced.
 
-**Diagnosis (done):** Not display_server, not term, not kbd_server — the PS/2 keyboard proves the whole downstream chain works. The break is **usb-hid is not injecting the USB keyboard's keystrokes.** Root in the code:
-`userspace/drivers/usb-hid/src/main.rs` → `classify_role` (~L140-165) classifies an interface as a keyboard **only if it declares the Boot subclass** (`interface_sub_class == SUBCLASS_HID_BOOT`). A **Report-protocol keyboard (subclass 0)** with plain keyboard usages and no pointer/consumer fields falls through to **`DeviceRole::Ignore`** — and **there is no `ReportKeyboard` role / decoder at all**, so its keys are never decoded or injected. (The LED is likely BIOS-retained NumLock, not m3OS.)
+**Why (diagnosed):** surfacing tier-2 devices is **usbhub**'s job (it resets each downstream port and sends `EnumerateChild` to the xHCI server). But usbhub used a **blocking `ipc_call_buf` with no timeout**, so during the long busy-server window at boot (usb-hid had to retry its own enumeration **15×** before the single-threaded server answered) usbhub almost certainly **parked forever in `BlockedOnReply` on its first `NextAttach`** — the exact a90aa2ca wedge usb-hid was hardened against but usbhub never was — and never enumerated the hub at all.
 
-**The one data point needed to pick the fix** — usb-hid logs the bound role (main.rs:1051-1064). On the Dell, with the USB keyboard attached:
+**Fix shipped this session (commit `d094d87a`, awaiting HW confirmation):** gave usbhub the same hardening usb-hid got — bounded `ipc_call_buf_timeout` (3 s) + a retry-while-busy initial hub scan (bounded 15 s) — **plus full dmesg diagnostics** for the whole tier-2 path.
+
+**The capture that decides the next step** (filter on the m3OS side — see §6):
 ```bash
-echo dmesg | ssh root@<m3os-ip> > k.log     # see §6 for why dmesg, not cat /proc/kmsg
-grep -a 'usb-hid: bound' k.log              # → "usb-hid: bound vid=.. pid=.. class=3 proto=.. role=.."
-grep -a 'USB_HID:key' k.log                 # should be ABSENT (confirms no key inject)
+echo 'dmesg | grep usbhub'  | ssh root@<ip> > usbhub.log
+echo 'dmesg | grep usb-hid' | ssh root@<ip> > usbhid.log   # press keys first
 ```
-Branch on the keyboard's `role=`:
-- **`role=IGNORE` / `role=CONSUMER` / no `proto=1` device** (most likely, per the code) → **classification/decoder bug.** Fix in usb-hid: add keyboard support for the non-boot path. Two viable shapes:
-  1. In `classify_role`, treat `interface_protocol == PROTOCOL_HID_KEYBOARD` as a keyboard regardless of subclass (and/or detect HID Usage Page 0x07 *Keyboard* in the parsed `ReportField`s), then **force boot protocol** via `boot_protocol_init` (`SET_PROTOCOL(0)`) so the device emits the standard 8-byte boot report that `BootKeyboardDecoder` already handles. Lowest-effort; relies on the keyboard supporting boot protocol (almost all do).
-  2. Add a real `ReportKeyboard` role + a report-descriptor keyboard decoder (Usage Page 0x07). More work; needed only if a keyboard rejects `SET_PROTOCOL(0)`.
-  ⚠️ The current `classify_role` comment (L141-147) deliberately refused to drive non-boot interfaces as boot devices (Phase 92, to avoid mis-driving tablets/media strips). Keep that intent for **protocol 0/2**; only relax for **protocol 1 (Keyboard)** / explicit keyboard usages.
-- **`role=KEYBOARD`** → it *is* bound as a boot keyboard; the break is the **interrupt-IN poll/decode** (key reports not arriving — suspect the dock-hub endpoint isn't armed/read by the xHCI server for that device). Different fix; chase `poll_keyboard` → `poll_report` (PollInterruptIn) → the xHCI server's interrupt-IN arming for hub-attached devices.
-
-This also unblocks **acceptance arm 4** (USB keyboard in text mode) — same usb-hid injection path.
+Branch on `usbhub.log`:
+- `bound hub` → `has N downstream ports` → `port X device connected` → `reset+enabled` → **`child enumerated … class=3`** → keyboard surfaced; `usbhid.log` should show `role=KEYBOARD` and keys should echo → **DONE** (also unblocks acceptance arm 4).
+- …`reset+enabled` → **`child enumerate FAILED … (reply=…)`** → the **server-side `EnumerateChild`** (tier-2 Enable-Slot/Address-Device with route string) is the next bug. Chase it in `xhci/src/server.rs` (the `EnumerateChild` request handler) and `controller.rs` (`enumerate_port` / route-string addressing). The `(reply=timeout/transport | empty-attach | wrong-reply)` tag says which.
+- `has N downstream ports` but **no `device connected`** → the hub isn't reporting the keyboard as connected (port power / connect-detect / it's on a *deeper* hub tier). Look at `enumerate_hub` port-status decode and whether the dock chains hubs.
+- **No `bound hub`** at all (only `spawned`/`retrying`) → usbhub still can't get the hub from the server → server-side attach-table / `NextAttach` issue.
 
 ---
 
-## 2. Fixed this session (commits, newest first)
+## 2. Fixed this session (commits, newest first — all on PR #272, each passed `cargo xtask check`)
 
-All on the PR #272 branch; each passed `cargo xtask check` (pre-commit hook) + pre-push gates.
-
-| Commit | What | Why |
+| Commit | What | Why it mattered on HW |
 |---|---|---|
-| `a90aa2ca` | **Bound usb-hid's xHCI RPC** (the "pid 7 wedge" fix). New kernel syscall `ipc_call_buf_timeout` (0x111D, dispatch opcode 30) = bulk variant of `ipc_call_timeout`; usb-hid's `usb_call` uses it with a 1 s budget and returns `None` on timeout (retries instead of parking). Watchdog `StuckNoWaker` warning rate-limited to ≤1/10 s. | usb-hid parked forever in `BlockedOnReply` (no waker) when the single-threaded xHCI server was monopolized by the dock-hub re-enumeration storm → watchdog flooded the log, mouse froze. **HW-confirmed fixed.** |
-| `982e3b18` | **Embed the 2.1 MB Nerd Font in the ramdisk** at `/usr/share/fonts/m3os/term.ttf` (new `/usr/share/fonts/m3os/` tree in `kernel/src/fs/ramdisk.rs`). | Diskless had no font asset → term used the static 8×16 bitmap. **HW-confirmed: terminal font now correct.** |
-| `f616dc54` | term: `blit_glyph_view` scales a sub-cell glyph to fill the 24×48 cell (gap-free fallback); trim the vfs wait 5 s→2 s. | Belt-and-suspenders for the font gaps; faster terminal. |
-| `48565f18` | **Round 2 desktop fixes:** (a) terminal renders — bounded term's `wait_for_shell_dependencies` vfs wait so a diskless boot (no vfs_server) proceeds via the kernel fs fallback instead of blocking forever; (b) launcher → **centered Overlay layer** (was a tiled Toplevel); (c) bar waits for login on diskless — init writes `/run/m3os-graphical-only`, bar/clients gate on it. | Terminal was a blank dwindle tile; launcher tiled instead of modal; bar appeared before login. **HW-confirmed fixed.** |
-| `d62fdad5` | **Round 1 desktop fixes:** add `bar`/`wallpaper`/`notifyd` to init `BUILTIN_CONFIGS` (diskless had no bar/wallpaper); clamp term's initial surface to the real framebuffer (was hardcoded 1920×1200); scale the launcher to the panel. | No bar/wallpaper on diskless; term oversized; launcher tiny. |
-| `47a6544e` | `scripts/phase-100-write-usb.sh` (safety-checked USB writer) + fix the runbook's `dd` source path. | The boot image is `boot-uefi-m3os.img`, not the data `disk.img`. |
-| `f80fc49c`, `679ec8b3` | Resolved all 7 PR #272 Copilot review threads (5 + 2). | — |
-
-(`4053bb95` between them is another session's xtask rust-port fix, pulled in via rebase.)
-
-**PR #272 review state:** all 7 inline threads replied + resolved (0 unresolved).
+| `d094d87a` | **usbhub: bounded RPC + retry-while-busy + dmesg diagnostics.** `usb_call`→`ipc_call_buf_timeout` (3 s); `enumerate_hubs_once` + retry loop; `klog` mirrors the whole hub/tier-2 lifecycle. | usbhub parked forever on a busy server → never enumerated the hub → tier-2 keyboard/mouse invisible. **Awaiting HW confirm (§1).** |
+| `f86946a9` | **usb-hid: retry enumeration while the server is busy.** `usb_call_status` (Reply/TimedOut/Failed) + `enumerate_once` + bounded retry loop (15 s). Clean empty reply still exits fast (QEMU). | usb-hid exited "no HID devices" on the **first** timed-out `NextAttach`. **HW-confirmed fixed** (it now retries and enumerates root devices). |
+| `3e7c0b8f` | **xhci: `poll_yield` must sleep ≥1 tick.** Was `nanosleep_for(0, 100_000)` (100 µs); the kernel busy-spins any **sub-millisecond** sleep (no deschedule), so `poll_yield(POLL_ITERS_1S)` pinned a core for a full second. Now 1 ms/iter, iter counts cut to keep the same wall-clock budgets. | Two controllers × ~1 s bring-up busy-spin = the `cpu-hog …/drivers/xhci …Running` storm that starved the HID driver. **Reduced but a residual ~2 s cpu-hog remains** — see §4.1. |
+| `1f29d53a` | **scripts/phase-100-write-usb.sh: don't reject a valid disk when `[[ -b ]]` is flaky.** Make lsblk authoritative for device-type; fall back to lsblk RM/HOTPLUG for the removable check. | `sudo bash …write-usb.sh /dev/sda` aborted "not a block device" even though lsblk listed it and `dd` worked (mount-namespaced sudo / udev timing). |
+| `7da75776` | **usb-hid + usbhub: mirror lifecycle into dmesg** via `serial_print`/`klog` (→ `sys_debug_print` → `[userspace] …` → dmesg ring). | **The unblock.** Driver fd-1 output is NOT in `/proc/kmsg`; without this, the bare-metal failure was invisible over SSH (the original handoff's "grep dmesg for the role line" plan never worked). |
+| `f61bd3af` | **xhci: ack ALL PORTSC RW1C change bits** in `on_port_status_change` (was CSC only) via `PORTSC_RW1C_MASK`. | Standard xHCI discipline; clears PLC/PEC/CEC a USB-3 dock raises. Correct, but was **not** the storm root (the busy-spin was — `3e7c0b8f`). |
+| `149b7210` | **usb-hid: classify non-boot keyboards.** A Report-Protocol keyboard (subclass 0) fell through `classify_role` to `Ignore`. Now proto==1 *or* HID Usage-Page-0x07 fields → `BootKeyboard` + `SET_PROTOCOL(0)`. Mouse path stays Boot-subclass-gated. | Necessary for any non-boot USB keyboard to inject keys. Not yet exercised (no keyboard has reached classification on HW yet — blocked by §1). |
 
 ---
 
-## 3. Phase 100 acceptance arms (runbook §4) — status
+## 3. Hard-won facts that corrected the original handoff's assumptions
 
-- [x] **Arm 2 — mouse moves cursor + focus-follows-click** — HW-confirmed (cursor moves; clicking changes focus).
-- [~] **Arm 1 — greeter renders** — functionally confirmed (login works); still need the *artifact*: a dated panel photo + the matching `RENDER_FP … rows_nonblank≥200` log line, committed under a phase evidence dir.
-- [ ] **Arm 3 — WC blit-latency win** — NOT done. Two-build measurement: note `[fb-blit] elapsed_ns` on the WC build (current), then build a write-back baseline (revert `PageTableFlags::NO_CACHE` in `sys_framebuffer_mmap`), reflash, note its `elapsed_ns`, record the ratio (expect 10–50×) in the runbook Results table. *(Offered to add a `cargo xtask image --wb-baseline` flag to avoid hand-editing — not yet built.)*
-- [ ] **Arm 4 — USB keyboard in text mode** — BLOCKED by the §1 usb-hid keyboard bug (same injection path). Fix §1 first.
-- [ ] **Arm 5 — idle-CPU flat** — NOT validated. Check `cat /proc/loadavg` after the desktop idles, and grep a full `dmesg` for `USB_HID:idle` / `USB_HUB:idle` plateau sentinels and absence of `cpu-hog`. ⚠️ Likely to still show a hot core / storm — see §4.1 (we bounded usb-hid but did **not** stop the usbhub storm).
+1. **"The mouse works" did NOT prove usb-hid's USB path.** The working pointer is the **I2C trackpad via the kernel PS/2 path**, not usb-hid. There is **no I2C-HID driver** in the tree (only `kernel/src/arch/x86_64/ps2.rs`). So usb-hid's USB poll path was never validated by the trackpad — and in fact usb-hid was *dying*, not polling.
+2. **Driver stdout (fd 1) is invisible in `dmesg`.** `/proc/kmsg` = the kernel ring, fed only by `log::`/`serial_println!` (`_kernel_print`) — and by **`sys_debug_print`** (syscall #12, `syscall_lib::serial_print`), which logs `[userspace] <msg>`. Ring-3 `write_str(STDOUT, …)` goes to the console/serial, **not** the ring. **To make a driver observable on bare metal, route key lines through `serial_print`/`klog`.**
+3. **A sub-millisecond `nanosleep` is a TSC busy-spin, not a yield** (`sys_nanosleep`, `kernel/src/arch/x86_64/syscall/mod.rs` ~L4290/4342). Anything that "sleeps 100 µs to be cooperative" actually **pins the core**. Sleep **≥ 1 ms** (one tick) to deschedule. This footgun caused the xHCI cpu-hog.
+4. **The `cpu-hog` warning is purely diagnostic** (logs any task holding a core ≥ 200 ms; `scheduler.rs` ~L5838). It does **not** kill. `final_state=Dead`/`Running` is the task's state at switch-out; `ran~Nms` is **continuous** CPU this dispatch (`start_tick` resets every dispatch).
 
 ---
 
 ## 4. Known residual issues (not yet fixed)
 
-1. **usbhub dock-hub re-enumeration storm (ROOT of the wedge).** The xHCI server is single-threaded and shared; `usbhub` re-enumerates on a dock-hub port-change bit that apparently never clears, monopolizing the server (`xhci/src/server.rs:483-493` runs `process_port_events` before answering clients; `usbhub/src/main.rs:506-548`). `a90aa2ca` made usb-hid *survive* this; it did not stop it. **Now diagnosable** (watchdog no longer floods). Targeted fix would be in `usbhub` (don't re-enumerate on an un-clearable change bit; verify `clear_port_change_bits` quiesces the dock port). Affects arm 5.
-2. **Greeter background image missing on diskless** — cosmetic; the greeter's bg PNG is a data-disk asset not in the ramdisk. Could embed it like the font if desired.
-3. **`ion: could not create config/history file: Read-only file system`** — the diskless ramdisk root is read-only; harmless shell warnings.
+1. **Residual ~2 s xHCI `cpu-hog`** (`final_state=Running`) persists after the `poll_yield` fix, so there is a *second* busy-spin. Prime suspect: the command-completion wait `COMPLETION_SPIN_POLLS = 4000` busy-spin phase (`controller.rs` ~L846/873, also `wait_for_transfer_event`/`wait_for_bulk_out_event` at ~L1166/2204/2288) — each iteration drains the event ring before the loop switches to 1 ms sleeps; under a flooded ring the 4000-spin phase alone can run ~2 s. If §1's fix doesn't fully settle the server, make these spin phases yield sooner (smaller `COMPLETION_SPIN_POLLS`, or switch to the 1 ms-sleep arm earlier). Affects acceptance arm 5 (idle CPU).
+2. **`f61bd3af` (PORTSC ack-all) is plausibly unnecessary** now that the busy-spin is understood — keep it (it's correct xHCI discipline) but don't assume it fixed anything.
+3. **Greeter bg image / `ion` RO-fs warnings** — cosmetic, from the earlier session (original handoff §4.2/§4.3); unchanged.
 
 ---
 
 ## 5. Key code locations touched / relevant
 
-- usb-hid keyboard classification: `userspace/drivers/usb-hid/src/main.rs` — `classify_role` (~L140), `DeviceRole` (~L118), `build_device`/bind log (~L1034-1064), `poll_keyboard` (~L376), `inject_key` (~L318), `usb_call` bounded RPC (~L225-260), `boot_protocol_init` (~L242).
-- New IPC syscall: `kernel/src/ipc/mod.rs` — `ipc_call_buf_timeout` fn + dispatch opcode 30; `kernel/src/arch/x86_64/syscall/mod.rs` — `IPC_LAST = 0x111D`; `userspace/syscall-lib/src/lib.rs` — `SYS_IPC_CALL_BUF_TIMEOUT` + `ipc_call_buf_timeout()` wrapper.
-- Watchdog rate-limit: `kernel/src/task/scheduler.rs` — `LAST_STUCK_WARN_TICK` / `STUCK_WARN_INTERVAL_TICKS` near the `StuckNoWaker` arm (~L6724).
-- Input routing (verified correct): dispatcher `kernel-core/src/input/dispatch.rs` `route_key_down` (exclusive-layer checked before focus); per-client delivery `userspace/display_server/src/main.rs` (`LABEL_CLIENT_EVENT_PULL`, ~L599-642, Outbound queue ~L1397-1426); term key reception `userspace/term/src/main.rs` (~L385-393, `pull_one_event` ~L790-833).
-- Diskless service set: `userspace/init/src/main.rs` `BUILTIN_CONFIGS` (~L1395) + graphical-only filter; `/run/m3os-graphical-only` marker writer.
-- Font embed: `kernel/src/fs/ramdisk.rs` `TERM_TTF` + `USR_ENTRIES`/`SHARE_ENTRIES`.
+- **usb-hid** `userspace/drivers/usb-hid/src/main.rs`: `classify_role` + `fields_have_keyboard` (~L140/200); `CallStatus`/`usb_call_status`/`usb_call` (~L294); `enumerate_once` + retry loop in `program_main` (~L1110/1170); `INITIAL_ENUM_BUDGET_MS`/`ENUM_RETRY_SLEEP_NS` (~L286); `klog` + bound-role/key/exit mirrors throughout.
+- **usbhub** `userspace/drivers/usbhub/src/main.rs`: `klog`/`monotonic_*`/`CallStatus`/`usb_call_status` (~L158); `enumerate_hubs_once` + retry loop in `program_main` (~L440/456); tier-2 `EnumerateChild` + diagnostics in `enumerate_hub` (~L360-420); steady-state `hub_ports_have_change` mask candidate (§unfixed, ~L244).
+- **xhci** `userspace/drivers/xhci/src/controller.rs`: `poll_yield` + `POLL_ITERS_*` (~L154/161); `on_port_status_change` PORTSC ack-all (~L2463); command-wait spin phases `COMPLETION_SPIN_POLLS` (~L98/846); `EnumerateChild` path begins server-side (`xhci/src/server.rs` `handle_request`).
+- **kernel** `sys_nanosleep` sub-ms busy-spin (`arch/x86_64/syscall/mod.rs` ~L4290/4342); `sys_debug_print` (~L2836); dmesg ring (`serial.rs` `_kernel_print`/`dmesg_snapshot`).
+- **PORTSC bits**: `kernel-core/src/usb/xhci/port.rs` (`PORTSC_RW1C_MASK`, `portsc_clear_change`).
 
 ---
 
-## 6. Workflow & environment facts (important for a fresh session)
+## 6. Workflow & environment facts (critical — these wasted time this session)
 
-- **Build the bootable image:** `cargo xtask image` → `target/x86_64-unknown-none/release/boot-uefi-m3os.img` (this is the artifact to flash; the separate `disk.img` is the data disk, NOT used by the diskless USB boot).
-- **Write USB:** `scripts/phase-100-write-usb.sh /dev/sdX` (validates whole-disk/removable/not-root, asks to confirm).
-- **Validation gate:** `cargo xtask check` (clippy -D warnings + rustfmt + host tests). Pre-commit runs it; pre-push adds smoke + regression.
-- **Reproducing diskless bugs in QEMU** — these bugs are diskless-only; `cargo xtask run` always regenerates `disk.img` and boots **serial** mode, so it can't reproduce the diskless **graphical** path. Boot the raw image with **no data disk**:
-  ```bash
-  qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
-    -drive format=raw,file=target/x86_64-unknown-none/release/boot-uefi-m3os.img \
-    -serial file:/tmp/diskless.log -m 2048 -smp 4 \
-    -cpu qemu64,+xsave,+avx,+xsaveopt,+smep,+smap,+aes \
-    -display none -vga std -no-reboot
-  ```
-  ⚠️ **QEMU has no real HID devices** — usb-hid prints "no HID devices attached — exiting cleanly" and exits. So QEMU reproduces the boot path / bar timing / term rendering, but **NOT** the USB-device bugs (the wedge, the keyboard). Those need the Dell.
-- **Getting logs off the Dell — SSH only.** m3OS sshd serves an **interactive shell only** (it rejects `exec` and sftp/scp). So:
-  - `echo dmesg | ssh root@<ip> > log` — runs `dmesg` on m3OS, output to a host file. The password prompts on your terminal (ssh reads it from /dev/tty, not stdin).
-  - Use the **`dmesg` command, not `cat /proc/kmsg`** — `cat` returns only the first ~4 KB of the ring (one read chunk → oldest-only); `dmesg` loops to EOF.
-  - Filter with `grep -a` (the SSH PTY injects control bytes).
-  - The USB `usb-logsink` boot.log does **not** work (the flashed USB has no ext2 partition to write to).
-- **HW topology reminder:** built-in keyboard = PS/2 (kernel path → kbd_server, works in GUI). USB mouse/keyboard = behind the dock hub → usb-hid. Network comes up (DHCP); `sshd` runs → that's the log channel.
+- **Build the bootable image:** `cargo xtask image` → `target/x86_64-unknown-none/release/boot-uefi-m3os.img`. The user flashes from **their** host (`git pull && cargo xtask image` there), not this one.
+- **Write USB:** `scripts/phase-100-write-usb.sh /dev/sdX` (now lsblk-authoritative). On the reference machine the USB is `/dev/sda` (NVMe system disk is `nvme0n1`). Direct fallback: `sudo dd if=…/boot-uefi-m3os.img of=/dev/sda bs=4M conv=fsync status=progress && sync`.
+- **Capture logs — FILTER ON THE M3OS SIDE.** A full `echo dmesg | ssh … > log` **truncates** (the SSH PTY / streaming `/proc/kmsg` gets cut mid-boot — we lost two captures to this). m3OS `grep` is **fixed-string, single-pattern** (`coreutils-rs/src/grep.rs`): `echo 'dmesg | grep usbhub' | ssh root@<ip> > x.log`. Each `dmesg` re-reads the full ring (per-fd cursor from oldest). The password prompts on your tty (ssh reads it from /dev/tty).
+- **`[userspace]` is the new-image gate.** If `grep '\[userspace\]'` is empty, the booted USB is an OLD image — re-flash. (We burned two cycles on stale images.)
+- **QEMU cannot reproduce any of this** — no real HID/hub/multi-controller. usb-hid prints "no HID devices … exiting" and the device-less paths are deliberately fast (the retry loops only trigger on a *timeout*, not a clean empty reply, so QEMU gates are unaffected). All USB-device bugs need the Dell.
+- **sshd serves an interactive shell only** (rejects exec/scp) — hence the `echo 'cmd' | ssh` idiom.
 
 ---
 
-## 7. Notes
-- `.agent/SESSION.md` is stale (left from a `/flow:pr-resolve` run early in the session) — ignore it; this doc supersedes it.
-- Suggested resume order: (1) get the `usb-hid: bound … role=` line from the Dell → fix the USB keyboard (§1), which also unblocks arm 4; (2) capture idle `dmesg` + `/proc/loadavg` → decide whether to fix the usbhub storm (§4.1) for arm 5; (3) arm 3 WC ratio (two builds); (4) arm 1 photo artifact → flip runbook status toward `Validated-on-HW`.
+## 7. Suggested resume order
+1. Get §1's `usbhub.log` + `usbhid.log` → branch on the tier-2 outcome. Most likely next fix is **server-side `EnumerateChild`** if usbhub reaches `reset+enabled` but `child enumerate FAILED`.
+2. Once the keyboard types: confirm the `149b7210` classifier actually fires (`role=KEYBOARD`) and arm 4 (USB keyboard in text mode) passes.
+3. Kill the residual ~2 s xHCI cpu-hog (§4.1) → re-check arm 5 (idle CPU flat) via `/proc/loadavg` + absence of `cpu-hog`.
+4. Arms 1 (greeter photo artifact) and 3 (WC blit-latency ratio) from the original runbook remain.
+
+> The original handoff's §1 (USB keyboard classification) is superseded: classification was *a* bug (`149b7210`) but the dominant blockers were the busy-spin storm and the usbhub wedge. `.agent/SESSION.md` is stale — ignore it; this doc supersedes it.
