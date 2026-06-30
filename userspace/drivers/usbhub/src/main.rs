@@ -533,6 +533,11 @@ fn program_main(_args: &[&str]) -> i32 {
 
         if any_change {
             consecutive_idle = 0;
+            // Mirror into the kernel dmesg ring (via sys_debug_print) as well as
+            // fd 1: on a bare-metal GUI boot the only off-box channel is `dmesg`
+            // over SSH, and a repeating re-enumerate line there is the fingerprint
+            // of a dock-hub change-bit storm (vs. a one-shot legitimate hot-plug).
+            syscall_lib::serial_print("usbhub: port status change detected; re-enumerating\n");
             syscall_lib::write_str(
                 STDOUT_FILENO,
                 "usbhub: port status change detected; re-enumerating\n",

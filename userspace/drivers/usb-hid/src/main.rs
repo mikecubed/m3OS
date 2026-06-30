@@ -69,14 +69,28 @@ static ALLOCATOR: BrkAllocator = BrkAllocator::new();
 
 #[alloc_error_handler]
 fn alloc_error(_layout: Layout) -> ! {
+    // Mirror to the kernel log ring so a bare-metal OOM death is visible in
+    // `dmesg` over SSH (driver fd-1 output is not captured there — see `klog`).
+    klog("usb-hid: alloc error\n");
     syscall_lib::write_str(STDOUT_FILENO, "usb-hid: alloc error\n");
     syscall_lib::exit(99)
 }
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
+    klog("usb-hid: PANIC\n");
     syscall_lib::write_str(STDOUT_FILENO, "usb-hid: PANIC\n");
     syscall_lib::exit(101)
+}
+
+/// Mirror a short diagnostic line into the kernel `dmesg` ring via
+/// `sys_debug_print` (it logs `[userspace] <msg>`, which `_kernel_print` writes
+/// to the dmesg ring + serial). A ring-3 driver's normal stdout (fd 1) is NOT
+/// captured by `dmesg`/`/proc/kmsg`, so on a bare-metal GUI boot — where the
+/// only off-box channel is `dmesg` over SSH — these lines are how the driver's
+/// lifecycle (bound role, exit reason, a crash) becomes observable.
+fn klog(msg: &str) {
+    syscall_lib::serial_print(msg);
 }
 
 syscall_lib::entry_point!(program_main);
@@ -422,6 +436,20 @@ fn poll_keyboard(usb_ep: u32, kbd_ep: u32, dev: &mut HidDevice, keymap: &Keymap)
             write_u8_hex(b);
         }
         syscall_lib::write_str(STDOUT_FILENO, "\n");
+        // Mirror into dmesg: proves an interrupt-IN boot report actually arrived
+        // from the keyboard over the (dock-hub) topology — isolating a delivery
+        // (controller/arming) failure from a decode/inject one on bare metal.
+        klog(&alloc::format!(
+            "usb-hid: kbd report {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}\n",
+            report[0],
+            report[1],
+            report[2],
+            report[3],
+            report[4],
+            report[5],
+            report[6],
+            report[7],
+        ));
     }
     let mut arr = [0u8; HID_KBD_REPORT_LEN];
     arr.copy_from_slice(&report[..HID_KBD_REPORT_LEN]);
@@ -683,6 +711,14 @@ fn emit_key_sentinel(ev: &KeyEvent) {
     syscall_lib::write_str(STDOUT_FILENO, " kc=0x");
     write_u32_hex(ev.keycode);
     syscall_lib::write_str(STDOUT_FILENO, "\n");
+    // Mirror into dmesg: proves the full USB→decode→kbd_server chain delivered a
+    // keystroke (visible over SSH on a bare-metal GUI boot).
+    klog(&alloc::format!(
+        "USB_HID:key kind={} sym=0x{:x} kc=0x{:x}\n",
+        ev.kind as u8,
+        ev.symbol,
+        ev.keycode,
+    ));
 }
 
 /// `USB_HID:mouse btn=0x<hex> moved=<0|1>` — proves a live interrupt-IN
@@ -1027,11 +1063,13 @@ fn reconcile_attachments(usb_ep: u32, devices: &mut Vec<HidDevice>) {
 
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, BOOT_LOG_MARKER);
+    klog("usb-hid: spawned\n");
 
     // 1. Wait for the xHCI driver to register the `usb` service (it is a
     //    `depends=xhci_driver` daemon, but ordering is best-effort). A bounded
     //    wait avoids hanging forever on a machine with no USB controller.
     if !syscall_lib::ipc_wait_service(USB_SERVICE_NAME, 10_000) {
+        klog("usb-hid: 'usb' service never appeared — exiting cleanly\n");
         syscall_lib::write_str(
             STDOUT_FILENO,
             "usb-hid: 'usb' service never appeared — exiting cleanly\n",
@@ -1039,6 +1077,7 @@ fn program_main(_args: &[&str]) -> i32 {
         return 0;
     }
     let Some(usb_ep) = lookup(USB_SERVICE_NAME) else {
+        klog("usb-hid: 'usb' lookup failed — exiting\n");
         syscall_lib::write_str(STDOUT_FILENO, "usb-hid: 'usb' lookup failed — exiting\n");
         return 0;
     };
@@ -1069,6 +1108,7 @@ fn program_main(_args: &[&str]) -> i32 {
     }
 
     if devices.is_empty() {
+        klog("usb-hid: no HID devices attached — exiting cleanly\n");
         syscall_lib::write_str(
             STDOUT_FILENO,
             "usb-hid: no HID devices attached — exiting cleanly\n",
@@ -1089,16 +1129,28 @@ fn program_main(_args: &[&str]) -> i32 {
         write_u8_dec(n.interface_class);
         syscall_lib::write_str(STDOUT_FILENO, " proto=");
         write_u8_dec(n.interface_protocol);
-        syscall_lib::write_str(
-            STDOUT_FILENO,
-            match dev.role {
-                DeviceRole::BootKeyboard => " role=KEYBOARD\n",
-                DeviceRole::BootMouse => " role=MOUSE\n",
-                DeviceRole::ReportPointer => " role=REPORT_POINTER\n",
-                DeviceRole::ReportConsumer => " role=REPORT_CONSUMER\n",
-                DeviceRole::Ignore => " role=other\n",
-            },
-        );
+        let role_str = match dev.role {
+            DeviceRole::BootKeyboard => " role=KEYBOARD\n",
+            DeviceRole::BootMouse => " role=MOUSE\n",
+            DeviceRole::ReportPointer => " role=REPORT_POINTER\n",
+            DeviceRole::ReportConsumer => " role=REPORT_CONSUMER\n",
+            DeviceRole::Ignore => " role=other\n",
+        };
+        syscall_lib::write_str(STDOUT_FILENO, role_str);
+        // Mirror the bound vid/pid/class/proto/role into the kernel dmesg ring
+        // so a bare-metal GUI boot — where the only off-box channel is `dmesg`
+        // over SSH and driver fd-1 output is invisible — reveals exactly what
+        // enumerated and how each interface was classified (the data point that
+        // distinguishes a classification gap from an enumeration/arming one).
+        klog(&alloc::format!(
+            "usb-hid: bound vid=0x{:04x} pid=0x{:04x} class={} sub={} proto={}{}",
+            n.vendor_id,
+            n.product_id,
+            n.interface_class,
+            n.interface_sub_class,
+            n.interface_protocol,
+            role_str,
+        ));
     }
 
     // 3. Resolve the input-server endpoints for the classes present. A
@@ -1152,6 +1204,7 @@ fn program_main(_args: &[&str]) -> i32 {
     }
 
     let keymap = Keymap::us_qwerty();
+    klog(READY_SENTINEL);
     syscall_lib::write_str(STDOUT_FILENO, READY_SENTINEL);
 
     // 4. Poll loop: each device's interrupt-IN endpoint, decode by role, inject.
