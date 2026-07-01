@@ -23,7 +23,7 @@ handoff](./2026-06-30-phase-100-bare-metal-gui-hw-validation.md) §6.
 - [ ] **Runbook arms 1 and 3** — greeter photo artifact; WC blit-latency ratio
       (`scripts/phase-100-bare-metal-validate.md` §4).
 
-## Phase 101 — ACPI Platform Foundation (fixture capture)
+## Phase 101 — ACPI Platform Foundation (fixture capture + HW arms)
 
 - [ ] **Capture the Dell's ACPI tables** — the Track A/B/C host tests currently run
       on QEMU/synthetic fixtures; the charter wants them on the real DSDT. Boot the
@@ -31,6 +31,15 @@ handoff](./2026-06-30-phase-100-bare-metal-gui-hw-validation.md) §6.
       path (or boot any Linux USB and `sudo acpidump > dell-5560-acpi.dat`). Land the
       dump under `kernel-core/tests/fixtures/acpi/` and re-point the
       `find_by_hid("DLL0945")` / touchpad-`_CRS` tests at it.
+- [ ] **acpid on metal** — boot log should show `ACPI_SMOKE:namespace-built` +
+      `sci-armed` from the real firmware (check `dmesg | grep acpid` /
+      `grep ACPI_SMOKE`). Record node/skipped counts; skips reveal which AML
+      constructs the Dell's tables need beyond the subset.
+- [ ] **FADT boot line on metal** — `[acpi] FADT: DSDT …, SCI_INT …, PM1a_EVT …`
+      with a non-zero DSDT pointer (D.1 `Validated-on-HW` arm).
+- [ ] **Lid-switch SCI** — close/open the lid; expect the kernel demux →
+      `acpid` GPE/fixed dispatch to log it (D.3/D.4 HW arm; charter's
+      lid `Validated-on-HW` item). Power button press is the fallback arm.
 
 ## Phase 106 — USB Installer (when the combined image lands)
 

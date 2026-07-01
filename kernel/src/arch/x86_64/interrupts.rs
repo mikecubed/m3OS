@@ -1191,6 +1191,8 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     // (allocated from the device-IRQ bank at `DEVICE_IRQ_VECTOR_BASE`).
     idt[InterruptIndex::Serial as u8].set_handler_fn(serial_handler);
     idt[InterruptIndex::Mouse as u8].set_handler_fn(mouse_handler);
+    // Phase 101 D.2 — ACPI SCI (routed on demand by sys_acpi_sci_subscribe).
+    idt[InterruptIndex::Sci as u8].set_handler_fn(sci_handler);
 
     // APIC spurious interrupt vector — must NOT send EOI.
     idt[InterruptIndex::Spurious as u8].set_handler_fn(spurious_handler);
@@ -2283,6 +2285,10 @@ pub enum InterruptIndex {
     /// Phase 56 Track B.2 — PS/2 AUX (mouse) IRQ12. With the standard PIC
     /// remap (master=32, slave=40), IRQ12 → vector 44.
     Mouse = 44,
+    /// Phase 101 Track D.2 — the ACPI System Control Interrupt. Routed by
+    /// `apic::route_sci` when the ring-3 `acpid` subscribes
+    /// (`sys_acpi_sci_subscribe`); never unmasked otherwise.
+    Sci = 45,
     Spurious = 0xFF,
 }
 
@@ -2940,6 +2946,26 @@ extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
 /// The IRQ12 line is shared with the slave PIC; we therefore only consume
 /// bytes whose status byte indicates the AUX port owns them. The 8042
 /// reports this via the AUX-OUTPUT bit (status bit 5).
+/// Phase 101 Track D — the SCI ISR. The demux (PM1a/GPE0 status reads,
+/// enable-bit masking, notification signal) lives in `acpi::sci::sci_demux`
+/// and obeys the ISR contract: port I/O + atomics only. Masking the
+/// asserted enable bits is what de-asserts the level-triggered line before
+/// the EOI — without it the SCI would re-fire in a storm until the ring-3
+/// `acpid` serviced the event.
+extern "x86-interrupt" fn sci_handler(stack_frame: InterruptStackFrame) {
+    clac_on_irq_entry();
+    let _ = crate::acpi::sci::sci_demux();
+    if USING_APIC.load(Ordering::Relaxed) {
+        super::apic::lapic_eoi();
+    } else {
+        unsafe {
+            PICS.lock()
+                .notify_end_of_interrupt(InterruptIndex::Sci as u8);
+        }
+    }
+    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+}
+
 extern "x86-interrupt" fn mouse_handler(stack_frame: InterruptStackFrame) {
     clac_on_irq_entry(); // SMAP enforce in-ISR when interrupted from ring 3 (M1)
     super::ps2::IRQ12_ENTRIES.fetch_add(1, Ordering::Relaxed);

@@ -240,6 +240,8 @@ static MT792X_DRIVER_ELF: &[u8] = generated_initrd_asset!("mt792x_driver");
 static XHCI_DRIVER_ELF: &[u8] = generated_initrd_asset!("xhci_driver");
 // Phase 78b Track B: ring-3 USB hub class driver.
 static USBHUB_ELF: &[u8] = generated_initrd_asset!("usbhub");
+// Phase 101 Track E: ring-3 ACPI daemon (AML namespace host + SCI events).
+static ACPID_ELF: &[u8] = generated_initrd_asset!("acpid");
 /// Phase 78c: ring-3 USB HID Boot-Protocol class driver (keyboard + mouse).
 static USB_HID_ELF: &[u8] = generated_initrd_asset!("usb_hid");
 /// Phase 92 Track D: ring-3 USB Mass Storage (Bulk-Only Transport) class driver.
@@ -1355,6 +1357,7 @@ static USR_ENTRIES: &[(&str, RamdiskNode)] = &[
 // any future `execve` call can target a canonical path that is not mixed
 // in with general userspace utilities under `/bin/`.
 static DRIVERS_ENTRIES: &[(&str, RamdiskNode)] = &[
+    ("acpid", RamdiskNode::File { content: ACPID_ELF }),
     (
         "nvme",
         RamdiskNode::File {

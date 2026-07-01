@@ -1,6 +1,6 @@
 # Phase 101 — ACPI Platform Foundation (AML + device/resource enumeration + SCI): Task List
 
-**Status:** In progress — Tracks A/B/C landed (host-tested `kernel-core/src/acpi/`; QEMU q35 DSDT + synthetic Dell-shaped fixtures green in CI). Tracks D/E/F planned. Dell-DSDT fixture arms pend the capture item on [`docs/handoffs/next-dell-session.md`](../../handoffs/next-dell-session.md).
+**Status:** In progress — Tracks A/B/C landed (host-tested `kernel-core/src/acpi/`; QEMU q35 DSDT + synthetic Dell-shaped fixtures green in CI); Track D/E cores landed (kernel FADT/SCI demux + `SYS_ACPI_*` surface + ring-3 `acpid` with `FindByHid`/`GetCrs`/`Sta` queries) with the QEMU `acpi-smoke` power-button arm green. Remaining: D.5/E.4 `Notify()`-subscriber routing, E.3 real `RegionSpace` backend, EC `_Qxx`, and the Dell capture + HW arms on [`docs/handoffs/next-dell-session.md`](../../handoffs/next-dell-session.md).
 **Source Ref:** phase-101
 **Depends on:** Phase 15 (ACPI table parse — RSDP/RSDT/XSDT, MADT, FADT) ✅, Phase 55a (DMAR/IVRS decode + the `kernel-core` host-tested table-decoder pattern) ✅, Phase 55b (capability-gated device-host syscalls + `Notification` IRQ objects) ✅
 **Goal:** Build an ACPI **namespace** on top of the existing static-table parse: a pragmatic AML interpreter (Track A), the namespace + `_HID`/`_CID` device tree (Track B), `_CRS` resource decode (Track C), SCI/GPE event handling + `Notify()` routing (Track D), a ring-3 `acpid` hosting the interpreter over a thin kernel surface (Track E), and host + bare-metal validation (Track F). The end state: on the Dell Tiger Lake, an `_HID` lookup for `DLL0945` finds the touchpad node and its `_CRS` yields the I2C address + `GpioInt` the Phase 102 driver needs, and a lid/power SCI is demuxed and routed to userspace.
@@ -12,9 +12,9 @@
 | A | AML interpreter (device-enumeration subset) in `kernel-core` — host-tested | — | Landed (`kernel-core/src/acpi/aml/{decode,interp,object}.rs`) |
 | B | Namespace build + device tree + `_HID`/`_CID` matching + `_STA` | A | Landed (`kernel-core/src/acpi/namespace.rs`) |
 | C | `_CRS` resource decode (I2C SerialBus / GpioInt / IRQ / Memory) | A, B | Landed (`kernel-core/src/acpi/resource.rs`) |
-| D | SCI handler + GPE dispatch + `_Lxx`/`_Exx`/`_Qxx` + `Notify()` routing | A, B, E | Planned |
-| E | Ring-3 `acpid` hosting + thin kernel surface + IPC query/event service (the split decision) | A, B, C | Planned |
-| F | Validation — host tests on captured DSDT, QEMU `acpi-smoke`, bare-metal run | A, B, C, D, E | Partial (host tests on the QEMU q35 DSDT + synthetic Dell-shaped fixtures are in; Dell capture, `acpi-smoke`, and the bare-metal run pend D/E) |
+| D | SCI handler + GPE dispatch + `_Lxx`/`_Exx`/`_Qxx` + `Notify()` routing | A, B, E | Landed core (D.1 FADT fields, D.2 route+ISR, D.3 demux+mask+notification, D.4 GPE `_Lxx`/`_Exx` eval + PM1 fixed events — QEMU power-button arm green via `acpi-smoke`); D.4 EC `_Qxx` + D.5 `Notify()` subscriber routing pending |
+| E | Ring-3 `acpid` hosting + thin kernel surface + IPC query/event service (the split decision) | A, B, C | Landed core (E.1 scaffold/wiring, E.2 `SYS_ACPI_TABLE_GET`/`SYS_ACPI_SCI_SUBSCRIBE`/`SYS_ACPI_PM_*`, E.4 `FindByHid`/`GetCrs`/`Sta` queries, E.5 split record); E.3 real `RegionSpace` backend (stub today) + E.4 `Subscribe` push pending |
+| F | Validation — host tests on captured DSDT, QEMU `acpi-smoke`, bare-metal run | A, B, C, D, E | Partial (host tests on the QEMU q35 DSDT + synthetic Dell-shaped fixtures green; `acpi-smoke` gate green + `M3OS_ACPI_REGRESSION` row live; Dell DSDT capture + HW arms pend the next Dell session) |
 
 ---
 
@@ -176,7 +176,7 @@
 **Why it matters:** `parse_fadt` reads only `IAPC_BOOT_ARCH` (offset 109) today; the DSDT pointer (offset 40 / `X_DSDT` 140), `SCI_INT` (offset 46), the PM1a event/control blocks, and `GPE0_BLK`/`GPE0_BLK_LEN` are needed to find the namespace and receive the SCI.
 
 **Acceptance:**
-- [ ] `parse_fadt` reads + caches the DSDT/`X_DSDT` pointer, `SCI_INT`, `PM1a_EVT_BLK`/`PM1a_CNT_BLK`, and `GPE0_BLK`/`GPE0_BLK_LEN` into `FADT_INFO`.
+- [x] `parse_fadt` reads + caches the DSDT/`X_DSDT` pointer, `SCI_INT`, `PM1a_EVT_BLK`/`PM1a_CNT_BLK`, and `GPE0_BLK`/`GPE0_BLK_LEN` into `FADT_INFO`.
 - [ ] On the Dell the boot log shows a non-zero DSDT pointer + the `SCI_INT` GSI + the `GPE0_BLK` I/O port (`Validated-on-HW`); host-side parse test over a captured FADT asserts the field offsets.
 
 ### D.2 — SCI ISR + IOAPIC redirection for the SCI GSI
@@ -189,8 +189,8 @@
 **Why it matters:** The SCI is a level-triggered, active-low GSI; it must be routed to a dedicated vector exactly like the ISA IRQs `ioapic_init` already programs, or no ACPI event is ever received.
 
 **Acceptance:**
-- [ ] The `SCI_INT` GSI (from D.1, honoring any `acpi::irq_override`) is programmed level-triggered/active-low to a new ISR vector.
-- [ ] In QEMU, a `qmp system_powerdown` raises the SCI and increments an SCI-received counter (asserted by `acpi-smoke`, F.2).
+- [x] The `SCI_INT` GSI (from D.1, honoring any `acpi::irq_override`) is programmed level-triggered/active-low to a new ISR vector.
+- [x] In QEMU, a `qmp system_powerdown` raises the SCI and increments an SCI-received counter (asserted by `acpi-smoke`, F.2).
 
 ### D.3 — Kernel SCI demux + hardware ack/mask + `Notification` signal
 
@@ -199,9 +199,9 @@
 **Why it matters:** A level-triggered SCI will storm if userspace is the only handler; the kernel must read PM1_STS/GPE_STS, mask the asserted enable bits, EOI, and hand the *pending bitmap* to `acpid` — the privileged half of the split.
 
 **Acceptance:**
-- [ ] The ISR reads `PM1_STS` + `GPE_STS`, masks the asserted bits in `PM1_EN`/`GPE_EN`, EOIs, and signals `acpid`'s `Notification` with the pending event word — no interrupt storm (the line de-asserts).
-- [ ] The pending PM1/GPE bitmap reaches `acpid` (verified by the QEMU power-button arm and the HW lid arm).
-- [ ] No allocation / blocking / IPC-call inside the ISR (per the interrupt-handler convention) — only a register read/mask + `Notification` signal.
+- [x] The ISR reads `PM1_STS` + `GPE_STS`, masks the asserted bits in `PM1_EN`/`GPE_EN`, EOIs, and signals `acpid`'s `Notification` with the pending event word — no interrupt storm (the line de-asserts).
+- [ ] The pending PM1/GPE bitmap reaches `acpid` (verified by the QEMU power-button arm and the HW lid arm). *(QEMU power-button arm green via `acpi-smoke`; the Dell lid arm pends the next HW session.)*
+- [x] No allocation / blocking / IPC-call inside the ISR (per the interrupt-handler convention) — only a register read/mask + `Notification` signal.
 
 ### D.4 — `acpid` GPE / fixed-event dispatch (`_Lxx`/`_Exx`/`_Qxx`)
 
@@ -210,8 +210,8 @@
 **Why it matters:** Each asserted GPE bit maps to a `_Lxx` (level) or `_Exx` (edge) method; EC events run `_Qxx`; fixed events (power button `PWRB`, lid `LID0`) map to their handlers. Running them is the *policy* that makes an SCI mean something.
 
 **Acceptance:**
-- [ ] For each pending GPE bit, `acpid` evaluates the matching `_Lxx`/`_Exx` method (or the EC `_Qxx`) via the Track A interpreter, then re-enables that GPE through the kernel.
-- [ ] The power-button fixed event runs its path in QEMU (`acpi-smoke`); the lid `_LID` returns a state on the Dell (`Validated-on-HW`).
+- [ ] For each pending GPE bit, `acpid` evaluates the matching `_Lxx`/`_Exx` method (or the EC `_Qxx`) via the Track A interpreter, then re-enables that GPE through the kernel. *(`_Lxx`/`_Exx` evaluation + status-clear landed; `acpid` deliberately does not blind-re-enable GPEs it never armed, and EC `_Qxx` pends the Phase 103 EC work.)*
+- [ ] The power-button fixed event runs its path in QEMU (`acpi-smoke`); the lid `_LID` returns a state on the Dell (`Validated-on-HW`). *(QEMU power-button arm green; Dell `_LID` pends HW.)*
 
 ### D.5 — `Notify()` routing to ring-3 subscribers
 
@@ -240,8 +240,8 @@
 **Why it matters:** Missing any of the four wiring points means `acpid` is not built, not embedded, or not started (per the "Adding a New Userspace Binary" rule). `needs_alloc = true` (uses `kernel-core`/`Vec`).
 
 **Acceptance:**
-- [ ] `cargo xtask check` builds `acpid`; it is embedded in the ramdisk and launched from `services.d/acpid.conf` (and `init`'s builtin defaults for the no-data-disk bare-metal path).
-- [ ] Defines a `#[global_allocator]` (`syscall_lib::heap::BrkAllocator`) and enables the `alloc` feature on `syscall-lib`.
+- [x] `cargo xtask check` builds `acpid`; it is embedded in the ramdisk and launched from `services.d/acpid.conf` (and `init`'s builtin defaults for the no-data-disk bare-metal path).
+- [x] Defines a `#[global_allocator]` (`syscall_lib::heap::BrkAllocator`) and enables the `alloc` feature on `syscall-lib`.
 
 ### E.2 — Thin kernel ACPI surface (table blob + SCI subscribe + PM/GPE access)
 
@@ -253,9 +253,9 @@
 **Why it matters:** `acpid` must fetch the firmware bytes the FADT points at, bind the SCI as a `Notification`, and read/write PM1/GPE — without these the ring-3 interpreter has no input and no events.
 
 **Acceptance:**
-- [ ] `acpid` fetches the DSDT (+ each SSDT) bytes read-only from the kernel (located via `find_table`/`SDT_ENTRIES`, translated through `phys_to_virt`) and the namespace builds.
-- [ ] `acpid` subscribes the SCI `Notification` and is woken when D.3 signals it.
-- [ ] `acpid` reads `PM1_STS` / re-enables a `GPE_EN` bit through the surface (PIO/MMIO, capability-gated) — and a non-`acpid` process is denied.
+- [x] `acpid` fetches the DSDT (+ each SSDT) bytes read-only from the kernel (located via `find_table`/`SDT_ENTRIES`, translated through `phys_to_virt`) and the namespace builds.
+- [x] `acpid` subscribes the SCI `Notification` and is woken when D.3 signals it.
+- [ ] `acpid` reads `PM1_STS` / re-enables a `GPE_EN` bit through the surface (PIO/MMIO, capability-gated) — and a non-`acpid` process is denied. *(PM1_STS read/clear + PM1_EN re-arm proven live by `acpi-smoke`; the GPE_EN selector exists but no GPE re-arm consumer yet, and the `/drivers/`-gate denial arm has no negative test yet.)*
 
 ### E.3 — `RegionSpace` backend over `device_host` syscalls
 
@@ -274,7 +274,7 @@
 **Why it matters:** Phase 102 (touchpad) and Phase 103 (power) attach by asking `acpid` to resolve a device + its resources and to subscribe to its events; this is the public face of the namespace.
 
 **Acceptance:**
-- [ ] A client resolves `FindByHid("DLL0945")` → a device handle, `GetResources` → a `DeviceResources` (I2C addr + GpioInt), over IPC.
+- [ ] A client resolves `FindByHid("DLL0945")` → a device handle, `GetResources` → a `DeviceResources` (I2C addr + GpioInt), over IPC. *(`FindByHid`/`GetCrs`/`Sta` labels are served (path + raw `_CRS` bytes; decode client-side via `kernel-core`); the first real client lands with Phase 102.)*
 - [ ] A client `Subscribe`s to a device and receives a `Notify()` event pushed from D.5.
 - [ ] The protocol is documented in the crate header (the contract Phase 102/103 consume).
 
@@ -285,8 +285,8 @@
 **Why it matters:** The spec requires deciding the ring-0-vs-ring-3 split honestly; recording *why* (interpreter size, fault isolation, host-testability) prevents a future drift back toward an in-kernel VM.
 
 **Acceptance:**
-- [ ] The rationale is recorded: AML interpreter in ring-3 `acpid`; ring 0 keeps only the FADT parse + SCI hardware-ack/demux + the thin blob/`Notification`/register surface.
-- [ ] A grep of the kernel tree finds **no** AML opcode evaluator symbols in ring 0 (the interpreter lives only in `kernel-core` + `acpid`).
+- [x] The rationale is recorded: AML interpreter in ring-3 `acpid`; ring 0 keeps only the FADT parse + SCI hardware-ack/demux + the thin blob/`Notification`/register surface.
+- [x] A grep of the kernel tree finds **no** AML opcode evaluator symbols in ring 0 (the interpreter lives only in `kernel-core` + `acpid`).
 
 ---
 
@@ -314,9 +314,9 @@
 **Why it matters:** QEMU models a generic ACPI namespace + the power-button SCI, so the *substrate* (namespace build, SCI demux → `acpid` dispatch → `Notify`) is CI-testable without the laptop — maximizing the non-HW-only surface.
 
 **Acceptance:**
-- [ ] Boots m3OS, asserts `acpid` built the namespace from QEMU's DSDT and enumerated the emulated devices (a sentinel line).
-- [ ] A `qmp system_powerdown` raises the power-button SCI; the gate asserts the kernel demux signalled `acpid`, the power-button method ran, and a `Notify()` reached a test subscriber.
-- [ ] `M3OS_ACPI_REGRESSION=1` row added to the `AGENTS.md` gate table; the laptop-device arms skip-with-reason in QEMU.
+- [x] Boots m3OS, asserts `acpid` built the namespace from QEMU's DSDT and enumerated the emulated devices (a sentinel line).
+- [ ] A `qmp system_powerdown` raises the power-button SCI; the gate asserts the kernel demux signalled `acpid`, the power-button method ran, and a `Notify()` reached a test subscriber. *(Green through "acpid dispatched the power-button event"; the `Notify()`-to-subscriber tail pends D.5/E.4 `Subscribe`.)*
+- [x] `M3OS_ACPI_REGRESSION=1` row added to the `AGENTS.md` gate table; the laptop-device arms skip-with-reason in QEMU.
 
 ### F.3 — Bare-metal validation run (Dell Tiger Lake)
 

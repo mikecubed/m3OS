@@ -11,6 +11,8 @@ use kernel_core::pci::McfgEntry;
 use spin::Once;
 use x86_64::PhysAddr;
 
+pub mod sci;
+
 // ---------------------------------------------------------------------------
 // P15-T001: Global RSDP address
 // ---------------------------------------------------------------------------
@@ -109,6 +111,65 @@ pub struct MadtInfo {
 }
 
 static MADT_INFO: Once<MadtInfo> = Once::new();
+
+// ---------------------------------------------------------------------------
+// Phase 101 (D.1): FADT fields beyond IAPC_BOOT_ARCH — the DSDT pointer the
+// namespace layer needs plus the SCI/PM1/GPE plumbing the SCI path needs.
+// ---------------------------------------------------------------------------
+
+/// FADT (`FACP`) fields cached at parse time (ACPI 6.5 §5.2.9 offsets).
+/// Everything here is read-only after `init`; the SCI ISR and the ACPI
+/// table-blob accessor both consume it.
+#[derive(Clone, Copy)]
+pub struct FadtInfo {
+    /// 32-bit physical DSDT pointer (offset 40).
+    pub dsdt: u32,
+    /// 64-bit physical DSDT pointer (offset 140, tables ≥ ACPI 2.0);
+    /// preferred over `dsdt` when non-zero.
+    pub x_dsdt: u64,
+    /// GSI of the System Control Interrupt (offset 46).
+    pub sci_int: u16,
+    /// SMI command port (offset 48); 0 = system has no SMI handshake.
+    pub smi_cmd: u32,
+    /// Value written to `smi_cmd` to hand SCI ownership to the OS
+    /// (offset 52).
+    pub acpi_enable: u8,
+    /// PM1a event block port (offset 56) — status register at +0,
+    /// enable register at +`pm1_evt_len`/2.
+    pub pm1a_evt_blk: u32,
+    /// PM1b event block port (offset 60); 0 on most machines (QEMU q35
+    /// has none).
+    pub pm1b_evt_blk: u32,
+    /// PM1a control block port (offset 64) — `SCI_EN` is bit 0.
+    pub pm1a_cnt_blk: u32,
+    /// Combined length of one PM1 event block in bytes (offset 88);
+    /// status and enable each occupy half.
+    pub pm1_evt_len: u8,
+    /// PM1 control block length in bytes (offset 89).
+    pub pm1_cnt_len: u8,
+    /// GPE0 block port (offset 76) — status bytes, then enable bytes.
+    pub gpe0_blk: u32,
+    /// GPE0 block length in bytes (offset 92); status and enable halves.
+    pub gpe0_blk_len: u8,
+}
+
+impl FadtInfo {
+    /// The physical DSDT address, preferring the 64-bit `X_DSDT`.
+    pub fn dsdt_phys(&self) -> u64 {
+        if self.x_dsdt != 0 {
+            self.x_dsdt
+        } else {
+            self.dsdt as u64
+        }
+    }
+}
+
+static FADT_INFO: Once<FadtInfo> = Once::new();
+
+/// The cached FADT fields, if a valid FACP was found at init.
+pub fn fadt_info() -> Option<&'static FadtInfo> {
+    FADT_INFO.get()
+}
 
 // ---------------------------------------------------------------------------
 // Phase 55 (B.1): MCFG table — PCIe Enhanced Configuration Access Mechanism
@@ -332,6 +393,50 @@ pub fn find_table(signature: &[u8; 4]) -> Option<*const AcpiSdtHeader> {
     None
 }
 
+/// Find the `index`-th table with the given signature (Phase 101: firmware
+/// commonly ships several `SSDT`s). `DSDT` is special-cased — it is not an
+/// RSDT/XSDT entry but hangs off the FADT's DSDT/`X_DSDT` pointer.
+pub fn table_by_index(signature: &[u8; 4], index: usize) -> Option<*const AcpiSdtHeader> {
+    if signature == b"DSDT" {
+        if index != 0 {
+            return None;
+        }
+        let phys = fadt_info()?.dsdt_phys();
+        if phys == 0 {
+            return None;
+        }
+        let hdr_virt = phys_to_virt(PhysAddr::new(phys));
+        // The DSDT is firmware-provided like any SDT: validate its own
+        // signature + checksum before handing it out.
+        let sig = unsafe {
+            let sig_ptr = core::ptr::addr_of!((*(hdr_virt as *const AcpiSdtHeader)).signature);
+            ptr::read_unaligned(sig_ptr)
+        };
+        if sig != *b"DSDT" || !validate_sdt(hdr_virt) {
+            log::warn!("[acpi] DSDT at {phys:#x} failed signature/checksum validation");
+            return None;
+        }
+        return Some(hdr_virt as *const AcpiSdtHeader);
+    }
+    let entries = SDT_ENTRIES.get()?;
+    let mut seen = 0usize;
+    for i in 0..entries.count {
+        let hdr_virt = entries.entries[i];
+        // SAFETY: hdr_virt points to an identity-mapped ACPI SDT header.
+        let sig = unsafe {
+            let sig_ptr = core::ptr::addr_of!((*(hdr_virt as *const AcpiSdtHeader)).signature);
+            ptr::read_unaligned(sig_ptr)
+        };
+        if sig == *signature {
+            if seen == index {
+                return Some(hdr_virt as *const AcpiSdtHeader);
+            }
+            seen += 1;
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // P15-T008: MADT parsing
 // ---------------------------------------------------------------------------
@@ -467,6 +572,68 @@ fn parse_fadt() {
     } else {
         log::warn!("[acpi] FADT too short for IAPC_BOOT_ARCH field");
     }
+
+    // Phase 101 (D.1): the fields parse_fadt skipped until the namespace/
+    // SCI work needed them. All reads are bounds-checked against the
+    // table's declared length; a short (ACPI 1.0) table simply yields
+    // zeros for the fields it lacks.
+    let read_u8 = |off: usize| -> u8 {
+        if table_length > off {
+            // SAFETY: bounds-checked read inside the validated FADT.
+            unsafe { ptr::read_unaligned((hdr_virt + off) as *const u8) }
+        } else {
+            0
+        }
+    };
+    let read_u16 = |off: usize| -> u16 {
+        if table_length >= off + 2 {
+            // SAFETY: bounds-checked read inside the validated FADT.
+            unsafe { ptr::read_unaligned((hdr_virt + off) as *const u16) }
+        } else {
+            0
+        }
+    };
+    let read_u32 = |off: usize| -> u32 {
+        if table_length >= off + 4 {
+            // SAFETY: bounds-checked read inside the validated FADT.
+            unsafe { ptr::read_unaligned((hdr_virt + off) as *const u32) }
+        } else {
+            0
+        }
+    };
+    let read_u64 = |off: usize| -> u64 {
+        if table_length >= off + 8 {
+            // SAFETY: bounds-checked read inside the validated FADT.
+            unsafe { ptr::read_unaligned((hdr_virt + off) as *const u64) }
+        } else {
+            0
+        }
+    };
+    let info = FadtInfo {
+        dsdt: read_u32(40),
+        x_dsdt: read_u64(140),
+        sci_int: read_u16(46),
+        smi_cmd: read_u32(48),
+        acpi_enable: read_u8(52),
+        pm1a_evt_blk: read_u32(56),
+        pm1b_evt_blk: read_u32(60),
+        pm1a_cnt_blk: read_u32(64),
+        pm1_evt_len: read_u8(88),
+        pm1_cnt_len: read_u8(89),
+        gpe0_blk: read_u32(76),
+        gpe0_blk_len: read_u8(92),
+    };
+    log::info!(
+        "[acpi] FADT: DSDT {:#x}, SCI_INT {}, PM1a_EVT {:#x}/{}B, PM1a_CNT {:#x}, GPE0 {:#x}/{}B",
+        info.dsdt_phys(),
+        info.sci_int,
+        info.pm1a_evt_blk,
+        info.pm1_evt_len,
+        info.pm1a_cnt_blk,
+        info.gpe0_blk,
+        info.gpe0_blk_len
+    );
+    FADT_INFO.call_once(|| info);
 }
 
 // ---------------------------------------------------------------------------

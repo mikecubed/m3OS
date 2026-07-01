@@ -61,9 +61,9 @@ fn alloc_error(_layout: Layout) -> ! {
 // `ahci_driver`). The fallback loader (`load_services_from_known_configs`) and
 // the dir-scan path both stop adding services once `self.count >= MAX_SERVICES`,
 // so the ceiling must exceed the number of `.conf` files actually present (the
-// ext2 staging now writes 32) or the last entries are silently dropped. Sized
+// ext2 staging now writes 33) or the last entries are silently dropped. Sized
 // with headroom for future additions; the extra slots cost a few hundred bytes.
-const MAX_SERVICES: usize = 34;
+const MAX_SERVICES: usize = 36;
 const MAX_DISCOVERED_DISABLED: usize = 24;
 const MAX_PIDS: usize = 64;
 const MAX_DEPS: usize = 4;
@@ -217,6 +217,8 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/ure_driver.conf\0",
     // Phase 81: ring-3 MediaTek mt792x Wi-Fi driver.
     b"/etc/services.d/mt792x_driver.conf\0",
+    // Phase 101 Track E: ring-3 ACPI daemon.
+    b"/etc/services.d/acpid.conf\0",
     // Phase 78a B.2: ring-3 xHCI USB host-controller driver.
     b"/etc/services.d/xhci_driver.conf\0",
     // Phase 78b Track B: ring-3 USB hub class driver.
@@ -1416,6 +1418,12 @@ impl ServiceManager {
             // `display.input-owner` IPC service (stdin_feeder probes it with
             // `ipc_service_exists`) — no competing text login occurs.
             b"name=stdin_feeder\ncommand=/bin/stdin_feeder\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=console,kbd\n",
+            // Phase 101 Track E: ring-3 ACPI daemon — builds the AML namespace
+            // from the DSDT/SSDTs, serves the `acpi` device/resource query
+            // service (Phase 102 touchpad, Phase 103 power), and dispatches
+            // SCI events (power button, lid). Exits cleanly on a platform
+            // with no FACP, so on-failure restarts don't loop there.
+            b"name=acpid\ncommand=/drivers/acpid\ntype=daemon\nrestart=on-failure\nmax_restart=5\n",
             // xHCI host controller + USB HID class driver (USB keyboard/mouse).
             b"name=xhci_driver\ncommand=/drivers/xhci\ntype=daemon\nrestart=on-failure\nmax_restart=5\n",
             b"name=usb_hid\ncommand=/drivers/usb-hid\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n",
