@@ -8,5 +8,6 @@
 //! Phase 55b Track A.4 — hosts the `MockBackend` reference implementation
 //! of the `driver_runtime` contract traits.
 
+pub mod aml_builder;
 pub mod driver_runtime_mock;
 pub mod mock_unit;

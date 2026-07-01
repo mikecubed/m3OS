@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod acpi;
 pub mod address_space;
 pub mod audio;
 pub mod buddy;
