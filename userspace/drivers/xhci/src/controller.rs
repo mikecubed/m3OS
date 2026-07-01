@@ -146,24 +146,36 @@ const INPUT_CONTEXT_ENTRIES: usize = DEVICE_CONTEXT_ENTRIES + 1;
 /// controller that stalled the *single-threaded* driver for minutes before it
 /// reached `server::run`. Every other ring-3 task (the NIC's `ure`, the HID
 /// driver) blocks on its first `NextAttach` IPC until then, so the whole USB
-/// subsystem looks hung. `poll_yield` instead sleeps 100µs per iteration:
+/// subsystem looks hung. `poll_yield` instead sleeps 1 ms per iteration:
 /// the CPU is released to those tasks, and the worst case is a bounded
 /// wall-clock timeout rather than a multi-second spin. 1 s covers the slow
 /// CNR-clear after `HCRST` (xHCI allows the controller to stay Not-Ready for a
 /// while); 250 ms covers a USB2 port reset's PRC latch.
-const POLL_ITERS_1S: u32 = 10_000;
-const POLL_ITERS_250MS: u32 = 2_500;
+///
+/// The per-iteration sleep MUST be ≥ 1 ms (one scheduler tick): the kernel
+/// services a sub-millisecond `nanosleep` as a TSC busy-spin that never
+/// deschedules (a context switch would cost more than the sleep), so the
+/// previous 100 µs sleep did NOT release the CPU — `poll_yield(POLL_ITERS_1S)`
+/// pinned a core for a full second per call. With two xHCI controllers on a
+/// laptop, back-to-back bring-up waits surfaced as the multi-second
+/// `cpu-hog …/drivers/xhci …Running` storm in the bare-metal log, which starved
+/// the HID class driver's `NextAttach` (it then exited "no HID devices"). At
+/// 1 ms the iteration counts shrink so the wall-clock budgets are unchanged.
+const POLL_ITERS_1S: u32 = 1_000;
+const POLL_ITERS_250MS: u32 = 250;
 
-/// Poll `ready` every 100µs, yielding the CPU, until it returns `true` or
-/// `max_iters` elapse. Returns whether `ready` ultimately held. Unlike a tight
-/// fixed-iteration spin, each iteration sleeps so a wedged register cannot starve
-/// the other ring-3 tasks waiting on this driver's IPC server.
+/// Poll `ready` every 1 ms, yielding the CPU, until it returns `true` or
+/// `max_iters` elapse. Returns whether `ready` ultimately held. Each iteration
+/// blocks for a full scheduler tick (a real deschedule, not a busy-spin) so a
+/// wedged register cannot starve the other ring-3 tasks waiting on this driver's
+/// IPC server.
 fn poll_yield(max_iters: u32, mut ready: impl FnMut() -> bool) -> bool {
     for _ in 0..max_iters {
         if ready() {
             return true;
         }
-        let _ = syscall_lib::nanosleep_for(0, 100_000);
+        // 1 ms ≥ one tick → kernel uses block_current_until (real yield).
+        let _ = syscall_lib::nanosleep_for(0, 1_000_000);
     }
     ready()
 }
@@ -2468,12 +2480,24 @@ impl Controller {
         let off = self.portsc(portnum);
         let raw = self.op_u32(off);
         let p = port::Portsc(raw);
-        // Acknowledge the connect-status change (RW1C) so the edge is not
-        // re-reported, then classify connect vs disconnect.
-        if p.csc() {
-            let cleared = port::portsc_clear_change(raw, port::PORTSC_CSC);
-            self.op_write_u32(off, cleared);
-            if p.ccs() {
+        // Classify connect vs disconnect from the connect-status edge BEFORE we
+        // clear anything.
+        let connect_change = p.csc();
+        let connected = p.ccs();
+        // Acknowledge EVERY pending RW1C change bit (CSC | PEC | WRC | OCC | PRC
+        // | PLC | CEC), not just CSC. A SuperSpeed dock hub asserts PLC (Port
+        // Link State Change) continuously as its USB3 link cycles U0/U1/U2 for
+        // power management, and may also raise PEC/CEC; leaving any change bit
+        // set keeps the controller re-asserting Port Status Change against the
+        // single-threaded server, which on Intel/Tiger-Lake silicon manifests
+        // as the server pinning a core (a ~2 s cpu-hog in the bare-metal log)
+        // and starving the HID class driver. Clearing the full RW1C mask in one
+        // RW1C write quiesces the port — standard xHCI driver discipline
+        // (`portsc_clear_change` preserves PED and the non-change status bits).
+        let acked = port::portsc_clear_change(raw, port::PORTSC_RW1C_MASK);
+        self.op_write_u32(off, acked);
+        if connect_change {
+            if connected {
                 // A real connect: drive the A.7 reset path (decoding speed) and
                 // queue the connect for the server's enumeration (Track C.1/C.3).
                 if let Some(speed) = self.reset_port_with_speed(portnum) {

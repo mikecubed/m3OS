@@ -161,7 +161,8 @@ ecosystem support inside m3OS.
   ecosystem tools (ripgrep, fd, etc.) is possible but deferred.
 - Running `cargo` or `rustc` inside m3OS is a stretch goal for future phases.
 - Dynamic linking of Rust programs is not supported — all binaries are static.
-- Debug symbol support and remote debugging (gdb stub) are deferred.
+- Debug symbol support and remote debugging (gdb stub) are deferred — now
+  chartered as [Phase 111 — Remote Debugging](./roadmap/111-remote-debugging.md).
 
 ## Related Roadmap Docs
 

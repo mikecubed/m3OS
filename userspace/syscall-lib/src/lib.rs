@@ -459,6 +459,16 @@ pub const SYS_IPC_PEER_IS_DRIVER: u64 = 0x111B;
 /// state when otherwise idle.
 pub const SYS_IPC_RECV_MSG_TIMEOUT: u64 = 0x111C;
 
+/// Phase 100 (bare-metal GUI): `ipc_call_buf_timeout(ep_cap, label, data0,
+/// buf_ptr, buf_len, deadline_ns)`. The bulk-bearing variant of
+/// [`SYS_IPC_CALL_TIMEOUT`] / the deadline variant of [`SYS_IPC_CALL_BUF`]:
+/// sends `buf` as the request bulk and blocks for the reply until an absolute
+/// CLOCK_MONOTONIC-ns deadline, returning the reply label, or `NEG_ETIMEDOUT`
+/// (-110) on expiry, or `u64::MAX` on transport error. Lets a client of a
+/// monopolised single-threaded server (usb-hid → xHCI) give up and retry
+/// instead of parking forever in `BlockedOnReply`.
+pub const SYS_IPC_CALL_BUF_TIMEOUT: u64 = 0x111D;
+
 /// Phase 74 Track B: `sys_page_grant_send(pages_vaddr, n_pages)`. Hands
 /// `n_pages` contiguous user-space pages starting at `pages_vaddr` to
 /// the kernel as a `PageGrant`. Returns the new capability handle on
@@ -822,6 +832,38 @@ pub fn ipc_call_buf(ep_cap_handle: u32, label: u64, data0: u64, buf: &[u8]) -> u
             buf.as_ptr() as u64,
             buf.len() as u64,
             0,
+        )
+    }
+}
+
+/// Bulk-bearing call with an absolute CLOCK_MONOTONIC-ns deadline — the
+/// timeout variant of [`ipc_call_buf`] (see [`SYS_IPC_CALL_BUF_TIMEOUT`]).
+///
+/// Sends `buf` as the request bulk and blocks for the reply until
+/// `deadline_ns`. Returns the reply label on success, `NEG_ETIMEDOUT`
+/// (`(-110_i64) as u64`) if the deadline elapses first, or `u64::MAX` on
+/// transport error. As with [`ipc_call_buf`], consume any reply bulk via
+/// [`ipc_take_pending_bulk`] immediately after a *successful* return; on a
+/// timeout there is no reply bulk to take.
+///
+/// Compute `deadline_ns` from [`clock_gettime`]'s monotonic clock plus the
+/// desired budget.
+pub fn ipc_call_buf_timeout(
+    ep_cap_handle: u32,
+    label: u64,
+    data0: u64,
+    buf: &[u8],
+    deadline_ns: u64,
+) -> u64 {
+    unsafe {
+        syscall6(
+            SYS_IPC_CALL_BUF_TIMEOUT,
+            ep_cap_handle as u64,
+            label,
+            data0,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            deadline_ns,
         )
     }
 }

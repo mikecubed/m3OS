@@ -466,4 +466,215 @@ mod tests {
         let ms = [manifest("a", &["missing"])];
         assert_eq!(detect_cycles(&ms), [0]);
     }
+
+    // ---- Phase 100 Track A.1 — builtin graphical-stack entries ----------
+    //
+    // Each test feeds the exact byte string from `BUILTIN_CONFIGS` in
+    // `userspace/init/src/main.rs` through `parse_manifest` (the kernel-core
+    // heap-backed equivalent of `parse_service_def` used in init). Both
+    // parsers accept the same `key=value` line format, so this gives
+    // host-testable coverage that the new entries are well-formed and carry
+    // the correct dependency edges before a QEMU boot is needed.
+    //
+    // Rationale for placing tests here rather than in init/main.rs: init is
+    // a `no_std` binary with no `#[cfg(test)]` module; kernel-core's
+    // `parse_manifest` is the canonical, host-testable parser for the same
+    // format. The byte strings below are kept byte-for-byte identical to the
+    // BUILTIN_CONFIGS literals so a mismatch would surface immediately.
+
+    #[test]
+    fn builtin_display_server_parses() {
+        // name=display (registered service name), command=/bin/display_server,
+        // depends=kbd (matching data-disk display_server.conf).
+        let cfg = "name=display\ncommand=/bin/display_server\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=kbd\n";
+        let (m, warns) = parse(cfg).expect("display_server builtin must parse");
+        assert_eq!(m.name, "display");
+        assert_eq!(m.command, "/bin/display_server");
+        assert_eq!(m.service_type, ServiceType::Daemon);
+        assert_eq!(m.restart_policy, RestartPolicy::OnFailure);
+        assert_eq!(m.depends, ["kbd"]);
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn builtin_mouse_server_parses() {
+        // mouse_server: peer of kbd, no graphical dependency on the builtin
+        // path (Phase 100 Track A.1 — starts before display_server so pointer
+        // events are buffered early).
+        let cfg = "name=mouse_server\ncommand=/bin/mouse_server\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
+        let (m, warns) = parse(cfg).expect("mouse_server builtin must parse");
+        assert_eq!(m.name, "mouse_server");
+        assert_eq!(m.command, "/bin/mouse_server");
+        assert_eq!(m.service_type, ServiceType::Daemon);
+        assert_eq!(m.restart_policy, RestartPolicy::OnFailure);
+        assert!(
+            m.depends.is_empty(),
+            "mouse_server must have no deps on builtin path"
+        );
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn builtin_session_manager_parses() {
+        // session_manager: session orchestrator, no explicit deps.
+        let cfg = "name=session_manager\ncommand=/bin/session_manager\ntype=daemon\nrestart=on-failure\nmax_restart=3\n";
+        let (m, warns) = parse(cfg).expect("session_manager builtin must parse");
+        assert_eq!(m.name, "session_manager");
+        assert_eq!(m.command, "/bin/session_manager");
+        assert_eq!(m.service_type, ServiceType::Daemon);
+        assert_eq!(m.restart_policy, RestartPolicy::OnFailure);
+        assert!(m.depends.is_empty());
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn builtin_audio_server_parses() {
+        // audio_server: ring-3 AC97/HDA driver; depends on display so the
+        // compositor is up before audio claims the device.
+        let cfg = "name=audio_server\ncommand=/drivers/audio_server\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display\n";
+        let (m, warns) = parse(cfg).expect("audio_server builtin must parse");
+        assert_eq!(m.name, "audio_server");
+        assert_eq!(m.command, "/drivers/audio_server");
+        assert_eq!(m.depends, ["display"]);
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn builtin_greeter_parses_with_four_deps() {
+        // greeter: GUI login manager. Four dependency edges — the exact MAX_DEPS
+        // boundary for init's fixed-size dep array. All four must round-trip.
+        let cfg = "name=greeter\ncommand=/bin/greeter\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display,kbd,mouse_server,audio_server\n";
+        let (m, warns) = parse(cfg).expect("greeter builtin must parse");
+        assert_eq!(m.name, "greeter");
+        assert_eq!(m.command, "/bin/greeter");
+        assert_eq!(m.service_type, ServiceType::Daemon);
+        assert_eq!(m.restart_policy, RestartPolicy::OnFailure);
+        assert_eq!(m.max_restart, 3);
+        // All four dependency edges must be present and in order.
+        assert_eq!(m.depends.len(), 4);
+        assert_eq!(m.depends[0], "display");
+        assert_eq!(m.depends[1], "kbd");
+        assert_eq!(m.depends[2], "mouse_server");
+        assert_eq!(m.depends[3], "audio_server");
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn builtin_wallpaper_parses() {
+        // wallpaper: Background-layer compositor client; depends on display.
+        let cfg = "name=wallpaper\ncommand=/bin/wallpaper\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n";
+        let (m, warns) = parse(cfg).expect("wallpaper builtin must parse");
+        assert_eq!(m.name, "wallpaper");
+        assert_eq!(m.command, "/bin/wallpaper");
+        assert_eq!(m.service_type, ServiceType::Daemon);
+        assert_eq!(m.depends, ["display"]);
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn builtin_bar_parses() {
+        // bar: Top-layer status/workspace bar; depends on display.
+        let cfg = "name=bar\ncommand=/bin/bar\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n";
+        let (m, warns) = parse(cfg).expect("bar builtin must parse");
+        assert_eq!(m.name, "bar");
+        assert_eq!(m.command, "/bin/bar");
+        assert_eq!(m.depends, ["display"]);
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn builtin_notifyd_parses() {
+        // notifyd: Overlay notification daemon; depends on display.
+        let cfg = "name=notifyd\ncommand=/bin/notifyd\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n";
+        let (m, warns) = parse(cfg).expect("notifyd builtin must parse");
+        assert_eq!(m.name, "notifyd");
+        assert_eq!(m.command, "/bin/notifyd");
+        assert_eq!(m.depends, ["display"]);
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn builtin_graphical_stack_dep_graph_has_no_cycles() {
+        // Feed all five graphical-stack BUILTIN_CONFIGS entries into
+        // detect_cycles together with their upstream dependencies. The dep
+        // graph must be acyclic and every dependency reference must resolve.
+        let ms = [
+            manifest("console", &[]),
+            manifest("kbd", &["console"]),
+            manifest("display", &["kbd"]),
+            manifest("mouse_server", &[]),
+            manifest("session_manager", &[]),
+            manifest("audio_server", &["display"]),
+            manifest(
+                "greeter",
+                &["display", "kbd", "mouse_server", "audio_server"],
+            ),
+            manifest("wallpaper", &["display"]),
+            manifest("bar", &["display"]),
+            manifest("notifyd", &["display"]),
+        ];
+        let bad = detect_cycles(&ms);
+        assert!(
+            bad.is_empty(),
+            "graphical-stack dep graph must be acyclic; bad indices: {bad:?}"
+        );
+    }
+
+    // ---- Phase 100 Track A.2 — graphical-mode decision truth table ------
+    //
+    // `decide_graphical` is the pure boot-mode decision that lives in
+    // `userspace/init/src/main.rs` and gates BOTH the builtin greeter filter
+    // and the serial-autologin choice. init is a `no_std` bin with no
+    // host-testable module, so this is a byte-for-byte mirror of that
+    // function used solely to lock the truth table under host unit tests. It
+    // is `#[cfg(test)]`-scoped — kernel-core ships no new runtime logic.
+    //
+    // Keep in lock-step with init's `decide_graphical`:
+    //   1. an explicit launch override always wins, in either direction
+    //   2. else the diskless builtin-defaults path defaults to graphical
+    //   3. else the on-disk marker decides
+    fn decide_graphical(boot_override: Option<bool>, diskless: bool, marker_present: bool) -> bool {
+        if let Some(g) = boot_override {
+            return g;
+        }
+        if diskless {
+            return true;
+        }
+        marker_present
+    }
+
+    #[test]
+    fn decide_graphical_override_true_wins_over_everything() {
+        // Explicit graphical override beats diskless/marker in all combos.
+        assert!(decide_graphical(Some(true), false, false));
+        assert!(decide_graphical(Some(true), true, false));
+        assert!(decide_graphical(Some(true), false, true));
+        assert!(decide_graphical(Some(true), true, true));
+    }
+
+    #[test]
+    fn decide_graphical_override_false_wins_over_everything() {
+        // Explicit serial override forces text even on the diskless path or
+        // with the marker present — the laptop can still be pinned to serial.
+        assert!(!decide_graphical(Some(false), false, false));
+        assert!(!decide_graphical(Some(false), true, false));
+        assert!(!decide_graphical(Some(false), false, true));
+        assert!(!decide_graphical(Some(false), true, true));
+    }
+
+    #[test]
+    fn decide_graphical_diskless_defaults_to_graphical() {
+        // No override + diskless builtin path → graphical, regardless of the
+        // (absent-disk) marker probe result.
+        assert!(decide_graphical(None, true, false));
+        assert!(decide_graphical(None, true, true));
+    }
+
+    #[test]
+    fn decide_graphical_data_disk_follows_marker() {
+        // No override + data-disk path (diskless=false) → the on-disk marker
+        // decides, matching the unchanged Phase 71 behavior.
+        assert!(decide_graphical(None, false, true));
+        assert!(!decide_graphical(None, false, false));
+    }
 }

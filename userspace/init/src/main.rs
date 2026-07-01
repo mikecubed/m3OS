@@ -137,6 +137,13 @@ const GRAPHICAL_ONLY_MARKER_PATH: &[u8] = b"/etc/m3os-graphical-only\0";
 // scheduler stall).
 const STATUS_FILE: &[u8] = b"/run/services.status\0";
 const CMD_FILE: &[u8] = b"/run/init.cmd\0";
+/// Runtime "graphical (greeter) boot" marker. The data-disk path ships
+/// `/etc/m3os-graphical-only`; the diskless builtin path has no such file, so
+/// init publishes the equivalent signal at this writable runtime path when it
+/// brings up the graphical stack. Session compositor clients (bar/wallpaper/
+/// notifyd) poll it to learn a greeter is running and hold their surfaces off
+/// the login screen until `/run/m3os-current-session` appears.
+const GRAPHICAL_RUN_MARKER: &[u8] = b"/run/m3os-graphical-only\0";
 
 // Phase 56 Track F.3: text-mode-fallback marker.
 //
@@ -911,6 +918,16 @@ struct ServiceManager {
     shutdown_requested: bool,
     login_pid: i32,
     respawn_login: bool,
+    /// Phase 100 Track A.2 — set `true` by `add_builtin_defaults()`, which
+    /// only runs on the diskless bare-metal fallback path (see
+    /// `load_services()`). On that path the `/etc/m3os-graphical-only` marker
+    /// that would gate the GUI greeter lives on the absent data disk and there
+    /// is no fw_cfg boot-mode override, so the diskless path defaults to
+    /// graphical mode (the bare-metal target IS the GUI session). Consulted by
+    /// `effective_graphical_mode()` so the greeter filter AND the serial
+    /// autologin decision agree on the diskless path. Stays `false` on the
+    /// data-disk path, leaving the marker behavior byte-for-byte unchanged.
+    diskless_builtin: bool,
     /// File descriptor for the syslog socket (`/dev/log`), or -1 if unavailable.
     syslog_fd: i32,
     defer_status_writes: bool,
@@ -971,6 +988,7 @@ impl ServiceManager {
             shutdown_requested: false,
             login_pid: -1,
             respawn_login: true,
+            diskless_builtin: false,
             syslog_fd: -1,
             defer_status_writes: false,
             display_fallback: false,
@@ -1074,6 +1092,23 @@ impl ServiceManager {
             i += 1;
         }
         false
+    }
+
+    /// Phase 100 Track A.2 — the effective graphical-mode decision used by
+    /// BOTH the builtin greeter filter (`add_builtin_defaults`) and the
+    /// serial-autologin decision in `init_main`, so the two sites never
+    /// disagree on the diskless path. Delegates to the pure `decide_graphical`
+    /// truth table, feeding it `self.diskless_builtin`: on the diskless
+    /// bare-metal fallback path this returns `true` (greeter spawned, serial
+    /// autologin suppressed) unless an explicit `/proc/m3os-boot-mode=serial`
+    /// override forces text; on the data-disk path `diskless_builtin` is
+    /// `false` so the on-disk marker decides, exactly as before.
+    fn effective_graphical_mode(&self) -> bool {
+        decide_graphical(
+            boot_mode_override(),
+            self.diskless_builtin,
+            graphical_only_marker_present(),
+        )
     }
 
     /// Open a DGRAM socket to `/dev/log` for syslog output.
@@ -1316,13 +1351,54 @@ impl ServiceManager {
     /// keyboard, no USB, no NIC. We parse embedded copies of the essential
     /// configs (mirrors xtask's `populate_ext2_files`) through the same
     /// `parse_service_def` path the on-disk configs use, so the dependency graph
-    /// and restart policy behave identically. Kept minimal — no display/greeter/
-    /// audio: a USB-only boot uses the kernel framebuffer console + the ramdisk
-    /// root. `usb_storage` IS included (Phase 92a added the mass-storage driver)
-    /// so a USB stick can be probed/mounted for persistent logs and as a
-    /// stepping stone toward a writable USB root. Order is irrelevant (deps
-    /// resolve by name across the set).
+    /// and restart policy behave identically.
+    ///
+    /// Phase 100 Track A.1: the graphical stack (`display_server`, `mouse_server`,
+    /// `session_manager`, `audio_server`, `greeter`) is now included so a
+    /// diskless bare-metal boot lands at the GUI greeter rather than a plain
+    /// text console. Dependency edges mirror the data-disk confs:
+    ///   - `display`  (display_server) depends on `kbd`
+    ///   - `mouse_server` has NO graphical dependency — it is a peer of `kbd`
+    ///     and starts before the compositor so pointer events are buffered early
+    ///   - `audio_server` depends on `display`
+    ///   - `greeter`  depends on `display`, `kbd`, `mouse_server`, `audio_server`
+    ///   - `session_manager` has no explicit deps (it is the session orchestrator)
+    ///
+    /// Phase 100 Track A.2: the greeter-vs-text decision is gated on
+    /// `effective_graphical_mode()`. Because this method only runs on the
+    /// diskless fallback path (see `load_services()`), `self.diskless_builtin`
+    /// is set `true` first, so `effective_graphical_mode()` defaults to
+    /// graphical (an explicit `/proc/m3os-boot-mode=serial` override still
+    /// forces text) — the `/etc/m3os-graphical-only` marker it would otherwise
+    /// consult lives on the absent data disk. This mirrors the
+    /// `GREETER_ONLY_SKIPPED_CONFS` / `GRAPHICAL_ONLY_SKIPPED_CONFS` filter
+    /// that `skip_for_greeter_filter` applies on the dir-scan/KNOWN_CONFIGS
+    /// path — "greeter" is skipped in non-graphical mode so init does not
+    /// start a competing text login while the compositor owns the framebuffer.
+    /// The same `effective_graphical_mode()` also gates the serial autologin in
+    /// `init_main`, so the two decision sites always agree.
+    ///
+    /// `usb_storage` IS included so a USB stick can be probed/mounted for
+    /// persistent logs and as a stepping stone toward a writable USB root.
+    /// Order is irrelevant (deps resolve by name across the set).
     fn add_builtin_defaults(&mut self) {
+        // Phase 100 Track A.2: this method is the diskless bare-metal fallback
+        // (load_services() calls it only when /etc/services.d is absent and the
+        // other paths yielded 0 services), so mark the boot diskless. That makes
+        // effective_graphical_mode() default to graphical on real hardware,
+        // standing in for the absent /etc/m3os-graphical-only marker, and keeps
+        // the greeter filter below in lock-step with the serial-autologin
+        // decision in init_main (both call effective_graphical_mode()).
+        self.diskless_builtin = true;
+        let graphical = self.effective_graphical_mode();
+
+        // Diskless graphical boot has no /etc/m3os-graphical-only (data-disk
+        // artifact); publish the runtime equivalent so the session compositor
+        // clients hold their surfaces off the greeter until login.
+        if graphical {
+            Self::create_graphical_run_marker();
+        }
+
         const BUILTIN_CONFIGS: &[&[u8]] = &[
             // console + kbd: the PS/2 and USB keyboard input pipeline to the
             // kernel framebuffer console / login tty.
@@ -1335,6 +1411,10 @@ impl ServiceManager {
             // the keyboard (SSH still works — sshd feeds its pty directly). It was
             // only in the data-disk KNOWN_CONFIGS, so bare-metal builtin-defaults
             // boots had no keyboard echo at all.
+            // In graphical mode stdin_feeder backs off PS/2-to-stdin
+            // automatically once display_server registers the
+            // `display.input-owner` IPC service (stdin_feeder probes it with
+            // `ipc_service_exists`) — no competing text login occurs.
             b"name=stdin_feeder\ncommand=/bin/stdin_feeder\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=console,kbd\n",
             // xHCI host controller + USB HID class driver (USB keyboard/mouse).
             b"name=xhci_driver\ncommand=/drivers/xhci\ntype=daemon\nrestart=on-failure\nmax_restart=5\n",
@@ -1362,6 +1442,65 @@ impl ServiceManager {
             // Remote-login daemons (previously the only built-in defaults).
             b"name=telnetd\ncommand=/bin/telnetd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\n",
             b"name=sshd\ncommand=/bin/sshd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\n",
+
+            // ----------------------------------------------------------------
+            // Phase 100 Track A.1 — graphical stack.
+            //
+            // These entries mirror the data-disk service manifests written by
+            // xtask's `populate_ext2_files`. The builtin path is a FALLBACK
+            // (runs only when /etc/services.d is absent/unreadable and the
+            // KNOWN_CONFIGS path yields 0 services), so these cannot be
+            // double-spawned with the data-disk path — see load_services().
+            // ----------------------------------------------------------------
+
+            // display_server (registered as "display", matching data-disk conf):
+            // claims the framebuffer via try_yield_console and, on first
+            // Toplevel map, registers the `display.input-owner` IPC service.
+            // stdin_feeder probes that service (`ipc_service_exists`) and stands
+            // down its PS/2-to-stdin pump once it appears, so the compositor
+            // owns input. Depends on kbd so input is available before the
+            // compositor binds the framebuffer.
+            b"name=display\ncommand=/bin/display_server\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=kbd\n",
+
+            // mouse_server: a peer of kbd with NO graphical dependency. Starts
+            // before display_server so pointer events are buffered from the
+            // moment USB-HID decodes them — the display_server can drain the
+            // injected queue immediately on first compose. The data-disk conf
+            // carries depends=display for ordering purposes, but the builtin
+            // path omits that edge so the server is available as early as kbd.
+            b"name=mouse_server\ncommand=/bin/mouse_server\ntype=daemon\nrestart=on-failure\nmax_restart=5\n",
+
+            // session_manager: graphical-session orchestrator. No explicit
+            // depends= — session_manager IS the orchestrator; all downstream
+            // session services depend on it, not vice versa. Mirrors data-disk
+            // session_manager.conf (restart=on-failure max_restart=3).
+            b"name=session_manager\ncommand=/bin/session_manager\ntype=daemon\nrestart=on-failure\nmax_restart=3\n",
+
+            // audio_server: ring-3 AC'97/HDA audio driver. Depends on display
+            // matching the data-disk ordering (display brings up before audio).
+            // Command /drivers/audio_server (not /bin/) so the kernel's
+            // is_authorized_driver_process gate accepts the sys_device_claim.
+            b"name=audio_server\ncommand=/drivers/audio_server\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display\n",
+
+            // greeter: GUI login manager. Depends on display, kbd, mouse_server,
+            // audio_server — matching data-disk greeter.conf exactly. Gated by
+            // the `graphical` flag (effective_graphical_mode()) in the loop below
+            // (mirrors GREETER_ONLY_SKIPPED_CONFS on the dir-scan path): greeter
+            // is added only when graphical mode is active.
+            b"name=greeter\ncommand=/bin/greeter\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display,kbd,mouse_server,audio_server\n",
+
+            // Desktop-session compositor clients (Phase 100 follow-up).
+            // These mirror the data-disk wallpaper/bar/notifyd manifests
+            // (xtask populate_ext2_files) so the diskless bare-metal boot
+            // brings up the same desktop as a data-disk boot: the wallpaper
+            // (Background), the status/workspace bar (Top), and the
+            // notification daemon (Overlay). All depend only on `display`
+            // and claim no keyboard focus. Gated by the graphical filter
+            // below (skipped on a serial/text boot) exactly like greeter —
+            // otherwise they would paint over the text console.
+            b"name=wallpaper\ncommand=/bin/wallpaper\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n",
+            b"name=bar\ncommand=/bin/bar\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n",
+            b"name=notifyd\ncommand=/bin/notifyd\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n",
         ];
         let mut i = 0;
         while i < BUILTIN_CONFIGS.len() {
@@ -1372,8 +1511,35 @@ impl ServiceManager {
             if let Some(svc) = parse_service_def(cfg, cfg.len())
                 && !Self::is_disabled(svc.name.as_bytes())
             {
-                self.services[self.count] = svc;
-                self.count += 1;
+                // Phase 100 Track A.2: greeter-vs-text filter on the builtin
+                // path. Mirrors the GREETER_ONLY_SKIPPED_CONFS decision that
+                // skip_for_greeter_filter makes on the dir-scan path. The
+                // `graphical` flag came from effective_graphical_mode() above
+                // (diskless → defaults to graphical, standing in for the absent
+                // /etc/m3os-graphical-only marker; an explicit
+                // /proc/m3os-boot-mode=serial override still forces text):
+                //   - graphical mode  → add greeter
+                //   - non-graphical   → skip greeter so init does not start a
+                //     competing text login on the framebuffer console
+                // Graphical-only clients (the GUI login + the desktop-session
+                // compositor clients) are skipped on a non-graphical boot so
+                // init does not start a competing text login or paint over the
+                // framebuffer text console.
+                let graphical_only = bytes_eq(svc.name.as_bytes(), b"greeter")
+                    || bytes_eq(svc.name.as_bytes(), b"wallpaper")
+                    || bytes_eq(svc.name.as_bytes(), b"bar")
+                    || bytes_eq(svc.name.as_bytes(), b"notifyd");
+                if graphical_only && !graphical {
+                    write_str(STDOUT_FILENO, "init: skipped ");
+                    write(STDOUT_FILENO, svc.name.as_bytes());
+                    write_str(
+                        STDOUT_FILENO,
+                        " (graphical client; serial/text path active)\n",
+                    );
+                } else {
+                    self.services[self.count] = svc;
+                    self.count += 1;
+                }
             }
             i += 1;
         }
@@ -2258,6 +2424,16 @@ impl ServiceManager {
         }
     }
 
+    /// Publish the diskless graphical-boot marker `/run/m3os-graphical-only`
+    /// (see [`GRAPHICAL_RUN_MARKER`]). Best-effort: a failure just means the
+    /// session clients fall back to their `/etc/m3os-graphical-only` check.
+    fn create_graphical_run_marker() {
+        let fd = open(GRAPHICAL_RUN_MARKER, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+        if fd >= 0 {
+            close(fd as i32);
+        }
+    }
+
     /// Remove a .disabled marker file for a service.
     fn remove_disabled_marker(name: &[u8]) {
         let mut path_buf = [0u8; 128];
@@ -2745,26 +2921,51 @@ fn display_server_inject_key_enabled() -> bool {
     true
 }
 
-/// Phase 71 — graphical-only gate.
+/// Phase 71 — graphical-only gate (data-disk / dir-scan path).
 ///
-/// Returns `true` when `/etc/m3os-graphical-only` exists. When `true`,
-/// init skips the serial autologin path so the Phase 71 GUI greeter
-/// is the sole user-session entry point.
+/// Returns `true` when graphical mode is active for a **non-diskless** boot:
+/// the fw_cfg launch override (`/proc/m3os-boot-mode`) wins; otherwise the
+/// on-disk `/etc/m3os-graphical-only` marker decides. Used by
+/// `skip_for_greeter_filter` on the dir-scan/`KNOWN_CONFIGS` path. The diskless
+/// builtin-defaults path uses `ServiceManager::effective_graphical_mode()`
+/// instead, which additionally defaults to graphical when the marker's disk is
+/// absent — see `decide_graphical`. This free function passes `diskless=false`,
+/// so its data-disk behavior is byte-for-byte unchanged.
 fn graphical_only_enabled() -> bool {
-    // Launch-time fw_cfg override (exposed by the kernel at /proc/m3os-boot-mode)
-    // wins over the on-disk marker, so `cargo xtask run` / `run-gui` pick the
-    // boot mode per launch without rewriting the persistent data disk. "graphical"
-    // → on, "serial" → off; "auto" / unreadable → fall back to the disk marker
-    // (standalone `cargo xtask image`, real hardware, smoke disks).
-    if let Some(graphical) = boot_mode_override() {
-        return graphical;
-    }
+    decide_graphical(boot_mode_override(), false, graphical_only_marker_present())
+}
+
+/// Probe for the on-disk `/etc/m3os-graphical-only` marker. Returns `true`
+/// iff the file is present and openable. Factored out so both
+/// `graphical_only_enabled()` and `ServiceManager::effective_graphical_mode()`
+/// share one probe.
+fn graphical_only_marker_present() -> bool {
     let fd = open(GRAPHICAL_ONLY_MARKER_PATH, O_RDONLY, 0);
     if fd < 0 {
         return false;
     }
     close(fd as i32);
     true
+}
+
+/// Phase 100 Track A.2 — pure graphical-mode decision (host-testable; the
+/// same truth table is mirrored and unit-tested in
+/// `kernel-core::init::manifest`). Order of precedence:
+///   1. An explicit launch override (fw_cfg → `/proc/m3os-boot-mode`) always
+///      wins, in either direction.
+///   2. Else the diskless builtin-defaults path defaults to **graphical**: the
+///      bare-metal target IS the GUI session and the `/etc/m3os-graphical-only`
+///      marker that would gate it lives on the absent data disk, so there is no
+///      on-disk signal to consult.
+///   3. Else the on-disk marker decides — the unchanged data-disk behavior.
+fn decide_graphical(boot_override: Option<bool>, diskless: bool, marker_present: bool) -> bool {
+    if let Some(g) = boot_override {
+        return g;
+    }
+    if diskless {
+        return true;
+    }
+    marker_present
 }
 
 /// Read the kernel's `/proc/m3os-boot-mode` launch-time override:
@@ -2953,14 +3154,20 @@ fn init_main() -> ! {
         if mgr.login_pid < 0 {
             write_str(STDOUT_FILENO, "init: failed to spawn smoke-runner\n");
         }
-    } else if graphical_only_enabled() {
-        // Phase 71 G.1 — graphical-only mode: the GUI greeter is the
-        // sole session entry point, so we deliberately do NOT spawn
-        // the serial login. The marker file is written by sites that
-        // want a "no serial root access" deployment.
+    } else if mgr.effective_graphical_mode() {
+        // Phase 71 G.1 / Phase 100 A.2 — graphical mode: the GUI greeter is the
+        // sole session entry point, so we deliberately do NOT spawn the serial
+        // login (which would fight the compositor for the framebuffer console).
+        // `effective_graphical_mode()` is the SAME decision the builtin greeter
+        // filter uses, so the two never disagree: it is true when an explicit
+        // `/proc/m3os-boot-mode=graphical` override is set, when the on-disk
+        // `/etc/m3os-graphical-only` marker is present (data-disk deployments
+        // wanting "no serial root access"), or on the diskless bare-metal
+        // fallback path (where the GUI greeter is the intended target and the
+        // marker's disk is absent).
         write_str(
             STDOUT_FILENO,
-            "init: graphical-only marker present, skipping serial autologin (Phase 71)\n",
+            "init: graphical mode active, skipping serial autologin (Phase 71/100)\n",
         );
         mgr.respawn_login = false;
     } else {

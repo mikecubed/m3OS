@@ -153,6 +153,24 @@ const VERB_ENCODE_BUF_LEN: usize = 64;
 static DISPLAY_VERB_FAILURE_LOG_BUDGET: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(16);
 
+/// Query the kernel framebuffer pixel size (`width`, `height`) so the
+/// initial surface allocation never exceeds the physical panel.
+///
+/// Mirrors `desktop_client::output_size` (same `sys_framebuffer_info` wire
+/// layout: `width u32 | height u32 | stride u32 | bpp u32 | pixel_format
+/// u32`). Returns `(0, 0)` if the syscall fails; the caller then keeps the
+/// default cell-grid size. term replicates this locally rather than taking a
+/// `desktop_client` dependency for one helper.
+fn query_output_size() -> (u32, u32) {
+    let mut buf = [0u8; 20];
+    if syscall_lib::framebuffer_info(&mut buf) < 0 {
+        return (0, 0);
+    }
+    let w = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let h = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    (w, h)
+}
+
 /// One SHM region paired with the `BufferId` term publishes it
 /// under. Created twice per [`DisplayClient`] for the double-buffered
 /// publish path.
@@ -312,15 +330,31 @@ impl DisplayClient {
             return Err(TermError::DisplayServerUnavailable);
         }
 
-        // 4. Allocate the two shared-memory regions. 1280 × 800 × 4 =
-        //    ~4 MiB per region (1000 contiguous 4 KiB pages). The SHM
-        //    registry's create path rounds up to the next power-of-two
-        //    page count (1024 = 4 MiB = order 10), which fits inside
-        //    Phase 69c's bumped `kernel_core::buddy::MAX_ORDER = 11`
-        //    (8 MiB max). Two regions = ~8 MiB total, still comfortably
-        //    inside the kernel's per-process SHM budget.
-        let byte_len = (SURFACE_WIDTH_PX as usize)
-            .saturating_mul(SURFACE_HEIGHT_PX as usize)
+        // 4. Allocate the two shared-memory regions, sized to the smaller of
+        //    the default cell-grid area and the actual framebuffer. The
+        //    default grid is 80×25 cells at CELL_WIDTH×CELL_HEIGHT
+        //    (= 1920×1200 px). On a panel shorter than 1200 px (e.g. a 1080p
+        //    laptop) an un-clamped 1200-tall buffer would exceed the panel,
+        //    forcing the compositor to nearest-neighbour downscale every
+        //    frame until the first SurfaceResized. Clamping to the real
+        //    framebuffer here keeps the surface ≤ panel; term::main re-derives
+        //    the initial cell grid from these clamped dims, and the compositor
+        //    resizes the surface to its assigned tile shortly after map via
+        //    ServerMessage::SurfaceResized. At 1920×1080 each region is
+        //    8,294,400 B (2025 pages → order-11 8 MiB block).
+        let (out_w, out_h) = query_output_size();
+        let init_w = if out_w > 0 {
+            SURFACE_WIDTH_PX.min(out_w)
+        } else {
+            SURFACE_WIDTH_PX
+        };
+        let init_h = if out_h > 0 {
+            SURFACE_HEIGHT_PX.min(out_h)
+        } else {
+            SURFACE_HEIGHT_PX
+        };
+        let byte_len = (init_w as usize)
+            .saturating_mul(init_h as usize)
             .saturating_mul(4);
         let front = SurfaceMapping::allocate(byte_len, BUFFER_IDS[0])
             .ok_or(TermError::DisplayServerUnavailable)?;
@@ -337,8 +371,8 @@ impl DisplayClient {
             surfaces: [front, back],
             back_idx: 1,
             surface_id: sid,
-            width: SURFACE_WIDTH_PX,
-            height: SURFACE_HEIGHT_PX,
+            width: init_w,
+            height: init_h,
         })
     }
 
@@ -751,13 +785,26 @@ fn blit_glyph_view(
     cell_view: &mut [u32],
     stride_pixels: usize,
     fg: u32,
-    bg: u32,
+    _bg: u32,
 ) {
     let w = glyph.width as usize;
     let h = glyph.height as usize;
     if w == 0 || h == 0 {
         return;
     }
+    // Scale a smaller-than-cell glyph up to fill the cell. The static IBM VGA
+    // fallback is 8×16; in the Phase 73 24×48 cell it would otherwise be
+    // stranded in the top-left corner, leaving a wide background gap after
+    // every character (the "spaces between characters" seen on diskless boots
+    // where the TTF atlas asset is absent). Integer nearest-neighbour: 8×16
+    // scales 3× to exactly fill 24×48. An atlas glyph already rasterised at
+    // cell size scales 1× (unchanged). The cell background was already painted
+    // by `fill_cell_bg`, so only set ("on") bits are written here.
+    let cw = CELL_WIDTH as usize;
+    let ch = CELL_HEIGHT as usize;
+    let scale = core::cmp::max(1, core::cmp::min(cw / w, ch / h));
+    let off_x = cw.saturating_sub(w * scale) / 2;
+    let off_y = ch.saturating_sub(h * scale) / 2;
     let bytes_per_row = w.div_ceil(8);
     for row in 0..h {
         let row_start = row * bytes_per_row;
@@ -767,12 +814,21 @@ fn blit_glyph_view(
                 break;
             }
             let bit_idx = 7 - (col % 8);
-            let bit_set = (glyph.bitmap[byte_idx] >> bit_idx) & 1 == 1;
-            let dst = row * stride_pixels + col;
-            if dst >= cell_view.len() {
-                return;
+            if (glyph.bitmap[byte_idx] >> bit_idx) & 1 != 1 {
+                continue; // background already filled
             }
-            cell_view[dst] = if bit_set { fg } else { bg };
+            // Paint a `scale × scale` block for this glyph pixel.
+            for dy in 0..scale {
+                let py = off_y + row * scale + dy;
+                let row_off = py * stride_pixels + off_x + col * scale;
+                for dx in 0..scale {
+                    let dst = row_off + dx;
+                    if dst >= cell_view.len() {
+                        break;
+                    }
+                    cell_view[dst] = fg;
+                }
+            }
         }
     }
 }

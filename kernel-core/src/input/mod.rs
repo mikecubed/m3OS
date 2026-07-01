@@ -1,6 +1,7 @@
 pub mod bind_table;
 pub mod dispatch;
 pub mod events;
+pub mod hid_poll;
 pub mod keymap;
 pub mod mouse;
 

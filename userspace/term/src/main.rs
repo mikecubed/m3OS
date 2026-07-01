@@ -123,6 +123,14 @@ const BLINK_INTERVAL_MS: u64 = 500;
 #[cfg(not(test))]
 const SHELL_DEPENDENCY_SERVICE: &str = "vfs";
 
+/// Bounded wait for the `vfs` service before spawning the shell. Long enough
+/// that a data-disk boot's `vfs_server` is always up first (it registers at
+/// boot, well before any post-login term), but finite so a diskless boot —
+/// where `vfs_server` cannot run (no ext2 disk to mount) — does not block term
+/// forever. On timeout term proceeds with the kernel's ramdisk/ext2 fallback.
+#[cfg(not(test))]
+const SHELL_DEPENDENCY_WAIT_MS: u64 = 2000;
+
 #[cfg(not(test))]
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, BOOT_LOG_MARKER);
@@ -178,8 +186,19 @@ fn program_main(_args: &[&str]) -> i32 {
     //    `PtyOps` trait the lib already exercises against
     //    `MockPtyOps`.
     if !wait_for_shell_dependencies() {
-        syscall_lib::write_str(STDOUT_FILENO, "term: VFS unavailable before shell spawn\n");
-        return 6;
+        // vfs did not register within the bounded wait. This is expected on a
+        // diskless / bare-metal boot: there is no ext2 data disk for
+        // vfs_server to mount, so the `vfs` service never comes up. Proceed
+        // anyway — the kernel serves /bin/ion and /etc from the ramdisk /
+        // built-in ext2 fallback, so the shell still spawns. (On a data-disk
+        // boot vfs registers long before any term spawn, so this branch is not
+        // taken there.) Blocking forever here was why the terminal never
+        // appeared on bare metal: term mapped its Toplevel — allocating a tile
+        // the dwindle layout shrank for — but never committed a buffer.
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "term: vfs absent after wait; using kernel fs fallback\n",
+        );
     }
     let mut pty = PtyHost::new(SyscallPtyOps::new());
     if let Err(_e) = pty.open_and_spawn() {
@@ -203,6 +222,11 @@ fn program_main(_args: &[&str]) -> i32 {
     //    AudioClientBellSink; on first AudioUnavailable we swap
     //    permanently to the warn-once stub so noisy bell-loops do
     //    not retry the audio path forever.
+    // Capture the clamped initial surface size before `display` is moved into
+    // the renderer. `DisplayClient::connect` clamps the surface to the real
+    // framebuffer, so on a panel shorter than the 80×25 default's 1200 px
+    // (e.g. 1080p) this is the panel height, not 1200.
+    let (init_surface_w, init_surface_h) = (display.width(), display.height());
     let mut screen = Screen::new();
     let mut renderer = Renderer::new(display);
     // Phase 69c Track E.1 — try to load the Nerd Font asset and
@@ -216,6 +240,22 @@ fn program_main(_args: &[&str]) -> i32 {
     // keep the fallback path reachable. See the docstring on
     // `build_atlas` for the full contract.
     build_atlas(&mut renderer);
+
+    // Re-derive the initial cell grid + PTY winsize from the actual (clamped)
+    // surface size. `Screen::new()` starts at the 80×25 default whose pixel
+    // area (1920×1200) can exceed a shorter panel; the surface was clamped to
+    // the framebuffer at `connect`, so sync the grid down to match here. This
+    // keeps the cell grid within the surface buffer (the renderer would
+    // otherwise write rows past a clamped buffer) and gives the shell a correct
+    // winsize immediately instead of waiting for the compositor's first
+    // `SurfaceResized`.
+    handle_surface_resize(
+        primary_fd,
+        &mut screen,
+        &mut renderer,
+        init_surface_w,
+        init_surface_h,
+    );
     let mut input_handler = InputHandler::new();
     let mut mouse_reporter = MouseReporter::new();
 
@@ -512,7 +552,10 @@ impl PtyWriter for PrimaryFdWriter {
 
 #[cfg(not(test))]
 fn wait_for_shell_dependencies() -> bool {
-    syscall_lib::ipc_wait_service(SHELL_DEPENDENCY_SERVICE, 0)
+    // Bounded (not indefinite) — see SHELL_DEPENDENCY_WAIT_MS. Returns true if
+    // `vfs` registered within the window, false on timeout (caller proceeds
+    // either way, falling back to the kernel filesystem).
+    syscall_lib::ipc_wait_service(SHELL_DEPENDENCY_SERVICE, SHELL_DEPENDENCY_WAIT_MS)
 }
 
 /// Phase 69c Track E.1 — load the Nerd Font asset from

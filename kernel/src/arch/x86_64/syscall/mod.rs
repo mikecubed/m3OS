@@ -1669,7 +1669,11 @@ mod syscall_nr {
     // Phase 87: `ipc_recv_msg_timeout` (0x111C, dispatch opcode 29) is the
     // deadline-capable bulk-message receive — `ipc_recv_msg` + a deadline — so a
     // request server (vfs_server) can wake to flush deferred state when idle.
-    pub const IPC_LAST: u64 = 0x111C;
+    // Phase 100 (bare-metal GUI): `ipc_call_buf_timeout` (0x111D, dispatch
+    // opcode 30) is the deadline-capable bulk *call* — `ipc_call_buf` + a
+    // deadline — so a client (usb-hid) of a monopolised single-threaded server
+    // gives up and retries instead of parking forever in BlockedOnReply.
+    pub const IPC_LAST: u64 = 0x111D;
 
     // -- device host (Phase 55b Track B) --
     //
@@ -14487,11 +14491,24 @@ pub(super) fn sys_framebuffer_mmap() -> u64 {
         // BIT_11 is an OS-available bit used here to mark "device/hardware frame —
         // do not return to the frame allocator on process teardown".  The frame
         // allocator only owns system-RAM frames; the UEFI framebuffer is MMIO.
+        //
+        // NO_CACHE sets PCD (bit 4) in the 4 KiB PTE leaf, selecting PAT index 2
+        // (PCD=1 / PWT=0 / PAT-bit=0) = Write-Combining after pat::init programs
+        // that slot to WC — mirroring pat.rs::set_range_write_combining's type
+        // selection.  WRITE_THROUGH (PWT) and the PAT bit (HUGE_PAGE / bit 7 in a
+        // 4 KiB PTE) are both absent from this set, preserving PAT index 2 rather
+        // than index 6 (UC-) or 3 (UC).
+        //
+        // pat::init runs on the BSP at kernel/src/lib.rs:309 and on every AP at
+        // kernel/src/smp/boot.rs:423, before any compositor WC mapping is faulted
+        // in — satisfying the Intel SDM per-core PAT requirement that every logical
+        // CPU mapping a shared WC region agree on the memory type.
         let flags = PageTableFlags::PRESENT
             | PageTableFlags::WRITABLE
             | PageTableFlags::USER_ACCESSIBLE
             | PageTableFlags::NO_EXECUTE
-            | PageTableFlags::BIT_11;
+            | PageTableFlags::BIT_11
+            | PageTableFlags::NO_CACHE; // PCD=1, PWT=0, PAT-bit=0 → PAT index 2 (WC)
 
         if unsafe { crate::mm::user_space::map_user_frames(&mut mapper, virt_addr, &frames, flags) }
             .is_err()
@@ -14506,6 +14523,37 @@ pub(super) fn sys_framebuffer_mmap() -> u64 {
                 });
             crate::fb::release_console_claim(pid);
             return NEG_EINVAL;
+        }
+
+        // WC readback sentinel: walk the user page table to confirm the mapped leaf
+        // has PCD=1 / PWT=0 / PAT=0 (= PAT index 2, WC).  Emitted once per FB map;
+        // a QEMU boot can assert the sentinel line contains "PCD=1 PWT=0 PAT=0".
+        {
+            use x86_64::structures::paging::Translate as _;
+            use x86_64::structures::paging::mapper::TranslateResult;
+            match mapper.translate(x86_64::VirtAddr::new(virt_addr)) {
+                TranslateResult::Mapped {
+                    flags: leaf_flags, ..
+                } => {
+                    let pcd = leaf_flags.contains(PageTableFlags::NO_CACHE) as u8;
+                    let pwt = leaf_flags.contains(PageTableFlags::WRITE_THROUGH) as u8;
+                    // In a 4 KiB PTE the PAT bit is bit 7, modelled as HUGE_PAGE
+                    // by the x86_64 crate.
+                    let pat = leaf_flags.contains(PageTableFlags::HUGE_PAGE) as u8;
+                    log::info!(
+                        "[fb-wc] user FB leaf flags: PCD={} PWT={} PAT={} (WC idx2)",
+                        pcd,
+                        pwt,
+                        pat
+                    );
+                }
+                _ => {
+                    log::warn!(
+                        "[fb-wc] user FB virt {:#x} — leaf readback failed (not mapped?)",
+                        virt_addr
+                    );
+                }
+            }
         }
 
         // Record the mapping in the process table while the page-table lock is held.
@@ -15079,6 +15127,18 @@ pub(super) fn sys_framebuffer_pageflip(arg0: u64) -> u64 {
         Ok(v) => v,
         Err(_) => return NEG_EINVAL,
     };
+    // WC store barrier: the user framebuffer is mapped Write-Combining (PCD=1,
+    // PAT index 2).  WC writes are weakly ordered and may remain in the CPU's
+    // WC write-combining buffers until an SFENCE flushes them.  Issuing SFENCE
+    // here guarantees that all compositor blit stores are globally visible before
+    // the display controller latches the page-flip address — preventing a torn
+    // frame from appearing on the panel.  SFENCE does not touch SSE/XMM state
+    // and is safe in the soft-float kernel target.
+    // SAFETY: sfence is a memory-ordering instruction; it has no side effects
+    // beyond ordering stores to WC and other memory types.
+    unsafe {
+        core::arch::asm!("sfence", options(nostack, preserves_flags));
+    }
     // SAFETY: ring-0 context; VBE I/O ports are device-owned.
     match unsafe { crate::fb::vbe::pageflip(y_offset) } {
         Ok(()) => 0,

@@ -1814,7 +1814,7 @@ fn build_userspace_bins() {
         // Phase 56 Track D.2: mouse_server depends on kernel-core
         // (ButtonTracker, decode_packet, PointerEvent codec) so needs_alloc.
         ("mouse_server", "mouse_server", true), // Phase 56 D.2: ring-3 mouse (alloc for kernel-core dep)
-        ("stdin_feeder", "stdin_feeder", false), // Phase 52: ring-3 stdin
+        ("stdin_feeder", "stdin_feeder", true), // Phase 52: ring-3 stdin (Phase 100 D.1: alloc for kernel-core key_event_to_stdin)
         ("fat_server", "fat_server", true),     // Phase 54: ring-3 FAT storage (alloc)
         ("vfs_server", "vfs_server", true),     // Phase 54: ring-3 VFS service (alloc)
         ("net_server", "net_server", true),     // Phase 54: ring-3 UDP network service (alloc)
@@ -11087,6 +11087,14 @@ fn cmd_usb_smoke(args: &SmokeBootArgs) {
             return Err("injected mouse motion never decoded by usb-hid".to_string());
         }
         println!("usb-smoke: mouse report decoded USB -> usb-hid -> mouse_server");
+        // Phase 100 Track C.1 — assert the decoded pointer report was actually
+        // injected into mouse_server (the `inject_pointer` → MOUSE_EVENT_INJECT
+        // path), not merely decoded. The `USB_HID:pointer-injected count=<n>`
+        // sentinel fires only inside the `ev.encode().is_ok()` inject branch, so
+        // a non-zero count proves the full decode→inject seam — previously
+        // emitted but never gated.
+        wait("USB_HID:pointer-injected count=")?;
+        println!("usb-smoke: pointer event injected into mouse_server (inject path gated)");
 
         // (8) Prompt render: type a recognizable string over USB and assert the
         // characters rendered as glyphs at the focused term (USB -> usb-hid ->
@@ -12659,6 +12667,14 @@ fn cmd_usb_hub_smoke(args: &SmokeBootArgs) {
         wait("XHCI_HUB:child-enumerated class=3")?;
         // …and finished its per-port PORT_POWER/PORT_RESET bring-up.
         wait("USB_HUB:ready")?;
+        // Phase 100 Track D.3 — assert the steady-state walker reaches idle.
+        // The topology has a live downstream device (usb-mouse on port 3.1), so
+        // C_PORT_CONNECTION is set on that port; until the walker acknowledges
+        // (RW1C-clears) the change bits, `wPortChange` stays non-zero, the
+        // backoff never engages, and `USB_HUB:idle` never fires — i.e. this wait
+        // fails against the pre-fix re-enumeration bug and passes once the change
+        // bits are cleared. Falsifiable regression guard for the de-busy-poll.
+        wait("USB_HUB:idle ticks=")?;
         Ok(())
     })();
 
@@ -17503,6 +17519,33 @@ fn cmd_compositor_stress(args: &CompositorStressArgs) {
             global_timeout,
         )?;
         println!("compositor-stress: display_server owns input grab");
+        // Phase 100 Track B.1/B.3 — gate the WC user-FB PTE-attribute readback
+        // and the full-screen-fill timing sentinels. These are emitted while
+        // display_server maps + fills the framebuffer (before it registers as
+        // input-owner), so they are already in the serial buffer here. They were
+        // previously emitted but never asserted by any gate, so a regression that
+        // dropped the NO_CACHE WC flag (B.1) or the blit instrumentation (B.3)
+        // would pass CI green. `PCD=1 PWT=0 PAT=0` proves the leaf selects PAT
+        // index 2 (= Write-Combining).
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "[fb-wc] user FB leaf flags: PCD=1 PWT=0 PAT=0",
+            std::time::Duration::from_secs(args.timeout_secs.min(180)),
+            global_start,
+            global_timeout,
+        )?;
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "[fb-blit] full-screen fill elapsed_ns=",
+            std::time::Duration::from_secs(args.timeout_secs.min(180)),
+            global_start,
+            global_timeout,
+        )?;
+        println!("compositor-stress: WC user-FB PTE + blit-timing sentinels present");
         wait_for_serial_pattern(
             &rx,
             &mut serial_buf,
@@ -17513,6 +17556,52 @@ fn cmd_compositor_stress(args: &CompositorStressArgs) {
             global_timeout,
         )?;
         println!("compositor-stress: term/sh0 prompt is ready; starting stress");
+        // Phase 100 Track E.1 — gate the on-device render-fingerprint sentinel.
+        // A damage-driven compose has happened by the time the term prompt is
+        // ready, so a `RENDER_FP` line must be present. This is the CI anchor for
+        // the bare-metal "the screen actually rendered" assertion.
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "RENDER_FP frame=",
+            std::time::Duration::from_secs(args.timeout_secs.min(180)),
+            global_start,
+            global_timeout,
+        )?;
+        // Strengthen the gate beyond "the line fired": assert the fingerprint
+        // shows real rendered content, not a blank/background-only frame. This is
+        // the exact falsifiability boundary the host test
+        // `all_background_yields_zero_nonblank` pins — `rows_nonblank == 0` means
+        // the compositor ran `fill_background` but nothing painted over it (or the
+        // screen is black/broken); `> 0` means a client's content composited. The
+        // term-prompt path here renders only a handful of text rows at this point
+        // (the higher `>= 200` "greeter dialog visible" threshold belongs to the
+        // HW greeter boot, not this term-path stress gate), so gate on the
+        // content-vs-blank boundary rather than a panel-fill magnitude.
+        let render_fp_hist = strip_ansi(&serial_history);
+        let max_rows_nonblank = render_fp_hist
+            .lines()
+            .filter(|l| l.contains("RENDER_FP frame="))
+            .filter_map(|l| {
+                let after = &l[l.find("rows_nonblank=")? + "rows_nonblank=".len()..];
+                let end = after
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(after.len());
+                after[..end].parse::<u32>().ok()
+            })
+            .max()
+            .unwrap_or(0);
+        if max_rows_nonblank == 0 {
+            return Err(
+                "RENDER_FP fired but every frame had rows_nonblank=0: the compositor \
+                 produced only a blank/background-only frame (no client content composited)"
+                    .to_string(),
+            );
+        }
+        println!(
+            "compositor-stress: RENDER_FP render-fingerprint present with content (rows_nonblank peak={max_rows_nonblank} > 0)"
+        );
 
         let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)

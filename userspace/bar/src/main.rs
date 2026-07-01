@@ -92,6 +92,11 @@ const WS_BOX_H: u32 = 40;
 const DISPLAY_CONTROL_SERVICE_NAME: &str = "display-control";
 const LABEL_DISPLAY_CTL_CMD: u64 = 1;
 const GRAPHICAL_ONLY_MARKER_PATH: &[u8] = b"/etc/m3os-graphical-only\0";
+/// Diskless equivalent of `GRAPHICAL_ONLY_MARKER_PATH`, published by init on
+/// the bare-metal graphical boot (where the `/etc` marker — a data-disk
+/// artifact — is absent). Either marker means "a greeter is running; wait for
+/// login before piercing the screen with the bar."
+const GRAPHICAL_RUN_MARKER_PATH: &[u8] = b"/run/m3os-graphical-only\0";
 const SESSION_STATE_PATH: &[u8] = b"/run/m3os-current-session\0";
 
 fn program_main(_args: &[&str]) -> i32 {
@@ -101,7 +106,7 @@ fn program_main(_args: &[&str]) -> i32 {
     // user authenticates. Wait for the session marker before we
     // declare our Layer surface, so the login screen is not pierced
     // by a 48 px bar at the top (`BAR_HEIGHT_PX`).
-    if file_exists(GRAPHICAL_ONLY_MARKER_PATH) {
+    if file_exists(GRAPHICAL_ONLY_MARKER_PATH) || file_exists(GRAPHICAL_RUN_MARKER_PATH) {
         syscall_lib::write_str(STDOUT_FILENO, "bar: waiting for login session\n");
         wait_for_session_marker();
         syscall_lib::write_str(STDOUT_FILENO, "bar: session active; connecting\n");

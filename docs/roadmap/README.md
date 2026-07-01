@@ -293,6 +293,12 @@ flowchart TD
     P107 --> P108["Phase 108<br/>HP OmniBook<br/>AMD Strix Point"]
     P108 --> P109["Phase 109<br/>Bare-Metal Audio"]
     P108 --> P110["Phase 110<br/>Real-Hardware<br/>Security"]
+
+    %% Developer experience — appended after the hardware arc (Track A pull-forward)
+    P3 --> P111["Phase 111<br/>Remote Debugging<br/>(gdb stub + ptrace)"]
+    P19 --> P111
+    P25 --> P111
+    P110 -.->|appended after arc| P111
 ```
 
 ## Milestone Summary
@@ -536,7 +542,7 @@ The dependency-sequenced arc toward a usable GUI workstation on the Dell Tiger L
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
 | 99 | SMP & Scheduler Robustness Hardening | Retire the recurring cross-core lost-wakeup bug class by consolidating + validating the Phase-57a single-state-word block/wake model at `-smp 8` (the 8-core laptop can't pin `-smp 1` like the toolchain gates), plus the kstack/`PROCESS_TABLE`-across-faults audit, the 4 GiB SMP panic-quiesce, the step-25 dynlink-mismatch CI flake (root-caused to a crash-dumper torn-`caller_file` deref — not the originally-suspected demand-fault NULL deref), `copyfile→EFAULT`, and the 55c `net::remote` test encoder bug. The CI-able kernel foundation the bare-metal GUI arc rests on. | Complete (all 5 tracks validated at `-smp 8`; the step-25 flake was root-caused to a torn-`caller_file` crash-dumper deref and fixed, 50/50 clean soak) | `phase-99` | [Phase 99](./99-smp-scheduler-robustness.md) | [Tasks](./tasks/99-smp-scheduler-robustness-tasks.md) |
-| 100 | Bare-Metal GUI Session (Dell) | Boot the Dell to a graphical greeter login: add `display_server`/`mouse_server`/`session_manager`/`greeter` to init's `BUILTIN_CONFIGS` (omitted today → text console), add the write-combining PAT attribute to the user framebuffer VMA in `sys_framebuffer_mmap` (only the kernel console got Phase 96's WC), and drive the cursor with an interim USB mouse via the existing `usb-hid → mouse_server` inject path. Folds in the USB-kbd-text-mode + `usb-hid`/`usbhub` CPU-hog input polish. | Planned | `phase-100` | [Phase 100](./100-bare-metal-gui-session.md) | [Tasks](./tasks/100-bare-metal-gui-session-tasks.md) |
+| 100 | Bare-Metal GUI Session (Dell) | Boot the Dell to a graphical greeter login: add `display_server`/`mouse_server`/`session_manager`/`greeter` to init's `BUILTIN_CONFIGS` (omitted today → text console), add the write-combining PAT attribute to the user framebuffer VMA in `sys_framebuffer_mmap` (only the kernel console got Phase 96's WC), and drive the cursor with an interim USB mouse via the existing `usb-hid → mouse_server` inject path. Folds in the USB-kbd-text-mode + `usb-hid`/`usbhub` CPU-hog input polish. | Implemented (HW-unvalidated) — CI-green (init parse, WC PTE-flag readback, input decode/routing, render fingerprint); awaiting a recorded `Dell Precision 5560` run for `Validated-on-HW` | `phase-100` | [Phase 100](./100-bare-metal-gui-session.md) | [Tasks](./tasks/100-bare-metal-gui-session-tasks.md) |
 | 101 | ACPI Platform Foundation | An ACPI namespace + pragmatic AML interpreter + `_HID`/`_CRS` device & interrupt-resource enumeration + SCI/GPE event handling — the substrate **both** the I2C-HID touchpad and laptop power require (the touchpad's I2C address + GpioInt come from ACPI `_CRS`). The hidden prerequisite the original charter missed. | Planned | `phase-101` | [Phase 101](./101-acpi-platform-foundation.md) | [Tasks](./tasks/101-acpi-platform-foundation-tasks.md) |
 | 102 | I2C-HID Touchpad (Intel LPSS) | The real built-in pointer (the laptop has no PS/2 pointer): an Intel LPSS DesignWare I2C controller (`dwiic` ref) + I2C-HID transport + multitouch report parse (reusing the Phase 92b HID Report-Protocol decode) → `mouse_server` inject, replacing the Phase 100 interim USB mouse. Depends on 101. | Planned | `phase-102` | [Phase 102](./102-i2c-hid-touchpad.md) | [Tasks](./tasks/102-i2c-hid-touchpad-tasks.md) |
 | 103 | Laptop Power Management | Table-stakes daily-driver functions: battery/AC, backlight/brightness, thermal zones, lid-switch + power-button (SCI), P-states/cpufreq, and (stretch) S3/S0ix suspend-resume. The backend behind the Phase 105 settings panel. Depends on 101. | Planned | `phase-103` | [Phase 103](./103-laptop-power-management.md) | [Tasks](./tasks/103-laptop-power-management-tasks.md) |
@@ -547,6 +553,14 @@ The dependency-sequenced arc toward a usable GUI workstation on the Dell Tiger L
 | 108 | HP OmniBook / AMD Strix Point Bring-up | Boot the HP OmniBook (Ryzen AI 9 365 / Strix Point), sequenced after the Dell line. Most paths are bus-agnostic and carry over free; the new work is **MT7925 connac3 Wi-Fi** (gating — device-ID already matches `is_mt792x`, needs MT7925 firmware + connac3 MCU adaptation), **bare-metal AMD-Vi validation** (coded, never run on real AMD silicon; graceful identity-map fallback), the trivial **fam1Ah microcode blob**, and the **AMD I2C-HID controller backend** (`AMDI0010` + `pinctrl-amd`/`AMDI0030`). | Planned | `phase-108` | [Phase 108](./108-amd-strix-omnibook.md) | [Tasks](./tasks/108-amd-strix-omnibook-tasks.md) |
 | 109 | Bare-Metal Audio | First **determine** the Dell codec path (legacy Intel HDA vs SoundWire + SOF DSP — modern Tiger Lake often routes over SoundWire, where the Phase 80 HDA driver may not bind), then HDA bare-metal validation **or** a new SoundWire+SOF driver. A scoping risk the original charter missed. | Planned | `phase-109` | [Phase 109](./109-bare-metal-audio.md) | [Tasks](./tasks/109-bare-metal-audio-tasks.md) |
 | 110 | Real-Hardware Security Hardening | Activate + bare-metal-validate **KPTI** (Phase 84 scaffolding, never activated), add **ASLR** + stack canaries / CET shadow stacks, move password hashing to **argon2id**, and formally validate/record **Secure Boot on metal** (retiring the stale Phase 59 item). Real silicon storing real user data is when these matter. | Planned | `phase-110` | [Phase 110](./110-real-hardware-security.md) | [Tasks](./tasks/110-real-hardware-security-tasks.md) |
+
+### Developer Experience (planned, appended after the 99–110 arc)
+
+Not part of the hardware-bring-up narrative; a developer-tooling addition appended at the end. **Track A is pull-forward** — its near-free QEMU-gdbstub kernel debugging is usable by whoever works the in-flight 101–110 bare-metal arc, independent of where the doc sits in the numbering.
+
+| Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
+|---|---|---|---|---|---|---|
+| 111 | Remote Debugging (Source-Level Kernel + Userspace) | Turn the long-deferred "gdb stub" item into real source-level debugging in three escalating tiers: **(A)** free in-emulator **kernel** debugging via QEMU's gdbstub + a DWARF-bearing build (`cargo xtask debug` → `-s -S`); **(B)** the trap/debug-register substrate that registers the absent-since-Phase-3 `#DB` handler, upgrades `#BP`, and adds `RFLAGS.TF` single-step + a `DR0`–`DR7` wrapper + `int3` patching; **(C)** an in-kernel `kgdb`-style GDB-RSP stub over **polled COM2** with NMI-IPI **SMP all-stop** + panic→stub hook, so the same workflow works **on bare metal**; and **(D)** a `ptrace`-backed userspace debugger — generate the defined-but-unused `SIGTRAP`, convert the kill-on-trap path to **stop-and-notify**, add `sys_ptrace`, and an `m3gdbserver` so host `gdb` debugs ring-3 programs over TCP. `kgdb`/`ptrace` are build-time features, off in production (W^X/PKU/capability posture). | Planned | `phase-111` | [Phase 111](./111-remote-debugging.md) | [Tasks](./tasks/111-remote-debugging-tasks.md) |
 
 ## Suggested Delivery Rhythm
 
@@ -706,6 +720,9 @@ gantt
     HP OmniBook / AMD Strix       :p108, after p107, 1
     Bare-Metal Audio              :p109, after p108, 1
     Real-Hardware Security        :p110, after p108, 1
+
+    section Developer Experience (planned, post-arc)
+    Remote Debugging (gdb/ptrace) :p111, after p110, 1
 ```
 
 ## Required Documentation for Every Phase

@@ -44,10 +44,12 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::alloc::Layout;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use kernel_core::input::events::{
     KeyEvent, KeyEventKind, ModifierSide, ModifierState, PointerButton, PointerEvent,
 };
+use kernel_core::input::hid_poll::next_hid_backoff_ns;
 use kernel_core::input::keymap::{KEY_CAPSLOCK, KEY_NUMLOCK, KEY_SCROLLLOCK, Keycode, Keymap};
 use kernel_core::usb::descriptor::{CLASS_HID, SUBCLASS_HID_BOOT};
 use kernel_core::usb::hid::{
@@ -67,14 +69,28 @@ static ALLOCATOR: BrkAllocator = BrkAllocator::new();
 
 #[alloc_error_handler]
 fn alloc_error(_layout: Layout) -> ! {
+    // Mirror to the kernel log ring so a bare-metal OOM death is visible in
+    // `dmesg` over SSH (driver fd-1 output is not captured there — see `klog`).
+    klog("usb-hid: alloc error\n");
     syscall_lib::write_str(STDOUT_FILENO, "usb-hid: alloc error\n");
     syscall_lib::exit(99)
 }
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
+    klog("usb-hid: PANIC\n");
     syscall_lib::write_str(STDOUT_FILENO, "usb-hid: PANIC\n");
     syscall_lib::exit(101)
+}
+
+/// Mirror a short diagnostic line into the kernel `dmesg` ring via
+/// `sys_debug_print` (it logs `[userspace] <msg>`, which `_kernel_print` writes
+/// to the dmesg ring + serial). A ring-3 driver's normal stdout (fd 1) is NOT
+/// captured by `dmesg`/`/proc/kmsg`, so on a bare-metal GUI boot — where the
+/// only off-box channel is `dmesg` over SSH — these lines are how the driver's
+/// lifecycle (bound role, exit reason, a crash) becomes observable.
+fn klog(msg: &str) {
+    syscall_lib::serial_print(msg);
 }
 
 syscall_lib::entry_point!(program_main);
@@ -90,9 +106,27 @@ pub const READY_SENTINEL: &str = "usb-hid: polling\n";
 const KBD_EVENT_INJECT: u64 = 5;
 const MOUSE_EVENT_INJECT: u64 = 3;
 
-/// Interrupt-IN poll cadence. Boot devices report at ~10 ms (`bInterval`); a
-/// 5 ms poll keeps input latency below one report period.
+/// Fast interrupt-IN poll cadence — active while reports are arriving.
+/// Boot devices report at ~10 ms (`bInterval`); a 5 ms poll keeps input
+/// latency below one report period.  Matches `HID_POLL_FAST_NS` in
+/// `kernel_core::input::hid_poll`.
 const POLL_INTERVAL_NS: u32 = 5_000_000;
+
+/// Hot-plug reconcile interval (ms). Kept time-based so the cadence is
+/// independent of the adaptive-backoff sleep duration.
+const RECONCILE_INTERVAL_MS: u64 = 200;
+
+/// Emit an idle-occupancy sentinel every this many consecutive empty polls
+/// (after we have already reached the max-backoff plateau).  At 100 ms idle
+/// sleep this is roughly every 10 s — visible in logs without flooding them.
+const IDLE_LOG_EVERY: u32 = 100;
+
+/// C.1 bare-metal sentinel — cumulative count of `PointerEvent`s successfully
+/// injected into `mouse_server` via [`inject_pointer`] since startup.
+/// Emitted as `USB_HID:pointer-injected count=<n>` on the first inject and
+/// every 64th inject thereafter, providing greppable evidence that a non-zero
+/// injected-event count accumulated over the dock-hub topology.
+static INJECTED_PTR_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// How this driver decodes a bound HID interface.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -118,34 +152,57 @@ enum DeviceRole {
 /// controls), so a tablet drives `mouse_server` and a media-key strip routes
 /// consumer keys — without either being mistaken for the other.
 fn classify_role(notice: &usb_core::protocol::AttachNotice, fields: &[ReportField]) -> DeviceRole {
-    // Per USB HID §4.2/§4.3 the boot protocol field (1 = keyboard, 2 = mouse) is
-    // only meaningful when the interface declares the Boot subclass. A
-    // Report-Protocol interface (subclass 0) that happens to advertise protocol
-    // 1/2 must NOT be driven as a boot device — that would issue boot-only
-    // SET_PROTOCOL/SET_IDLE and pick the fixed-format boot decoder over the
-    // parsed `ReportField` layout. Honor the boot protocol only under the Boot
-    // subclass; otherwise classify by the layout the descriptor actually carries.
+    // Boot keyboard/mouse: under the Boot subclass the boot protocol field
+    // (1 = keyboard, 2 = mouse) is authoritative — keep the fixed-format boot
+    // decode.
     let is_boot = notice.interface_sub_class == SUBCLASS_HID_BOOT;
     match notice.interface_protocol {
-        PROTOCOL_HID_KEYBOARD if is_boot => DeviceRole::BootKeyboard,
-        PROTOCOL_HID_MOUSE if is_boot => DeviceRole::BootMouse,
-        _ => {
-            if notice.interface_class != CLASS_HID || fields.is_empty() {
-                return DeviceRole::Ignore;
-            }
-            if fields_have_pointer(fields) {
-                DeviceRole::ReportPointer
-            } else if fields.iter().any(|f| f.usage_page == USAGE_PAGE_CONSUMER) {
-                DeviceRole::ReportConsumer
-            } else {
-                DeviceRole::Ignore
-            }
-        }
+        PROTOCOL_HID_KEYBOARD if is_boot => return DeviceRole::BootKeyboard,
+        PROTOCOL_HID_MOUSE if is_boot => return DeviceRole::BootMouse,
+        _ => {}
+    }
+    // Everything past here must be a HID-class interface with a usable layout.
+    if notice.interface_class != CLASS_HID {
+        return DeviceRole::Ignore;
+    }
+    // A non-boot interface that still declares the Keyboard protocol (1) is a
+    // keyboard (USB HID §4.3) — many modern keyboards default to Report Protocol
+    // (subclass 0). Drive it as a boot keyboard regardless of subclass:
+    // `boot_protocol_init` issues SET_PROTOCOL(0), which makes a Report-only
+    // keyboard emit the fixed 8-byte boot report `BootKeyboardDecoder` already
+    // handles (virtually every keyboard supports boot protocol). This relaxation
+    // is deliberately keyboard-only — the mouse path stays Boot-subclass-gated
+    // above, because a Report-Protocol pointer (tablet/touchpad/gaming mouse) has
+    // a richer layout the `ReportPointer` path decodes and must NOT be collapsed
+    // to the 3-byte boot mouse decode (the Phase 92 caution).
+    if notice.interface_protocol == PROTOCOL_HID_KEYBOARD {
+        return DeviceRole::BootKeyboard;
+    }
+    if fields.is_empty() {
+        return DeviceRole::Ignore;
+    }
+    // Classify the remaining Report-Protocol interfaces by the usages their
+    // parsed layout actually carries. Pointer is tested before keyboard so a
+    // combo device that exposes both axes and a keyboard collection on one
+    // interface (e.g. a touchpad with hotkeys) keeps driving `mouse_server`
+    // rather than being forced into the boot-keyboard decode.
+    if fields_have_pointer(fields) {
+        DeviceRole::ReportPointer
+    } else if fields_have_keyboard(fields) {
+        // Subclass 0, protocol 0, but the descriptor carries Keyboard-page
+        // usages and no pointer axes — a Report-only keyboard. Boot-protocol it.
+        DeviceRole::BootKeyboard
+    } else if fields.iter().any(|f| f.usage_page == USAGE_PAGE_CONSUMER) {
+        DeviceRole::ReportConsumer
+    } else {
+        DeviceRole::Ignore
     }
 }
 
 /// HID Usage Page 0x01 — Generic Desktop (pointer axes live here).
 const USAGE_PAGE_GENERIC_DESKTOP: u16 = 0x01;
+/// HID Usage Page 0x07 — Keyboard / Keypad.
+const USAGE_PAGE_KEYBOARD: u16 = 0x07;
 /// HID Usage Page 0x09 — Button.
 const USAGE_PAGE_BUTTON: u16 = 0x09;
 /// HID Usage Page 0x0C — Consumer (media/volume/brightness controls).
@@ -159,6 +216,14 @@ fn fields_have_pointer(fields: &[ReportField]) -> bool {
         f.usage_page == USAGE_PAGE_BUTTON
             || (f.usage_page == USAGE_PAGE_GENERIC_DESKTOP && matches!(f.usage, 0x30 | 0x31))
     })
+}
+
+/// True if the parsed layout carries Keyboard-page usages — i.e. a keyboard that
+/// declared neither the Boot subclass nor the Keyboard protocol but still emits
+/// keystrokes. Such an interface is driven as a boot keyboard (see
+/// [`classify_role`]): `SET_PROTOCOL(0)` switches it to the fixed boot report.
+fn fields_have_keyboard(fields: &[ReportField]) -> bool {
+    fields.iter().any(|f| f.usage_page == USAGE_PAGE_KEYBOARD)
 }
 
 /// One bound HID device the daemon polls.
@@ -201,19 +266,84 @@ fn monotonic_ms() -> u64 {
         .saturating_add((nsec as u64) / 1_000_000)
 }
 
+fn monotonic_ns() -> u64 {
+    let (sec, nsec) = syscall_lib::clock_gettime(syscall_lib::CLOCK_MONOTONIC);
+    if sec < 0 {
+        return 0;
+    }
+    (sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nsec as u64)
+}
+
+/// Per-RPC budget for a synchronous call to the shared, single-threaded xHCI
+/// server. Comfortably above the server's worst-case per-request bound (~400 ms
+/// command / ~200 ms control) so a legitimately slow-but-completing call is
+/// never aborted, yet finite so a monopolised server (a dock-hub re-enumeration
+/// storm from `usbhub` keeps the single-threaded `usb` server out of `recv`)
+/// can never park usb-hid forever in `BlockedOnReply` with no waker.
+const USB_CALL_TIMEOUT_NS: u64 = 1_000_000_000; // 1 s
+
+/// Total wall-clock budget for the boot-time enumeration retry. The
+/// single-threaded xHCI server can be busy bringing up one or more controllers
+/// (each bring-up wait is bounded but several seconds in aggregate on a laptop
+/// with two xHCI controllers) when usb-hid first asks for the attach table, so a
+/// single timed-out `NextAttach` does NOT mean "no devices". Retry until the
+/// server answers — but bounded, so a machine with a genuinely absent/wedged
+/// controller still exits instead of spinning forever.
+const INITIAL_ENUM_BUDGET_MS: u64 = 15_000;
+
+/// Sleep between enumeration retries while the server is busy. Each timed-out
+/// `NextAttach` already consumed up to `USB_CALL_TIMEOUT_NS`, so this only adds
+/// a little slack to avoid hammering a busy server.
+const ENUM_RETRY_SLEEP_NS: u32 = 500_000_000; // 500 ms
+
 /// Issue a `UsbRequest` to the xHCI server and decode the `UsbReply`.
+///
+/// Uses the deadline-bounded `ipc_call_buf_timeout`: if the (shared,
+/// single-threaded) server does not reply within [`USB_CALL_TIMEOUT_NS`], the
+/// call returns `NEG_ETIMEDOUT` instead of parking forever, and we surface
+/// `None` so the caller's poll loop treats it as "no report" and retries (with
+/// adaptive backoff) on the next tick.
 fn usb_call(usb_ep: u32, req: &UsbRequest) -> Option<UsbReply> {
+    match usb_call_status(usb_ep, req) {
+        CallStatus::Reply(r) => Some(r),
+        CallStatus::TimedOut | CallStatus::Failed => None,
+    }
+}
+
+/// Outcome of one `usb_call`, distinguishing a **server timeout** (the
+/// single-threaded server was too busy to reply within the budget — e.g. still
+/// busy-spinning controller bring-up — and the request is worth retrying) from a
+/// transport **failure** and from a decoded **reply**. The boot enumeration uses
+/// this to wait out a busy server instead of declaring "no HID devices" on the
+/// first timed-out `NextAttach`.
+enum CallStatus {
+    Reply(UsbReply),
+    TimedOut,
+    Failed,
+}
+
+fn usb_call_status(usb_ep: u32, req: &UsbRequest) -> CallStatus {
+    const NEG_ETIMEDOUT: u64 = (-110_i64) as u64;
     let req_bytes = req.encode();
-    let rc = syscall_lib::ipc_call_buf(usb_ep, USB_REQ_LABEL, 0, &req_bytes);
+    let deadline_ns = monotonic_ns().saturating_add(USB_CALL_TIMEOUT_NS);
+    let rc = syscall_lib::ipc_call_buf_timeout(usb_ep, USB_REQ_LABEL, 0, &req_bytes, deadline_ns);
+    if rc == NEG_ETIMEDOUT {
+        return CallStatus::TimedOut;
+    }
     if rc == u64::MAX {
-        return None;
+        return CallStatus::Failed;
     }
     let mut reply_buf = [0u8; USB_MSG_MAX];
     let n = syscall_lib::ipc_take_pending_bulk(&mut reply_buf);
     if n == u64::MAX {
-        return None;
+        return CallStatus::Failed;
     }
-    UsbReply::decode(&reply_buf[..n as usize])
+    match UsbReply::decode(&reply_buf[..n as usize]) {
+        Some(r) => CallStatus::Reply(r),
+        None => CallStatus::Failed,
+    }
 }
 
 /// Put a HID interface into Boot Protocol and stop duplicate reports by issuing
@@ -281,7 +411,26 @@ fn inject_key(kbd_ep: u32, ev: &KeyEvent) {
 fn inject_pointer(mouse_ep: u32, ev: &PointerEvent) {
     let mut buf = [0u8; kernel_core::input::events::POINTER_EVENT_WIRE_SIZE];
     if ev.encode(&mut buf).is_ok() {
-        let _ = syscall_lib::ipc_call_buf(mouse_ep, MOUSE_EVENT_INJECT, 0, &buf);
+        let reply = syscall_lib::ipc_call_buf(mouse_ep, MOUSE_EVENT_INJECT, 0, &buf);
+        // Only count injects that actually reached `mouse_server`. A failed
+        // transport returns `u64::MAX` (no endpoint, server down, or reject);
+        // counting those would let the C.1 sentinel — and `usb-smoke` — pass
+        // even when the decode→inject seam is broken, defeating its purpose.
+        if reply == u64::MAX {
+            return;
+        }
+        // C.1 bare-metal sentinel: emit a greppable injected-event count so
+        // that, when run on real hardware over the dock-hub topology, logs
+        // capture proof of a non-zero injected count.  Emitted on the first
+        // successful inject and then every 64th inject to coalesce output.
+        let n = INJECTED_PTR_COUNT
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        if n == 1 || n % 64 == 0 {
+            syscall_lib::write_str(STDOUT_FILENO, "USB_HID:pointer-injected count=");
+            write_u32_dec(n);
+            syscall_lib::write_str(STDOUT_FILENO, "\n");
+        }
     }
 }
 
@@ -306,10 +455,12 @@ fn key_event_from_edge(
 }
 
 /// Poll one keyboard device: read its report, decode edges, inject each.
-fn poll_keyboard(usb_ep: u32, kbd_ep: u32, dev: &mut HidDevice, keymap: &Keymap) {
+/// Returns `true` if a non-empty report was received (used by the adaptive
+/// backoff state machine to snap back to the fast poll cadence).
+fn poll_keyboard(usb_ep: u32, kbd_ep: u32, dev: &mut HidDevice, keymap: &Keymap) -> bool {
     let report = match poll_report(usb_ep, dev) {
         Some(r) if r.len() >= HID_KBD_REPORT_LEN => r,
-        _ => return,
+        _ => return false,
     };
     // Bare-metal diagnostic: prove a non-empty interrupt-IN report actually
     // arrived from the keyboard. Logged only when a key/modifier byte is set, so
@@ -324,6 +475,20 @@ fn poll_keyboard(usb_ep: u32, kbd_ep: u32, dev: &mut HidDevice, keymap: &Keymap)
             write_u8_hex(b);
         }
         syscall_lib::write_str(STDOUT_FILENO, "\n");
+        // Mirror into dmesg: proves an interrupt-IN boot report actually arrived
+        // from the keyboard over the (dock-hub) topology — isolating a delivery
+        // (controller/arming) failure from a decode/inject one on bare metal.
+        klog(&alloc::format!(
+            "usb-hid: kbd report {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}\n",
+            report[0],
+            report[1],
+            report[2],
+            report[3],
+            report[4],
+            report[5],
+            report[6],
+            report[7],
+        ));
     }
     let mut arr = [0u8; HID_KBD_REPORT_LEN];
     arr.copy_from_slice(&report[..HID_KBD_REPORT_LEN]);
@@ -344,6 +509,7 @@ fn poll_keyboard(usb_ep: u32, kbd_ep: u32, dev: &mut HidDevice, keymap: &Keymap)
     // the H.2-hardened EP0 control path, interleaved with the armed interrupt-IN
     // poll above).
     maybe_update_leds(usb_ep, dev, &edges);
+    true
 }
 
 /// Boot-keyboard LED output-report bit positions (USB HID §B.1 / boot output
@@ -425,16 +591,23 @@ fn set_keyboard_leds(usb_ep: u32, dev: &HidDevice) {
 /// (`decode_pointer_report`, B.2), and inject motion + wheel + button edges into
 /// `mouse_server`. A tablet reports an absolute position; a gaming mouse reports
 /// relative deltas + a scroll wheel + extra buttons.
-fn poll_report_pointer(usb_ep: u32, mouse_ep: u32, dev: &mut HidDevice) {
+///
+/// Returns `true` only when the report carried new pointer activity (motion,
+/// wheel, or a button-state change). Returns `false` both when no report was
+/// available and when an idle report decoded to no movement and no button
+/// change — e.g. a tablet that re-reports its static position every frame.
+/// The caller uses this to drive the adaptive-backoff state machine, so
+/// "empty" here means "no new activity", not "no USB transfer".
+fn poll_report_pointer(usb_ep: u32, mouse_ep: u32, dev: &mut HidDevice) -> bool {
     let report = match poll_report(usb_ep, dev) {
         Some(r) => r,
-        None => return,
+        None => return false,
     };
     let p: DecodedPointer = decode_pointer_report(&dev.report_fields, &report);
     // Nothing moved and no button changed — stay quiet (an idle tablet still
     // reports its position every frame, but `any_input` gates the sentinel).
     if !p.any_input && p.buttons == dev.prev_pointer_buttons {
-        return;
+        return false;
     }
     let now = monotonic_ms();
     // Load-bearing sentinel for the I.2 Report-Protocol gate arm: a live
@@ -487,6 +660,7 @@ fn poll_report_pointer(usb_ep: u32, mouse_ep: u32, dev: &mut HidDevice) {
         }
     }
     dev.prev_pointer_buttons = p.buttons;
+    true
 }
 
 /// `HID_REPORT:pointer btn=0x<hex> abs=<0|1> moved=<0|1>` — proves a live
@@ -510,10 +684,11 @@ fn emit_report_pointer_sentinel(p: &DecodedPointer) {
 /// keys onward (`display_server` → `audio_server`). Press-edge-detected so a held
 /// key fires once. (No QEMU device emits consumer reports, so this path is
 /// bare-metal/VFIO-validated; the decode is host-tested in `kernel-core`.)
-fn poll_report_consumer(usb_ep: u32, kbd_ep: u32, dev: &mut HidDevice, keymap: &Keymap) {
+/// Returns `true` if a non-empty report was received.
+fn poll_report_consumer(usb_ep: u32, kbd_ep: u32, dev: &mut HidDevice, keymap: &Keymap) -> bool {
     let report = match poll_report(usb_ep, dev) {
         Some(r) => r,
-        None => return,
+        None => return false,
     };
     let active = decode_consumer_usages(&dev.report_fields, &report);
     let now = monotonic_ms();
@@ -537,6 +712,7 @@ fn poll_report_consumer(usb_ep: u32, kbd_ep: u32, dev: &mut HidDevice, keymap: &
         }
     }
     dev.prev_consumer = snapshot;
+    true
 }
 
 /// Inject a consumer/media keycode as a Down then Up `KeyEvent` into kbd_server
@@ -574,6 +750,14 @@ fn emit_key_sentinel(ev: &KeyEvent) {
     syscall_lib::write_str(STDOUT_FILENO, " kc=0x");
     write_u32_hex(ev.keycode);
     syscall_lib::write_str(STDOUT_FILENO, "\n");
+    // Mirror into dmesg: proves the full USB→decode→kbd_server chain delivered a
+    // keystroke (visible over SSH on a bare-metal GUI boot).
+    klog(&alloc::format!(
+        "USB_HID:key kind={} sym=0x{:x} kc=0x{:x}\n",
+        ev.kind as u8,
+        ev.symbol,
+        ev.keycode,
+    ));
 }
 
 /// `USB_HID:mouse btn=0x<hex> moved=<0|1>` — proves a live interrupt-IN
@@ -590,13 +774,14 @@ fn emit_mouse_sentinel(m: &kernel_core::usb::hid::MouseReport) {
 }
 
 /// Poll one mouse device: read its report, decode motion + button edges.
-fn poll_mouse(usb_ep: u32, mouse_ep: u32, dev: &mut HidDevice) {
+/// Returns `true` if a non-empty report was received.
+fn poll_mouse(usb_ep: u32, mouse_ep: u32, dev: &mut HidDevice) -> bool {
     let report = match poll_report(usb_ep, dev) {
         Some(r) => r,
-        None => return,
+        None => return false,
     };
     let Some(m) = parse_boot_mouse_report(&report) else {
-        return;
+        return false;
     };
     let now = monotonic_ms();
     // Load-bearing sentinel for the `usb-smoke` gate's live-mouse assertion: a
@@ -646,6 +831,7 @@ fn poll_mouse(usb_ep: u32, mouse_ep: u32, dev: &mut HidDevice) {
         }
     }
     dev.prev_buttons = m.buttons;
+    true
 }
 
 /// Read a HID interface's **Report descriptor** over EP0 and parse it into a
@@ -914,13 +1100,52 @@ fn reconcile_attachments(usb_ep: u32, devices: &mut Vec<HidDevice>) {
     }
 }
 
+/// One full `NextAttach` walk. Returns every attached HID interface as a built
+/// [`HidDevice`], plus whether the walk was cut short by a server **timeout**
+/// (`true`) rather than reaching the end of the attach table (`false`). The boot
+/// path retries while the result is empty *and* a timeout occurred — i.e. the
+/// server was merely busy (controller bring-up) rather than reporting no devices.
+fn enumerate_once(usb_ep: u32) -> (Vec<HidDevice>, bool) {
+    let mut devices: Vec<HidDevice> = Vec::new();
+    let mut cursor = 0u8;
+    loop {
+        match usb_call_status(usb_ep, &UsbRequest::NextAttach { cursor }) {
+            CallStatus::TimedOut => return (devices, true),
+            CallStatus::Reply(UsbReply::Attach {
+                notice: Some(notice),
+            }) => {
+                let idx = cursor;
+                cursor = match cursor.checked_add(1) {
+                    Some(c) => c,
+                    None => return (devices, false),
+                };
+                // A boot enumeration only surfaces attached devices, but guard
+                // the flag so the walk is correct if it sees a stale detached one.
+                if !notice.attached {
+                    continue;
+                }
+                syscall_lib::write_str(STDOUT_FILENO, "usb-hid: bound HID device (proto ");
+                write_u8_dec(notice.interface_protocol);
+                syscall_lib::write_str(STDOUT_FILENO, ")\n");
+                devices.push(build_device(usb_ep, notice, idx));
+            }
+            // End of the attach table (`Attach { notice: None }`), a transport
+            // failure, or any other reply: the walk is done and the server was
+            // responsive enough to answer — not a "busy" timeout.
+            CallStatus::Reply(_) | CallStatus::Failed => return (devices, false),
+        }
+    }
+}
+
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, BOOT_LOG_MARKER);
+    klog("usb-hid: spawned\n");
 
     // 1. Wait for the xHCI driver to register the `usb` service (it is a
     //    `depends=xhci_driver` daemon, but ordering is best-effort). A bounded
     //    wait avoids hanging forever on a machine with no USB controller.
     if !syscall_lib::ipc_wait_service(USB_SERVICE_NAME, 10_000) {
+        klog("usb-hid: 'usb' service never appeared — exiting cleanly\n");
         syscall_lib::write_str(
             STDOUT_FILENO,
             "usb-hid: 'usb' service never appeared — exiting cleanly\n",
@@ -928,36 +1153,32 @@ fn program_main(_args: &[&str]) -> i32 {
         return 0;
     }
     let Some(usb_ep) = lookup(USB_SERVICE_NAME) else {
+        klog("usb-hid: 'usb' lookup failed — exiting\n");
         syscall_lib::write_str(STDOUT_FILENO, "usb-hid: 'usb' lookup failed — exiting\n");
         return 0;
     };
 
-    // 2. Enumerate attached HID devices via the NextAttach cursor. `idx` is the
-    //    table index this device is bound from — passed to `build_device` as its
-    //    stable `source_cursor` for the C.4 reconcile.
-    let mut devices: Vec<HidDevice> = Vec::new();
-    let mut cursor = 0u8;
-    while let Some(UsbReply::Attach {
-        notice: Some(notice),
-    }) = usb_call(usb_ep, &UsbRequest::NextAttach { cursor })
-    {
-        let idx = cursor;
-        cursor = match cursor.checked_add(1) {
-            Some(c) => c,
-            None => break,
-        };
-        // A boot enumeration only surfaces attached devices, but guard the flag
-        // so the same walk is correct if it ever sees a stale detached entry.
-        if !notice.attached {
-            continue;
+    // 2. Enumerate attached HID devices via the NextAttach cursor, retrying while
+    //    the server is still too busy to answer. A multi-controller bring-up can
+    //    keep the single-threaded xHCI server out of `recv` for several seconds —
+    //    longer than one `USB_CALL_TIMEOUT_NS` — so a single timed-out
+    //    `NextAttach` means "busy, try again", NOT "no devices". A clean empty
+    //    reply means the server is responsive and there genuinely are no HID
+    //    devices (the QEMU-without-HID path), so exit promptly. The retry is
+    //    bounded by `INITIAL_ENUM_BUDGET_MS` so a wedged/absent controller still
+    //    exits instead of looping forever.
+    let enum_deadline_ms = monotonic_ms().saturating_add(INITIAL_ENUM_BUDGET_MS);
+    let mut devices: Vec<HidDevice> = loop {
+        let (found, timed_out) = enumerate_once(usb_ep);
+        if !found.is_empty() || !timed_out || monotonic_ms() >= enum_deadline_ms {
+            break found;
         }
-        syscall_lib::write_str(STDOUT_FILENO, "usb-hid: bound HID device (proto ");
-        write_u8_dec(notice.interface_protocol);
-        syscall_lib::write_str(STDOUT_FILENO, ")\n");
-        devices.push(build_device(usb_ep, notice, idx));
-    }
+        klog("usb-hid: 'usb' server busy (controller bring-up?); retrying enumeration\n");
+        let _ = syscall_lib::nanosleep_for(0, ENUM_RETRY_SLEEP_NS);
+    };
 
     if devices.is_empty() {
+        klog("usb-hid: no HID devices attached — exiting cleanly\n");
         syscall_lib::write_str(
             STDOUT_FILENO,
             "usb-hid: no HID devices attached — exiting cleanly\n",
@@ -978,16 +1199,28 @@ fn program_main(_args: &[&str]) -> i32 {
         write_u8_dec(n.interface_class);
         syscall_lib::write_str(STDOUT_FILENO, " proto=");
         write_u8_dec(n.interface_protocol);
-        syscall_lib::write_str(
-            STDOUT_FILENO,
-            match dev.role {
-                DeviceRole::BootKeyboard => " role=KEYBOARD\n",
-                DeviceRole::BootMouse => " role=MOUSE\n",
-                DeviceRole::ReportPointer => " role=REPORT_POINTER\n",
-                DeviceRole::ReportConsumer => " role=REPORT_CONSUMER\n",
-                DeviceRole::Ignore => " role=other\n",
-            },
-        );
+        let role_str = match dev.role {
+            DeviceRole::BootKeyboard => " role=KEYBOARD\n",
+            DeviceRole::BootMouse => " role=MOUSE\n",
+            DeviceRole::ReportPointer => " role=REPORT_POINTER\n",
+            DeviceRole::ReportConsumer => " role=REPORT_CONSUMER\n",
+            DeviceRole::Ignore => " role=other\n",
+        };
+        syscall_lib::write_str(STDOUT_FILENO, role_str);
+        // Mirror the bound vid/pid/class/proto/role into the kernel dmesg ring
+        // so a bare-metal GUI boot — where the only off-box channel is `dmesg`
+        // over SSH and driver fd-1 output is invisible — reveals exactly what
+        // enumerated and how each interface was classified (the data point that
+        // distinguishes a classification gap from an enumeration/arming one).
+        klog(&alloc::format!(
+            "usb-hid: bound vid=0x{:04x} pid=0x{:04x} class={} sub={} proto={}{}",
+            n.vendor_id,
+            n.product_id,
+            n.interface_class,
+            n.interface_sub_class,
+            n.interface_protocol,
+            role_str,
+        ));
     }
 
     // 3. Resolve the input-server endpoints for the classes present. A
@@ -1041,48 +1274,98 @@ fn program_main(_args: &[&str]) -> i32 {
     }
 
     let keymap = Keymap::us_qwerty();
+    klog(READY_SENTINEL);
     syscall_lib::write_str(STDOUT_FILENO, READY_SENTINEL);
 
     // 4. Poll loop: each device's interrupt-IN endpoint, decode by role, inject.
-    //    Every `RECONCILE_EVERY` ticks, reconcile against the live attach table
-    //    so a hot-plugged device is bound and a hot-unplugged one is released
-    //    (C.4) without restarting the daemon. ~200 ms cadence at the 5 ms poll
-    //    period — fast enough to observe an attach/detach pair, cheap enough not
-    //    to flood the server with `NextAttach` walks.
-    const RECONCILE_EVERY: u32 = 40;
-    let mut tick: u32 = 0;
+    //
+    // Phase 100 Track D.2 — adaptive-backoff bring-up step.
+    //
+    // While reports are arriving the fast cadence (POLL_INTERVAL_NS = 5 ms) is
+    // preserved so input latency stays below one report period.  When N
+    // consecutive polls across all devices return no data the idle sleep grows
+    // (via `next_hid_backoff_ns`) up to a cap of 100 ms, reducing idle core-wake
+    // frequency from ~200/s to ~10/s without any change to the xHCI server.
+    //
+    // Hot-plug reconcile uses a monotonic timestamp so its ~200 ms cadence is
+    // independent of the adaptive sleep duration.
+    //
+    // Full xHCI transfer-event notification (blocking on the controller's
+    // IRQ-driven wakeup instead of polling) is deferred to Phase 103 (USB runtime
+    // power management).  The adaptive backoff is the Phase 100 bring-up step.
+    let mut last_reconcile_ms = monotonic_ms();
+    let mut consecutive_empty: u32 = 0;
     loop {
-        if tick.is_multiple_of(RECONCILE_EVERY) {
+        // Time-based hot-plug reconcile: stays at ~200 ms regardless of backoff.
+        let now = monotonic_ms();
+        if now.wrapping_sub(last_reconcile_ms) >= RECONCILE_INTERVAL_MS {
             reconcile_attachments(usb_ep, &mut devices);
+            last_reconcile_ms = now;
         }
-        tick = tick.wrapping_add(1);
+
+        // Poll all devices; track whether any returned a non-empty report.
+        let mut got_report = false;
         for dev in devices.iter_mut() {
-            match dev.role {
-                DeviceRole::BootKeyboard => {
-                    if let Some(kbd_ep) = kbd_ep {
-                        poll_keyboard(usb_ep, kbd_ep, dev, &keymap);
-                    }
-                }
-                DeviceRole::BootMouse => {
-                    if let Some(mouse_ep) = mouse_ep {
-                        poll_mouse(usb_ep, mouse_ep, dev);
-                    }
-                }
-                DeviceRole::ReportPointer => {
-                    if let Some(mouse_ep) = mouse_ep {
-                        poll_report_pointer(usb_ep, mouse_ep, dev);
-                    }
-                }
-                DeviceRole::ReportConsumer => {
-                    if let Some(kbd_ep) = kbd_ep {
-                        poll_report_consumer(usb_ep, kbd_ep, dev, &keymap);
-                    }
-                }
-                DeviceRole::Ignore => {}
+            let had = match dev.role {
+                DeviceRole::BootKeyboard => kbd_ep
+                    .map(|ep| poll_keyboard(usb_ep, ep, dev, &keymap))
+                    .unwrap_or(false),
+                DeviceRole::BootMouse => mouse_ep
+                    .map(|ep| poll_mouse(usb_ep, ep, dev))
+                    .unwrap_or(false),
+                DeviceRole::ReportPointer => mouse_ep
+                    .map(|ep| poll_report_pointer(usb_ep, ep, dev))
+                    .unwrap_or(false),
+                DeviceRole::ReportConsumer => kbd_ep
+                    .map(|ep| poll_report_consumer(usb_ep, ep, dev, &keymap))
+                    .unwrap_or(false),
+                DeviceRole::Ignore => false,
+            };
+            if had {
+                got_report = true;
             }
         }
-        let _ = syscall_lib::nanosleep_for(0, POLL_INTERVAL_NS);
+
+        // Update the consecutive-empty counter and choose the sleep duration.
+        if got_report {
+            consecutive_empty = 0;
+        } else {
+            consecutive_empty = consecutive_empty.saturating_add(1);
+
+            // Periodic idle-occupancy sentinel — falsifiable evidence that the
+            // driver is no longer pinning a core at idle (Phase 100 D.2 acceptance).
+            if consecutive_empty > 0 && consecutive_empty % IDLE_LOG_EVERY == 0 {
+                let sleep_ns = next_hid_backoff_ns(consecutive_empty);
+                syscall_lib::write_str(STDOUT_FILENO, "USB_HID:idle ticks=");
+                write_u32_dec(consecutive_empty);
+                syscall_lib::write_str(STDOUT_FILENO, " backoff_ns=");
+                write_u32_dec(sleep_ns);
+                syscall_lib::write_str(STDOUT_FILENO, "\n");
+            }
+        }
+
+        let sleep_ns = next_hid_backoff_ns(consecutive_empty);
+        let _ = syscall_lib::nanosleep_for(0, sleep_ns);
     }
+}
+
+/// Write a `u32` as decimal to stdout without `alloc::format!`.
+fn write_u32_dec(n: u32) {
+    let mut buf = [0u8; 10]; // max u32 decimal is 10 digits
+    let mut i = buf.len();
+    let mut v = n;
+    if v == 0 {
+        syscall_lib::write_str(STDOUT_FILENO, "0");
+        return;
+    }
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    // SAFETY: `buf[i..]` contains only ASCII digits.
+    let s = unsafe { core::str::from_utf8_unchecked(&buf[i..]) };
+    syscall_lib::write_str(STDOUT_FILENO, s);
 }
 
 /// Write a `u8` as decimal to stdout without `alloc::format!`.

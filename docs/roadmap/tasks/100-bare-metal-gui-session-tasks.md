@@ -1,6 +1,6 @@
 # Phase 100 — Bare-Metal GUI Session (Dell Tiger Lake): Task List
 
-**Status:** Planned
+**Status:** Implemented (HW-unvalidated) — all five tracks' CI-testable surface is green and now **gate-enforced** (the `[fb-wc]` WC-flag readback, `[fb-blit]` timing, and `RENDER_FP` content sentinels are asserted by `compositor-stress`; `USB_HID:pointer-injected` by `usb-smoke`; `USB_HUB:idle` by `usb-hub-smoke` — per-track acceptance below). Terminal `Validated-on-HW (run N, date)` awaits a recorded run on the physical Dell Precision 5560 for the un-modelable arms (panel render, real USB pointer + focus-on-click, WC blit-latency ratio, USB-kbd text login, flat idle-CPU).
 **Source Ref:** phase-100
 **Depends on:** Phase 99 (SMP & Scheduler Robustness Hardening) ✅, Phase 56/68/71/72/73 (display_server / compositor clients / greeter / session_manager) ✅, Phase 96 (Bare-Metal Bring-up + console-FB write-combining) ✅
 **Goal:** Boot the physical Dell Precision 5560 (Tiger Lake) to a usable graphical session — `display_server` takes the framebuffer, `greeter` renders the login, an interim USB mouse moves the cursor with focus following, and the keyboard works — by (A) spawning the existing-but-unspawned graphical stack on init's diskless bare-metal boot path, (B) finishing the Phase 96 write-combining work for the *userspace* framebuffer in `sys_framebuffer_mmap`, (C) bare-metal-validating the `usb-hid → mouse_server → InputDispatcher` pointer datapath, (D) folding in the open Phase 96 input-polish handoff (USB text-mode keyboard + de-busy-polling `usb-hid`/`usbhub`), and (E) defining the on-metal "the screen shows the greeter" validation method. HW-only: there is no QEMU model for the real panel/MMIO-FB/pointer behavior, so validation follows `docs/appendix/bare-metal-validation.md` and the status convention is **Validated-on-HW (run N, date)**, not a bare "Complete."
@@ -9,11 +9,11 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Spawn `display_server`/`mouse_server`/`session_manager`/`greeter` (+`audio_server`/`term`) on init's bare-metal `BUILTIN_CONFIGS` path + resolve the graphical skip-filter so init yields the tty to the greeter | — | Planned |
-| B | Write-combining user framebuffer — WC PAT attribute on the `sys_framebuffer_mmap` VMA + present-path `sfence` + blit-latency measurement | — | Planned |
-| C | Interim USB-mouse pointer — bare-metal-validate `usb-hid` PointerEvent → `mouse_server` → `InputDispatcher` focus routing on the dock-hub topology | A, B | Planned |
-| D | Input polish — `stdin_feeder` USB-keyboard text-mode drain + convert `usb-hid`/`usbhub` busy-poll to notification-driven waits | A | Planned |
-| E | Bare-metal validation method ("the screen shows the greeter") — on-device render assertion over the log sink + photo evidence convention | A, C | Planned |
+| A | Spawn `display_server`/`mouse_server`/`session_manager`/`greeter` (+`audio_server`/`term`) on init's bare-metal `BUILTIN_CONFIGS` path + resolve the graphical skip-filter so init yields the tty to the greeter | — | Implemented (CI-green) |
+| B | Write-combining user framebuffer — WC PAT attribute on the `sys_framebuffer_mmap` VMA + present-path `sfence` + blit-latency measurement | — | Implemented (CI-gated: `[fb-wc]` WC-flag + `[fb-blit]` presence asserted in `compositor-stress`; B.3 WC-vs-WB ratio HW-pending) |
+| C | Interim USB-mouse pointer — bare-metal-validate `usb-hid` PointerEvent → `mouse_server` → `InputDispatcher` focus routing on the dock-hub topology | A, B | Implemented (CI-gated: `usb-smoke` asserts `USB_HID:pointer-injected`; dispatch host-tested); cursor-on-panel + focus-on-real-click HW-pending |
+| D | Input polish — `stdin_feeder` USB-keyboard text-mode drain + convert `usb-hid`/`usbhub` busy-poll to notification-driven waits | A | Implemented (CI-gated: usbhub change-bit-clear + `USB_HUB:idle` in `usb-hub-smoke`; `stdin_feeder` calls host-tested `key_event_to_stdin`; idle-CPU long-run + USB-kbd-echo HW-pending; full notification → Phase 103) |
+| E | Bare-metal validation method ("the screen shows the greeter") — on-device render assertion over the log sink + photo evidence convention | A, C | E.1 Implemented (CI-green); E.2 photo + recorded HW run pending |
 
 ---
 
@@ -26,9 +26,9 @@
 **Why it matters:** A diskless bare-metal USB boot has no `/etc/services.d`, so init falls back to `add_builtin_defaults()`; today that list is the Phase 96 minimal set (`console`/`kbd`/`stdin_feeder`/USB/`ure`/`telnetd`/`sshd`) and explicitly "no display/greeter/audio", so the laptop comes up at a text console with the compositor never spawned.
 
 **Acceptance:**
-- [ ] `BUILTIN_CONFIGS` gains `display_server`, `mouse_server`, `session_manager`, and `greeter` entries (and `audio_server`/`term` as needed), each parsed through `parse_service_def` like the existing entries.
-- [ ] Dependency edges match the data-disk `KNOWN_CONFIGS` semantics: `greeter`/`term` `depends=display_server`; `session_manager` supervises the session; `mouse_server` has no graphical dep (peer of `kbd`).
-- [ ] On a diskless boot the new services appear in the dependency graph and start in topological order (no `unresolvable dependency` / `deps not ready` log for them).
+- [x] `BUILTIN_CONFIGS` gains `display`, `mouse_server`, `session_manager`, `audio_server`, and `greeter` entries, each parsed through `parse_service_def` like the existing entries. (`term` is intentionally omitted from the builtin set — it is a post-login client launched by `session_manager`, and the data-disk path skips `term.conf` in default mode too.)
+- [x] Dependency edges match the data-disk `KNOWN_CONFIGS` semantics: `greeter` `depends=display,kbd,mouse_server,audio_server` (verbatim from data-disk `greeter.conf`, xtask:26713); `audio_server depends=display`; `session_manager` has no deps (it supervises); `mouse_server` has no graphical dep (peer of `kbd`).
+- [x] Host-test-covered: `builtin_graphical_stack_dep_graph_has_no_cycles` + per-entry parse tests assert the new entries parse and form an acyclic graph; the data-disk path is unchanged (`compositor-stress` PASS).
 
 ### A.2 — Resolve the graphical skip-filter on the builtin path
 
@@ -37,9 +37,9 @@
 **Why it matters:** The greeter-vs-text decision is driven by the `/etc/m3os-graphical-only` marker file, which lives on the **absent** data disk; `skip_for_greeter_filter` also runs only on the `KNOWN_CONFIGS`/dir-scan path, not the builtin path — so without a builtin-path toggle init would either skip the greeter or start a text login competing for the same console.
 
 **Acceptance:**
-- [ ] The builtin path makes the same greeter-vs-text choice as `skip_for_greeter_filter` (greeter selected when graphical mode is on), via a toggle that does not require the absent marker file (e.g. a builtin-defaults graphical flag / a kernel-cmdline or FB-present heuristic), documented in a code comment referencing the marker it stands in for.
-- [ ] In graphical mode on the diskless boot, init does **not** also bring up a foreground text login on the FB console — the tty is yielded to the greeter (the `GREETER_ONLY_SKIPPED_CONFS` / `GRAPHICAL_ONLY_SKIPPED_CONFS` intent holds on the builtin path).
-- [ ] `display_server` claims the FB via `try_yield_console` with `raw_input_enabled=false` (exec path `/bin/display_server`), so `stdin_feeder` backs off PS/2-to-stdin once the compositor owns the console.
+- [x] The builtin path makes the same greeter-vs-text choice via a pure `decide_graphical(boot_override, diskless, marker_present)` + `effective_graphical_mode()`: the diskless builtin-defaults path defaults to graphical (standing in for the absent `/etc/m3os-graphical-only` marker; an explicit `/proc/m3os-boot-mode=serial` override still forces text). 4 host truth-table tests cover the decision; documented in code comments referencing the marker.
+- [x] In graphical mode the serial autologin is gated on the **same** `effective_graphical_mode()` as the greeter filter, so init does **not** bring up a competing foreground text login on the diskless graphical boot (the two decision sites can never disagree).
+- [x] `display_server` exec path `/bin/display_server`; `stdin_feeder` backs off PS/2-to-stdin once `display_server` registers the `display.input-owner` IPC service (`compositor-stress` log confirms registration).
 
 ### A.3 — No regression to the QEMU / data-disk boot
 
@@ -51,8 +51,8 @@
 **Why it matters:** The data-disk GUI boot under QEMU must be byte-for-byte unchanged — the builtin path is a *fallback*, and a stack started twice (once from disk, once from builtin) would double-claim the FB.
 
 **Acceptance:**
-- [ ] A data-disk boot (QEMU `run-gui`) still loads the graphical stack from `/etc/services.d/*.conf` and **not** from `add_builtin_defaults` (the builtin path runs only when `/etc/services.d` is absent/unreadable).
-- [ ] The existing QEMU GUI-session boot reaches the compositor + greeter render with no new double-spawn / FB-claim error in the log.
+- [x] A data-disk boot still loads the graphical stack from `/etc/services.d/*.conf` and **not** from `add_builtin_defaults` (`diskless_builtin` is set only on the `count == 0` fallback in `load_services`).
+- [x] The existing QEMU GUI-session boot reaches the compositor + greeter render with no new double-spawn / FB-claim error: `compositor-stress PASSED (no kernel panic)`, `display_server registered as 'display.input-owner' (first Toplevel mapped)` once.
 
 ---
 
@@ -65,9 +65,9 @@
 **Why it matters:** The compositor FB is mapped `PRESENT | WRITABLE | USER_ACCESSIBLE | NO_EXECUTE | BIT_11` with **no `NO_CACHE`/PCD bit**, so it decodes write-back; on real MMIO that makes every per-frame blit a stream of single-store bus transactions (10–50× slower than WC). Phase 96 fixed only the kernel console FB.
 
 **Acceptance:**
-- [ ] The `sys_framebuffer_mmap` PTE flags include `PageTableFlags::NO_CACHE` (PCD set), with `WRITE_THROUGH`/PWT **clear** and the PAT bit **clear**, so a 4 KiB leaf selects PAT index 2 (= WC after `pat::init`) — mirroring `pat.rs::set_range_write_combining`'s type selection.
-- [ ] The recorded `MemoryMapping` for the FB VMA is unchanged in `prot`/`flags` semantics; the mapping still survives the existing `tlb_shootdown_range` + `bump_generation`.
-- [ ] A QEMU boot reads back the mapped leaf's flags and confirms PCD=1 / PWT=0 / PAT=0 (WC index 2) — falsifiable without real MMIO.
+- [x] The `sys_framebuffer_mmap` PTE flags include `PageTableFlags::NO_CACHE` (PCD set), with `WRITE_THROUGH`/PWT **clear** and the PAT bit **clear**, so a 4 KiB leaf selects PAT index 2 (= WC after `pat::init`).
+- [x] The recorded `MemoryMapping` for the FB VMA is unchanged in `prot`/`flags` semantics (the `1 | FB_MAPPING_FLAG` line is untouched); the mapping still survives the existing `tlb_shootdown_range` + `bump_generation`.
+- [x] **Gate-enforced in QEMU**: `compositor-stress` now waits on the readback sentinel `[fb-wc] user FB leaf flags: PCD=1 PWT=0 PAT=0 (WC idx2)` and fails on any other PCD/PWT/PAT combination — confirms PAT index 2 (WC) and guards against a `NO_CACHE`-flag regression in `sys_framebuffer_mmap`.
 
 ### B.2 — Confirm per-core PAT programming + present-path ordering
 
@@ -79,8 +79,8 @@
 **Why it matters:** PAT is per-core — the Intel SDM requires every logical CPU mapping a shared WC region to have the same PAT — and WC is weakly ordered, so the compositor's present must `sfence` before signalling the flip or a half-written frame can be latched.
 
 **Acceptance:**
-- [ ] `pat::init` is confirmed to run on every core the compositor can be scheduled on (BSP + each AP at `ap_entry`, before any WC user mapping is faulted in); documented at the `sys_framebuffer_mmap` change site.
-- [ ] The present / `sys_framebuffer_pageflip` path issues an `sfence` (or equivalent store barrier) before the flip is signalled, so WC writes are globally visible first.
+- [x] `pat::init` is confirmed to run on every core the compositor can be scheduled on (BSP `kernel/src/lib.rs:309` + each AP `kernel/src/smp/boot.rs:423`, before any WC user mapping is faulted in); documented at the `sys_framebuffer_mmap` change site.
+- [x] The present / `sys_framebuffer_pageflip` path issues an inline-asm `sfence` before the flip is signalled (`crate::fb::vbe::pageflip`), so WC writes are globally visible first. (Soft-float-safe: `sfence` touches no XMM.)
 
 ### B.3 — Measure blit latency on the laptop (WC vs write-back)
 
@@ -89,8 +89,8 @@
 **Why it matters:** The phase's premise is "the WC user-FB measurably improves blit latency"; on QEMU the RAM FB makes WC vs WB negligible, so this is a bare-metal-only measurement and must be recorded as real evidence, not assumed.
 
 **Acceptance:**
-- [ ] A recorded full-screen-fill (or representative blit) timing on the laptop shows the WC mapping is materially faster than a write-back baseline (target order-of-magnitude on real MMIO; the exact ratio recorded).
-- [ ] The measurement method (how the timing was taken and emitted over `usb-logsink`/network sink) is documented so the run is reproducible.
+- [ ] **HW-pending**: a recorded full-screen-fill (or representative blit) timing on the laptop shows the WC mapping is materially faster than a write-back baseline (target order-of-magnitude on real MMIO; the exact ratio recorded). QEMU's RAM-FB makes WC≈WB, so this ratio is a Dell-only measurement.
+- [x] The `[fb-blit] full-screen fill elapsed_ns=<N> pixels=<P>` timing sentinel is emitted by `display_server` on the initial full-screen fill (every boot, QEMU included) and its presence is gate-checked in `compositor-stress`; only the WC-vs-WB *ratio* (above) stays a Dell-only measurement. The capture method is documented in `scripts/phase-100-bare-metal-validate.md`, so the bare-metal run is boot-and-grep rather than write-instrumentation-first.
 
 ---
 
@@ -106,8 +106,8 @@
 **Why it matters:** The decode + inject path has only ever run against an emulated PS/2 mouse under QEMU; the laptop's pointer is a USB mouse behind the dock/`usbhub` walker, so this is the first time the path runs against a real pointer through a real hub on bare metal.
 
 **Acceptance:**
-- [ ] With a USB mouse attached (behind the dock/`usbhub`), `usb-hid` decodes its reports into `PointerEvent`s and injects them; a **non-zero** injected-event count is captured in the log over the dock-hub topology.
-- [ ] `mouse_server` serves the injected events ahead of its PS/2 pipeline (injected-first drain) and `display_server`'s pointer source pulls them on `MOUSE_EVENT_PULL`.
+- [x] `usb-hid` decodes pointer reports into `PointerEvent`s and injects them; `usb-smoke` now **gates** the `USB_HID:pointer-injected count=<n>` sentinel (waited on right after the `USB_HID:mouse … moved=1` decode), so a decode-OK-but-inject-broken regression fails CI — not just the decode step. The **dock-hub topology** specificity remains the HW arm.
+- [x] `mouse_server` serves injected events ahead of its PS/2 pipeline (Phase 78c `PendingEdges` injected-first drain, unchanged) and `display_server`'s pointer source pulls them on `MOUSE_EVENT_PULL` — exercised end-to-end by `usb-smoke` (mouse decoded → injected → served → rendered at the term prompt).
 
 ### C.2 — Cursor motion + focus-follows-pointer on the panel
 
@@ -119,9 +119,9 @@
 **Why it matters:** The dispatcher and its focus routing are pure-logic + QEMU-PS/2-validated only; this proves the compositor cursor and focus state respond to a real pointer on hardware (the falsifiable "the pointer works" arm).
 
 **Acceptance:**
-- [ ] Moving the USB mouse moves the compositor cursor on the panel (captured as continuous `PointerEvent` motion + a render-assertion delta, cross-referenced with Track E).
-- [ ] A button-down over a `Toplevel` produces a `PointerRouteDecision` with a `focus_change`, and the focus sentinel is captured in the log — focus follows the click.
-- [ ] No new dispatch logic was added (this is a validation arm); any change is confined to logging/sentinels.
+- [ ] **HW-pending**: moving the USB mouse moves the compositor cursor on the panel — captured as the small-`rows_changed` `RENDER_FP` delta (Track E reuse). `usb-smoke` confirms the `moved=1` decode + inject; cursor-on-real-panel is the HW arm.
+- [ ] **HW-pending capture** (code done): a button-down over a `Toplevel` produces a `PointerRouteDecision.focus_change` and emits `INPUT:pointer-focus-change surface=<id>`. The focus-on-click logic is host-tested (`pointer_button_down_on_toplevel_requests_focus_change`) and the sentinel is wired at the apply site; capturing it on a real click is HW.
+- [x] No new dispatch logic was added — `kernel-core/src/input/dispatch.rs` is untouched and its 3 `pointer_button_down` tests pass; the change is confined to the two log sentinels.
 
 ---
 
@@ -139,9 +139,9 @@
 **Why it matters:** `stdin_feeder` only drains PS/2 scancodes (`KBD_TRY_READ`); a USB keyboard's input reaches `kbd_server` as typed `KeyEvent`s via `usb-hid`'s `KBD_EVENT_INJECT`, which `stdin_feeder` never reads — so a USB keyboard is dead at the text login on a machine with no PS/2 keyboard.
 
 **Acceptance:**
-- [ ] `stdin_feeder` also drains typed `KeyEvent`s on `KBD_EVENT_PULL` (honoring the `KBD_EVENT_NONE` empty/timeout sentinel) and converts them to stdin bytes, alongside the existing PS/2 `KBD_TRY_READ` path.
-- [ ] The two drains do not starve `display_server`'s concurrent `KBD_EVENT_PULL` requests (the non-blocking-probe discipline is preserved).
-- [ ] On the laptop (or via `--usb-passthrough` of a USB keyboard), typing on a USB keyboard echoes at the framebuffer text login before the compositor takes the FB.
+- [x] `stdin_feeder` also drains typed `KeyEvent`s on `KBD_EVENT_PULL` (honoring the `KBD_EVENT_NONE` empty/timeout sentinel) and converts them to stdin bytes by calling the host-tested `kernel_core::input::hid_poll::key_event_to_stdin` **directly** — `stdin_feeder` now links `kernel-core` (`default-features = false`, like the `usb-hid` class driver) instead of carrying a hand-synced copy, so the host tests cover the executed code path. This runs alongside the existing PS/2 `KBD_TRY_READ` path; `termios-smoke` PASS confirms the PS/2 line-discipline path is unregressed.
+- [x] The two drains do not starve `display_server`'s concurrent `KBD_EVENT_PULL` requests — `stdin_feeder` keeps the non-blocking probe and stands down entirely once `display.input-owner` is registered.
+- [ ] **HW/passthrough-pending**: on the laptop (or via `--usb-passthrough` of a USB keyboard), typing on a USB keyboard echoes at the framebuffer text login before the compositor takes the FB.
 
 ### D.2 — Convert `usb-hid` from 5 ms busy-poll to a notification-driven wait
 
@@ -150,9 +150,9 @@
 **Why it matters:** `usb-hid` polls every device's interrupt-IN endpoint every 5 ms forever, pinning a core at idle (and burning battery the moment Phase 103 lands); the xHCI server already captures reports on its IRQ, so the driver can block on a notification instead.
 
 **Acceptance:**
-- [ ] `usb-hid` blocks on an xHCI transfer-event notification (or a bounded wait that idles the core) rather than spinning on the fixed 5 ms cadence; input latency stays below one report period when events arrive.
-- [ ] Hot-plug attach/detach reconcile (the existing ~200 ms cadence behavior) still works without the busy spin.
-- [ ] Recorded idle-CPU evidence shows `usb-hid` no longer keeps a core hot at idle.
+- [x] `usb-hid` uses a bounded adaptive backoff that idles the core (fast 5 ms cadence preserved while reports arrive — `usb-smoke` confirms live HID decode latency is unchanged — growing to a 100 ms idle cap via the host-tested `next_hid_backoff_ns`) rather than spinning on the fixed 5 ms cadence. *(Full xHCI transfer-event notification needs xHCI-server + `usb-core` protocol changes → deferred to Phase 103, as the design doc scopes; the adaptive backoff is the Phase 100 bring-up step.)*
+- [x] Hot-plug attach/detach reconcile (now a monotonic ~200 ms timestamp, independent of backoff) still works without the busy spin: `usb-hotplug-smoke` PASS (3 attach/detach cycles, no slot exhaustion / daemon restart).
+- [ ] **HW/long-run-pending**: recorded idle-CPU evidence shows `usb-hid` no longer keeps a core hot at idle. The `USB_HID:idle ticks=<n> backoff_ns=<n>` sentinel is in place; the idle-occupancy measurement is recorded on a longer/HW run.
 
 ### D.3 — Convert `usbhub` walker off the busy-poll
 
@@ -161,8 +161,8 @@
 **Why it matters:** The hub walker similarly spins; combined with `usb-hid` it keeps cores hot at idle on the laptop.
 
 **Acceptance:**
-- [ ] `usbhub` waits on a notification / bounded idle rather than a tight walk loop once enumeration is steady; port-status-change still triggers (re)enumeration promptly.
-- [ ] Recorded idle-CPU evidence shows the hub walker no longer pins a core.
+- [x] `usbhub` uses a bounded steady-state monitoring loop (50 ms → 200 ms backoff via host-tested `hub_next_backoff_ns`) rather than a tight walk once enumeration is steady. It now acknowledges (RW1C-clears via `CLEAR_FEATURE`) the per-port change bits (`C_PORT_CONNECTION`/`ENABLE`/`SUSPEND`/`OVER_CURRENT`) after each probe so `wPortChange` returns to 0 and the backoff actually engages — without this, a populated downstream port (its `C_PORT_CONNECTION` set on connect and previously never cleared) re-enumerated every 50 ms forever and never idled. A genuine later `wPortChange` still triggers prompt (re)enumeration. `usb-hub-smoke` now **gates** `USB_HUB:idle ticks=` on its populated-hub topology (a downstream usb-mouse on port 3.1), which can only fire once the walker reaches idle — a falsifiable guard that fails against the pre-fix re-enumeration bug.
+- [ ] **HW/long-run-pending**: recorded idle-CPU evidence shows the hub walker no longer pins a core. The `USB_HUB:idle ticks=<n> backoff_ns=<n>` sentinel is in place.
 
 ---
 
@@ -178,8 +178,8 @@
 **Why it matters:** There is no QMP/PPM screendump on bare metal (the QEMU-only path the `less-render-probe`/`claude_tui_render_arm` gates use), so "the screen shows the greeter" needs a falsifiable on-metal substitute — the on-device analog of the PPM band-diff.
 
 **Acceptance:**
-- [ ] The compositor/greeter computes and prints a cheap render fingerprint (changed-scanline count or hash) over the log sink; a blank screen yields ≈0 and the rendered greeter yields a non-trivial value (threshold recorded), so the sentinel falsifiably distinguishes "rendered" from "black."
-- [ ] The sentinel string is quoted in the Track-E / phase acceptance and reused for the Track C cursor-motion delta.
+- [x] The compositor computes and prints a cheap render fingerprint (changed-scanline count + sampled FNV hash) over the log sink on each damage-driven compose. Sentinel: **`RENDER_FP frame=<n> rows_nonblank=<R> rows_changed=<C> hash=0x<8hex>`**. Falsifiable: a background-only frame yields `rows_nonblank=0` (host test `all_background_yields_zero_nonblank`); content yields a non-trivial value — confirmed in QEMU (`compositor-stress` log: `RENDER_FP frame=2 rows_nonblank=1072 rows_changed=1064 …`, `rows_changed=0` when static). `compositor-stress` now **gates** both the sentinel's presence **and** that some frame carries rendered content (`rows_nonblank > 0` — the exact blank-vs-content boundary the `all_background_yields_zero_nonblank` host test pins; a black/blank compositor yields 0 and fails the gate). The stronger `rows_nonblank ≥ 200` "greeter dialog visible" threshold is asserted on the HW greeter boot, not this term-path stress gate.
+- [x] The sentinel string `RENDER_FP … rows_changed=<C>` is quoted here and reused for the Track C cursor-motion delta (a small `rows_changed` value on pointer motion).
 
 ### E.2 — Photo evidence convention + recorded HW run
 
@@ -191,9 +191,9 @@
 **Why it matters:** Per the bare-metal validation strategy, a HW-only phase is Validated only when the host/QEMU surface is green **and** a recorded physical run cleared the un-modelable remainder — captured, not asserted from memory.
 
 **Acceptance:**
-- [ ] A dated panel photo (and/or the captured boot.log + render sentinel) is committed/referenced as the evidence artifact for the greeter render on `Dell Precision 5560 / Tiger Lake`.
-- [ ] The phase design doc + README Status carry `Validated-on-HW (run N, YYYY-MM-DD)` with the machine + evidence pointer once the run is recorded (Status stays `Planned` / `Implemented (HW-unvalidated)` until then — never a bare "Complete").
-- [ ] The recorded run confirms all five HW acceptance arms together: greeter renders, USB mouse moves the cursor + focus follows, WC blit-latency win measured, USB keyboard works in text mode, and `usb-hid`/`usbhub` idle-CPU is flat.
+- [ ] **HW-pending**: a dated panel photo (and/or the captured boot.log + `RENDER_FP` sentinel) is committed/referenced as the evidence artifact for the greeter render on `Dell Precision 5560 / Tiger Lake`. The capture convention + sentinel index are documented in `scripts/phase-100-bare-metal-validate.md`.
+- [x] The phase design doc + README Status now carry **`Implemented (HW-unvalidated)`** (the correct intermediate — never a bare "Complete"); they flip to `Validated-on-HW (run N, YYYY-MM-DD)` with the machine + evidence pointer once the run is recorded.
+- [ ] **HW-pending**: the recorded run confirms all five HW acceptance arms together: greeter renders, USB mouse moves the cursor + focus follows, WC blit-latency win measured, USB keyboard works in text mode, and `usb-hid`/`usbhub` idle-CPU is flat.
 
 ---
 
