@@ -842,6 +842,19 @@ fn main() {
                 });
             cmd_xhci_bringup_smoke(&smoke_args);
         }
+        // Phase 101 Track F — boots headless, waits for the ring-3 acpid to
+        // build the AML namespace from QEMU's own DSDT and arm the SCI, then
+        // fires the ACPI power button via QMP `system_powerdown` and asserts
+        // the kernel-demux → acpid PM1-dispatch path reports it.
+        Some("acpi-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("acpi-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_acpi_smoke(&smoke_args);
+        }
         // Phase 78b Track A-glue — boots with `-device qemu-xhci` + `usb-kbd`
         // and asserts that the ring-3 xhci_driver enumerates the device to
         // Configured state (`XHCI_ENUM:configured`).
@@ -1839,6 +1852,7 @@ fn build_userspace_bins() {
         // Phase 78b Track B: ring-3 USB hub class driver.
         // `needs_alloc = true` for kernel-core + usb-core deps.
         ("usbhub", "usbhub", true),
+        ("acpid", "acpid", true), // Phase 101 E: ring-3 ACPI daemon (alloc for kernel-core namespace)
         // Phase 78c: ring-3 USB HID Boot-Protocol class driver (kbd + mouse).
         // `needs_alloc = true` for kernel-core + usb-core deps.
         ("usb_hid", "usb_hid", true),
@@ -10686,6 +10700,137 @@ fn cmd_device_smoke(args: &DeviceSmokeArgs) {
 /// detected` serial line proves only that the daemon ran — it is explicitly
 /// **not** sufficient for PASS, so the gate waits for the interrupt-delivered
 /// completion sentinel, which the driver emits only from its IRQ event loop.
+/// Phase 101 Track F — `acpi-smoke`: the QEMU-testable arm of the ACPI
+/// platform foundation. Asserts, on a live boot:
+///
+/// 1. `ACPI_SMOKE:namespace-built` — acpid fetched the FACP/DSDT/SSDTs
+///    through `SYS_ACPI_TABLE_GET` and the `kernel-core` AML interpreter
+///    built the namespace from QEMU's real firmware bytecode.
+/// 2. `ACPI_SMOKE:sci-armed` — the SCI GSI is routed, acpid completed the
+///    ACPI-enable handshake (`SCI_EN`), and `PWRBTN_EN` is set.
+/// 3. `ACPI_SMOKE:power-button` — a QMP `system_powerdown` raised the SCI;
+///    the kernel ISR demuxed + masked PM1, signalled the bound
+///    notification, and acpid's dispatcher read `PWRBTN_STS`.
+///
+/// The serial-only arms prove the same code paths the Dell's lid/battery
+/// events will take; only the devices differ (bare-metal validation doc).
+fn cmd_acpi_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = fs::remove_file(&qmp_socket);
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    // Strip hostfwd to avoid port conflicts in CI (same as device-smoke).
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+
+    println!(
+        "acpi-smoke: launching QEMU (timeout {}s, qmp {})",
+        args.timeout_secs,
+        qmp_socket.display()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let stdout = child.stdout.take().expect("qemu stdout");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_buf = String::new();
+    let mut serial_history = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let step = std::time::Duration::from_secs(args.timeout_secs);
+
+    let result: Result<(), String> = (|| {
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "ACPI_SMOKE:namespace-built",
+            step,
+            global_start,
+            global_timeout,
+        )?;
+        println!("acpi-smoke: namespace built from the live QEMU DSDT");
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "ACPI_SMOKE:sci-armed",
+            step,
+            global_start,
+            global_timeout,
+        )?;
+        println!("acpi-smoke: SCI armed — firing power button via QMP system_powerdown");
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+        q.execute("system_powerdown", serde_json::json!({}))
+            .map_err(|e| format!("qmp system_powerdown: {e}"))?;
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "ACPI_SMOKE:power-button",
+            step,
+            global_start,
+            global_timeout,
+        )?;
+        Ok(())
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_file(&qmp_socket);
+
+    match result {
+        Ok(()) => {
+            let elapsed = global_start.elapsed().as_secs();
+            println!(
+                "acpi-smoke: PASSED ({elapsed}s) — namespace built from live firmware AML, \
+                 SCI routed, and a QMP power-button event traversed kernel demux → acpid"
+            );
+        }
+        Err(msg) => {
+            eprintln!("acpi-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn cmd_xhci_bringup_smoke(args: &SmokeBootArgs) {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
@@ -26657,6 +26802,10 @@ fn populate_ext2_files(
     // substrate is kernel-internal init), restart=on-failure max_restart=5.
     let xhci_driver_conf =
         "name=xhci_driver\ncommand=/drivers/xhci\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
+    // Phase 101 Track E — ring-3 ACPI daemon (AML namespace + SCI events).
+    // No depends: the table-fetch/SCI syscalls are kernel-internal init.
+    let acpid_conf =
+        "name=acpid\ncommand=/drivers/acpid\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
     // Phase 78b Track B — ring-3 USB hub class driver. Depends on xhci_driver
     // so the hub daemon starts after the host controller is up.
     let usbhub_conf = "name=usbhub\ncommand=/drivers/usbhub\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n";
@@ -27116,6 +27265,7 @@ fn populate_ext2_files(
     let ure_driver_conf_tmp = output_dir.join("_tmp_ure_driver_conf");
     let mt792x_driver_conf_tmp = output_dir.join("_tmp_mt792x_driver_conf");
     let xhci_driver_conf_tmp = output_dir.join("_tmp_xhci_driver_conf");
+    let acpid_conf_tmp = output_dir.join("_tmp_acpid_conf");
     let usbhub_conf_tmp = output_dir.join("_tmp_usbhub_conf");
     let usb_hid_conf_tmp = output_dir.join("_tmp_usb_hid_conf");
     let usb_storage_conf_tmp = output_dir.join("_tmp_usb_storage_conf");
@@ -27187,6 +27337,7 @@ fn populate_ext2_files(
     fs::write(&ure_driver_conf_tmp, ure_driver_conf).expect("write temp ure_driver.conf");
     fs::write(&mt792x_driver_conf_tmp, mt792x_driver_conf).expect("write temp mt792x_driver.conf");
     fs::write(&xhci_driver_conf_tmp, xhci_driver_conf).expect("write temp xhci_driver.conf");
+    fs::write(&acpid_conf_tmp, acpid_conf).expect("write temp acpid.conf");
     fs::write(&usbhub_conf_tmp, usbhub_conf).expect("write temp usbhub.conf");
     fs::write(&usb_hid_conf_tmp, usb_hid_conf).expect("write temp usb-hid.conf");
     fs::write(&usb_storage_conf_tmp, usb_storage_conf).expect("write temp usb-storage.conf");
@@ -28031,6 +28182,10 @@ fn populate_ext2_files(
          sif etc/services.d/xhci_driver.conf mode 0x81A4\n\
          sif etc/services.d/xhci_driver.conf uid 0\n\
          sif etc/services.d/xhci_driver.conf gid 0\n\
+         write \"{acpid_conf}\" etc/services.d/acpid.conf\n\
+         sif etc/services.d/acpid.conf mode 0x81A4\n\
+         sif etc/services.d/acpid.conf uid 0\n\
+         sif etc/services.d/acpid.conf gid 0\n\
          write \"{usbhub_conf}\" etc/services.d/usbhub.conf\n\
          sif etc/services.d/usbhub.conf mode 0x81A4\n\
          sif etc/services.d/usbhub.conf uid 0\n\
@@ -28129,6 +28284,7 @@ fn populate_ext2_files(
         ure_driver_conf = ure_driver_conf_tmp.display(),
         mt792x_driver_conf = mt792x_driver_conf_tmp.display(),
         xhci_driver_conf = xhci_driver_conf_tmp.display(),
+        acpid_conf = acpid_conf_tmp.display(),
         usbhub_conf = usbhub_conf_tmp.display(),
         usb_hid_conf = usb_hid_conf_tmp.display(),
         usb_storage_conf = usb_storage_conf_tmp.display(),

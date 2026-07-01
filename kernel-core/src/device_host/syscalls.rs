@@ -256,6 +256,55 @@ pub const fn unpack_config_read_arg(packed: u64) -> (u16, u8) {
     (((packed >> 8) & 0xFFFF) as u16, (packed & 0xFF) as u8)
 }
 
+// ---------------------------------------------------------------------------
+// Phase 101 Tracks D/E — platform-ACPI syscalls for the ring-3 `acpid`.
+//
+// These extend the device-host block but are gated on the `/drivers/`
+// exec-path only (like `SYS_DEVICE_PCI_ENUMERATE`), not on a
+// `Capability::Device`: ACPI's register blocks are FADT-enumerated fixed
+// ports, not a claimable PCI function's BAR, and the DSDT/SSDT blobs are
+// firmware memory no device owns.
+// ---------------------------------------------------------------------------
+
+/// Fetch an ACPI table's raw bytes read-only:
+/// `sys_acpi_table_get(sig_ptr, index, out_ptr, out_len) -> isize`.
+/// `sig_ptr` names a 4-byte signature (`FACP`, `DSDT`, `SSDT`, …); `index`
+/// selects among same-signature tables (SSDTs). Returns the table's full
+/// byte length (callers with a short buffer get a truncated copy and can
+/// re-size), `-ENOENT` if absent, `-EACCES` outside `/drivers/`.
+pub const SYS_ACPI_TABLE_GET: u64 = 0x112C;
+
+/// Subscribe the platform SCI:
+/// `sys_acpi_sci_subscribe(notification_arg) -> isize` (a fresh
+/// `Capability::Notification` handle). The kernel routes the FADT's
+/// `SCI_INT` GSI, demuxes + masks PM1/GPE events in its ISR, and signals
+/// the notification ([`ACPI_SCI_BIT_PM1`]/[`ACPI_SCI_BIT_GPE`]). Pass
+/// [`NOTIFICATION_SENTINEL_NEW`]; one subscriber at a time (`-EBUSY`).
+pub const SYS_ACPI_SCI_SUBSCRIBE: u64 = 0x112D;
+
+/// Read an ACPI PM register:
+/// `sys_acpi_pm_read(reg_sel, byte_index) -> isize` (the register value).
+pub const SYS_ACPI_PM_READ: u64 = 0x112E;
+
+/// Write an ACPI PM register:
+/// `sys_acpi_pm_write(reg_sel, byte_index, value) -> isize`.
+pub const SYS_ACPI_PM_WRITE: u64 = 0x112F;
+
+/// `reg_sel` values for [`SYS_ACPI_PM_READ`]/[`SYS_ACPI_PM_WRITE`]. The
+/// kernel resolves each selector to its FADT-declared port and access
+/// width — ring 3 never names a raw port number.
+pub const ACPI_PM_REG_PM1A_STS: u64 = 0; // u16 @ PM1a_EVT_BLK
+pub const ACPI_PM_REG_PM1A_EN: u64 = 1; // u16 @ PM1a_EVT_BLK + PM1_EVT_LEN/2
+pub const ACPI_PM_REG_PM1A_CNT: u64 = 2; // u16 @ PM1a_CNT_BLK (SCI_EN = bit 0)
+pub const ACPI_PM_REG_GPE0_STS: u64 = 3; // u8  @ GPE0_BLK + byte_index
+pub const ACPI_PM_REG_GPE0_EN: u64 = 4; // u8  @ GPE0_BLK + GPE0_BLK_LEN/2 + byte_index
+pub const ACPI_PM_REG_SMI_CMD: u64 = 5; // u8  @ SMI_CMD (ACPI-enable handshake)
+
+/// Notification bit the SCI ISR sets for pending PM1 fixed events.
+pub const ACPI_SCI_BIT_PM1: u8 = 0;
+/// Notification bit the SCI ISR sets for pending GPE0 events.
+pub const ACPI_SCI_BIT_GPE: u8 = 1;
+
 /// Lowest syscall number in the reserved device-host block.
 ///
 /// Track B dispatch arms match `DEVICE_HOST_BASE..=DEVICE_HOST_LAST` so new
@@ -267,7 +316,7 @@ pub const DEVICE_HOST_BASE: u64 = SYS_DEVICE_CLAIM;
 ///
 /// Adjust upward when adding new device-host syscalls; the Track B acceptance
 /// items pin this constant as the authoritative upper bound.
-pub const DEVICE_HOST_LAST: u64 = SYS_DEVICE_DMA_UNMAP_SHM;
+pub const DEVICE_HOST_LAST: u64 = SYS_ACPI_PM_WRITE;
 
 #[cfg(test)]
 mod tests {
@@ -294,7 +343,12 @@ mod tests {
         // Phase 92a H.4 — IOMMU-map / unmap a shared-memory region for device DMA.
         assert_eq!(SYS_DEVICE_DMA_MAP_SHM, 0x112A);
         assert_eq!(SYS_DEVICE_DMA_UNMAP_SHM, 0x112B);
-        assert_eq!(DEVICE_HOST_LAST, SYS_DEVICE_DMA_UNMAP_SHM);
+        // Phase 101 D/E — platform-ACPI syscalls for the ring-3 acpid.
+        assert_eq!(SYS_ACPI_TABLE_GET, 0x112C);
+        assert_eq!(SYS_ACPI_SCI_SUBSCRIBE, 0x112D);
+        assert_eq!(SYS_ACPI_PM_READ, 0x112E);
+        assert_eq!(SYS_ACPI_PM_WRITE, 0x112F);
+        assert_eq!(DEVICE_HOST_LAST, SYS_ACPI_PM_WRITE);
     }
 
     #[test]
@@ -312,6 +366,10 @@ mod tests {
             SYS_DEVICE_CONFIG_WRITE,
             SYS_DEVICE_DMA_MAP_SHM,
             SYS_DEVICE_DMA_UNMAP_SHM,
+            SYS_ACPI_TABLE_GET,
+            SYS_ACPI_SCI_SUBSCRIBE,
+            SYS_ACPI_PM_READ,
+            SYS_ACPI_PM_WRITE,
         ];
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate() {
@@ -337,6 +395,10 @@ mod tests {
             SYS_DEVICE_CONFIG_WRITE,
             SYS_DEVICE_DMA_MAP_SHM,
             SYS_DEVICE_DMA_UNMAP_SHM,
+            SYS_ACPI_TABLE_GET,
+            SYS_ACPI_SCI_SUBSCRIBE,
+            SYS_ACPI_PM_READ,
+            SYS_ACPI_PM_WRITE,
         ];
         for n in all {
             assert!(
@@ -359,10 +421,15 @@ mod tests {
         assert_eq!(SYS_DEVICE_CONFIG_READ, SYS_DEVICE_PCI_ENUMERATE + 1);
         // Phase 80c Track F.1 pin: CONFIG_WRITE follows CONFIG_READ without gap.
         assert_eq!(SYS_DEVICE_CONFIG_WRITE, SYS_DEVICE_CONFIG_READ + 1);
-        // Phase 92a H.4 pin: the shm-DMA map/unmap pair closes the block.
+        // Phase 92a H.4 pin: the shm-DMA map/unmap pair follows CONFIG_WRITE.
         assert_eq!(SYS_DEVICE_DMA_MAP_SHM, SYS_DEVICE_CONFIG_WRITE + 1);
         assert_eq!(SYS_DEVICE_DMA_UNMAP_SHM, SYS_DEVICE_DMA_MAP_SHM + 1);
-        assert_eq!(DEVICE_HOST_LAST, SYS_DEVICE_DMA_UNMAP_SHM);
+        // Phase 101 D/E pin: the platform-ACPI quartet closes the block.
+        assert_eq!(SYS_ACPI_TABLE_GET, SYS_DEVICE_DMA_UNMAP_SHM + 1);
+        assert_eq!(SYS_ACPI_SCI_SUBSCRIBE, SYS_ACPI_TABLE_GET + 1);
+        assert_eq!(SYS_ACPI_PM_READ, SYS_ACPI_SCI_SUBSCRIBE + 1);
+        assert_eq!(SYS_ACPI_PM_WRITE, SYS_ACPI_PM_READ + 1);
+        assert_eq!(DEVICE_HOST_LAST, SYS_ACPI_PM_WRITE);
     }
 
     #[test]

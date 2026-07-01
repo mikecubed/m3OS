@@ -95,7 +95,81 @@ const ERDP_EHB: u64 = 1 << 3;
 /// completion in microseconds; genuinely slow or absent completions still fall
 /// through to the bounded 1 ms sleep phase, so the timeout behaviour is
 /// unchanged. Empty polls are cheap (event-ring memory reads, no MMIO writes).
+///
+/// The spin phase is bounded by BOTH this iteration count and the
+/// `COMPLETION_SPIN_NS` wall clock. The iteration count alone proved to be no
+/// bound at all on real hardware: each "spin" iteration includes a full
+/// event-ring drain, and during a dock-hub port-status storm every iteration
+/// does real work (PORTSC MMIO + event processing), so 4000 iterations ran for
+/// seconds of continuous CPU without a single deschedule — the residual ~2 s
+/// `cpu-hog …/drivers/xhci` storm in the Phase 100 bare-metal log. The wall
+/// clock is the primary bound (the fast path this phase exists for completes
+/// in microseconds); the iteration count remains only as a backstop should
+/// CLOCK_MONOTONIC misbehave.
 const COMPLETION_SPIN_POLLS: u32 = 4000;
+
+/// Wall-clock ceiling on the busy-poll phase of a completion wait. Generous
+/// for the µs-scale fast completion it exists to catch, and three orders of
+/// magnitude below the multi-second spin the pure iteration bound allowed
+/// under an event-storm (see `COMPLETION_SPIN_POLLS`).
+const COMPLETION_SPIN_NS: u64 = 2_000_000;
+
+/// CLOCK_MONOTONIC in nanoseconds (0 on error — the spin phase then falls back
+/// to the `COMPLETION_SPIN_POLLS` iteration backstop).
+fn monotonic_ns() -> u64 {
+    let (sec, nsec) = syscall_lib::clock_gettime(syscall_lib::CLOCK_MONOTONIC);
+    if sec < 0 {
+        return 0;
+    }
+    (sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nsec as u64)
+}
+
+/// Pacer for the spin-then-sleep completion waits (`submit_command`,
+/// `wait_for_transfer_event`, `wait_for_bulk_out_event`, `drain_isoch_batch`):
+/// spin while inside both the `COMPLETION_SPIN_NS` wall-clock window and the
+/// `COMPLETION_SPIN_POLLS` backstop, then take up to `max_sleep_polls` 1 ms
+/// sleep-polls (the unchanged timeout budget), then report exhaustion.
+struct CompletionWait {
+    spin_deadline_ns: u64,
+    spin_polls: u32,
+    sleep_polls: u32,
+    max_sleep_polls: u32,
+}
+
+impl CompletionWait {
+    fn new(max_sleep_polls: u32) -> Self {
+        CompletionWait {
+            spin_deadline_ns: monotonic_ns().saturating_add(COMPLETION_SPIN_NS),
+            spin_polls: 0,
+            sleep_polls: 0,
+            max_sleep_polls,
+        }
+    }
+
+    /// Whether the next `step` will spin rather than deschedule.
+    fn spinning(&self) -> bool {
+        self.spin_polls < COMPLETION_SPIN_POLLS && monotonic_ns() < self.spin_deadline_ns
+    }
+
+    /// One pacing step: a `spin_loop` hint inside the spin window, a 1 ms
+    /// sleep (a real deschedule) after it. Returns `false` once the sleep
+    /// budget is exhausted.
+    fn step(&mut self) -> bool {
+        if self.spinning() {
+            self.spin_polls += 1;
+            core::hint::spin_loop();
+            true
+        } else if self.sleep_polls < self.max_sleep_polls {
+            self.sleep_polls += 1;
+            let _ = syscall_lib::nanosleep_for(0, 1_000_000);
+            true
+        } else {
+            false
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Extended-capability IDs (xECP walk)
@@ -843,7 +917,8 @@ impl Controller {
         // instead, so the bring-up loop always completes. This mirrors
         // `wait_for_transfer_event`'s bounded-poll design.
         const MAX_POLLS: u32 = 400;
-        for poll_i in 0..(COMPLETION_SPIN_POLLS + MAX_POLLS) {
+        let mut wait = CompletionWait::new(MAX_POLLS);
+        loop {
             let before = self.consumer.index;
             let mut completed: alloc::vec::Vec<(u8, u8)> = alloc::vec::Vec::new();
             let found = self.drain_for_command_completion(cmd_iova, &mut completed);
@@ -870,10 +945,8 @@ impl Controller {
             if let Some(ev) = found {
                 return ev;
             }
-            if poll_i < COMPLETION_SPIN_POLLS {
-                core::hint::spin_loop();
-            } else {
-                let _ = syscall_lib::nanosleep_for(0, 1_000_000);
+            if !wait.step() {
+                break;
             }
         }
 
@@ -1163,7 +1236,8 @@ impl Controller {
         // dead/stuck-device ceiling (was 400 ms). The interleaved `drain_others`
         // below keeps co-resident controllers alive even across this window.
         const MAX_POLLS: u32 = 200;
-        for poll_i in 0..(COMPLETION_SPIN_POLLS + MAX_POLLS) {
+        let mut wait = CompletionWait::new(MAX_POLLS);
+        loop {
             let before = self.consumer.index;
             let mut completed: alloc::vec::Vec<(u8, u8)> = alloc::vec::Vec::new();
             let found = self.drain_for_transfer_event(slot_id, endpoint_id, &mut completed);
@@ -1192,9 +1266,7 @@ impl Controller {
             if let Some(ev) = found {
                 return Some(ev);
             }
-            if poll_i < COMPLETION_SPIN_POLLS {
-                core::hint::spin_loop();
-            } else {
+            if !wait.spinning() {
                 // Phase 92d interleaved drain: this control transfer is blocking
                 // the single server loop. Before sleeping, service the OTHER
                 // controllers' event rings so a co-resident controller (e.g. a
@@ -1202,7 +1274,9 @@ impl Controller {
                 // completions while we wait here. No-op closure for the
                 // single-controller and enumeration paths (no other controllers).
                 drain_others();
-                let _ = syscall_lib::nanosleep_for(0, 1_000_000);
+            }
+            if !wait.step() {
+                break;
             }
         }
         None
@@ -2201,7 +2275,8 @@ impl Controller {
         // completion in µs — see `COMPLETION_SPIN_POLLS`), then a bounded ~400 ms
         // sleep-poll budget (400 × 1 ms) before giving up.
         const MAX_POLLS: u32 = 400;
-        for poll_i in 0..(COMPLETION_SPIN_POLLS + MAX_POLLS) {
+        let mut wait = CompletionWait::new(MAX_POLLS);
+        loop {
             let before = self.consumer.index;
             let mut found: Option<trb::TransferEvent> = None;
             let mut completed: alloc::vec::Vec<(u8, u8)> = alloc::vec::Vec::new();
@@ -2258,10 +2333,8 @@ impl Controller {
             if let Some(ev) = found {
                 return Some(ev);
             }
-            if poll_i < COMPLETION_SPIN_POLLS {
-                core::hint::spin_loop();
-            } else {
-                let _ = syscall_lib::nanosleep_for(0, 1_000_000);
+            if !wait.step() {
+                break;
             }
         }
         None
@@ -2285,7 +2358,8 @@ impl Controller {
     ) -> IsochBatchDrain {
         const MAX_POLLS: u32 = 400;
         let mut drained = 0usize;
-        for poll_i in 0..(COMPLETION_SPIN_POLLS + MAX_POLLS) {
+        let mut wait = CompletionWait::new(MAX_POLLS);
+        loop {
             let before = self.consumer.index;
             let mut fatal: Option<u8> = None;
             let mut underrun = false;
@@ -2358,10 +2432,8 @@ impl Controller {
             if underrun || drained >= want {
                 return IsochBatchDrain::Drained;
             }
-            if poll_i < COMPLETION_SPIN_POLLS {
-                core::hint::spin_loop();
-            } else {
-                let _ = syscall_lib::nanosleep_for(0, 1_000_000);
+            if !wait.step() {
+                break;
             }
         }
         IsochBatchDrain::Timeout

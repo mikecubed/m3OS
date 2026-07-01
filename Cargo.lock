@@ -12,6 +12,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "acpid"
+version = "0.99.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

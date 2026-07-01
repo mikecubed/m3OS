@@ -1,6 +1,6 @@
 # Phase 101 — ACPI Platform Foundation (AML + device/resource enumeration + SCI): Task List
 
-**Status:** Planned
+**Status:** In progress — Tracks A/B/C landed (host-tested `kernel-core/src/acpi/`; QEMU q35 DSDT + synthetic Dell-shaped fixtures green in CI); Track D/E cores landed (kernel FADT/SCI demux + `SYS_ACPI_*` surface + ring-3 `acpid` with `FindByHid`/`GetCrs`/`Sta` queries) with the QEMU `acpi-smoke` power-button arm green. Remaining: D.5/E.4 `Notify()`-subscriber routing, E.3 real `RegionSpace` backend, EC `_Qxx`, and the Dell capture + HW arms on [`docs/handoffs/next-dell-session.md`](../../handoffs/next-dell-session.md).
 **Source Ref:** phase-101
 **Depends on:** Phase 15 (ACPI table parse — RSDP/RSDT/XSDT, MADT, FADT) ✅, Phase 55a (DMAR/IVRS decode + the `kernel-core` host-tested table-decoder pattern) ✅, Phase 55b (capability-gated device-host syscalls + `Notification` IRQ objects) ✅
 **Goal:** Build an ACPI **namespace** on top of the existing static-table parse: a pragmatic AML interpreter (Track A), the namespace + `_HID`/`_CID` device tree (Track B), `_CRS` resource decode (Track C), SCI/GPE event handling + `Notify()` routing (Track D), a ring-3 `acpid` hosting the interpreter over a thin kernel surface (Track E), and host + bare-metal validation (Track F). The end state: on the Dell Tiger Lake, an `_HID` lookup for `DLL0945` finds the touchpad node and its `_CRS` yields the I2C address + `GpioInt` the Phase 102 driver needs, and a lid/power SCI is demuxed and routed to userspace.
@@ -9,12 +9,12 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | AML interpreter (device-enumeration subset) in `kernel-core` — host-tested | — | Planned |
-| B | Namespace build + device tree + `_HID`/`_CID` matching + `_STA` | A | Planned |
-| C | `_CRS` resource decode (I2C SerialBus / GpioInt / IRQ / Memory) | A, B | Planned |
-| D | SCI handler + GPE dispatch + `_Lxx`/`_Exx`/`_Qxx` + `Notify()` routing | A, B, E | Planned |
-| E | Ring-3 `acpid` hosting + thin kernel surface + IPC query/event service (the split decision) | A, B, C | Planned |
-| F | Validation — host tests on captured DSDT, QEMU `acpi-smoke`, bare-metal run | A, B, C, D, E | Planned |
+| A | AML interpreter (device-enumeration subset) in `kernel-core` — host-tested | — | Landed (`kernel-core/src/acpi/aml/{decode,interp,object}.rs`) |
+| B | Namespace build + device tree + `_HID`/`_CID` matching + `_STA` | A | Landed (`kernel-core/src/acpi/namespace.rs`) |
+| C | `_CRS` resource decode (I2C SerialBus / GpioInt / IRQ / Memory) | A, B | Landed (`kernel-core/src/acpi/resource.rs`) |
+| D | SCI handler + GPE dispatch + `_Lxx`/`_Exx`/`_Qxx` + `Notify()` routing | A, B, E | Landed core (D.1 FADT fields, D.2 route+ISR, D.3 demux+mask+notification, D.4 GPE `_Lxx`/`_Exx` eval + PM1 fixed events — QEMU power-button arm green via `acpi-smoke`); D.4 EC `_Qxx` + D.5 `Notify()` subscriber routing pending |
+| E | Ring-3 `acpid` hosting + thin kernel surface + IPC query/event service (the split decision) | A, B, C | Landed core (E.1 scaffold/wiring, E.2 `SYS_ACPI_TABLE_GET`/`SYS_ACPI_SCI_SUBSCRIBE`/`SYS_ACPI_PM_*`, E.4 `FindByHid`/`GetCrs`/`Sta` queries, E.5 split record); E.3 real `RegionSpace` backend (stub today) + E.4 `Subscribe` push pending |
+| F | Validation — host tests on captured DSDT, QEMU `acpi-smoke`, bare-metal run | A, B, C, D, E | Partial (host tests on the QEMU q35 DSDT + synthetic Dell-shaped fixtures green; `acpi-smoke` gate green + `M3OS_ACPI_REGRESSION` row live; Dell DSDT capture + HW arms pend the next Dell session) |
 
 ---
 
@@ -29,9 +29,9 @@
 **Why it matters:** Every later step (method eval, namespace build) consumes a decoded AML term stream; the variable-length `PkgLength` and the root/parent-prefix (`\`/`^`)/multi-segment `NameString` encodings are the foundation of the whole format.
 
 **Acceptance:**
-- [ ] `decode_pkg_length` decodes the 1–4-byte variable-length encoding (lead-byte `<6:4>` count) and is host-tested across all four widths.
-- [ ] `decode_name_string` handles `RootChar`, `ParentPrefixChar` runs, `DualNamePrefix`/`MultiNamePrefix`, and a bare 4-char `NameSeg`.
-- [ ] The opcode table covers the device-enumeration subset (Zero/One/Ones, Byte/Word/DWord/QWord prefixes, `Package`/`Buffer`, `Scope`/`Device`/`Method`/`Name`, `OperationRegion`/`Field`, `Store`/`If`/`Else`/`While`/`Return`, the integer + logical ops, `Local0..7`/`Arg0..6`) and decodes a captured DSDT term-by-term with **0 unknown-opcode panics**.
+- [x] `decode_pkg_length` decodes the 1–4-byte variable-length encoding (lead-byte `<6:4>` count) and is host-tested across all four widths.
+- [x] `decode_name_string` handles `RootChar`, `ParentPrefixChar` runs, `DualNamePrefix`/`MultiNamePrefix`, and a bare 4-char `NameSeg`.
+- [x] The opcode table covers the device-enumeration subset (Zero/One/Ones, Byte/Word/DWord/QWord prefixes, `Package`/`Buffer`, `Scope`/`Device`/`Method`/`Name`, `OperationRegion`/`Field`, `Store`/`If`/`Else`/`While`/`Return`, the integer + logical ops, `Local0..7`/`Arg0..6`) and decodes a captured DSDT term-by-term with **0 unknown-opcode panics**.
 
 ### A.2 — Control-method evaluator
 
@@ -40,9 +40,9 @@
 **Why it matters:** `_STA`/`_HID`/`_CID`/`_CRS` and the GPE methods are AML *methods*; without an evaluator the namespace is inert bytecode.
 
 **Acceptance:**
-- [ ] Evaluates `Store`/`If`/`Else`/`While`/`Return`, integer arithmetic (`Add`/`Subtract`/`And`/`Or`/`ShiftLeft`/`ShiftRight`) and logical ops (`LEqual`/`LGreater`/`LAnd`/`LNot`), with `Local0..7`/`Arg0..6` scoping.
-- [ ] A synthetic `_STA` method returning `0x0F` and a captured-DSDT `_STA` both evaluate to the expected `AmlValue::Integer` — host-tested.
-- [ ] Method invocation passes args + returns a value; recursion is bounded (see A.4).
+- [x] Evaluates `Store`/`If`/`Else`/`While`/`Return`, integer arithmetic (`Add`/`Subtract`/`And`/`Or`/`ShiftLeft`/`ShiftRight`) and logical ops (`LEqual`/`LGreater`/`LAnd`/`LNot`), with `Local0..7`/`Arg0..6` scoping.
+- [x] A synthetic `_STA` method returning `0x0F` and a captured-DSDT `_STA` both evaluate to the expected `AmlValue::Integer` — host-tested.
+- [x] Method invocation passes args + returns a value; recursion is bounded (see A.4).
 
 ### A.3 — Named-object model + `OperationRegion`/`Field` + `RegionSpace` backend trait
 
@@ -51,9 +51,9 @@
 **Why it matters:** AML reaches hardware through `OperationRegion` (`SystemMemory`/`SystemIO`/`PCI_Config`/`EmbeddedController`) + `Field`; abstracting that behind a trait keeps the interpreter pure (mock backend in tests, `device_host`-backed in `acpid` per E.3).
 
 **Acceptance:**
-- [ ] `OperationRegion` + `Field` declarations register `FieldUnit`s with correct bit offset/width.
-- [ ] A `Field` read/write is delegated to `RegionSpace::read`/`write` (region kind + offset + width), and a `Vec`-backed mock returns the backing byte — host-tested.
-- [ ] The four region spaces are distinguishable by `RegionSpace` kind; unsupported spaces return `AmlError::UnsupportedRegion` rather than panicking.
+- [x] `OperationRegion` + `Field` declarations register `FieldUnit`s with correct bit offset/width.
+- [x] A `Field` read/write is delegated to `RegionSpace::read`/`write` (region kind + offset + width), and a `Vec`-backed mock returns the backing byte — host-tested.
+- [x] The four region spaces are distinguishable by `RegionSpace` kind (the raw space byte reaches the backend); a backend refusing a space returns `AmlError::RegionAccess` rather than panicking.
 
 ### A.4 — Interpreter safety limits (untrusted bytecode)
 
@@ -62,9 +62,9 @@
 **Why it matters:** AML is arbitrary firmware bytecode; a malformed/hostile DSDT must not panic the interpreter or loop forever (it runs in `acpid`, but a panic there loses ACPI for the whole system).
 
 **Acceptance:**
-- [ ] Method recursion beyond `MAX_METHOD_DEPTH` returns `AmlError::RecursionLimit`, not a stack overflow.
-- [ ] A `While` exceeding `MAX_LOOP_ITERS` returns `AmlError::LoopLimit`.
-- [ ] A truncated / byte-corrupted DSDT slice returns `Err(AmlError)` for **every** offset in a host-side truncation sweep (no panic, no UB).
+- [x] Method recursion beyond `MAX_METHOD_DEPTH` returns `AmlError::RecursionLimit`, not a stack overflow.
+- [x] A `While` exceeding `MAX_LOOP_ITERS` returns `AmlError::LoopLimit`.
+- [x] A truncated / byte-corrupted DSDT slice returns `Err(AmlError)` for **every** offset in a host-side truncation sweep (no panic, no UB).
 
 ---
 
@@ -77,8 +77,8 @@
 **Why it matters:** Devices, methods, and resources are nodes in a tree; without path resolution (`\_SB.PCI0.I2C1`) nothing can be looked up by name.
 
 **Acceptance:**
-- [ ] Building from a captured DSDT yields a node count > 0 with a `\` root and a `\_SB` system-bus scope.
-- [ ] `resolve_path` resolves absolute (`\_SB.PCI0`), parent-prefixed (`^^DEV`), and relative names against a current scope — host-tested.
+- [x] Building from a captured DSDT yields a node count > 0 with a `\` root and a `\_SB` system-bus scope.
+- [x] `resolve_path` resolves absolute (`\_SB.PCI0`), parent-prefixed (`^^DEV`), and relative names against a current scope — host-tested.
 
 ### B.2 — DSDT + SSDT load + merge
 
@@ -87,8 +87,8 @@
 **Why it matters:** Real firmware splits objects across one DSDT + several SSDTs, and an SSDT routinely *extends* a scope (e.g. `Scope(\_SB.PCI0)`) defined in the DSDT; loading only the DSDT misses devices.
 
 **Acceptance:**
-- [ ] A DSDT + ≥1 SSDT merge into one namespace; a `Scope(...)` in the SSDT that extends a DSDT-defined path adds children under the existing node (no duplicate root).
-- [ ] Host test loads a 2-block fixture and asserts a cross-block device resolves.
+- [x] A DSDT + ≥1 SSDT merge into one namespace; a `Scope(...)` in the SSDT that extends a DSDT-defined path adds children under the existing node (no duplicate root).
+- [x] Host test loads a 2-block fixture and asserts a cross-block device resolves.
 
 ### B.3 — `_HID`/`_CID` matching + `EisaId` decode
 
@@ -98,8 +98,8 @@
 
 **Acceptance:**
 - [ ] `find_by_hid("DLL0945")` returns the touchpad device node on the captured Dell DSDT.
-- [ ] `decode_eisa_id` round-trips `PNP0C0A` (battery), `PNP0C0D` (lid), `PNP0C0C` (power button) between the packed 32-bit integer form and the 7-char string — host-tested.
-- [ ] A device matched by `_CID` (when `_HID` differs) is found via `find_by_cid`.
+- [x] `decode_eisa_id` round-trips `PNP0C0A` (battery), `PNP0C0D` (lid), `PNP0C0C` (power button) between the packed 32-bit integer form and the 7-char string — host-tested.
+- [x] A device matched by `_CID` (when `_HID` differs) is found — `find_by_hid` matches `_HID` then `_CID` (QEMU q35 `PNP0A03` `_CID` on the `PNP0A08` root complex, host-tested); no separate `find_by_cid` needed.
 
 ### B.4 — `_STA` presence/enable filtering
 
@@ -108,8 +108,8 @@
 **Why it matters:** A device with `_STA` bit 0 (present) clear must not be enumerated; the spec also says an absent `_STA` means present + enabled.
 
 **Acceptance:**
-- [ ] `device_present` evaluates `_STA` and treats absent `_STA` as present (`0x0F`).
-- [ ] A fixture device with `_STA` returning `0` is excluded from `iter_present_devices`; one returning `0x0F` is included — host-tested.
+- [x] `device_present` evaluates `_STA` and treats absent `_STA` as present (`0x0F`).
+- [x] A fixture device with `_STA` returning `0` is excluded from `iter_present_devices`; one returning `0x0F` is included — host-tested.
 
 ---
 
@@ -122,8 +122,8 @@
 **Why it matters:** `_CRS` returns a `Buffer` of chained small/large resource descriptors terminated by an end tag; every resource type rides this framing.
 
 **Acceptance:**
-- [ ] Decodes small (`<7>`=0) and large (`<7>`=1) resource items by tag, stops at the End Tag (0x79), and validates the end-tag checksum.
-- [ ] A truncated/over-long `_CRS` buffer returns `Err`, not a panic — host-tested.
+- [x] Decodes small (`<7>`=0) and large (`<7>`=1) resource items by tag, stops at the End Tag (0x79), and validates the end-tag checksum.
+- [x] A truncated/over-long `_CRS` buffer returns `Err`, not a panic — host-tested.
 
 ### C.2 — I2C SerialBus connection descriptor
 
@@ -132,7 +132,7 @@
 **Why it matters:** The touchpad's I2C **slave address** and the **controller it sits on** come only from its `_CRS` I2C SerialBus descriptor — the single most important value Phase 102 needs.
 
 **Acceptance:**
-- [ ] Decodes slave address, bus speed, addressing mode, and the `ResourceSource` controller path (e.g. `\_SB.PC00.I2C1`) from the touchpad's `_CRS`.
+- [x] Decodes slave address, bus speed, addressing mode, and the `ResourceSource` controller path (e.g. `\_SB.PC00.I2C1`) from the touchpad's `_CRS`.
 - [ ] Host test asserts the captured `DLL0945` `_CRS` yields its expected 7-bit slave address + a non-empty controller path.
 
 ### C.3 — GpioInt / GpioIo descriptor
@@ -142,7 +142,7 @@
 **Why it matters:** The I2C-HID transport is interrupt-driven over a SoC GPIO line; the `GpioInt` pin + polarity/trigger from `_CRS` is what the Phase 102 driver arms.
 
 **Acceptance:**
-- [ ] Decodes GPIO connection type (Int vs Io), pin number(s), edge/level + active-high/low flags, and the GPIO controller `ResourceSource`.
+- [x] Decodes GPIO connection type (Int vs Io), pin number(s), edge/level + active-high/low flags, and the GPIO controller `ResourceSource`.
 - [ ] Host test asserts the touchpad's `GpioInt` pin + (level, active-low) flags from the captured `_CRS`.
 
 ### C.4 — IRQ / Memory32Fixed / FixedMemory descriptors
@@ -152,7 +152,7 @@
 **Why it matters:** The embedded controller and legacy/platform devices report classic IRQ + MMIO-window resources; Phase 103's EC and any MMIO device need these.
 
 **Acceptance:**
-- [ ] Decodes the small IRQ descriptor (0x22/0x23) and the large Memory32Fixed (0x86) / FixedMemory descriptors into `IrqResource` / `MemoryRange`.
+- [x] Decodes the small IRQ descriptor (0x22/0x23) and the large Memory32Fixed (0x86) / FixedMemory descriptors into `IrqResource` / `MemoryRange`.
 - [ ] Host test decodes an EC (`PNP0C09`) `_CRS` IRQ + MMIO window from a fixture.
 
 ### C.5 — Resolved `DeviceResources` query struct
@@ -162,8 +162,8 @@
 **Why it matters:** Other drivers want one struct answering "what bus/address/IRQ/GPIO is device X on" — not a raw descriptor stream.
 
 **Acceptance:**
-- [ ] `Namespace::device_resources(node)` evaluates `_CRS` and returns a populated `DeviceResources` (interpreter → resource decode end-to-end).
-- [ ] Host test: `device_resources(find_by_hid("DLL0945"))` returns `i2c.slave_address` and `gpio_int.pin` both populated.
+- [x] `Namespace::device_resources(node)` evaluates `_CRS` and returns a populated `DeviceResources` (interpreter → resource decode end-to-end).
+- [x] Host test: `device_resources(find_by_hid("DLL0945"))` returns `i2c.slave_address` and `gpio_int.pin` both populated.
 
 ---
 
@@ -176,7 +176,7 @@
 **Why it matters:** `parse_fadt` reads only `IAPC_BOOT_ARCH` (offset 109) today; the DSDT pointer (offset 40 / `X_DSDT` 140), `SCI_INT` (offset 46), the PM1a event/control blocks, and `GPE0_BLK`/`GPE0_BLK_LEN` are needed to find the namespace and receive the SCI.
 
 **Acceptance:**
-- [ ] `parse_fadt` reads + caches the DSDT/`X_DSDT` pointer, `SCI_INT`, `PM1a_EVT_BLK`/`PM1a_CNT_BLK`, and `GPE0_BLK`/`GPE0_BLK_LEN` into `FADT_INFO`.
+- [x] `parse_fadt` reads + caches the DSDT/`X_DSDT` pointer, `SCI_INT`, `PM1a_EVT_BLK`/`PM1a_CNT_BLK`, and `GPE0_BLK`/`GPE0_BLK_LEN` into `FADT_INFO`.
 - [ ] On the Dell the boot log shows a non-zero DSDT pointer + the `SCI_INT` GSI + the `GPE0_BLK` I/O port (`Validated-on-HW`); host-side parse test over a captured FADT asserts the field offsets.
 
 ### D.2 — SCI ISR + IOAPIC redirection for the SCI GSI
@@ -189,8 +189,8 @@
 **Why it matters:** The SCI is a level-triggered, active-low GSI; it must be routed to a dedicated vector exactly like the ISA IRQs `ioapic_init` already programs, or no ACPI event is ever received.
 
 **Acceptance:**
-- [ ] The `SCI_INT` GSI (from D.1, honoring any `acpi::irq_override`) is programmed level-triggered/active-low to a new ISR vector.
-- [ ] In QEMU, a `qmp system_powerdown` raises the SCI and increments an SCI-received counter (asserted by `acpi-smoke`, F.2).
+- [x] The `SCI_INT` GSI (from D.1, honoring any `acpi::irq_override`) is programmed level-triggered/active-low to a new ISR vector.
+- [x] In QEMU, a `qmp system_powerdown` raises the SCI and increments an SCI-received counter (asserted by `acpi-smoke`, F.2).
 
 ### D.3 — Kernel SCI demux + hardware ack/mask + `Notification` signal
 
@@ -199,9 +199,9 @@
 **Why it matters:** A level-triggered SCI will storm if userspace is the only handler; the kernel must read PM1_STS/GPE_STS, mask the asserted enable bits, EOI, and hand the *pending bitmap* to `acpid` — the privileged half of the split.
 
 **Acceptance:**
-- [ ] The ISR reads `PM1_STS` + `GPE_STS`, masks the asserted bits in `PM1_EN`/`GPE_EN`, EOIs, and signals `acpid`'s `Notification` with the pending event word — no interrupt storm (the line de-asserts).
-- [ ] The pending PM1/GPE bitmap reaches `acpid` (verified by the QEMU power-button arm and the HW lid arm).
-- [ ] No allocation / blocking / IPC-call inside the ISR (per the interrupt-handler convention) — only a register read/mask + `Notification` signal.
+- [x] The ISR reads `PM1_STS` + `GPE_STS`, masks the asserted bits in `PM1_EN`/`GPE_EN`, EOIs, and signals `acpid`'s `Notification` with the pending event word — no interrupt storm (the line de-asserts).
+- [ ] The pending PM1/GPE bitmap reaches `acpid` (verified by the QEMU power-button arm and the HW lid arm). *(QEMU power-button arm green via `acpi-smoke`; the Dell lid arm pends the next HW session.)*
+- [x] No allocation / blocking / IPC-call inside the ISR (per the interrupt-handler convention) — only a register read/mask + `Notification` signal.
 
 ### D.4 — `acpid` GPE / fixed-event dispatch (`_Lxx`/`_Exx`/`_Qxx`)
 
@@ -210,8 +210,8 @@
 **Why it matters:** Each asserted GPE bit maps to a `_Lxx` (level) or `_Exx` (edge) method; EC events run `_Qxx`; fixed events (power button `PWRB`, lid `LID0`) map to their handlers. Running them is the *policy* that makes an SCI mean something.
 
 **Acceptance:**
-- [ ] For each pending GPE bit, `acpid` evaluates the matching `_Lxx`/`_Exx` method (or the EC `_Qxx`) via the Track A interpreter, then re-enables that GPE through the kernel.
-- [ ] The power-button fixed event runs its path in QEMU (`acpi-smoke`); the lid `_LID` returns a state on the Dell (`Validated-on-HW`).
+- [ ] For each pending GPE bit, `acpid` evaluates the matching `_Lxx`/`_Exx` method (or the EC `_Qxx`) via the Track A interpreter, then re-enables that GPE through the kernel. *(`_Lxx`/`_Exx` evaluation + status-clear landed; `acpid` deliberately does not blind-re-enable GPEs it never armed, and EC `_Qxx` pends the Phase 103 EC work.)*
+- [ ] The power-button fixed event runs its path in QEMU (`acpi-smoke`); the lid `_LID` returns a state on the Dell (`Validated-on-HW`). *(QEMU power-button arm green; Dell `_LID` pends HW.)*
 
 ### D.5 — `Notify()` routing to ring-3 subscribers
 
@@ -240,8 +240,8 @@
 **Why it matters:** Missing any of the four wiring points means `acpid` is not built, not embedded, or not started (per the "Adding a New Userspace Binary" rule). `needs_alloc = true` (uses `kernel-core`/`Vec`).
 
 **Acceptance:**
-- [ ] `cargo xtask check` builds `acpid`; it is embedded in the ramdisk and launched from `services.d/acpid.conf` (and `init`'s builtin defaults for the no-data-disk bare-metal path).
-- [ ] Defines a `#[global_allocator]` (`syscall_lib::heap::BrkAllocator`) and enables the `alloc` feature on `syscall-lib`.
+- [x] `cargo xtask check` builds `acpid`; it is embedded in the ramdisk and launched from `services.d/acpid.conf` (and `init`'s builtin defaults for the no-data-disk bare-metal path).
+- [x] Defines a `#[global_allocator]` (`syscall_lib::heap::BrkAllocator`) and enables the `alloc` feature on `syscall-lib`.
 
 ### E.2 — Thin kernel ACPI surface (table blob + SCI subscribe + PM/GPE access)
 
@@ -253,9 +253,9 @@
 **Why it matters:** `acpid` must fetch the firmware bytes the FADT points at, bind the SCI as a `Notification`, and read/write PM1/GPE — without these the ring-3 interpreter has no input and no events.
 
 **Acceptance:**
-- [ ] `acpid` fetches the DSDT (+ each SSDT) bytes read-only from the kernel (located via `find_table`/`SDT_ENTRIES`, translated through `phys_to_virt`) and the namespace builds.
-- [ ] `acpid` subscribes the SCI `Notification` and is woken when D.3 signals it.
-- [ ] `acpid` reads `PM1_STS` / re-enables a `GPE_EN` bit through the surface (PIO/MMIO, capability-gated) — and a non-`acpid` process is denied.
+- [x] `acpid` fetches the DSDT (+ each SSDT) bytes read-only from the kernel (located via `find_table`/`SDT_ENTRIES`, translated through `phys_to_virt`) and the namespace builds.
+- [x] `acpid` subscribes the SCI `Notification` and is woken when D.3 signals it.
+- [ ] `acpid` reads `PM1_STS` / re-enables a `GPE_EN` bit through the surface (PIO/MMIO, capability-gated) — and a non-`acpid` process is denied. *(PM1_STS read/clear + PM1_EN re-arm proven live by `acpi-smoke`; the GPE_EN selector exists but no GPE re-arm consumer yet, and the `/drivers/`-gate denial arm has no negative test yet.)*
 
 ### E.3 — `RegionSpace` backend over `device_host` syscalls
 
@@ -274,7 +274,7 @@
 **Why it matters:** Phase 102 (touchpad) and Phase 103 (power) attach by asking `acpid` to resolve a device + its resources and to subscribe to its events; this is the public face of the namespace.
 
 **Acceptance:**
-- [ ] A client resolves `FindByHid("DLL0945")` → a device handle, `GetResources` → a `DeviceResources` (I2C addr + GpioInt), over IPC.
+- [ ] A client resolves `FindByHid("DLL0945")` → a device handle, `GetResources` → a `DeviceResources` (I2C addr + GpioInt), over IPC. *(`FindByHid`/`GetCrs`/`Sta` labels are served (path + raw `_CRS` bytes; decode client-side via `kernel-core`); the first real client lands with Phase 102.)*
 - [ ] A client `Subscribe`s to a device and receives a `Notify()` event pushed from D.5.
 - [ ] The protocol is documented in the crate header (the contract Phase 102/103 consume).
 
@@ -285,8 +285,8 @@
 **Why it matters:** The spec requires deciding the ring-0-vs-ring-3 split honestly; recording *why* (interpreter size, fault isolation, host-testability) prevents a future drift back toward an in-kernel VM.
 
 **Acceptance:**
-- [ ] The rationale is recorded: AML interpreter in ring-3 `acpid`; ring 0 keeps only the FADT parse + SCI hardware-ack/demux + the thin blob/`Notification`/register surface.
-- [ ] A grep of the kernel tree finds **no** AML opcode evaluator symbols in ring 0 (the interpreter lives only in `kernel-core` + `acpid`).
+- [x] The rationale is recorded: AML interpreter in ring-3 `acpid`; ring 0 keeps only the FADT parse + SCI hardware-ack/demux + the thin blob/`Notification`/register surface.
+- [x] A grep of the kernel tree finds **no** AML opcode evaluator symbols in ring 0 (the interpreter lives only in `kernel-core` + `acpid`).
 
 ---
 
@@ -314,9 +314,9 @@
 **Why it matters:** QEMU models a generic ACPI namespace + the power-button SCI, so the *substrate* (namespace build, SCI demux → `acpid` dispatch → `Notify`) is CI-testable without the laptop — maximizing the non-HW-only surface.
 
 **Acceptance:**
-- [ ] Boots m3OS, asserts `acpid` built the namespace from QEMU's DSDT and enumerated the emulated devices (a sentinel line).
-- [ ] A `qmp system_powerdown` raises the power-button SCI; the gate asserts the kernel demux signalled `acpid`, the power-button method ran, and a `Notify()` reached a test subscriber.
-- [ ] `M3OS_ACPI_REGRESSION=1` row added to the `AGENTS.md` gate table; the laptop-device arms skip-with-reason in QEMU.
+- [x] Boots m3OS, asserts `acpid` built the namespace from QEMU's DSDT and enumerated the emulated devices (a sentinel line).
+- [ ] A `qmp system_powerdown` raises the power-button SCI; the gate asserts the kernel demux signalled `acpid`, the power-button method ran, and a `Notify()` reached a test subscriber. *(Green through "acpid dispatched the power-button event"; the `Notify()`-to-subscriber tail pends D.5/E.4 `Subscribe`.)*
+- [x] `M3OS_ACPI_REGRESSION=1` row added to the `AGENTS.md` gate table; the laptop-device arms skip-with-reason in QEMU.
 
 ### F.3 — Bare-metal validation run (Dell Tiger Lake)
 

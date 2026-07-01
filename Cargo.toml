@@ -85,6 +85,8 @@ members = [
     "userspace/lib/usb-core",
     # Phase 78b Track B — ring-3 USB hub class driver
     "userspace/drivers/usbhub",
+    # Phase 101 Track E — ring-3 ACPI daemon (AML namespace host + SCI events)
+    "userspace/drivers/acpid",
     # Phase 78c — ring-3 USB HID Boot-Protocol class driver (keyboard + mouse)
     "userspace/drivers/usb-hid",
     # Phase 92 Track D — ring-3 USB Mass Storage (Bulk-Only Transport) class driver

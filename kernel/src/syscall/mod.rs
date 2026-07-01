@@ -14,5 +14,6 @@
 //! misc) continue to live under `arch::x86_64::syscall`. New work hangs off
 //! this module instead so the arch tree stops accreting per-subsystem code.
 
+pub mod acpi;
 pub mod device_host;
 pub mod net;

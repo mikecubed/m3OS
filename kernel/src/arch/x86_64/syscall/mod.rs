@@ -1685,7 +1685,8 @@ mod syscall_nr {
     // to match against once they land.
     #[allow(unused_imports)]
     pub use kernel_core::device_host::syscalls::{
-        DEVICE_HOST_BASE, DEVICE_HOST_LAST, SYS_DEVICE_CLAIM, SYS_DEVICE_CONFIG_READ,
+        DEVICE_HOST_BASE, DEVICE_HOST_LAST, SYS_ACPI_PM_READ, SYS_ACPI_PM_WRITE,
+        SYS_ACPI_SCI_SUBSCRIBE, SYS_ACPI_TABLE_GET, SYS_DEVICE_CLAIM, SYS_DEVICE_CONFIG_READ,
         SYS_DEVICE_CONFIG_WRITE, SYS_DEVICE_DMA_ALLOC, SYS_DEVICE_DMA_HANDLE_INFO,
         SYS_DEVICE_DMA_MAP_SHM, SYS_DEVICE_DMA_UNMAP_SHM, SYS_DEVICE_IRQ_SUBSCRIBE,
         SYS_DEVICE_MMIO_MAP, SYS_DEVICE_PCI_ENUMERATE, SYS_DEVICE_PIO_READ, SYS_DEVICE_PIO_WRITE,
@@ -2477,6 +2478,32 @@ pub extern "C" fn syscall_handler(
             } else {
                 crate::syscall::device_host::sys_device_dma_unmap_shm(arg0 as u32, arg1) as u64
             }
+        }
+        // -- Phase 101 D/E: platform-ACPI syscalls (ring-3 acpid) --
+        SYS_ACPI_TABLE_GET => {
+            // Signature: sys_acpi_table_get(sig_ptr, index, out_ptr, out_len) -> isize.
+            crate::syscall::acpi::sys_acpi_table_get(
+                arg0 as usize,
+                arg1 as usize,
+                arg2 as usize,
+                per_core_syscall_arg3() as usize,
+            ) as u64
+        }
+        SYS_ACPI_SCI_SUBSCRIBE => {
+            // Signature: sys_acpi_sci_subscribe(notification_arg: u32) -> isize.
+            if arg0 > u64::from(u32::MAX) {
+                NEG_EINVAL
+            } else {
+                crate::syscall::acpi::sys_acpi_sci_subscribe(arg0 as u32) as u64
+            }
+        }
+        SYS_ACPI_PM_READ => {
+            // Signature: sys_acpi_pm_read(reg_sel, byte_index) -> isize.
+            crate::syscall::acpi::sys_acpi_pm_read(arg0, arg1) as u64
+        }
+        SYS_ACPI_PM_WRITE => {
+            // Signature: sys_acpi_pm_write(reg_sel, byte_index, value) -> isize.
+            crate::syscall::acpi::sys_acpi_pm_write(arg0, arg1, arg2) as u64
         }
         // -- Phase 84 Spectre mitigations --
         SYS_MITIGATIONS_STATUS => sys_mitigations_status(arg0, arg1),

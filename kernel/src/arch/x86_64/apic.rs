@@ -659,6 +659,61 @@ pub fn route_pci_irq(irq_line: u8, vector: u8) {
     }
 }
 
+/// Route the ACPI System Control Interrupt (Phase 101 Track D.2).
+///
+/// `SCI_INT` is an ISA IRQ number (typically 9), so any MADT Interrupt
+/// Source Override for it applies — QEMU, for one, overrides IRQ 9 to
+/// level-triggered/active-high. Where an override leaves a field at
+/// "conforms to bus" (bits 00), the SCI convention is level-triggered
+/// active-low (ACPI §5.2.9: OSPM assumes level/low absent an override) —
+/// NOT the edge/high ISA default `decode_override_flags` would pick, which
+/// is why the flags are decoded locally here.
+pub fn route_sci(sci_int: u16, vector: u8) {
+    let max_redir = match IOAPIC_MAX_REDIR.get() {
+        Some(&m) => m,
+        None => {
+            log::warn!("[apic] route_sci: I/O APIC not initialized");
+            return;
+        }
+    };
+    let gsi_base = crate::acpi::ioapic_gsi_base();
+    let (gsi, active_low, level) = if let Some(ovr) = crate::acpi::irq_override(sci_int as u8) {
+        let polarity = ovr.flags & 0x3;
+        let trigger = (ovr.flags >> 2) & 0x3;
+        (
+            ovr.global_system_interrupt,
+            polarity != 1, // 01 = active-high; conforms/11 → low
+            trigger != 1,  // 01 = edge; conforms/11 → level
+        )
+    } else {
+        (gsi_base + sci_int as u32, true, true)
+    };
+
+    if let Some(pin) = gsi_to_pin(gsi, gsi_base, max_redir) {
+        let bsp_id = unsafe { lapic_read(LAPIC_ID) & 0xFF00_0000 };
+        let low = redir_entry_low(vector, active_low, level, false);
+        unsafe {
+            ioapic_write_redir(pin, low, bsp_id);
+        }
+        log::info!(
+            "[apic] I/O APIC: SCI IRQ {} → GSI {} (pin {}) → vector {} ({}, active-{})",
+            sci_int,
+            gsi,
+            pin,
+            vector,
+            if level { "level" } else { "edge" },
+            if active_low { "low" } else { "high" }
+        );
+    } else {
+        log::warn!(
+            "[apic] I/O APIC: SCI GSI {} not routable (base={}, max_pin={})",
+            gsi,
+            gsi_base,
+            max_redir
+        );
+    }
+}
+
 // ===========================================================================
 // Orchestration
 // ===========================================================================
