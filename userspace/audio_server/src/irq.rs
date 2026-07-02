@@ -175,6 +175,24 @@ pub fn dispatch_message(
     }
 }
 
+/// Phase 105 Track D.2 — apply the system master gain to a PCM buffer,
+/// returning the slice to forward to the backend.
+///
+/// At unity the input is returned unchanged (zero-copy — the common case,
+/// so an un-attenuated stream and the page-grant fast path pay nothing).
+/// Below unity, `pcm` is copied into `scratch` and scaled in place so the
+/// source (which may be a read-only page grant from the client) is never
+/// mutated. The scratch is caller-owned and reused across submits.
+fn gained_pcm<'a>(pcm: &'a [u8], q15_gain: u16, scratch: &'a mut alloc::vec::Vec<u8>) -> &'a [u8] {
+    if q15_gain >= kernel_core::audio::MASTER_GAIN_UNITY_Q15 {
+        return pcm;
+    }
+    scratch.clear();
+    scratch.extend_from_slice(pcm);
+    kernel_core::audio::apply_master_gain_s16le(scratch, q15_gain);
+    scratch.as_slice()
+}
+
 // ---------------------------------------------------------------------------
 // run_io_loop — production entry point
 // ---------------------------------------------------------------------------
@@ -212,6 +230,14 @@ pub fn run_io_loop(
     const AUDIO_RECV_CAP: usize = MAX_SUBMIT_BYTES + 256;
 
     let mut transport = driver_runtime::ipc::SyscallBackend::new();
+    // Phase 105 Track D.2 — system master volume. Starts at unity (the
+    // forward path is a no-op until the settings panel attenuates it) and
+    // is updated by the `SetMasterVolume` control verb below; applied to
+    // every forwarded PCM buffer via `apply_master_gain_s16le`.
+    let mut master_gain_q15: u16 = kernel_core::audio::MASTER_GAIN_UNITY_Q15;
+    // Reused scratch for the attenuated PCM copy so a below-unity volume
+    // does not allocate per `SubmitFrames`.
+    let mut gain_scratch: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     loop {
         let result = match transport.recv_with_capacity(endpoint, AUDIO_RECV_CAP) {
             Ok(r) => r,
@@ -309,7 +335,11 @@ pub fn run_io_loop(
                                 let stream_id =
                                     streams.open.as_ref().map(|s| s.stream_id).unwrap_or(0);
                                 let pcm = &frame.bulk[consumed..consumed + pcm_len];
-                                match streams.submit(backend, stream_id, pcm) {
+                                // Phase 105 Track D.2 — apply the system
+                                // master gain before forwarding (no-op copy
+                                // elision at unity).
+                                let forward = gained_pcm(pcm, master_gain_q15, &mut gain_scratch);
+                                match streams.submit(backend, stream_id, forward) {
                                     Ok(_) => DispatchOutcome::SubmitAck {
                                         frames_consumed: streams.stats().frames_consumed,
                                     },
@@ -370,7 +400,15 @@ pub fn run_io_loop(
                                     let pcm = unsafe {
                                         core::slice::from_raw_parts(user_va as *const u8, pcm_len)
                                     };
-                                    match streams.submit(backend, stream_id, pcm) {
+                                    // Phase 105 Track D.2 — apply the system
+                                    // master gain. Below unity this copies
+                                    // into `gain_scratch` (the client's
+                                    // granted pages are never mutated); at
+                                    // unity the zero-copy grant is forwarded
+                                    // as-is.
+                                    let forward =
+                                        gained_pcm(pcm, master_gain_q15, &mut gain_scratch);
+                                    match streams.submit(backend, stream_id, forward) {
                                         Ok(_) => DispatchOutcome::SubmitAck {
                                             frames_consumed: streams.stats().frames_consumed,
                                         },
@@ -378,6 +416,19 @@ pub fn run_io_loop(
                                     }
                                 }
                             }
+                        }
+                        // Phase 105 Track D.2 — the system master volume is
+                        // io-loop state (it scales the forwarded PCM above),
+                        // so `dispatch_message` — which cannot reach it —
+                        // does not handle this verb. Update the gain here and
+                        // reply with the current stats (same reply shape as
+                        // `GetStats`, so the control surface is uniform).
+                        ClientMessage::ControlCommand(
+                            kernel_core::audio::AudioControlCommand::SetMasterVolume { q15_gain },
+                        ) => {
+                            master_gain_q15 =
+                                (*q15_gain).min(kernel_core::audio::MASTER_GAIN_UNITY_Q15);
+                            DispatchOutcome::StatsRequested
                         }
                         _ => dispatch_message(&msg, streams, backend),
                     },
@@ -914,5 +965,52 @@ mod tests {
             !prod_section.contains(".wait("),
             "audio_server irq.rs production code must never call .wait() on a notification",
         );
+    }
+
+    // Phase 105 Track D.2 — the system master-gain forward helper.
+
+    fn s16le(samples: &[i16]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(samples.len() * 2);
+        for &s in samples {
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn gained_pcm_unity_is_zero_copy() {
+        let pcm = s16le(&[100, -200, 300]);
+        let mut scratch = Vec::new();
+        let out = gained_pcm(
+            &pcm,
+            kernel_core::audio::MASTER_GAIN_UNITY_Q15,
+            &mut scratch,
+        );
+        // Unity returns the input slice unchanged and never fills scratch.
+        assert_eq!(out, pcm.as_slice());
+        assert!(scratch.is_empty(), "unity must not copy into scratch");
+    }
+
+    #[test]
+    fn gained_pcm_attenuates_via_scratch() {
+        let pcm = s16le(&[0, 200, -200, 1000]);
+        let mut scratch = Vec::new();
+        let out = gained_pcm(&pcm, 0x4000, &mut scratch); // half
+        let decoded: Vec<i16> = out
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(decoded, [0, 100, -100, 500]);
+        // The source PCM is untouched (a page grant must never be mutated).
+        assert_eq!(pcm, s16le(&[0, 200, -200, 1000]));
+    }
+
+    #[test]
+    fn gained_pcm_zero_mutes_without_touching_source() {
+        let pcm = s16le(&[1234, -4321]);
+        let mut scratch = Vec::new();
+        let out = gained_pcm(&pcm, 0, &mut scratch);
+        assert!(out.iter().all(|&b| b == 0));
+        assert_eq!(pcm, s16le(&[1234, -4321]));
     }
 }

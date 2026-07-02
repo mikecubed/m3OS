@@ -53,6 +53,14 @@ pub const OUTPUT_RATE_HZ: u32 = 48_000;
 /// Bytes per stereo S16LE frame.
 pub const BYTES_PER_FRAME: usize = 4;
 
+/// Phase 105 Track D.2 — the Q15 master-gain value that leaves the mixed
+/// output unchanged (`1.0`). A gain of `0` mutes; intermediate values
+/// attenuate linearly (`out = acc * gain >> 15`). The mixer never
+/// amplifies: [`Mixer::set_master_volume`] clamps requests to this
+/// ceiling, so the master gain is a pure `0..=1.0` attenuator and cannot
+/// introduce clipping the per-channel mix did not already have.
+pub const MASTER_GAIN_UNITY_Q15: u16 = 0x8000;
+
 /// Per-channel mix state. Public for tests and FFI introspection;
 /// production callers never construct one directly — they go through
 /// [`Mixer::set_channel`].
@@ -135,6 +143,11 @@ impl ChannelState {
 pub struct Mixer {
     channels: [ChannelState; MAX_CHANNELS],
     channel_count: usize,
+    /// Phase 105 Track D.2 — Q15 master gain applied to the summed output
+    /// just before the final i16 clamp. Starts at
+    /// [`MASTER_GAIN_UNITY_Q15`] (pass-through); the settings panel drives
+    /// it via `audio_server`'s `SetMasterVolume` control verb.
+    master_gain_q15: u16,
 }
 
 impl Mixer {
@@ -148,12 +161,25 @@ impl Mixer {
         Self {
             channels: [ChannelState::default(); MAX_CHANNELS],
             channel_count,
+            master_gain_q15: MASTER_GAIN_UNITY_Q15,
         }
     }
 
     /// Active channel count. Set at construction time.
     pub fn channel_count(&self) -> usize {
         self.channel_count
+    }
+
+    /// Phase 105 Track D.2 — set the master gain from a Q15 multiplier.
+    /// `0` mutes, [`MASTER_GAIN_UNITY_Q15`] (`0x8000`) is unity; requests
+    /// above unity are clamped so the master stage only ever attenuates.
+    pub fn set_master_volume(&mut self, q15_gain: u16) {
+        self.master_gain_q15 = q15_gain.min(MASTER_GAIN_UNITY_Q15);
+    }
+
+    /// The current Q15 master gain (never exceeds [`MASTER_GAIN_UNITY_Q15`]).
+    pub fn master_gain_q15(&self) -> u16 {
+        self.master_gain_q15
     }
 
     /// Read-only access to a channel slot. Intended for tests and
@@ -460,8 +486,15 @@ impl Mixer {
                     }
                 }
             }
-            let l = acc_l.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            let r = acc_r.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            // Phase 105 Track D.2 — apply the Q15 master gain before the
+            // i16 clamp. The multiply is in i64 so a full-scale sum times
+            // unity (`i16::MAX * MAX_CHANNELS * 0x8000`) cannot overflow
+            // before the shift brings it back into range.
+            let gain = self.master_gain_q15 as i64;
+            let scaled_l = (acc_l as i64 * gain) >> 15;
+            let scaled_r = (acc_r as i64 * gain) >> 15;
+            let l = scaled_l.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+            let r = scaled_r.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
             let off = frame_i * BYTES_PER_FRAME;
             let lu = l as u16;
             let ru = r as u16;
@@ -528,6 +561,60 @@ mod tests {
             assert_eq!(l, v, "left frame {} mismatch (got {}, want {})", i, l, v);
             assert_eq!(r, v, "right frame {} mismatch (got {}, want {})", i, r, v);
         }
+    }
+
+    /// Phase 105 Track D.2 — the same 4-sample full-volume input used by
+    /// `single_channel_full_volume`, so unity gain reproduces its
+    /// `[0, 16256, 16256, 0]` output and the gain arms scale from a known
+    /// baseline.
+    fn full_volume_output(q15_gain: Option<u16>) -> [i16; 4] {
+        let mut mixer = Mixer::new(1);
+        let samples = alloc::vec![128u8, 192, 192, 128];
+        unsafe {
+            mixer.set_channel(0, &samples, 48_000, 127, 127);
+        }
+        if let Some(g) = q15_gain {
+            mixer.set_master_volume(g);
+        }
+        let mut out = [0u8; 4 * BYTES_PER_FRAME];
+        mixer.step(&mut out, 4);
+        let mut got = [0i16; 4];
+        for (i, slot) in got.iter_mut().enumerate() {
+            let off = i * BYTES_PER_FRAME;
+            *slot = i16::from_le_bytes([out[off], out[off + 1]]);
+        }
+        got
+    }
+
+    #[test]
+    fn master_volume_default_is_unity() {
+        // A fresh mixer passes the mix through unchanged.
+        assert_eq!(Mixer::new(1).master_gain_q15(), MASTER_GAIN_UNITY_Q15);
+        assert_eq!(full_volume_output(None), [0, 16256, 16256, 0]);
+        assert_eq!(
+            full_volume_output(Some(MASTER_GAIN_UNITY_Q15)),
+            [0, 16256, 16256, 0]
+        );
+    }
+
+    #[test]
+    fn master_volume_zero_silences() {
+        assert_eq!(full_volume_output(Some(0)), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn master_volume_half_scales() {
+        // Q15 half = 0x4000; 16256 * 0x4000 >> 15 = 8128.
+        assert_eq!(full_volume_output(Some(0x4000)), [0, 8128, 8128, 0]);
+    }
+
+    #[test]
+    fn master_volume_clamps_above_unity() {
+        // Any request above unity is held at unity — no amplification.
+        let mut mixer = Mixer::new(1);
+        mixer.set_master_volume(0xFFFF);
+        assert_eq!(mixer.master_gain_q15(), MASTER_GAIN_UNITY_Q15);
+        assert_eq!(full_volume_output(Some(0xFFFF)), [0, 16256, 16256, 0]);
     }
 
     #[test]

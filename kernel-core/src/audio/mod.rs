@@ -23,6 +23,7 @@
 
 pub mod errno;
 pub mod format;
+pub mod gain;
 pub mod protocol;
 pub mod ring;
 #[cfg(test)]
@@ -30,6 +31,7 @@ mod ring_proptest;
 
 pub use errno::audio_error_to_neg_errno;
 pub use format::{ChannelLayout, PcmFormat, SampleRate, frame_size_bytes};
+pub use gain::{MASTER_GAIN_UNITY_Q15, apply_master_gain_s16le};
 pub use protocol::{
     AudioControlCommand, AudioControlEvent, AudioError, ClientMessage, MAX_SUBMIT_BYTES,
     ProtocolError, ServerMessage,

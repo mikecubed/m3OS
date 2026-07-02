@@ -1,6 +1,6 @@
 # Phase 105 — Native GUI Toolkit & Core Desktop Apps: Task List
 
-**Status:** In progress — **Tracks A + B + C landed and green.** A/B merged; C (`imagefmt` shared crate = extracted BMP/PNG + new baseline JPEG decode + PNG encode; `CaptureOutput`/`CaptureReply` protocol verbs + pure `pack_capture_bgra`; compositor SHM blit; `screenshot` tool; `screenshot-smoke` gate) is complete on `feat/phase-105-imagefmt-screenshot` — `xtask check` clean, 15 imagefmt + 10 kernel-core capture/protocol host tests pass, `screenshot-smoke` PASSES end-to-end on a default multi-core boot. Remaining: D (imgview + audio `SetMasterVolume`; settings' Network/Display/Power sections gate on Phase 103/104 → Dell) / E (TUI ports). Handoff: `docs/handoffs/2026-07-02-phase-105-gui-toolkit.md`.
+**Status:** In progress — **Tracks A + B + C landed and green; Track D.1 + D.2 landed and green.** A/B/C merged. C = `imagefmt` shared crate (extracted BMP/PNG + new baseline JPEG decode + PNG encode) + `CaptureOutput`/`CaptureReply` verbs + `screenshot` tool + `screenshot-smoke`. D.1 = `imgview` viewer (`imagefmt` + `m3ui` Toplevel) + `imgview-smoke` (PNG/BMP/JPEG decode + non-blank render, PASS multi-core). D.2 = audio `SetMasterVolume` verb + `audio_mixer` master-gain + kernel-core `audio::gain` + `audio_server` `gained_pcm` (host-tested). Remaining: **D.3–D.5** (settings panel + live Wi-Fi/brightness — 103/104 → Dell) / **E** (TUI ports). Handoff: `docs/handoffs/2026-07-02-phase-105-gui-toolkit.md`.
 **Source Ref:** phase-105
 **Depends on:** Phase 100 (Bare-Metal GUI Session — compositor + session in init, WC framebuffer, USB-mouse cursor) ✅, Phase 99 (SMP & Scheduler Robustness) ✅ via 100. The **settings panel** is additionally sequenced after Phase 103 (power: brightness/battery) and Phase 104 (Wi-Fi AX201 + connect daemon); Tracks A/B/C and the `imgview` app are **not** gated on 103/104.
 **Goal:** Ship a minimal native immediate-mode Rust widget toolkit (`m3ui`) on `desktop_client`, a compositor-brokered clipboard, a shared `imagefmt` crate (extracted BMP/PNG + new JPEG decode + PNG encode) with an output-capture screenshot tool, and the two core desktop apps (image viewer + settings/control panel) that make the GUI usable — the settings panel being the user-facing consumer of the Phase 103 power and Phase 104 Wi-Fi backends. Toolkit layout, protocol codecs, and the image codecs are host-tested; rendering/interaction are proven by QMP/PPM render probes; the live Wi-Fi/brightness arm is validated on the reference Dell per `docs/appendix/bare-metal-validation.md`.
@@ -12,7 +12,7 @@
 | A | `m3ui` immediate-mode toolkit (layout solver, widgets, input/focus, theme, proportional text) — host-tested layout | 100 | **Done + green** |
 | B | Clipboard / data-transfer protocol (`display_server` broker + protocol verbs + `desktop_client` helpers + `m3ui` Ctrl+C/V/X) | 100 | **Done + green** |
 | C | `imagefmt` shared crate (extract BMP/PNG, add JPEG + PNG encode) + `CaptureOutput` in `display_server` + `screenshot` tool | B (capture) | **Done + green** |
-| D | `imgview` image viewer + `settings` control panel (Wi-Fi/brightness/volume/battery) + audio `SetMasterVolume` | A, C; settings also 103, 104 | Planned |
+| D | `imgview` image viewer + `settings` control panel (Wi-Fi/brightness/volume/battery) + audio `SetMasterVolume` | A, C; settings also 103, 104 | **D.1 + D.2 done + green**; D.3–D.5 (settings/HW) pending |
 | E | TUI-in-`term` parallel ports charter (`nnn`/`lf`, `nano`/`vim`, `bsdtar`, `symphonia`); browser/office deferral | — | Planned |
 
 ---
@@ -232,8 +232,8 @@
 **Why it matters:** The first content app on the new toolkit; proves `imagefmt` + `m3ui` + a Toplevel compose together for a real user task.
 
 **Acceptance:**
-- [ ] Opens a PNG, a BMP, and a JPEG (by path arg) and renders each scaled-to-fit; an `m3ui` toolbar shows the filename + a "fit / 1:1" toggle + prev/next.
-- [ ] A render probe asserts each format produces a non-black surface; an unsupported/corrupt file shows an `m3ui` error label rather than crashing.
+- [x] Opens a PNG, a BMP, and a JPEG (by path arg, format auto-detected by magic bytes) and renders each scaled-to-fit; an `m3ui` toolbar (`split_row`) shows the filename + a Fit/1:1 toggle + Prev/Next buttons. Fixtures: `xtask/assets/imgview/{sample.png,sample.bmp,sample.jpg}` staged to `/usr/share/imgview/`.
+- [x] `imgview-smoke` (serial, `M3OS_IMGVIEW_REGRESSION=1`, exit 97) asserts each format decodes and scale-to-fit-renders to non-blank content (`IMGVIEW:ok fmt=<x> nonblank=<N>`, one per format); a decode failure shows an error label + `IMGVIEW:error`/`IMGVIEW:blank` rather than crashing. **PASS on a default multi-core boot.** (Serial non-blank self-check stands in for a PPM probe, mirroring `screenshot-smoke`.)
 
 ### D.2 — Audio `SetMasterVolume` control verb + mixer master-gain
 
@@ -246,9 +246,9 @@
 **Why it matters:** The Phase 57 audio control surface is `GetStats`-only; the settings panel's volume slider needs a real volume verb, applied as a master gain in the mixer.
 
 **Acceptance:**
-- [ ] `SetMasterVolume` added to `AudioControlCommand` with codec; host test round-trips it.
-- [ ] `audio_mixer` applies the master gain to the mixed S16LE output (host test: gain 0 → silence, full → unchanged, mid → scaled).
-- [ ] `audio_server` handles the verb on the control surface; a non-silent audio gate confirms a level change is audible/measurable.
+- [x] `SetMasterVolume { q15_gain: u16 }` added to `AudioControlCommand` (opcode 0x0202) with codec; per-value round-trip test + proptest strategy updated. Q15: `0x8000` = unity, `0` = mute.
+- [x] `audio_mixer::Mixer` applies the master gain to the mixed S16LE output (`set_master_volume`/`master_gain_q15`, applied to the i64 accumulator pre-clamp); host tests: gain 0 → silence, unity → unchanged, half → scaled, above-unity → clamped.
+- [x] `audio_server` handles the verb on the control surface: it holds `master_gain_q15` and runs forwarded PCM through `gained_pcm` (kernel-core `audio::gain::apply_master_gain_s16le`; unity = zero-copy, below-unity copies into a reused scratch so a read-only page grant is never mutated). Host-tested at the mixer, gain-helper (5), and `gained_pcm` (3) layers. **Note:** the live *audible* level-change gate is deferred to D.3 (the settings slider that drives the verb); the host tests prove the full verb→state→PCM-scale path meanwhile.
 
 ### D.3 — `settings` control panel Toplevel
 

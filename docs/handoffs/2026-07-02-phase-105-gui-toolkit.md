@@ -1,14 +1,14 @@
 # Handoff — Phase 105: Native GUI Toolkit & Core Desktop Apps
 
 **Date:** 2026-07-02 (living doc — update each session)
-**Branch:** `feat/phase-105-imagefmt-screenshot` (Track C; off `main`)
-**State:** **Tracks A + B + C COMPLETE + green.** A/B committed/PR'd. Track C
-(`imagefmt` lib + baseline JPEG decode + PNG encode + `CaptureOutput` verb +
-`screenshot` tool + `screenshot-smoke` gate) is complete on this branch:
-`cargo xtask check` clean, 15 imagefmt host tests + 10 kernel-core capture/
-protocol host tests pass, and `screenshot-smoke` PASSES end-to-end on a
-default multi-core boot (capture → PNG → file → decode round-trips losslessly).
-Tracks D/E are the remaining follow-ups (below).
+**Branch:** `feat/phase-105-imgview-audio-volume` (Track D.1+D.2; off `main`)
+**State:** **Tracks A + B + C COMPLETE + green; Track D.1 + D.2 COMPLETE +
+green** (D.3–D.5 are the Dell-gated remainder). A/B/C merged. This branch adds
+the hardware-free Track D: `imgview` image viewer (D.1) + audio
+`SetMasterVolume` master-gain (D.2). `cargo xtask check` clean; `imgview-smoke`
+PASSES on a default multi-core boot (PNG + BMP + JPEG each decode and
+non-blank-render); the audio gain math + protocol verb + server wiring are
+host-tested (audio_mixer, kernel-core `audio::gain`, audio_server `gained_pcm`).
 **Charter:** `docs/roadmap/105-gui-toolkit-and-apps.md`
 **Tasks:** `docs/roadmap/tasks/105-gui-toolkit-and-apps-tasks.md`
 
@@ -166,12 +166,51 @@ Tracks D/E are the remaining follow-ups (below).
   → `/bin/screenshot` → assert `SCREENSHOT_OK`), env
   `M3OS_SCREENSHOT_REGRESSION=1`, exit code 96. PASS on default `-smp` boot.
 
-## RESUME HERE — Track D (imgview + audio volume) next
+## Track D.1 + D.2 — what landed (imgview + master volume)
 
-Track C is done + green. Next is **Track D**: the `imgview` image viewer
-(reuses `imagefmt` decoders + a `desktop_client` Toplevel; NOT gated on
-103/104) and audio `SetMasterVolume` (`audio_server` mixer master-gain verb
-+ `desktop_client`/settings hook). The settings-panel Network/Display/Power
-sections stay deferred to the Dell (Phase 103/104 backends). **Track E**
-(TUI-in-`term` ports — file manager/editor/archive/audio player) is
-parallel ports-infra work that can land anytime.
+- **`imgview`** (`userspace/imgview`, four-place wired) — a `desktop_client`
+  Toplevel on `m3ui` + `imagefmt`. Decodes each path arg (PNG/BMP/JPEG,
+  detected by magic bytes), renders the current one scaled-to-fit (or 1:1)
+  into the content region below an `m3ui` toolbar (`split_row` → filename
+  label + Fit/1:1 toggle + Prev/Next `button_at`). Up-front it decodes every
+  arg and prints `IMGVIEW:ok fmt=<x> ... nonblank=<N>` (or
+  `IMGVIEW:blank`/`IMGVIEW:error`) per file — the serial oracle. Fixtures
+  live under `xtask/assets/imgview/{sample.png,sample.bmp,sample.jpg}` (each
+  regenerable by its `mk*.py`; PNG/BMP are tiny 32×24 gradients, JPEG is the
+  imagefmt `tiny16.jpg`), staged to `/usr/share/imgview/` by
+  `populate_ext2_files`.
+- **Gate**: `cmd_imgview_smoke` / `imgview-smoke` boots the stack, runs
+  `imgview` on all three fixtures, and asserts one `IMGVIEW:ok fmt=<x>` per
+  format (fail on `blank`/`error`). `M3OS_IMGVIEW_REGRESSION=1`, exit 97.
+  **PASS on a default multi-core boot.** Serial-only (the per-format
+  non-blank count is the oracle — consistent with `screenshot-smoke`).
+- **Audio `SetMasterVolume` (D.2)** — a system master volume:
+  - Protocol: `AudioControlCommand::SetMasterVolume { q15_gain: u16 }`
+    (opcode 0x0202) in `kernel-core/src/audio/protocol.rs`; codec +
+    round-trip + proptest coverage. Q15: `0x8000` = unity, `0` mutes.
+  - `audio_mixer::Mixer` gained a `set_master_volume`/`master_gain_q15` +
+    applies the gain to its i64 accumulator pre-clamp (the per-client DOOM
+    mixer path); 4 host tests (unity/zero/half/clamp).
+  - `kernel-core::audio::gain::apply_master_gain_s16le` — the pure S16LE
+    in-place scaler used by the **server** (the mixer runs in the client, so
+    the *system* master applies where `audio_server` forwards PCM); 5 host
+    tests.
+  - `audio_server` (`irq.rs`): holds `master_gain_q15`, updates it on the
+    `SetMasterVolume` verb, and runs forwarded PCM through `gained_pcm`
+    (unity = zero-copy passthrough; below unity copies into a reused scratch
+    so a read-only page grant is never mutated); 3 host tests.
+  - No new QEMU gate for the audible level change — that arm belongs with the
+    settings slider (D.3) that drives it; the host tests prove the full
+    verb→state→PCM-scale path.
+
+## RESUME HERE — Track D.3+ (settings panel) / Track E next
+
+D.1 + D.2 are done + green. What's left in Track D is **Dell-adjacent**:
+**D.3** `settings` control panel Toplevel (Sound section drives D.2's
+`SetMasterVolume`; the Wi-Fi CI arm needs a stub `wifi.control` service),
+**D.4** live Wi-Fi (104) + brightness/battery (103) backends, **D.5** on-metal
+validation. The Sound section of D.3 is hardware-free (it can land against
+D.2) — a reasonable next hardware-free slice is "`settings` panel with only
+the Sound section wired, driving the volume slider through `SetMasterVolume`,"
+deferring Network/Display/Power to the Dell. **Track E** (TUI-in-`term` ports)
+is parallel ports-infra work that can land anytime.

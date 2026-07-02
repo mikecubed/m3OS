@@ -1,0 +1,16 @@
+[package]
+name = "imgview"
+version.workspace = true
+edition.workspace = true
+description = "Phase 105 Track D.1 — image-viewer Toplevel (imagefmt + m3ui); drives imgview-render-probe."
+
+[[bin]]
+name = "imgview"
+path = "src/main.rs"
+
+[dependencies]
+m3ui = { path = "../lib/m3ui", features = ["render"] }
+imagefmt = { path = "../lib/imagefmt" }
+desktop_client = { path = "../lib/desktop_client" }
+kernel-core = { path = "../../kernel-core", default-features = false }
+syscall-lib = { path = "../syscall-lib", features = ["alloc"] }

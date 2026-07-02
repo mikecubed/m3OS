@@ -237,6 +237,8 @@ members = [
     "userspace/clip-smoke",
     # Phase 105 Track C.5 — screen capture to PNG (screenshot-smoke).
     "userspace/screenshot",
+    # Phase 105 Track D.1 — image viewer Toplevel (imgview-render-probe).
+    "userspace/imgview",
     # Phase 76 — dynamic linker (no_std PIE). Phase 76 ships the
     # transfer-only stub; Phase 76b grows it into a real bring-up
     # linker that walks DT_NEEDED and applies relocations.

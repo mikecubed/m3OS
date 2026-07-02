@@ -428,6 +428,12 @@ const SMOKE_EXIT_CLIPBOARD_SMOKE_FAILED: i32 = 95;
 /// did not reproduce the captured pixels).
 const SMOKE_EXIT_SCREENSHOT_SMOKE_FAILED: i32 = 96;
 
+/// Phase 105 Track D.1 — `imgview-smoke` failed: `imgview` did not decode
+/// and non-blank-render one of the PNG/BMP/JPEG fixtures (an `IMGVIEW:error`
+/// or `IMGVIEW:blank` sentinel fired, or an `IMGVIEW:ok fmt=<x>` never
+/// appeared for some format).
+const SMOKE_EXIT_IMGVIEW_SMOKE_FAILED: i32 = 97;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -1536,6 +1542,16 @@ fn main() {
                 });
             cmd_screenshot_smoke(&smoke_args);
         }
+        // Phase 105 Track D.1 — image viewer over PNG/BMP/JPEG fixtures.
+        Some("imgview-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("imgview-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_imgview_smoke(&smoke_args);
+        }
         // Phase 69d Track E.1 — `cargo xtask tui-app-smoke` boots and
         // drives less, htop, and tmux smokes in sequence. Reports per-app
         // :ok / :fail; non-zero exit on any failure.
@@ -1762,7 +1778,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm.\n\
      USB passthrough: --usb-passthrough <vid:pid> (e.g. `--usb-passthrough 0bda:8156`) passes a physical USB device into the guest's emulated xHCI (qemu-xhci,id=xhci_pt). The QEMU process must have access to the USB device node — add a udev rule granting the user/group read-write on the device, or run with sudo. The device is claimed from the host kernel while QEMU runs and is released on exit."
@@ -2119,6 +2135,7 @@ fn build_userspace_bins() {
         ("m3ui-demo", "m3ui-demo", true), // Phase 105 A.7: toolkit demo Toplevel
         ("clip-smoke", "clip-smoke", true), // Phase 105 B.4: clipboard round-trip helper
         ("screenshot", "screenshot", true), // Phase 105 C.5: screen capture to PNG
+        ("imgview", "imgview", true),     // Phase 105 D.1: image viewer Toplevel
         ("notifyd", "notify-send", true),
         // Phase 73 — lockscreen Layer-shell stub.
         ("lockscreen", "lockscreen", true),
@@ -26439,6 +26456,126 @@ fn cmd_screenshot_smoke(args: &SmokeBootArgs) {
     }
 }
 
+/// Phase 105 Track D.1 — `imgview-smoke`: boots the graphical stack and runs
+/// `imgview` against the three committed sample fixtures (a PNG, a BMP, and a
+/// JPEG staged under `/usr/share/imgview/`). `imgview` decodes each via
+/// `imagefmt`, renders it scaled-to-fit into a scratch, and prints
+/// `IMGVIEW:ok fmt=<x> ... nonblank=<N>` per format (or `IMGVIEW:blank`/
+/// `IMGVIEW:error` on failure). Serial-only: the per-format non-blank count
+/// is the oracle — it proves each decoder produced real content and the
+/// scale-to-fit path ran, without a framebuffer capture (the compositor's
+/// own render gates cover on-screen display).
+#[allow(clippy::zombie_processes)]
+fn cmd_imgview_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let steps = imgview_smoke_steps();
+
+    println!(
+        "imgview-smoke: launching QEMU (timeout {}s, {} steps)",
+        args.timeout_secs,
+        steps.len()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "imgview-smoke: PASSED ({} steps in {elapsed}s) — decoded + non-blank-rendered \
+                 PNG, BMP, and JPEG through imgview",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("imgview-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_IMGVIEW_SMOKE_FAILED);
+        }
+    }
+}
+
+/// Step list for `imgview-smoke`: boot → login → run `imgview` on the three
+/// fixtures → assert one `IMGVIEW:ok fmt=<x>` per format (fail fast on
+/// `IMGVIEW:error` / `IMGVIEW:blank`).
+fn imgview_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/imgview: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/imgview /usr/share/imgview/sample.png /usr/share/imgview/sample.bmp \
+                /usr/share/imgview/sample.jpg\n",
+        label: "imgview-smoke: open PNG + BMP + JPEG",
+    });
+    for fmt in ["png", "bmp", "jpeg"] {
+        // Each format's `ok` line carries `fmt=<x>`; a `blank`/`error`
+        // sentinel for any file fails the gate immediately.
+        let (pass, label) = match fmt {
+            "png" => (
+                "IMGVIEW:ok fmt=png",
+                "imgview-smoke: PNG decoded + non-blank",
+            ),
+            "bmp" => (
+                "IMGVIEW:ok fmt=bmp",
+                "imgview-smoke: BMP decoded + non-blank",
+            ),
+            _ => (
+                "IMGVIEW:ok fmt=jpeg",
+                "imgview-smoke: JPEG decoded + non-blank",
+            ),
+        };
+        steps.push(SmokeStep::WaitPassOrFail {
+            pass_pattern: pass,
+            fail_prefixes: &["IMGVIEW:error", "IMGVIEW:blank"],
+            timeout_secs: 60,
+            label,
+            exit_code_on_fail: SMOKE_EXIT_IMGVIEW_SMOKE_FAILED,
+        });
+    }
+    steps
+}
+
 /// Step list for `screenshot-smoke`: boot → login → run `screenshot` →
 /// assert the `SCREENSHOT_OK` sentinel (fail fast on `SCREENSHOT_FAIL`).
 fn screenshot_smoke_steps() -> Vec<SmokeStep> {
@@ -28547,6 +28684,41 @@ fn populate_ext2_files(
         }
     }
 
+    // Phase 105 Track D.1 — stage the `imgview` sample fixtures (one per
+    // supported format) under `/usr/share/imgview/` so `imgview-render-probe`
+    // can open a real PNG, BMP, and JPEG in-guest. The assets are committed
+    // under `xtask/assets/imgview/` (each regenerable by its `mk*.py`).
+    let imgview_assets_root = workspace_root().join("xtask/assets/imgview");
+    let mut imgview_cmds = String::new();
+    {
+        let fixtures = [
+            ("sample.png", imgview_assets_root.join("sample.png")),
+            ("sample.bmp", imgview_assets_root.join("sample.bmp")),
+            ("sample.jpg", imgview_assets_root.join("sample.jpg")),
+        ];
+        if fixtures.iter().any(|(_, p)| p.is_file()) {
+            // `/usr` and `/usr/share` are already created earlier in this
+            // same debugfs script, so only the leaf directory is made here.
+            imgview_cmds.push_str(
+                "mkdir usr/share/imgview\n\
+                 sif usr/share/imgview mode 0x41ED\n\
+                 sif usr/share/imgview uid 0\n\
+                 sif usr/share/imgview gid 0\n",
+            );
+            for (name, path) in fixtures.iter() {
+                if path.is_file() {
+                    imgview_cmds.push_str(&format!(
+                        "write \"{}\" usr/share/imgview/{name}\n\
+                         sif usr/share/imgview/{name} mode 0x81A4\n\
+                         sif usr/share/imgview/{name} uid 0\n\
+                         sif usr/share/imgview/{name} gid 0\n",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+
     // Phase 71 — graphical-session entry point. In every non-smoke mode
     // we write BOTH `term.conf` and `greeter.conf` to the disk image;
     // init then chooses which manifest to load at boot via
@@ -29159,6 +29331,7 @@ fn populate_ext2_files(
          {smoke_mode_cmds}\
          {graphical_only_cmds}\
          {greeter_bg_cmds}\
+         {imgview_cmds}\
          {skip_tcc_cmds}\
          {disable_display_cmds}\
          {debug_crash_cmds}\
@@ -29219,6 +29392,7 @@ fn populate_ext2_files(
         smoke_mode_cmds = smoke_mode_cmds,
         graphical_only_cmds = graphical_only_cmds,
         greeter_bg_cmds = greeter_bg_cmds,
+        imgview_cmds = imgview_cmds,
         skip_tcc_cmds = skip_tcc_cmds,
         disable_display_cmds = disable_display_cmds,
         debug_crash_cmds = debug_crash_cmds,
