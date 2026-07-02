@@ -98,7 +98,7 @@ This sets `core.hooksPath` to `.githooks/`. **pre-commit** runs `cargo xtask che
 | `ssh-e1000-banner-check` | `M3OS_E1000_REGRESSION=1` | e1000 NIC initializes; SSH server banner answers on TCP/22. |
 | `doom-audio-smoke` | `M3OS_DOOM_AUDIO_REGRESSION=1` | DOOM plays non-silent PCM through the ac97/hda `audio_server` mixer. |
 | `termios-smoke` | `M3OS_TERMIOS_REGRESSION=1` | PTY/termios/line-discipline correct (raw mode, SIGWINCH, ICANON). |
-| `tui-app-smoke` | `M3OS_TUI_APP_REGRESSION=1` | ncurses TUI apps (htop, tmux, less, nano, nnn) render correctly over the terminal. |
+| `tui-app-smoke` | `M3OS_TUI_APP_REGRESSION=1` | Ported terminal apps work in-OS: ncurses TUIs (htop, tmux, less, nano, nnn) render correctly; bsdtar round-trips a gzip archive. |
 | `doom-concurrent-smoke` | `M3OS_DOOM_CONCURRENT_REGRESSION=1` | DOOM runs concurrently with other ring-3 processes; no scheduler starvation. |
 | `tiling-smoke` | `M3OS_TILING_REGRESSION=1` | `display_server` tiling layout and multi-window compositor work correctly. |
 | `clipboard-smoke` | `M3OS_CLIPBOARD_REGRESSION=1` | Compositor-brokered clipboard round-trips text between two independent clients (copy in A, paste in B). |

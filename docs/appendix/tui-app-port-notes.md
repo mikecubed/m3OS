@@ -21,6 +21,7 @@ broke.
 | `tmux` | 3.5a | `github.com/tmux/.../tmux-3.5a.tar.gz` | `16216bd087717ddf` | `/usr/local/bin/tmux` |
 | `nano` | 8.7 | `nano-editor.org/dist/v8/nano-8.7.tar.xz` | `afd287aa672c48b8` | `/usr/local/bin/nano` |
 | `nnn` | 5.2 | `github.com/jarun/nnn/archive/refs/tags/v5.2.tar.gz` | `f166eda5093ac8dc` | `/usr/local/bin/nnn` |
+| `bsdtar` | 3.8.8 | `github.com/libarchive/.../libarchive-3.8.8.tar.gz` | `038918ea315cdd44` | `/usr/local/bin/bsdtar` |
 
 Full SHA-256 lives in each port's `Portfile`. The host-side
 `cargo xtask port build <name>` driver re-verifies the SHA on every
@@ -90,6 +91,62 @@ makes startup survive missing kernel inotify support (m3OS has none):
 upstream exits if `inotify_init1` fails; the patch degrades to
 no-directory-watching, which is safe because every downstream inotify
 use is guarded by `inotify_wd >= 0`.
+
+### bsdtar (Phase 105 Track E)
+libarchive autotools with static `bsdtar` only:
+`--enable-bsdtar=static --disable-bsdcat --disable-bsdcpio
+--disable-bsdunzip --enable-static --disable-shared`. zlib is the sole
+compression backend (`--with-zlib` against the in-tree zlib stage;
+bz2/lzma/lz4/zstd have no ports → `--without-*`), every crypto/XML
+backend is off (openssl/mbedtls/nettle/cng/xml2/expat/iconv), and
+`--disable-acl --disable-xattr` because m3OS has no acl/xattr syscalls.
+BLAKE2 falls back to libarchive's bundled copy (`libb2/bundled` in
+`bsdtar --version`) — no extra dep. Not a curses app: no terminfo /
+capability-table entry; the smoke asserts a gzip'd create → extract →
+`cat` payload round-trip instead of rendered chrome.
+
+**Static-link gotcha:** libtool silently EATS a plain `-static` from
+`LDFLAGS` at link time (it reserves that spelling for libtool-library
+semantics), so the first build produced a *dynamically linked* bsdtar
+(`PT_INTERP=/lib/ld-musl-x86_64.so.1`) despite `-static` in the
+configure LDFLAGS — and it even ran in-OS via the Phase 93 loader,
+masking the regression. The fix is libtool's `-all-static` spelling,
+passed on the **make** line (`make LDFLAGS="-all-static …"`), NOT to
+configure — plain gcc rejects `-all-static`, so it would break every
+configure link probe. `build_bsdtar` also greps the produced binary for
+the `ld-musl` interp string and fails the build if it reappears.
+
+**Serial-shell smoke gotchas (all hit while landing this arm — the
+rules below apply to ANY smoke step typed at the sh0 serial console):**
+
+1. **sh0 has NO `&&` (or `;`) chaining.** `execute_line` tokenizes the
+   whole line into one argv — `cmd1 && cmd2` runs `cmd1` with `&&`,
+   `cmd2`… as literal arguments. Worse, a chained sentinel like
+   `cmd && echo SENTINEL` *appears* to work because the `Wait` matches
+   the PTY **keystroke echo** of the typed line, not executed output —
+   a silent false pass. (Several pre-existing steps in this gate use
+   the `test -x … && echo …` shape and pass only by this mechanism;
+   their real assertions are carried by later output-matching steps.)
+   One command per line.
+2. **Never type while a long-running command runs** — the keystrokes
+   can vanish (the extract line typed during a multi-second bsdtar
+   create was never executed). Each long stage must be
+   completion-proven before the next Send; the best oracle is the
+   stage's OWN output: the bsdtar steps use `-v` (`a payload.txt` on
+   create, `x payload.txt` on extract — neither is a substring of any
+   typed line).
+3. **Execution-proof sentinels via whitespace collapse**: type
+   `echo NNN  SEEDED` (double space) and wait for the single-space
+   `NNN SEEDED` — argv rejoining collapses the run, so the pattern can
+   only match executed output, never the keystroke echo. This is how
+   the nano/nnn/bsdtar arms prove "app exited, shell is back" at every
+   boundary.
+4. **Keep lines short and consider `SmokeStep::SendPaced`** (5 ms/byte)
+   for anything beyond ~60 chars: a ~150-char burst `write_all`
+   vanished wholesale without even a keystroke echo (never diagnosed
+   to the byte — shortening + pacing + the rules above made it moot).
+5. `printf` and `touch` are not part of the in-OS command set — seed
+   files with the proven `echo text > file` idiom.
 
 ## What proved tricky during the port
 

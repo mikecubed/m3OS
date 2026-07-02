@@ -1,15 +1,18 @@
 # Handoff — Phase 105: Native GUI Toolkit & Core Desktop Apps
 
 **Date:** 2026-07-02 (living doc — update each session)
-**Branch:** `feat/phase-105-track-e-tui-ports` (Track E slice 1; stacked on
-`feat/phase-105-settings-sound` = PR #279 (D.3 Sound), itself stacked on
-`feat/phase-105-imgview-audio-volume` = PR #278 (D.1+D.2) off `main`)
-**State:** **Tracks A + B + C COMPLETE + green; D.1 + D.2 COMPLETE + green
-(PR #278); D.3 Sound slice COMPLETE + green (PR #279); Track E slice 1
-(`nano` + `nnn` ports) COMPLETE + green (this branch).**
-A/B/C merged. D.3's remaining Wi-Fi-stub CI arm moves with D.4; D.4–D.5 are
-the Dell-gated remainder; Track E's `bsdtar`/`symphonia`/`vim` are follow-on
-Portfiles. `cargo xtask check` clean.
+**Branch:** `feat/phase-105-track-e-bsdtar` (Track E slice 2, off `main`)
+**State:** **Tracks A + B + C, D.1 + D.2 (#278), D.3 Sound slice (#281,
+re-filed #279), and Track E slice 1 `nano` + `nnn` (#282, re-filed #280)
+are ALL MERGED to `main`. Track E slice 2 (`bsdtar`) COMPLETE + green
+(this branch).**
+Stacked-PR gotcha recorded: squash-merging a stack base with
+`--delete-branch` makes GitHub **close** (not retarget) child PRs — #279/
+#280 had to be re-filed as #281/#282 after rebasing onto the new `main`
+(rebase auto-drops the already-applied commits; identical trees).
+D.3's remaining Wi-Fi-stub CI arm moves with D.4; D.4–D.5 are the
+Dell-gated remainder; Track E's `symphonia` player (+ `vim` alt) is the
+follow-on. `cargo xtask check` clean.
 **Charter:** `docs/roadmap/105-gui-toolkit-and-apps.md`
 **Tasks:** `docs/roadmap/tasks/105-gui-toolkit-and-apps-tasks.md`
 
@@ -274,15 +277,45 @@ Portfiles. `cargo xtask check` clean.
 - Docs: `tui-app-port-notes.md` matrix + capability + flags + tricky
   sections; AGENTS.md `tui-app-smoke` row now names nano/nnn.
 
-## RESUME HERE — Track E follow-ons / D.3 Wi-Fi-stub arm → D.4
+## Track E slice 2 — what landed (branch `feat/phase-105-track-e-bsdtar`)
 
-Track E slice 1 (`nano` + `nnn`) is done + green in `tui-app-smoke`.
-**Track E follow-ons** (parallel, land anytime): `bsdtar` (libarchive)
-port, the `symphonia`-based Rust terminal audio player feeding
-`audio_server` (a new app, not just a Portfile), `vim` as an editor
-alternate. What's left in Track D is **Dell-adjacent**: the D.3
+- **`bsdtar` 3.8.8 port** (`ports/util/bsdtar/Portfile`, `build_bsdtar`;
+  `DEPS=zlib`): libarchive autotools, static `bsdtar` only
+  (bsdcat/bsdcpio/bsdunzip disabled), zlib the sole codec backend
+  (bz2/lzma/lz4/zstd unported → `--without-*`), all crypto/XML backends
+  off, `--disable-acl --disable-xattr` (no such syscalls). BLAKE2 uses
+  libarchive's bundled fallback. Host-validated round-trip before the
+  gate. **Gotcha (recorded in `tui-app-port-notes.md`):** libtool eats a
+  plain `-static` at link time — the first build was dynamically linked
+  (`PT_INTERP` present) and even RAN in-OS via the Phase 93 loader,
+  masking it; fixed with `make LDFLAGS="-all-static …"` (never on
+  configure — gcc rejects the spelling) + a build-time interp-string
+  grep that fails on regression.
+- Six-place registration as before (dispatch, `BUILDABLE_PORTS`,
+  `port_deps`, `build_recipe_id`, `build_phase_69d_ports`,
+  `populate_phase_69d_ports`).
+- **`tui-app-smoke`** grew a bsdtar arm after nnn: seed (one command
+  per line) → verbose create → verbose extract → `cat` round-trip.
+  **The big discovery** (full rules in `tui-app-port-notes.md` §bsdtar):
+  **sh0 has no `&&` chaining** — `cmd && echo SENTINEL` runs `cmd`
+  with literal `&&`/`echo` argv AND the wait false-passes on the PTY
+  keystroke echo. The nano/nnn arms were de-`&&`-ed too, and every
+  app boundary now uses the whitespace-collapse execution-proof
+  sentinel (`echo X  exit-ok` double-space typed → single-space wait).
+  Long stages are completion-proven by bsdtar's own `-v` output
+  (`a payload.txt` / `x payload.txt`), never by typing during
+  execution (keystrokes vanish). `SmokeStep::SendPaced` (new, both
+  runners) paces longer lines at 5 ms/byte.
+
+## RESUME HERE — Track E symphonia player / D.3 Wi-Fi-stub arm → D.4
+
+Track E slices 1+2 (`nano`, `nnn`, `bsdtar`) are merged/green. The
+remaining Track E item is the **`symphonia`-based Rust terminal audio
+player** feeding `audio_server` — a new userspace app (four-place
+wiring + audio_client), not just a Portfile; `vim` stays an optional
+editor alternate. What's left in Track D is **Dell-adjacent**: the D.3
 **Wi-Fi stub-service CI arm** (stub `wifi.control` + ScanResult rows +
 passphrase text_field — moves with D.4's backend clients), **D.4** live
 Wi-Fi (104) + brightness/battery (103) backends, **D.5** on-metal
-validation. Merge order: PR #278 (D.1+D.2) → PR #279 (D.3 Sound) →
-this branch's PR (Track E slice 1).
+validation. When merging stacked PRs, remember the gotcha in the State
+block: merge children before deleting bases, or stack onto `main`.
