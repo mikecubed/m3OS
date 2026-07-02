@@ -367,6 +367,15 @@ fn build_recipe_id(name: &str) -> &'static str {
             "make:O_NORL=1 O_NOX11=1 O_NOFIFO=1 PREFIX=/usr/local;\
              cflags:-O2;libs:-lncursesw -ltinfow -lpthread;ldflags:-static"
         }
+        "bsdtar" => {
+            "configure:--enable-bsdtar=static --disable-bsdcat --disable-bsdcpio \
+             --disable-bsdunzip --enable-static --disable-shared --disable-acl \
+             --disable-xattr --disable-rpath --with-zlib --without-bz2lib \
+             --without-lzma --without-lz4 --without-zstd --without-lzo2 \
+             --without-libb2 --without-openssl --without-mbedtls --without-nettle \
+             --without-cng --without-xml2 --without-expat --without-iconv \
+             --host=x86_64-linux-musl --prefix=/usr/local;make-ldflags:-all-static"
+        }
         "tmux" => {
             "configure:--enable-utempter=no --enable-systemd=no --disable-utf8proc \
              --host=x86_64-linux-musl --prefix=/usr/local"
@@ -921,9 +930,10 @@ pub fn port_deps(name: &str) -> &'static [&'static str] {
     match name {
         "less" => &["ncurses"],
         "htop" => &["ncurses"],
-        // Phase 105 Track E — TUI editor + file manager.
+        // Phase 105 Track E — TUI editor + file manager + archiver.
         "nano" => &["ncurses"],
         "nnn" => &["ncurses"],
+        "bsdtar" => &["zlib"],
         // Phase 93: musl (libc.so) is self-contained (no deps).
         "musl" => &[],
         // Phase 93 Track D — the DYNAMIC python's only RUNTIME dep is musl
@@ -1285,9 +1295,10 @@ pub const BUILDABLE_PORTS: &[&str] = &[
     "python",
     "less",
     "htop",
-    // Phase 105 Track E — TUI editor + file manager.
+    // Phase 105 Track E — TUI editor + file manager + archiver.
     "nano",
     "nnn",
+    "bsdtar",
     "tmux",
     "curl",
     "git",
@@ -1906,9 +1917,10 @@ fn port_build(name: &str) -> Result<(), String> {
         "libffi" => build_libffi(&extracted, &stage, &toolchain)?,
         "less" => build_less(&extracted, &stage, &toolchain, &ncurses_stage)?,
         "htop" => build_htop(&extracted, &stage, &toolchain, &ncurses_stage)?,
-        // Phase 105 Track E — TUI editor + file manager.
+        // Phase 105 Track E — TUI editor + file manager + archiver.
         "nano" => build_nano(&extracted, &stage, &toolchain, &ncurses_stage)?,
         "nnn" => build_nnn(&extracted, &stage, &toolchain, &ncurses_stage)?,
+        "bsdtar" => build_bsdtar(&extracted, &stage, &toolchain, &zlib_stage)?,
         "tmux" => build_tmux(
             &extracted,
             &stage,
@@ -3964,6 +3976,120 @@ fn build_nnn(
     }
     println!(
         "nnn: produced /usr/local/bin/nnn ({} bytes)",
+        file_size(&bin)
+    );
+    Ok(())
+}
+
+/// Phase 105 Track E — bsdtar from libarchive (autotools, zlib consumer).
+///
+/// Static `bsdtar` only: bsdcat/bsdcpio/bsdunzip are disabled, zlib is the
+/// sole compression backend (gzip + POSIX/GNU tar formats; bz2/lzma/lz4/
+/// zstd have no in-tree ports), and every crypto/XML backend is off.
+/// acl/xattr are disabled — m3OS has no such syscalls, and libarchive's
+/// runtime probes would only produce noise.
+fn build_bsdtar(
+    src: &Path,
+    stage: &Path,
+    (cc, ar, ranlib): &(&'static str, String, String),
+    zlib_stage: &Path,
+) -> Result<(), String> {
+    let zlib_prefix = zlib_stage.join("usr/local");
+    if !zlib_prefix.join("lib/libz.a").exists() {
+        return Err(format!(
+            "bsdtar build: zlib stage not found at {}",
+            zlib_prefix.display()
+        ));
+    }
+    let stage_prefix = stage.join("usr/local");
+    fs::create_dir_all(&stage_prefix).map_err(|e| format!("mkdir: {e}"))?;
+
+    let cflags = format!("-O2 -I{}/include", zlib_prefix.display());
+    let extra_ld = musl_extra_ldflags_joined();
+    let ldflags = if extra_ld.is_empty() {
+        format!("-static -L{}/lib", zlib_prefix.display())
+    } else {
+        format!("-static -L{}/lib {extra_ld}", zlib_prefix.display())
+    };
+
+    let mut configure_cmd = Command::new("sh");
+    configure_cmd
+        .current_dir(src)
+        .arg("./configure")
+        .args([
+            "--enable-bsdtar=static",
+            "--disable-bsdcat",
+            "--disable-bsdcpio",
+            "--disable-bsdunzip",
+            "--enable-static",
+            "--disable-shared",
+            "--disable-acl",
+            "--disable-xattr",
+            "--disable-rpath",
+            "--with-zlib",
+            "--without-bz2lib",
+            "--without-lzma",
+            "--without-lz4",
+            "--without-zstd",
+            "--without-lzo2",
+            "--without-libb2",
+            "--without-openssl",
+            "--without-mbedtls",
+            "--without-nettle",
+            "--without-cng",
+            "--without-xml2",
+            "--without-expat",
+            "--without-iconv",
+            "--host=x86_64-linux-musl",
+        ])
+        .arg("--prefix=/usr/local")
+        .env("CC", cc)
+        .env("AR", ar)
+        .env("RANLIB", ranlib)
+        .env("CFLAGS", &cflags)
+        .env("LDFLAGS", &ldflags);
+    run(&mut configure_cmd, "bsdtar configure")?;
+
+    // libtool EATS a plain `-static` from LDFLAGS at link time (it reserves
+    // it for libtool-library semantics), which left bsdtar dynamically
+    // linked (PT_INTERP=/lib/ld-musl-x86_64.so.1) despite the configure
+    // LDFLAGS. `-all-static` is libtool's "fully static binary" spelling —
+    // but plain gcc rejects it, so it must ride the `make` invocation
+    // (libtool link mode), NOT the configure LDFLAGS the probes run with.
+    let make_ldflags = format!("-all-static {ldflags}");
+    let mut make_cmd = Command::new("make");
+    make_cmd
+        .current_dir(src)
+        .arg(format!("LDFLAGS={make_ldflags}"))
+        .arg(format!("-j{}", num_jobs()));
+    run(&mut make_cmd, "bsdtar make")?;
+
+    let mut install_cmd = Command::new("make");
+    install_cmd
+        .current_dir(src)
+        .arg("install")
+        .arg(format!("DESTDIR={}", stage.display()));
+    run(&mut install_cmd, "bsdtar install")?;
+
+    let bin = stage_prefix.join("bin/bsdtar");
+    if !bin.exists() {
+        return Err(format!("bsdtar build missing {}", bin.display()));
+    }
+    // Guard the static-link contract: a PT_INTERP string in the binary
+    // means libtool dropped the static flags again.
+    let bytes = fs::read(&bin).map_err(|e| format!("read bsdtar: {e}"))?;
+    if bytes
+        .windows(b"/lib/ld-musl-x86_64.so.1".len())
+        .any(|w| w == b"/lib/ld-musl-x86_64.so.1")
+    {
+        return Err(
+            "bsdtar build: binary is dynamically linked (PT_INTERP present) — \
+             the libtool -all-static wiring regressed"
+                .to_string(),
+        );
+    }
+    println!(
+        "bsdtar: produced /usr/local/bin/bsdtar ({} bytes, static)",
         file_size(&bin)
     );
     Ok(())
@@ -7651,7 +7777,7 @@ pub fn build_phase_69d_ports() -> Result<(), String> {
         );
     }
     for name in &[
-        "zlib", "ncurses", "libevent", "less", "htop", "nano", "nnn", "tmux",
+        "zlib", "ncurses", "libevent", "less", "htop", "nano", "nnn", "bsdtar", "tmux",
     ] {
         port_build(name).map_err(|e| format!("port {name}: {e}"))?;
     }

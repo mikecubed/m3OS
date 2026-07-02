@@ -7206,6 +7206,23 @@ enum SmokeStep {
         input: &'static str,
         label: &'static str,
     },
+    /// Send `input` to QEMU stdin one byte at a time with a small delay
+    /// between bytes.
+    ///
+    /// Phase 105 Track E: a burst `write_all` of a longer command line
+    /// sporadically overruns the guest's serial RX path on a busy TCG
+    /// boot — the line vanishes without even a PTY echo (observed twice
+    /// while landing the bsdtar arm: a ~150-char chained line always, a
+    /// ~92-char line intermittently). Pacing gives the RX IRQ handler
+    /// time to drain between bytes. Prefer this over `Send` for command
+    /// lines longer than ~60 chars typed into a busy graphical session.
+    /// Clears `serial_buf` exactly like `Send` (same reset-boundary
+    /// semantics for the following `Wait`s).
+    SendPaced {
+        input: &'static str,
+        char_delay_ms: u64,
+        label: &'static str,
+    },
     /// Pause between steps.
     Sleep { millis: u64 },
     /// Wait for either `pattern_a` or `pattern_b`. Injects `extra_steps_a`
@@ -7959,6 +7976,37 @@ fn run_smoke_script(
                         ));
                     }
                     let _ = stdin.flush();
+                } else {
+                    return Err(format!("no stdin pipe at step {}: {label}", step_num));
+                }
+            }
+
+            SmokeStep::SendPaced {
+                input,
+                char_delay_ms,
+                label,
+            } => {
+                println!("[step {}] send-paced: {label}", step_num);
+                drain_serial_until_idle(
+                    &rx,
+                    &mut serial_buf,
+                    &mut serial_history,
+                    std::time::Duration::from_millis(150),
+                    std::time::Duration::from_secs(2),
+                );
+                if let Some(stdin) = child.stdin.as_mut() {
+                    use std::io::Write;
+                    serial_buf.clear();
+                    for byte in input.as_bytes() {
+                        if stdin.write_all(std::slice::from_ref(byte)).is_err() {
+                            return Err(format!(
+                                "failed to send paced input at step {}: {label}",
+                                step_num
+                            ));
+                        }
+                        let _ = stdin.flush();
+                        std::thread::sleep(std::time::Duration::from_millis(*char_delay_ms));
+                    }
                 } else {
                     return Err(format!("no stdin pipe at step {}: {label}", step_num));
                 }
@@ -16808,14 +16856,13 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Sleep { millis: 250 });
     steps.push(SmokeStep::Send {
-        input: "cat /tmp/nano-smoke.txt && echo TUI_APP_SMOKE:nano:seeded\n",
+        // NO `&&` — the serial shell (sh0) has no command chaining; a
+        // chained line becomes one command with `&&` as a literal argv
+        // token. The `Send` clears the serial match window, and this
+        // command's own echo names only the path, so the wait below can
+        // only match cat's executed output.
+        input: "cat /tmp/nano-smoke.txt\n",
         label: "guest/tui-app-smoke: verify nano seed file",
-    });
-    steps.push(SmokeStep::Wait {
-        // Matches this command's own echo — consumes past the seed echo.
-        pattern: "TUI_APP_SMOKE:nano:seeded",
-        timeout_secs: 15,
-        label: "guest/tui-app-smoke: nano seed fence",
     });
     steps.push(SmokeStep::Wait {
         // cat's output — proves the redirect actually wrote the line.
@@ -16852,14 +16899,18 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
-        input: "echo TUI_APP_SMOKE:nano:ok\n",
+        // Double space: the pass pattern below (single space) can only
+        // match the EXECUTED echo output — if nano failed to exit, the
+        // keystrokes vanish into its raw-mode input and this times out
+        // right here, pinpointing the boundary.
+        input: "echo TUI_APP_SMOKE:nano  exit-ok\n",
         label: "guest/tui-app-smoke: nano sentinel",
     });
     steps.push(SmokeStep::WaitPassOrFail {
-        pass_pattern: "TUI_APP_SMOKE:nano:ok",
+        pass_pattern: "TUI_APP_SMOKE:nano exit-ok",
         fail_prefixes: &["TUI_APP_SMOKE:nano:fail"],
         timeout_secs: 15,
-        label: "guest/tui-app-smoke: nano :ok",
+        label: "guest/tui-app-smoke: nano exited to shell",
         exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
     });
 
@@ -16869,17 +16920,31 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
     //      listing itself is plain readdir. Same fence discipline as
     //      nano: the seed command's echo contains both filenames, so a
     //      fence consumes past it before the render waits.
+    // NO `&&` (sh0 has no chaining) and no `touch` (not a guaranteed
+    // in-OS binary) — one command per line, files seeded via the proven
+    // echo-redirect idiom, then an execution-proof fence (double space →
+    // single-space wait matches only the executed echo output).
     steps.push(SmokeStep::Send {
-        input: "mkdir -p /tmp/nnn-smoke && touch /tmp/nnn-smoke/alpha.txt /tmp/nnn-smoke/bravo.txt\n",
-        label: "guest/tui-app-smoke: seed nnn smoke dir",
+        input: "mkdir -p /tmp/nnn-smoke\n",
+        label: "guest/tui-app-smoke: mkdir nnn smoke dir",
     });
     steps.push(SmokeStep::Sleep { millis: 250 });
     steps.push(SmokeStep::Send {
-        input: "echo TUI_APP_SMOKE:nnn:seeded\n",
+        input: "echo a > /tmp/nnn-smoke/alpha.txt\n",
+        label: "guest/tui-app-smoke: seed nnn alpha.txt",
+    });
+    steps.push(SmokeStep::Sleep { millis: 250 });
+    steps.push(SmokeStep::Send {
+        input: "echo b > /tmp/nnn-smoke/bravo.txt\n",
+        label: "guest/tui-app-smoke: seed nnn bravo.txt",
+    });
+    steps.push(SmokeStep::Sleep { millis: 250 });
+    steps.push(SmokeStep::Send {
+        input: "echo NNN  SEEDED\n",
         label: "guest/tui-app-smoke: nnn seed fence echo",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "TUI_APP_SMOKE:nnn:seeded",
+        pattern: "NNN SEEDED",
         timeout_secs: 15,
         label: "guest/tui-app-smoke: nnn seed fence",
     });
@@ -16906,14 +16971,117 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
-        input: "echo TUI_APP_SMOKE:nnn:ok\n",
+        // Execution-proof boundary sentinel (see the nano arm) — a
+        // still-running nnn would silently eat every later command in
+        // the gate, so prove the shell is back before bsdtar runs.
+        input: "echo TUI_APP_SMOKE:nnn  exit-ok\n",
         label: "guest/tui-app-smoke: nnn sentinel",
     });
     steps.push(SmokeStep::WaitPassOrFail {
-        pass_pattern: "TUI_APP_SMOKE:nnn:ok",
+        pass_pattern: "TUI_APP_SMOKE:nnn exit-ok",
         fail_prefixes: &["TUI_APP_SMOKE:nnn:fail"],
         timeout_secs: 15,
-        label: "guest/tui-app-smoke: nnn :ok",
+        label: "guest/tui-app-smoke: nnn exited to shell",
+        exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
+    });
+
+    // ---- bsdtar (Phase 105 Track E): gzip'd create → extract → verify
+    //      the payload round-trips byte-for-byte.
+    //
+    //      Two hard-won rules shape these steps (full story in
+    //      docs/appendix/tui-app-port-notes.md):
+    //      1. Commands stay under ~100 chars. A single ~150-char chained
+    //         line vanished without even a PTY echo (serial RX burst
+    //         overrun); the longest proven line in this gate is ~101.
+    //      2. Each bsdtar stage is EXECUTION-proven before the next is
+    //         typed, or the next stage's keystrokes race the multi-second
+    //         TCG startup and get eaten. The completion sentinel uses
+    //         sh0's whitespace collapse: the typed line has a DOUBLE
+    //         space ("BSDTAR  STEP1"), so the single-space wait pattern
+    //         can only match echo's executed output — never the PTY echo
+    //         of the keystrokes.
+    // One command per line (sh0 has no `&&`); the two long-running
+    // bsdtar stages are completion-proven by bsdtar's OWN `-v` output
+    // (`a payload.txt` on create, `x payload.txt` on extract — neither
+    // string occurs in any typed line), so the next command is never
+    // typed while a stage still runs (typed-while-running keystrokes
+    // get eaten — see tui-app-port-notes.md).
+    steps.push(SmokeStep::Send {
+        input: "mkdir -p /tmp/tar-src\n",
+        label: "guest/tui-app-smoke: mkdir bsdtar src dir",
+    });
+    steps.push(SmokeStep::Sleep { millis: 250 });
+    steps.push(SmokeStep::Send {
+        input: "mkdir -p /tmp/tar-out\n",
+        label: "guest/tui-app-smoke: mkdir bsdtar out dir",
+    });
+    steps.push(SmokeStep::Sleep { millis: 250 });
+    steps.push(SmokeStep::Send {
+        input: "echo m3os bsdtar payload > /tmp/tar-src/payload.txt\n",
+        label: "guest/tui-app-smoke: seed bsdtar payload",
+    });
+    steps.push(SmokeStep::Sleep { millis: 250 });
+    steps.push(SmokeStep::Send {
+        input: "echo SEED  DONE\n",
+        label: "guest/tui-app-smoke: bsdtar seed fence echo",
+    });
+    steps.push(SmokeStep::Wait {
+        // Single space — only the executed echo output matches (the
+        // typed line carries a double space), proving the shell consumed
+        // and ran the seed lines above in order.
+        pattern: "SEED DONE",
+        timeout_secs: 30,
+        label: "guest/tui-app-smoke: bsdtar seed completed",
+    });
+    steps.push(SmokeStep::SendPaced {
+        input: "/usr/local/bin/bsdtar -czvf /tmp/s.tgz -C /tmp/tar-src payload.txt\n",
+        char_delay_ms: 5,
+        label: "guest/tui-app-smoke: bsdtar create (gzip, verbose)",
+    });
+    steps.push(SmokeStep::Wait {
+        // bsdtar's create-verbose line — printed only when the entry is
+        // actually archived. Not a substring of the typed command
+        // ("...tar-src payload.txt" ends in "c payload.txt", not
+        // "a payload.txt").
+        pattern: "a payload.txt",
+        timeout_secs: 60,
+        label: "guest/tui-app-smoke: bsdtar create archived the payload",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::SendPaced {
+        input: "/usr/local/bin/bsdtar -xzvf /tmp/s.tgz -C /tmp/tar-out\n",
+        char_delay_ms: 5,
+        label: "guest/tui-app-smoke: bsdtar extract (verbose)",
+    });
+    steps.push(SmokeStep::Wait {
+        // Extract-verbose line; the typed extract command never names
+        // the payload file at all.
+        pattern: "x payload.txt",
+        timeout_secs: 60,
+        label: "guest/tui-app-smoke: bsdtar extract restored the payload",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "cat /tmp/tar-out/payload.txt\n",
+        label: "guest/tui-app-smoke: cat extracted payload",
+    });
+    steps.push(SmokeStep::Wait {
+        // The Send cleared the match window and this command's echo names
+        // only the path — only cat's output of the round-tripped file
+        // can match.
+        pattern: "m3os bsdtar payload",
+        timeout_secs: 30,
+        label: "guest/tui-app-smoke: bsdtar payload round-tripped",
+    });
+    steps.push(SmokeStep::Send {
+        input: "echo TUI_APP_SMOKE:bsdtar  exit-ok\n",
+        label: "guest/tui-app-smoke: bsdtar sentinel",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "TUI_APP_SMOKE:bsdtar exit-ok",
+        fail_prefixes: &["TUI_APP_SMOKE:bsdtar:fail"],
+        timeout_secs: 15,
+        label: "guest/tui-app-smoke: bsdtar :ok",
         exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
     });
 
@@ -30382,7 +30550,7 @@ fn populate_ports_tree(part_path: &Path, workspace_root: &Path, ports_src: &Path
 /// the other five ports.
 fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
     const PORTS: &[&str] = &[
-        "zlib", "ncurses", "libevent", "less", "htop", "nano", "nnn", "tmux",
+        "zlib", "ncurses", "libevent", "less", "htop", "nano", "nnn", "bsdtar", "tmux",
     ];
     let stage_root = workspace_root.join("target/port-stage");
     let preinstall_root = workspace_root.join("target/pkg-preinstall");
@@ -33933,6 +34101,34 @@ fn run_smoke_steps_with_capture(
                     .flush()
                     .map_err(|e| format!("flush failed at step {} ({label}): {e}", step_num))?;
             }
+            SmokeStep::SendPaced {
+                input,
+                char_delay_ms,
+                label,
+            } => {
+                drain_serial_until_idle(
+                    rx,
+                    &mut serial_buf,
+                    serial_history,
+                    std::time::Duration::from_millis(150),
+                    std::time::Duration::from_secs(2),
+                );
+                let stdin = child
+                    .stdin
+                    .as_mut()
+                    .ok_or_else(|| format!("no stdin at step {} ({label})", step_num))?;
+                use std::io::Write;
+                serial_buf.clear();
+                for byte in input.as_bytes() {
+                    stdin.write_all(std::slice::from_ref(byte)).map_err(|e| {
+                        format!("paced write failed at step {} ({label}): {e}", step_num)
+                    })?;
+                    stdin.flush().map_err(|e| {
+                        format!("paced flush failed at step {} ({label}): {e}", step_num)
+                    })?;
+                    std::thread::sleep(std::time::Duration::from_millis(*char_delay_ms));
+                }
+            }
             SmokeStep::Sleep { millis } => {
                 std::thread::sleep(std::time::Duration::from_millis(*millis));
             }
@@ -35313,6 +35509,7 @@ mod tests {
             match step {
                 SmokeStep::Wait { label, .. }
                 | SmokeStep::Send { label, .. }
+                | SmokeStep::SendPaced { label, .. }
                 | SmokeStep::WaitLineNotMatching { label, .. }
                 | SmokeStep::WaitPassOrFail { label, .. } => out.push(*label),
                 SmokeStep::WaitEither {
