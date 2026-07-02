@@ -54,6 +54,21 @@ Gates are ordered identically to the AGENTS.md lean table.
 
 **Env var:** `M3OS_SETTINGS_REGRESSION=1`
 
+## symphonia-smoke
+
+**Env var:** `M3OS_SYMPHONIA_REGRESSION=1`
+
+Builds the `symphonia-play` port (the tree's first local-source port: a
+musl-`std` Rust cargo crate under `ports/util/symphonia-play/src` that
+reaches the m3OS audio IPC via raw syscalls), boots with the AC'97
+WAV-capture backend, decodes and plays the 48 kHz WAV and FLAC fixtures
+(`/usr/share/symphonia/`) in separate invocations (proving the
+single-client Open/Close cycle re-opens), asserts the per-file
+`SYMPHONIA_PLAY:ok` serial sentinels, and finally verifies the captured
+WAV is non-silent via `assert_wav_non_silent` — the same audible-output
+oracle as `doom-audio-smoke`/`hda-smoke`. A silent capture exits with
+the shared `SMOKE_EXIT_WAV_SILENT` code.
+
 Boots the graphical stack headlessly (QMP + VNC) with the AC'97 device
 attached so `audio_server` runs its real io loop, launches the `settings`
 Toplevel from the term prompt, and drives the default-focused volume slider

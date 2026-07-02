@@ -1,0 +1,20 @@
+# Phase 105 Track E — symphonia-play, the terminal audio player.
+#
+# A `std` Rust crate cross-built for the SELF-CONTAINED
+# x86_64-unknown-linux-musl target (the Phase 94 uutils pattern — prebuilt
+# std + bundled musl + rust-lld, no external musl-gcc). The leading
+# `[workspace]` detaches it from the m3OS workspace, whose default target
+# is the bare-metal x86_64-unknown-none (see
+# docs/appendix/rust-std-userspace.md §"Two compilation paths").
+[workspace]
+
+[package]
+name = "symphonia-play"
+version = "0.1.0"
+edition = "2021"
+description = "m3OS terminal audio player: symphonia decode -> 48 kHz S16LE -> audio_server IPC"
+
+[dependencies]
+# Default features cover the royalty-free set (FLAC, Vorbis/OGG, WAV/RIFF,
+# PCM, ...); `mp3` is the opt-in MPEG audio decoder.
+symphonia = { version = "0.5", features = ["mp3"] }

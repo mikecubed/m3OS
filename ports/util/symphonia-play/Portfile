@@ -1,0 +1,19 @@
+# Phase 105 Track E — symphonia-play, the terminal audio player.
+#
+# The tree's first LOCAL-SOURCE port (URL=local): the crate lives under
+# this port's src/ (hashed into the content key by recipe_digest, so
+# source edits invalidate the pkgcache), there is no tarball to fetch.
+# A std-Rust cargo port in the Phase 94 uutils mold: built for the
+# self-contained x86_64-unknown-linux-musl target (static ET_EXEC), it
+# decodes FLAC/WAV/OGG/MP3 via symphonia (crates.io deps, --locked) and
+# feeds audio_server over the m3OS audio IPC — the kernel's flat,
+# personality-free syscall table lets a musl binary invoke the three
+# IPC syscalls directly (see src/src/m3ipc.rs).
+NAME=symphonia-play
+VERSION=0.1.0
+DESCRIPTION="symphonia terminal audio player (static musl Rust; FLAC/WAV/OGG/MP3 -> audio_server)"
+CATEGORY=util
+DEPS=
+URL=local
+SHA256=local
+MAINTAINER=m3os

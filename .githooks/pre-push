@@ -328,6 +328,18 @@ if [ "${M3OS_SETTINGS_REGRESSION:-0}" = "1" ]; then
     cargo xtask settings-smoke --timeout 300
 fi
 
+# Phase 105 Track E — symphonia terminal-player gate. Gated behind
+# M3OS_SYMPHONIA_REGRESSION=1 because it builds the symphonia-play port,
+# boots with the AC'97 WAV-capture backend, decodes + plays the WAV and
+# FLAC fixtures through audio_server, and asserts the captured WAV is
+# non-silent. Set the env var on branches touching
+# ports/util/symphonia-play, the audio protocol/audio_server, or the
+# ports local-source plumbing.
+if [ "${M3OS_SYMPHONIA_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask symphonia-smoke..."
+    cargo xtask symphonia-smoke --timeout 300
+fi
+
 # Phase 77 — htop process-list regression gate. Gated behind
 # M3OS_HTOP_REGRESSION=1 because the gate cross-compiles the ncurses +
 # htop ports and boots the graphical stack headlessly (QMP + VNC), then
