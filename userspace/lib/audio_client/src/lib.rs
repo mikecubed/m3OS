@@ -17,6 +17,8 @@
 //! - [`AudioClient::close`] — close the stream and release the slot.
 //! - [`AudioClient::get_stats`] — query playback statistics from the server
 //!   (frames submitted / consumed, underrun count).
+//! - [`AudioClient::set_master_volume`] — set the system master gain
+//!   (Q15) applied by the server to all forwarded PCM.
 //! - [`AudioClientError`] — typed error returned by every verb.
 //!
 //! Anything else is private. The protocol byte format is private to
@@ -352,6 +354,37 @@ impl<S: AudioSocket> AudioClient<S> {
     pub fn get_stats(&mut self) -> Result<AudioStats, AudioClientError> {
         let mut frame = [0u8; MAX_REQUEST_BYTES];
         let n = ClientMessage::ControlCommand(AudioControlCommand::GetStats).encode(&mut frame)?;
+        let reply = self.socket.call(&frame[..n], &[])?;
+        match decode_server_message(reply.as_slice())? {
+            ServerMessage::ControlEvent(AudioControlEvent::Stats {
+                underrun_count,
+                frames_submitted,
+                frames_consumed,
+            }) => Ok(AudioStats {
+                underrun_count,
+                frames_submitted,
+                frames_consumed,
+            }),
+            _ => Err(AudioClientError::UnexpectedReply),
+        }
+    }
+
+    /// Set the system master volume on the audio server.
+    ///
+    /// Sends `ControlCommand(SetMasterVolume { q15_gain })` to the control
+    /// socket. Q15 fixed-point gain: `0x8000` is unity, `0` mutes; the
+    /// server clamps above-unity values to unity. Like
+    /// [`AudioClient::get_stats`] this is a control-plane verb — it works
+    /// on a control-only [`AudioClient::connect`] client without a prior
+    /// `Open`. The server replies with the same `Stats` event shape as
+    /// `GetStats` (the control surface is uniform), which is returned so
+    /// callers get a stats snapshot for free.
+    ///
+    /// Phase 105 Track D.3: issued by the `settings` panel's volume slider.
+    pub fn set_master_volume(&mut self, q15_gain: u16) -> Result<AudioStats, AudioClientError> {
+        let mut frame = [0u8; MAX_REQUEST_BYTES];
+        let n = ClientMessage::ControlCommand(AudioControlCommand::SetMasterVolume { q15_gain })
+            .encode(&mut frame)?;
         let reply = self.socket.call(&frame[..n], &[])?;
         match decode_server_message(reply.as_slice())? {
             ServerMessage::ControlEvent(AudioControlEvent::Stats {

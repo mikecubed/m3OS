@@ -426,8 +426,23 @@ pub fn run_io_loop(
                         ClientMessage::ControlCommand(
                             kernel_core::audio::AudioControlCommand::SetMasterVolume { q15_gain },
                         ) => {
-                            master_gain_q15 =
+                            let clamped =
                                 (*q15_gain).min(kernel_core::audio::MASTER_GAIN_UNITY_Q15);
+                            if clamped != master_gain_q15 {
+                                master_gain_q15 = clamped;
+                                // Phase 105 Track D.3 — settings-smoke's
+                                // server-side oracle: proves the verb was
+                                // decoded and the gain state updated (the
+                                // client-side ack alone cannot distinguish
+                                // SetMasterVolume from GetStats, which
+                                // shares the Stats reply shape). Printed
+                                // only on change so a dragged slider does
+                                // not spam the console.
+                                syscall_lib::write_str(
+                                    STDOUT_FILENO,
+                                    &alloc::format!("AUDIO_SMOKE:master_gain q15={clamped}\n"),
+                                );
+                            }
                             DispatchOutcome::StatsRequested
                         }
                         _ => dispatch_message(&msg, streams, backend),

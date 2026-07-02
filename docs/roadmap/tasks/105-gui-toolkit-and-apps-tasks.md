@@ -1,6 +1,6 @@
 # Phase 105 — Native GUI Toolkit & Core Desktop Apps: Task List
 
-**Status:** In progress — **Tracks A + B + C landed and green; Track D.1 + D.2 landed and green.** A/B/C merged. C = `imagefmt` shared crate (extracted BMP/PNG + new baseline JPEG decode + PNG encode) + `CaptureOutput`/`CaptureReply` verbs + `screenshot` tool + `screenshot-smoke`. D.1 = `imgview` viewer (`imagefmt` + `m3ui` Toplevel) + `imgview-smoke` (PNG/BMP/JPEG decode + non-blank render, PASS multi-core). D.2 = audio `SetMasterVolume` verb + `audio_mixer` master-gain + kernel-core `audio::gain` + `audio_server` `gained_pcm` (host-tested). Remaining: **D.3–D.5** (settings panel + live Wi-Fi/brightness — 103/104 → Dell) / **E** (TUI ports). Handoff: `docs/handoffs/2026-07-02-phase-105-gui-toolkit.md`.
+**Status:** In progress — **Tracks A + B + C landed and green; Track D.1 + D.2 landed and green; D.3 Sound slice landed and green.** A/B/C merged. C = `imagefmt` shared crate (extracted BMP/PNG + new baseline JPEG decode + PNG encode) + `CaptureOutput`/`CaptureReply` verbs + `screenshot` tool + `screenshot-smoke`. D.1 = `imgview` viewer (`imagefmt` + `m3ui` Toplevel) + `imgview-smoke` (PNG/BMP/JPEG decode + non-blank render, PASS multi-core). D.2 = audio `SetMasterVolume` verb + `audio_mixer` master-gain + kernel-core `audio::gain` + `audio_server` `gained_pcm` (host-tested). D.3 Sound slice = `settings` panel Toplevel (four sections; Sound's volume slider drives `SetMasterVolume` via the new `audio_client::set_master_volume`) + `settings-smoke`. Remaining: **D.3 Wi-Fi-stub CI arm + D.4–D.5** (settings backends + live Wi-Fi/brightness — 103/104 → Dell) / **E** (TUI ports). Handoff: `docs/handoffs/2026-07-02-phase-105-gui-toolkit.md`.
 **Source Ref:** phase-105
 **Depends on:** Phase 100 (Bare-Metal GUI Session — compositor + session in init, WC framebuffer, USB-mouse cursor) ✅, Phase 99 (SMP & Scheduler Robustness) ✅ via 100. The **settings panel** is additionally sequenced after Phase 103 (power: brightness/battery) and Phase 104 (Wi-Fi AX201 + connect daemon); Tracks A/B/C and the `imgview` app are **not** gated on 103/104.
 **Goal:** Ship a minimal native immediate-mode Rust widget toolkit (`m3ui`) on `desktop_client`, a compositor-brokered clipboard, a shared `imagefmt` crate (extracted BMP/PNG + new JPEG decode + PNG encode) with an output-capture screenshot tool, and the two core desktop apps (image viewer + settings/control panel) that make the GUI usable — the settings panel being the user-facing consumer of the Phase 103 power and Phase 104 Wi-Fi backends. Toolkit layout, protocol codecs, and the image codecs are host-tested; rendering/interaction are proven by QMP/PPM render probes; the live Wi-Fi/brightness arm is validated on the reference Dell per `docs/appendix/bare-metal-validation.md`.
@@ -12,7 +12,7 @@
 | A | `m3ui` immediate-mode toolkit (layout solver, widgets, input/focus, theme, proportional text) — host-tested layout | 100 | **Done + green** |
 | B | Clipboard / data-transfer protocol (`display_server` broker + protocol verbs + `desktop_client` helpers + `m3ui` Ctrl+C/V/X) | 100 | **Done + green** |
 | C | `imagefmt` shared crate (extract BMP/PNG, add JPEG + PNG encode) + `CaptureOutput` in `display_server` + `screenshot` tool | B (capture) | **Done + green** |
-| D | `imgview` image viewer + `settings` control panel (Wi-Fi/brightness/volume/battery) + audio `SetMasterVolume` | A, C; settings also 103, 104 | **D.1 + D.2 done + green**; D.3–D.5 (settings/HW) pending |
+| D | `imgview` image viewer + `settings` control panel (Wi-Fi/brightness/volume/battery) + audio `SetMasterVolume` | A, C; settings also 103, 104 | **D.1 + D.2 + D.3 Sound slice done + green**; D.3 Wi-Fi-stub arm + D.4–D.5 (backends/HW) pending |
 | E | TUI-in-`term` parallel ports charter (`nnn`/`lf`, `nano`/`vim`, `bsdtar`, `symphonia`); browser/office deferral | — | Planned |
 
 ---
@@ -253,15 +253,21 @@
 ### D.3 — `settings` control panel Toplevel
 
 **Files:**
-- `userspace/settings/{Cargo.toml,src/main.rs}` (new — four-place new-binary wiring)
+- `userspace/settings/{Cargo.toml,src/main.rs}` (new — workspace member + xtask `bins` + ramdisk `BIN_ENTRIES`; no service conf — launched from the prompt like `imgview`)
+- `userspace/lib/audio_client/src/lib.rs` (`set_master_volume` verb, new)
+- `userspace/audio_server/src/irq.rs` (`AUDIO_SMOKE:master_gain` change sentinel)
+- `xtask/src/main.rs` (`cmd_settings_smoke`, new)
 
-**Symbol:** `main` + section builders `network_section` / `display_section` / `sound_section` / `power_section`
+**Symbol:** `main` + `build_ui` (one `Ui` pass declaring the four sections), `pct_to_q15`
 **Why it matters:** The deliberate user-facing consumer of the Phase 103/104 backends — the reason the GUI workstation is usable without a shell.
 
+> **Landed in the hardware-free Sound slice:** the panel + Sound wiring +
+> gate. The Wi-Fi stub-service CI arm moves with D.4's backend wiring.
+
 **Acceptance:**
-- [ ] Renders four `m3ui` sections (Network, Display, Sound, Power) with working focus/scroll.
-- [ ] **Sound:** the volume slider drives `SetMasterVolume` (D.2); the change is reflected in `audio_mixer`.
-- [ ] **CI arm:** the Wi-Fi section issues `wifi_core::control::WIFI_SCAN_REQ`/`WIFI_CONNECT_REQ` against a stub `wifi.control` service and renders the returned `ScanResult` rows + a passphrase `text_field`; gated headlessly.
+- [x] Renders four `m3ui` sections (Network, Display, Sound, Power) with working focus — the volume slider holds default keyboard focus; Network/Display/Power render placeholder rows naming their Phase 103/104 dependency until D.4 wires them. *(No scrolling: the panel fits its content; revisit if D.4's section content outgrows the window.)*
+- [x] **Sound:** the volume slider drives `SetMasterVolume` (D.2) via the new `audio_client::set_master_volume` (control-plane verb, host-tested against the mock socket); the server confirms the gain-state update via the change-only `AUDIO_SMOKE:master_gain q15=<N>` sentinel in the io loop. Gate: `settings-smoke` (`M3OS_SETTINGS_REGRESSION=1`, exit 98) — QMP/VNC boot with the AC'97 device attached, keyboard `Left` drives 100%→99%→98% asserting client-ack + server-state sentinels and a ≥12-scanline repaint. **PASS on a default multi-core boot.**
+- [ ] **CI arm:** the Wi-Fi section issues `wifi_core::control::WIFI_SCAN_REQ`/`WIFI_CONNECT_REQ` against a stub `wifi.control` service and renders the returned `ScanResult` rows + a passphrase `text_field`; gated headlessly. *(Deferred to the D.4 slice — lands with the backend clients.)*
 
 ### D.4 — Settings backends: Wi-Fi (104), brightness/battery (103)
 

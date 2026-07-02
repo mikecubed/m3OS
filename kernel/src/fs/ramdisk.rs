@@ -495,6 +495,8 @@ static CLIP_SMOKE_ELF: &[u8] = generated_initrd_asset!("clip-smoke");
 static SCREENSHOT_ELF: &[u8] = generated_initrd_asset!("screenshot");
 // Phase 105 Track D.1 — image viewer Toplevel.
 static IMGVIEW_ELF: &[u8] = generated_initrd_asset!("imgview");
+// Phase 105 Track D.3 — settings/control-panel Toplevel.
+static SETTINGS_ELF: &[u8] = generated_initrd_asset!("settings");
 static NOTIFY_SEND_ELF: &[u8] = generated_initrd_asset!("notify-send");
 
 // Phase 73 — lockscreen Layer-shell stub (exclusive keyboard grab).
@@ -1250,6 +1252,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "imgview",
         RamdiskNode::File {
             content: IMGVIEW_ELF,
+        },
+    ),
+    // Phase 105 Track D.3 — settings/control-panel Toplevel.
+    (
+        "settings",
+        RamdiskNode::File {
+            content: SETTINGS_ELF,
         },
     ),
     // Phase 73 — lockscreen stub.

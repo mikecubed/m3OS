@@ -571,3 +571,87 @@ fn get_stats_unexpected_reply_returns_error() {
         "get_stats() must return UnexpectedReply on a non-Stats server reply"
     );
 }
+
+// ---------------- Phase 105 Track D.3: set_master_volume() ----------------
+
+/// A control-only client (no `Open`) can set the master volume; the sole
+/// frame on the wire is `ControlCommand(SetMasterVolume { q15_gain })` and
+/// the server's `Stats` reply is surfaced to the caller. This mirrors the
+/// production path used by the `settings` panel's volume slider.
+#[test]
+fn set_master_volume_without_open_stream_succeeds() {
+    let mut socket = MockSocket::new();
+    socket.push_reply_msg(ServerMessage::ControlEvent(AudioControlEvent::Stats {
+        underrun_count: 0,
+        frames_submitted: 960,
+        frames_consumed: 480,
+    }));
+    let mut client: AudioClient<MockSocket> = AudioClient::new_with_socket(socket);
+    assert_eq!(
+        client.stream_id(),
+        None,
+        "control-only client must have no stream_id"
+    );
+    let stats = client
+        .set_master_volume(0x4000)
+        .expect("set_master_volume must succeed without an open stream");
+    assert_eq!(stats.frames_submitted, 960);
+    assert_eq!(stats.frames_consumed, 480);
+    assert_eq!(
+        client.socket.sent.len(),
+        1,
+        "control-only set_master_volume must send exactly one frame (no Open)"
+    );
+    let (decoded, _) = ClientMessage::decode(&client.socket.sent[0].frame)
+        .expect("SetMasterVolume frame must decode");
+    assert_eq!(
+        decoded,
+        ClientMessage::ControlCommand(AudioControlCommand::SetMasterVolume { q15_gain: 0x4000 }),
+        "sole frame must be ControlCommand(SetMasterVolume) carrying the gain"
+    );
+    assert!(
+        client.socket.sent[0].bulk.is_empty(),
+        "control verbs carry no bulk payload"
+    );
+}
+
+/// Boundary gains encode faithfully: mute (0) and unity (0x8000) survive
+/// the wire round-trip unmodified — the client does not clamp; clamping
+/// is the server's job.
+#[test]
+fn set_master_volume_encodes_boundary_gains_unclamped() {
+    for gain in [0u16, 0x8000, 0xFFFF] {
+        let mut socket = MockSocket::new();
+        socket.push_reply_msg(ServerMessage::ControlEvent(AudioControlEvent::Stats {
+            underrun_count: 0,
+            frames_submitted: 0,
+            frames_consumed: 0,
+        }));
+        let mut client: AudioClient<MockSocket> = AudioClient::new_with_socket(socket);
+        client
+            .set_master_volume(gain)
+            .expect("set_master_volume ok");
+        let (decoded, _) = ClientMessage::decode(&client.socket.sent[0].frame)
+            .expect("SetMasterVolume frame must decode");
+        assert_eq!(
+            decoded,
+            ClientMessage::ControlCommand(AudioControlCommand::SetMasterVolume { q15_gain: gain }),
+            "gain {gain:#06x} must round-trip unclamped"
+        );
+    }
+}
+
+/// A non-Stats reply to SetMasterVolume returns `UnexpectedReply`
+/// rather than panicking (same contract as `get_stats`).
+#[test]
+fn set_master_volume_unexpected_reply_returns_error() {
+    let mut socket = MockSocket::new();
+    socket.push_reply_msg(ServerMessage::DrainAck);
+    let mut client: AudioClient<MockSocket> = AudioClient::new_with_socket(socket);
+    let result = client.set_master_volume(0x8000);
+    assert_eq!(
+        result.err(),
+        Some(AudioClientError::UnexpectedReply),
+        "set_master_volume must return UnexpectedReply on a non-Stats reply"
+    );
+}

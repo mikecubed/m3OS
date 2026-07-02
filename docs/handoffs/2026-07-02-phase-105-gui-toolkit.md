@@ -1,14 +1,15 @@
 # Handoff — Phase 105: Native GUI Toolkit & Core Desktop Apps
 
 **Date:** 2026-07-02 (living doc — update each session)
-**Branch:** `feat/phase-105-imgview-audio-volume` (Track D.1+D.2; off `main`)
+**Branch:** `feat/phase-105-settings-sound` (D.3 Sound slice; stacked on
+`feat/phase-105-imgview-audio-volume` = PR #278, which is D.1+D.2 off `main`)
 **State:** **Tracks A + B + C COMPLETE + green; Track D.1 + D.2 COMPLETE +
-green** (D.3–D.5 are the Dell-gated remainder). A/B/C merged. This branch adds
-the hardware-free Track D: `imgview` image viewer (D.1) + audio
-`SetMasterVolume` master-gain (D.2). `cargo xtask check` clean; `imgview-smoke`
-PASSES on a default multi-core boot (PNG + BMP + JPEG each decode and
-non-blank-render); the audio gain math + protocol verb + server wiring are
-host-tested (audio_mixer, kernel-core `audio::gain`, audio_server `gained_pcm`).
+green (PR #278 open); D.3 Sound slice COMPLETE + green (this branch).**
+A/B/C merged. D.3's remaining Wi-Fi-stub CI arm moves with D.4; D.4–D.5 are
+the Dell-gated remainder. This branch adds the `settings` control-panel
+Toplevel with the Sound section wired end to end
+(slider → `audio_client::set_master_volume` → `audio_server` gain state) +
+the `settings-smoke` gate. `cargo xtask check` clean.
 **Charter:** `docs/roadmap/105-gui-toolkit-and-apps.md`
 **Tasks:** `docs/roadmap/tasks/105-gui-toolkit-and-apps-tasks.md`
 
@@ -203,14 +204,53 @@ host-tested (audio_mixer, kernel-core `audio::gain`, audio_server `gained_pcm`).
     settings slider (D.3) that drives it; the host tests prove the full
     verb→state→PCM-scale path.
 
-## RESUME HERE — Track D.3+ (settings panel) / Track E next
+## Track D.3 Sound slice — what landed (this branch)
 
-D.1 + D.2 are done + green. What's left in Track D is **Dell-adjacent**:
-**D.3** `settings` control panel Toplevel (Sound section drives D.2's
-`SetMasterVolume`; the Wi-Fi CI arm needs a stub `wifi.control` service),
-**D.4** live Wi-Fi (104) + brightness/battery (103) backends, **D.5** on-metal
-validation. The Sound section of D.3 is hardware-free (it can land against
-D.2) — a reasonable next hardware-free slice is "`settings` panel with only
-the Sound section wired, driving the volume slider through `SetMasterVolume`,"
-deferring Network/Display/Power to the Dell. **Track E** (TUI-in-`term` ports)
-is parallel ports-infra work that can land anytime.
+- **`audio_client::set_master_volume(q15_gain) -> Result<AudioStats>`** —
+  mirrors `get_stats` (control-plane, works on a `connect()`-only client;
+  the server replies with the uniform `Stats` shape). 3 new mock-socket
+  host tests (control-only send, boundary gains unclamped client-side,
+  UnexpectedReply).
+- **`audio_server` change sentinel** — the io-loop `SetMasterVolume` arm
+  now prints `AUDIO_SMOKE:master_gain q15=<N>` **only when the clamped
+  gain actually changes** (a dragged slider can't spam serial). This is
+  the server-side smoke oracle; the stub loop stays sentinel-free (it
+  accepts the verb but holds no gain state — a gate run that lands in
+  stub mode fails on the missing sentinel, correctly).
+- **`userspace/settings`** (three-place wired: workspace member, xtask
+  `bins`, ramdisk `BIN_ENTRIES`; **no service conf** — launched from the
+  prompt like `imgview`). An `m3ui` Toplevel (m3ui-demo loop skeleton)
+  rendering Network/Display/Sound/Power; Network/Display/Power are
+  placeholder label rows naming their Phase 103/104 dependency. The
+  volume slider is the panel's **only focusable widget** → default
+  keyboard focus from frame 1, Left/Right = ±1%. `pct_to_q15` maps
+  0–100% onto Q15 (`pct * 0x8000 / 100`, truncating; 100% = exactly
+  unity). Volume pushes coalesce to one IPC per frame. Sentinels:
+  `SETTINGS:ready`, `SETTINGS:audio=ok|unavailable`,
+  `SETTINGS:volume=<pct> q15=<q> ack=ok|err|none`. Starts at 100% —
+  matching the server's boot-time unity gain, so no startup write.
+- **Gate `settings-smoke`** (`cmd_settings_smoke`, exit 98,
+  `M3OS_SETTINGS_REGRESSION=1`, pre-push wired): toolkit-render-probe
+  boot pattern (QMP+VNC, `-vga std`) **plus
+  `append_ac97_audio_flags_headless`** so the ring-3 `ac97` driver claims
+  the device and `audio_server` runs the real io loop (waits
+  `AUDIO_SMOKE:server:READY` before launching). QMP-types
+  `/bin/settings\n` at the term prompt, waits `SETTINGS:audio=ok` +
+  `SETTINGS:ready`, then two `Left` presses assert the pinned pairs
+  99%→q15=32440 and 98%→q15=32112 (client ack + server sentinel each)
+  plus a ≥12-scanline PPM repaint diff. Uses `parse_less_render_probe_args`
+  (`--timeout/--out/--keep-qemu`).
+- Docs: AGENTS.md gate table row; `regression-gates.md` gained the
+  missing Phase 105 gate stanzas (clipboard/screenshot/imgview/toolkit)
+  + a full `settings-smoke` description; tasks doc D.3 updated.
+
+## RESUME HERE — Track D.3 Wi-Fi-stub arm → D.4 / Track E next
+
+The D.3 Sound slice is done + green (`settings-smoke` PASS). What's left
+in Track D is **Dell-adjacent**: the D.3 **Wi-Fi stub-service CI arm**
+(stub `wifi.control` service + ScanResult rows + passphrase text_field
+in the Network section — moves with D.4's backend clients), **D.4** live
+Wi-Fi (104) + brightness/battery (103) backends, **D.5** on-metal
+validation. **Track E** (TUI-in-`term` ports) is parallel ports-infra
+work that can land anytime. Merge order: PR #278 (D.1+D.2) first, then
+this branch's PR (D.3 Sound).

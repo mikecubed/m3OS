@@ -239,6 +239,8 @@ members = [
     "userspace/screenshot",
     # Phase 105 Track D.1 — image viewer Toplevel (imgview-render-probe).
     "userspace/imgview",
+    # Phase 105 Track D.3 — settings/control-panel Toplevel (settings-smoke).
+    "userspace/settings",
     # Phase 76 — dynamic linker (no_std PIE). Phase 76 ships the
     # transfer-only stub; Phase 76b grows it into a real bring-up
     # linker that walks DT_NEEDED and applies relocations.
