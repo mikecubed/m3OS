@@ -28,3 +28,8 @@ syscall-lib = { path = "../syscall-lib", features = ["alloc"] }
 # pkg-format: parse/verify .m3pkg + content_hash/to_hex.  no_std surface:
 # `default-features = false` omits the std-only pack/unpack helpers.
 pkg-format = { path = "../../pkg-format", default-features = false }
+# Phase 107: ed25519 verification of the signed repo index (`pkg update`).
+# The signing half of the same crate runs host-side in `cargo xtask
+# repo-index`, so sign and verify agree by construction. No TLS here —
+# HTTPS lives in the spawned curl.
+crypto-lib = { path = "../crypto-lib", default-features = false }

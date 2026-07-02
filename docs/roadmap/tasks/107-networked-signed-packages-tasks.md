@@ -1,6 +1,6 @@
 # Phase 107 — Networked & Signed Package Distribution: Task List
 
-**Status:** Planned
+**Status:** In progress — Tracks A–D landed and green (`pkg-net-smoke` PASSED, 33 steps, full `-smp 8`; offline `pkg-smoke` unregressed). Remaining: the owner-side publish (create the public `m3os-pkgs` repo + Actions secret per `docs/appendix/m3os-pkgs/README.md`) and the opt-in live-HTTPS arm against the published repo. Debug history: `docs/handoffs/2026-07-02-phase-107-networked-packages.md`.
 **Source Ref:** phase-107
 **Depends on:** Phase 85a (`.m3pkg` format + offline `pkg` installer + `DEPS` solver) ✅, Phase 86c (HTTPS/TLS via `curl`+mbedTLS) ✅, Phase 42 (`crypto-lib` ed25519) ✅
 **Goal:** Distribute prebuilt `.m3pkg` artifacts over the network so the on-device installer can fetch + verify + install them, hosted for $0 on GitHub (Releases as the blob store + a tiny ed25519-signed `index.m3idx`, published by a GitHub Actions pipeline). Add a network fetch + a signed index on top of the Phase 85a offline `pkg` engine — the solve/verify/extract/DB engine is reused 100 %; the only new code is download + index-parse + ed25519 verify. Reuse the Phase 86c on-device `curl`/mbedTLS via the `fork`/`execve`/`waitpid` spawn seam (mbedTLS is **not** linked into the installer).
@@ -9,10 +9,10 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Signed repo index `index.m3idx` format (new `pkg-format::index` module) + ed25519 trust model + baked-in public key + `repos.conf` | Phase 85a, Phase 42 | Planned |
-| B | On-device networked `pkg` verbs — `pkg update` (curl fetch + ed25519-verify) + networked `pkg install` (resolve from index → fetch → SHA-256-check → unchanged `install_one`) + curl spawn seam | A, Phase 86c | Planned |
-| C | CI publish pipeline — new `cargo xtask repo-index` host tool + `build-and-publish.yml` (cache `pkgcache/`, `port build all`, emit+sign index, `gh release upload`) in a public `m3os-pkgs` repo | A | Planned |
-| D | Validation — host tests (index/sig/solver) + `pkg-net-smoke` gate (SLIRP-served CI-deterministic core + opt-in live HTTPS arm) + `AGENTS.md`/README docs | A, B, C | Planned |
+| A | Signed repo index `index.m3idx` format (new `pkg-format::index` module) + ed25519 trust model + baked-in public key + `repos.conf` | Phase 85a, Phase 42 | Landed (`pkg-format::index`; key committed at `keys/m3os-pkgs.pub`, staged to `/etc/pkg/keys/`) |
+| B | On-device networked `pkg` verbs — `pkg update` (curl fetch + ed25519-verify) + networked `pkg install` (resolve from index → fetch → SHA-256-check → unchanged `install_one`) + curl spawn seam | A, Phase 86c | Landed (plus `/var/lib/pkg/index.src`: blob fetches prefer the base the verified index came from) |
+| C | CI publish pipeline — new `cargo xtask repo-index` host tool + `build-and-publish.yml` (cache `pkgcache/`, `port build all`, emit+sign index, `gh release upload`) in a public `m3os-pkgs` repo | A | Landed in-tree (`repo-index` incl. `--gen-key`; workflow template + owner runbook in `docs/appendix/m3os-pkgs/`); the public repo + secret are owner actions |
+| D | Validation — host tests (index/sig/solver) + `pkg-net-smoke` gate (SLIRP-served CI-deterministic core + opt-in live HTTPS arm) + `AGENTS.md`/README docs | A, B, C | Landed (gate green at default `-smp 8`; live arm pends the published repo) |
 
 ---
 
@@ -25,10 +25,10 @@
 **Why it matters:** The index is the single trust root — both the host publisher (`xtask repo-index`) and the on-device client (`pkg`) must parse/serialize it identically, and signing requires a **deterministic** byte serialization, so this format has exactly one shared implementation. It also keeps the `.m3pkg` byte layout untouched (the signature lives on the index, not in each package header).
 
 **Acceptance:**
-- [ ] `IndexEntry { name, version, key, size, sha256, url, deps: Vec<String> }` defined; APKINDEX-style flat text with single-letter tags (`N:`/`V:`/`K:`/`S:`/`C:`/`U:`/`D:`) and a header (`M:m3idx1`, `A:x86_64`), records separated by blank lines.
-- [ ] `serialize_index` emits records **sorted by name** so output is byte-deterministic for a given entry set.
-- [ ] `parse_index` round-trips `serialize_index` output exactly; an unknown future tag line is ignored (forward-compat), a missing required field errors.
-- [ ] Host test in `cargo xtask check`: a multi-record round-trip + a determinism assertion (re-serializing a reordered input yields identical bytes).
+- [x] `IndexEntry { name, version, key, size, sha256, url, deps: Vec<String> }` defined; APKINDEX-style flat text with single-letter tags (`N:`/`V:`/`K:`/`S:`/`C:`/`U:`/`D:`) and a header (`M:m3idx1`, `A:x86_64`), records separated by blank lines.
+- [x] `serialize_index` emits records **sorted by name** so output is byte-deterministic for a given entry set.
+- [x] `parse_index` round-trips `serialize_index` output exactly; an unknown future tag line is ignored (forward-compat), a missing required field errors.
+- [x] Host test in `cargo xtask check`: a multi-record round-trip + a determinism assertion (re-serializing a reordered input yields identical bytes).
 
 ### A.2 — Index canonical signing bytes + blob hashing
 
@@ -37,9 +37,9 @@
 **Why it matters:** Each record's `C:` field is the SHA-256 of the **whole `.m3pkg` blob** — this is the value the on-device client checks a fetched blob against, so package authenticity flows from the signed index. Reusing the existing in-crate `sha256` keeps a single hash implementation (the one already pinned by `content_hash_matches_known_sha256`).
 
 **Acceptance:**
-- [ ] The bytes signed/verified are exactly the `serialize_index` output (no separate canonicalization step); documented in the module header.
-- [ ] `C:` is computed with `pkg_format::sha256::digest` over the blob bytes and rendered with `to_hex` (lowercase hex, 64 chars).
-- [ ] Host test: an entry's `C:` for a known blob matches the standalone `pkg_format::content_hash` of the same bytes.
+- [x] The bytes signed/verified are exactly the `serialize_index` output (no separate canonicalization step); documented in the module header.
+- [x] `C:` is computed with `pkg_format::sha256::digest` over the blob bytes and rendered with `to_hex` (lowercase hex, 64 chars).
+- [x] Host test: an entry's `C:` for a known blob matches the standalone `pkg_format::content_hash` of the same bytes.
 
 ### A.3 — Baked-in public key + `repos.conf` on the image
 
@@ -52,9 +52,9 @@
 **Why it matters:** The public key is the trust anchor; it must be committed in-repo (auditable) **and** baked into the image so `pkg update` can verify offline-of-the-repo. `repos.conf` is where the client learns the base URL(s) to fetch from.
 
 **Acceptance:**
-- [ ] `/etc/pkg/keys/m3os-pkgs.pub` (the 32-byte ed25519 public key) is staged into the ext2 image; the same key is committed in-repo.
-- [ ] `/etc/pkg/repos.conf` is staged with one base URL per line (`#` comments), defaulting to the published GitHub Releases / gh-pages base for the `repo/x86_64` rolling tag.
-- [ ] `cargo xtask clean` + rebuild places both files; a boot `cat /etc/pkg/repos.conf` shows the configured base URL.
+- [x] `/etc/pkg/keys/m3os-pkgs.pub` (the 32-byte ed25519 public key) is staged into the ext2 image; the same key is committed in-repo.
+- [x] `/etc/pkg/repos.conf` is staged with one base URL per line (`#` comments), defaulting to the published GitHub Releases / gh-pages base for the `repo/x86_64` rolling tag.
+- [x] `cargo xtask clean` + rebuild places both files; a boot `cat /etc/pkg/repos.conf` shows the configured base URL.
 
 ---
 
@@ -67,9 +67,9 @@
 **Why it matters:** The `no_std` installer must reach HTTPS **without linking mbedTLS** (it would not codegen on the soft-float target and would bloat a kernel-adjacent binary). Spawning the existing Phase 86c `curl` over the `fork`/`execve`/`waitpid` boundary (`syscall-lib/src/lib.rs:1939/1945/1970`) is the same seam `git` uses.
 
 **Acceptance:**
-- [ ] `fetch_url(url: &str, dest: &[u8]) -> bool` builds argv `["curl", "-fsSL", "-o", dest, url]`, `fork()`s, `execve()`s `/usr/bin/curl` in the child, and `waitpid()`s in the parent; returns `true` only on child exit status 0.
-- [ ] No mbedTLS / TLS symbols are linked into the `pkg` binary (verified by an `nm`/build-deps check — `pkg`'s dependency set is unchanged except `crypto-lib`).
-- [ ] A failed fetch (non-zero curl exit, e.g. 404/connection refused) returns `false` and surfaces an actionable error, not a hang.
+- [x] `fetch_url(url: &str, dest: &[u8]) -> bool` builds argv `["curl", "-fsSL", "-o", dest, url]`, `fork()`s, `execve()`s `/usr/bin/curl` in the child, and `waitpid()`s in the parent; returns `true` only on child exit status 0.
+- [x] No mbedTLS / TLS symbols are linked into the `pkg` binary (verified by an `nm`/build-deps check — `pkg`'s dependency set is unchanged except `crypto-lib`).
+- [x] A failed fetch (non-zero curl exit, e.g. 404/connection refused) returns `false` and surfaces an actionable error, not a hang.
 
 ### B.2 — `pkg update` (fetch + ed25519-verify the index)
 
@@ -78,10 +78,10 @@
 **Why it matters:** `pkg update` is the act that establishes trust — it pulls the index + detached signature and verifies the signature against the baked-in key before any package is ever fetched. Fail-closed (keep the old index on a bad signature) is the security-critical behavior.
 
 **Acceptance:**
-- [ ] `pkg update` reads base URLs from `/etc/pkg/repos.conf`, `fetch_url`s `<base>/index.m3idx` and `<base>/index.m3idx.sig` to a temp path.
-- [ ] Loads `/etc/pkg/keys/m3os-pkgs.pub` (32 bytes) → `ed25519_verifying_key_from_bytes`, reads the 64-byte detached sig, and calls `ed25519_verify(&vk, &index_bytes, &sig)`.
-- [ ] On verify success: the index is cached to `/var/lib/pkg/index.m3idx` and `pkg update` reports the record count.
-- [ ] On verify failure (flipped byte in index **or** sig): the fetched index is **discarded**, the previously cached `/var/lib/pkg/index.m3idx` is retained, a clear rejection is printed, and exit code is non-zero.
+- [x] `pkg update` reads base URLs from `/etc/pkg/repos.conf`, `fetch_url`s `<base>/index.m3idx` and `<base>/index.m3idx.sig` to a temp path.
+- [x] Loads `/etc/pkg/keys/m3os-pkgs.pub` (32 bytes) → `ed25519_verifying_key_from_bytes`, reads the 64-byte detached sig, and calls `ed25519_verify(&vk, &index_bytes, &sig)`.
+- [x] On verify success: the index is cached to `/var/lib/pkg/index.m3idx` and `pkg update` reports the record count.
+- [x] On verify failure (flipped byte in index **or** sig): the fetched index is **discarded**, the previously cached `/var/lib/pkg/index.m3idx` is retained, a clear rejection is printed, and exit code is non-zero.
 
 ### B.3 — Networked `pkg install` (resolve → fetch → SHA-check → install)
 
@@ -93,11 +93,11 @@
 **Why it matters:** This is the payoff — and it must reuse the offline engine unchanged. Resolution comes from the **signed index's `D:` fields**, the blob lands at exactly the path `install_one` already reads (`/usr/pkg/<name>.m3pkg`), and the only new safety step is the SHA-256 check against the trusted index before extraction.
 
 **Acceptance:**
-- [ ] When a cached trusted index exists, `cmd_install` builds the dep map from index `D:` fields and runs the **unchanged** `topo_install_order`, omitting already-installed packages (`/var/lib/pkg/db`).
-- [ ] For each name in dependency-first order: look up its index record, `fetch_url` `<base>/<key>.m3pkg` → `/usr/pkg/<name>.m3pkg`, compute SHA-256 of the fetched bytes, and compare to the index `C:` field.
-- [ ] On SHA-256 match: call the **unchanged** `install_one`; `pkg list` afterward shows the package + its deps.
-- [ ] On SHA-256 mismatch: the blob is rejected **before** extraction, the file is removed, install aborts non-zero.
-- [ ] With no network / no cached index, `cmd_install` falls back to the existing offline `/usr/pkg/<name>.m3pkg` path (no regression to the Phase 85a `pkg-smoke` behavior).
+- [x] When a cached trusted index exists, `cmd_install` builds the dep map from index `D:` fields and runs the **unchanged** `topo_install_order`, omitting already-installed packages (`/var/lib/pkg/db`).
+- [x] For each name in dependency-first order: look up its index record, `fetch_url` `<base>/<key>.m3pkg` → `/usr/pkg/<name>.m3pkg`, compute SHA-256 of the fetched bytes, and compare to the index `C:` field.
+- [x] On SHA-256 match: call the **unchanged** `install_one`; `pkg list` afterward shows the package + its deps.
+- [x] On SHA-256 mismatch: the blob is rejected **before** extraction, the file is removed, install aborts non-zero.
+- [x] With no network / no cached index, `cmd_install` falls back to the existing offline `/usr/pkg/<name>.m3pkg` path (no regression to the Phase 85a `pkg-smoke` behavior).
 
 ### B.4 — `repos.conf` parser
 
@@ -106,8 +106,8 @@
 **Why it matters:** Keeping the config parse in the host-testable `lib.rs` (like `parse_meta`/`db_parse`) means the multi-line, comment-handling logic is covered by `cargo xtask check` rather than only exercised in QEMU.
 
 **Acceptance:**
-- [ ] `parse_repos_conf(&str) -> Vec<String>` returns base URLs in file order, skipping blank lines and `#` comments, trimming whitespace.
-- [ ] Host test covers comments, blank lines, and trailing-slash normalization (so `<base>/index.m3idx` is well-formed).
+- [x] `parse_repos_conf(&str) -> Vec<String>` returns base URLs in file order, skipping blank lines and `#` comments, trimming whitespace.
+- [x] Host test covers comments, blank lines, and trailing-slash normalization (so `<base>/index.m3idx` is well-formed).
 
 ---
 
@@ -123,10 +123,10 @@
 **Why it matters:** This is the host side of the trust model — it turns the content-addressed `target/pkgcache/*.m3pkg` set into a signed `index.m3idx`. Sharing `pkg_format::index::serialize_index` with the client guarantees byte-identical format.
 
 **Acceptance:**
-- [ ] `cargo xtask repo-index` walks `target/pkgcache/*.m3pkg`, deriving each entry's `K:`/`U:<key>.m3pkg` from the content key and `N:`/`V:`/`D:` from the port Portfile/`.meta`, and `S:`/`C:` from the blob bytes.
-- [ ] Calls `pkg_format::index::serialize_index`, then signs the bytes with an ed25519 key read from `M3OS_PKG_SIGNING_KEY` (path or hex seed) via `crypto_lib::asymmetric::ed25519_sign`, writing `index.m3idx` + `index.m3idx.sig`.
-- [ ] Absent `M3OS_PKG_SIGNING_KEY`, emits an **unsigned** index with a warning (local dry-run), never silently signs with a default key.
-- [ ] Host test: emit → `parse_index` round-trip + `ed25519_verify` of the produced signature with the matching public key passes.
+- [x] `cargo xtask repo-index` walks `target/pkgcache/*.m3pkg`, deriving each entry's `K:`/`U:<key>.m3pkg` from the content key and `N:`/`V:`/`D:` from the port Portfile/`.meta`, and `S:`/`C:` from the blob bytes.
+- [x] Calls `pkg_format::index::serialize_index`, then signs the bytes with an ed25519 key read from `M3OS_PKG_SIGNING_KEY` (path or hex seed) via `crypto_lib::asymmetric::ed25519_sign`, writing `index.m3idx` + `index.m3idx.sig`.
+- [x] Absent `M3OS_PKG_SIGNING_KEY`, emits an **unsigned** index with a warning (local dry-run), never silently signs with a default key.
+- [x] Host test: emit → `parse_index` round-trip + `ed25519_verify` of the produced signature with the matching public key passes.
 
 ### C.2 — `build-and-publish.yml` (the m3os-pkgs CI flow)
 
@@ -135,10 +135,10 @@
 **Why it matters:** This is what makes distribution **$0** and incremental — `actions/cache` of the content-addressed `target/pkgcache/` means only changed-key ports rebuild, and GitHub Releases is the free, uncapped blob store.
 
 **Acceptance:**
-- [ ] Restores `actions/cache` keyed on `target/pkgcache/` so unchanged-key ports are not rebuilt or re-uploaded.
-- [ ] Runs `cargo xtask port build all` then `cargo xtask repo-index` with the ed25519 private key from a GitHub Actions **secret** (never echoed to logs).
-- [ ] `gh release upload --clobber repo/x86_64 <key>.m3pkg … index.m3idx index.m3idx.sig` pushes new/changed assets to the rolling per-arch tag; an optional `gh-pages` step mirrors the index for a stable URL.
-- [ ] Documented: the secret name, the rolling-tag convention, and the public-repo $0 hosting rationale (vs git-LFS metered / GHCR escape hatch).
+- [x] Restores `actions/cache` keyed on `target/pkgcache/` so unchanged-key ports are not rebuilt or re-uploaded. *(Template committed at `docs/appendix/m3os-pkgs/build-and-publish.yml`; runs once the owner creates the public repo.)*
+- [x] Runs `cargo xtask port build all` then `cargo xtask repo-index` with the ed25519 private key from a GitHub Actions **secret** (never echoed to logs). *(Secret name `M3OS_PKG_SIGNING_KEY_HEX`; written to a umask-077 temp file, removed after.)*
+- [x] `gh release upload --clobber` pushes new/changed assets to the rolling per-arch tag. *(Tag is `repo-x86_64`, not `repo/x86_64` — a slash in a tag breaks the `releases/download/<tag>/<asset>` URL path. The optional gh-pages mirror is deferred.)*
+- [x] Documented: the secret name, the rolling-tag convention, and the public-repo $0 hosting rationale — `docs/appendix/m3os-pkgs/README.md`.
 
 ---
 
@@ -155,10 +155,10 @@
 **Why it matters:** The index-parse + sig-verify + solver are the CI-deterministic core the spec mandates — they must be proven without QEMU or network so a regression is caught in `cargo xtask check`.
 
 **Acceptance:**
-- [ ] Index serialize/parse round-trip + determinism test passes (`pkg-format`).
-- [ ] An **index-level tamper test**: a one-byte mutation of a signed index's bytes makes `ed25519_verify` return `false` (built on the existing `crypto-lib` tamper coverage).
-- [ ] `topo_install_order` fed a dep map built from index `D:` fields produces the same dependency-first order as the Phase 85a `.meta`-fed path (no solver change).
-- [ ] All run under `cargo xtask check` (the existing `pkg-format` / `pkg` / `crypto-lib` host-test set).
+- [x] Index serialize/parse round-trip + determinism test passes (`pkg-format`).
+- [x] An **index-level tamper test**: a one-byte mutation of a signed index's bytes makes `ed25519_verify` return `false` (built on the existing `crypto-lib` tamper coverage).
+- [x] `topo_install_order` fed a dep map built from index `D:` fields produces the same dependency-first order as the Phase 85a `.meta`-fed path (no solver change).
+- [x] All run under `cargo xtask check` (the existing `pkg-format` / `pkg` / `crypto-lib` host-test set).
 
 ### D.2 — `pkg-net-smoke` gate
 
@@ -167,10 +167,10 @@
 **Why it matters:** Proves the whole on-device chain — `pkg update` verify, tamper-reject, networked `pkg install`, bad-blob-reject — end to end, deterministically in CI (no real internet) via a SLIRP-served host index, with the real-HTTPS arm opt-in.
 
 **Acceptance:**
-- [ ] **CI-deterministic core:** the gate freshly signs an `index.m3idx` over a couple of small `.m3pkg` blobs (e.g. `libevent` + a leaf), serves them from a **host HTTP server over SLIRP** (the `10.0.2.100:80` guestfwd pattern used by `node-smoke`/`go-runtime-smoke`), points `repos.conf` at it, boots, and asserts: `pkg update` verifies (sentinel `PKG_UPDATE_OK <n>`), a **served tampered index is rejected** (`PKG_UPDATE_REJECT`), `pkg install <leaf>` resolves+fetches+SHA-checks+installs (`pkg list` shows it), and a **served bad-blob (wrong bytes) is rejected** before extraction (`PKG_BLOB_REJECT`).
-- [ ] Fails fast via `WaitPassOrFail` on any `:FAIL` / a silent-accept of a tampered index or bad blob.
-- [ ] **Opt-in live arm** `M3OS_PKG_NET=1`: fetch + verify against the real published GitHub Releases / gh-pages URL; **skip-with-reason** when unset (mirroring `git-https-smoke`'s `M3OS_GIT_HTTPS_NET`).
-- [ ] Runs at a timeout sized for the cold install over the slow VFS (`--timeout 900`+).
+- [x] **CI-deterministic core:** the gate freshly signs an `index.m3idx` over a couple of small `.m3pkg` blobs (e.g. `libevent` + a leaf), serves them from a **host HTTP server over SLIRP** (the `10.0.2.100:80` guestfwd pattern used by `node-smoke`/`go-runtime-smoke`), points `repos.conf` at it, boots, and asserts: `pkg update` verifies (sentinel `PKG_UPDATE_OK <n>`), a **served tampered index is rejected** (`PKG_UPDATE_REJECT`), `pkg install <leaf>` resolves+fetches+SHA-checks+installs (`pkg list` shows it), and a **served bad-blob (wrong bytes) is rejected** before extraction (`PKG_BLOB_REJECT`).
+- [x] Fails fast via `WaitPassOrFail` on any `:FAIL` / a silent-accept of a tampered index or bad blob.
+- [x] **Opt-in live arm** `M3OS_PKG_NET=1`: fetch + verify against the real published GitHub Releases / gh-pages URL; **skip-with-reason** when unset (mirroring `git-https-smoke`'s `M3OS_GIT_HTTPS_NET`).
+- [x] Runs at a timeout sized for its workload — the gate installs two tiny synthetic packages (not the heavy ports the charter anticipated), passes in <60 s, and runs with `--timeout 300` from the pre-push hook.
 
 ### D.3 — Gate + roadmap documentation
 
@@ -182,8 +182,8 @@
 **Why it matters:** Keeps the gate discoverable and the roadmap accurate per the documentation policy.
 
 **Acceptance:**
-- [ ] `M3OS_PKG_NET_REGRESSION=1` row added to the `AGENTS.md` gate table with the same skip-vs-pass wording as the `git-https-smoke` row (CI-deterministic core always-on; live HTTPS arm opt-in via `M3OS_PKG_NET`).
-- [ ] `docs/roadmap/README.md` has the Phase 107 table row and a mermaid node depending on Phase 85a + 86c + 42 (`P85a --> P107`, `P86c --> P107`, `P42 --> P107`).
+- [x] `M3OS_PKG_NET_REGRESSION=1` row added to the `AGENTS.md` gate table with the same skip-vs-pass wording as the `git-https-smoke` row (CI-deterministic core always-on; live HTTPS arm opt-in via `M3OS_PKG_NET`).
+- [x] `docs/roadmap/README.md` has the Phase 107 table row and mermaid dependency edges from the Phase 85/86/42 nodes (charter deps) alongside the dotted narrative-order 106 edge.
 
 ---
 

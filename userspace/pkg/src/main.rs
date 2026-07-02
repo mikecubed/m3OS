@@ -1,19 +1,27 @@
-//! Phase 85a Track C — `pkg`: offline `.m3pkg` installer for m3OS.
-//!
-//! **Offline only** — no network access.  The networked install path is a
-//! Phase 86 task (`docs/roadmap/86-networking-and-github.md`).
+//! Phase 85a Track C — `pkg`: the `.m3pkg` installer for m3OS.
 //!
 //! # Verbs
 //!
-//! - `pkg install <name>` — read `/usr/pkg/<name>.m3pkg`, verify, extract under
-//!   `/`, record the DB.
+//! - `pkg install <name>` — install `<name>` + its deps. A blob already at
+//!   `/usr/pkg/<name>.m3pkg` installs offline (the Phase 85a path,
+//!   unchanged); otherwise Phase 107's networked branch resolves it from
+//!   the signature-verified index cached by `pkg update`, fetches
+//!   `<key>.m3pkg` via `curl`, SHA-256-checks it against the index, and
+//!   installs through the same offline code.
+//! - `pkg update [url]` — fetch `index.m3idx` + `index.m3idx.sig` from each
+//!   base URL in `/etc/pkg/repos.conf` (or the explicit `url` override) and
+//!   ed25519-verify the index against `/etc/pkg/keys/m3os-pkgs.pub`.
+//!   **Fail-closed**: a bad signature is rejected and the previously cached
+//!   index is kept.
 //! - `pkg list` — print installed packages from `/var/lib/pkg/db`.
 //! - `pkg verify <name>` — re-check installed files against the DB hashes.
 //!
 //! # Engineering notes
 //!
-//! All logic delegates to [`pkg_app`] (the `[lib]`).  This binary is thin:
-//! parse argv → dispatch verb → print result.  No socket syscalls anywhere.
+//! All pure logic delegates to [`pkg_app`] (the `[lib]`).  This binary
+//! stays `no_std` and **never links a TLS stack** — HTTPS lives entirely
+//! inside the spawned Phase 86c `curl` binary, reached through
+//! `fork`/`execve`/`waitpid` (the same process boundary `git` uses).
 #![no_std]
 #![no_main]
 #![feature(alloc_error_handler)]
@@ -103,6 +111,10 @@ fn program_main(args: &[&str]) -> i32 {
                 2
             }
         },
+        // Phase 107: fetch + verify the signed repo index. The optional URL
+        // argument overrides /etc/pkg/repos.conf (manual runs + the
+        // pkg-net-smoke tamper arm).
+        Some("update") => cmd_update(args.get(2).copied()),
         _ => {
             print_usage();
             2
@@ -130,6 +142,14 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 /// installs each in turn. With no `.meta` (or empty `DEPS=`) this degrades to a
 /// single-package install — preserving the original flat behaviour.
 fn cmd_install(name: &str) -> i32 {
+    // Phase 107: a blob already at /usr/pkg/<name>.m3pkg takes the Phase 85a
+    // offline path unchanged (the bundled-repo contract pkg-smoke pins);
+    // anything else resolves through the signature-verified index.
+    let local = build_path(b"/usr/pkg/", name.as_bytes(), b".m3pkg\0");
+    if !file_exists(&local) {
+        return cmd_install_networked(name);
+    }
+
     // Build the dependency map by reading .meta sidecars transitively.
     let mut deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
     collect_deps(name, &mut deps);
@@ -190,6 +210,390 @@ fn collect_deps(name: &str, deps: &mut BTreeMap<String, Vec<String>>) {
     for d in &meta.deps {
         collect_deps(d, deps);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 107 Track B — networked update + install
+// ---------------------------------------------------------------------------
+
+/// Cached, signature-verified index (written only by a successful
+/// `pkg update`).
+const INDEX_CACHE_PATH: &[u8] = b"/var/lib/pkg/index.m3idx\0";
+/// Repo base URLs, one per line.
+const REPOS_CONF_PATH: &[u8] = b"/etc/pkg/repos.conf\0";
+/// The 32-byte ed25519 trust root baked into the image.
+const PUBKEY_PATH: &[u8] = b"/etc/pkg/keys/m3os-pkgs.pub\0";
+/// Unverified fetch landing spots — never read as trusted state.
+const TMP_INDEX_PATH: &[u8] = b"/var/lib/pkg/index.m3idx.new\0";
+const TMP_SIG_PATH: &[u8] = b"/var/lib/pkg/index.m3idx.sig.new\0";
+/// The base URL the cached index was verified from. Blob fetches prefer
+/// it so `U:` entries resolve against the repo that published them
+/// (repos.conf bases remain the fallback) — and so a `pkg update <url>`
+/// override coheres with the installs that follow it.
+const INDEX_SRC_PATH: &[u8] = b"/var/lib/pkg/index.src\0";
+
+/// `pkg update [url]` — fetch + ed25519-verify the repo index. Fail-closed:
+/// every failure path leaves the previously cached index untouched.
+fn cmd_update(url_override: Option<&str>) -> i32 {
+    let bases: Vec<String> = match url_override {
+        Some(u) => alloc::vec![u.trim_end_matches('/').into()],
+        None => read_repo_bases(),
+    };
+    if bases.is_empty() {
+        eprint_str("pkg update: no repos configured in /etc/pkg/repos.conf\n");
+        return 1;
+    }
+
+    // The trust root must load before any fetch — no key, no update.
+    let pubkey_bytes = match read_file_bytes(PUBKEY_PATH) {
+        Ok(b) => b,
+        Err(_) => {
+            eprint_str("pkg update: trust key /etc/pkg/keys/m3os-pkgs.pub missing\n");
+            return 1;
+        }
+    };
+    if pubkey_bytes.len() != 32 {
+        eprint_str("pkg update: trust key is not 32 bytes\n");
+        return 1;
+    }
+    let mut pubkey = [0u8; 32];
+    pubkey.copy_from_slice(&pubkey_bytes);
+    let vk = match crypto_lib::asymmetric::ed25519_verifying_key_from_bytes(&pubkey) {
+        Ok(k) => k,
+        Err(_) => {
+            eprint_str("pkg update: trust key is not a valid ed25519 public key\n");
+            return 1;
+        }
+    };
+
+    ensure_pkg_state_dirs();
+    for base in &bases {
+        let index_url = join_url(base, "index.m3idx");
+        let sig_url = join_url(base, "index.m3idx.sig");
+        print_str("pkg update: fetching ");
+        print_str(&index_url);
+        print_str("\n");
+        if !fetch_url(&index_url, TMP_INDEX_PATH) || !fetch_url(&sig_url, TMP_SIG_PATH) {
+            eprint_str("pkg update: fetch failed from ");
+            eprint_str(base);
+            eprint_str("\n");
+            clean_tmp_fetches();
+            continue;
+        }
+        let index_bytes = read_file_bytes(TMP_INDEX_PATH);
+        let sig_bytes = read_file_bytes(TMP_SIG_PATH);
+        clean_tmp_fetches();
+        let (Ok(index_bytes), Ok(sig_bytes)) = (index_bytes, sig_bytes) else {
+            eprint_str("pkg update: fetched files unreadable\n");
+            continue;
+        };
+        if sig_bytes.len() != 64 {
+            eprint_str("pkg update: signature is not 64 bytes - rejecting\n");
+            continue;
+        }
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&sig_bytes);
+        if !crypto_lib::asymmetric::ed25519_verify(&vk, &index_bytes, &sig) {
+            eprint_str("pkg update: signature verification FAILED - keeping previous index\n");
+            continue;
+        }
+        // Signature is good; sanity-parse before caching so a signed-but-
+        // malformed index can never wedge later installs.
+        let entry_count = match core::str::from_utf8(&index_bytes)
+            .ok()
+            .and_then(|t| pkg_format::index::parse_index(t).ok())
+        {
+            Some(entries) => entries.len(),
+            None => {
+                eprint_str("pkg update: verified index does not parse - rejecting\n");
+                continue;
+            }
+        };
+        if !write_file(INDEX_CACHE_PATH, &index_bytes) {
+            eprint_str("pkg update: cannot write /var/lib/pkg/index.m3idx\n");
+            return 1;
+        }
+        let _ = write_file(INDEX_SRC_PATH, base.as_bytes());
+        print_str("pkg update: index verified (");
+        syscall_lib::write_u64(STDOUT_FILENO, entry_count as u64);
+        print_str(" packages)\n");
+        return 0;
+    }
+    1
+}
+
+/// Networked install: resolve `name` from the cached verified index, fetch
+/// every missing blob, SHA-256-check each against the index, and install
+/// through the unchanged offline path.
+fn cmd_install_networked(name: &str) -> i32 {
+    let index_bytes = match read_file_bytes(INDEX_CACHE_PATH) {
+        Ok(b) => b,
+        Err(_) => {
+            eprint_str("pkg install: ");
+            eprint_str(name);
+            eprint_str(": no local package and no cached index - run `pkg update` first\n");
+            return 1;
+        }
+    };
+    let entries = match core::str::from_utf8(&index_bytes)
+        .ok()
+        .and_then(|t| pkg_format::index::parse_index(t).ok())
+    {
+        Some(e) => e,
+        None => {
+            eprint_str("pkg install: cached index corrupt - run `pkg update`\n");
+            return 1;
+        }
+    };
+    if find_index_entry(&entries, name).is_none() {
+        eprint_str("pkg install: ");
+        eprint_str(name);
+        eprint_str(": not in the repo index\n");
+        return 1;
+    }
+
+    let deps = pkg_app::index_dep_map(&entries);
+    let installed: BTreeSet<String> = match db_read() {
+        Ok(recs) => recs.into_iter().map(|r| r.name).collect(),
+        Err(e) => {
+            eprint_str("pkg install: ");
+            eprint_str(e);
+            eprint_str("\n");
+            return 1;
+        }
+    };
+    let order = match topo_install_order(name, &deps, &installed) {
+        Ok(o) => o,
+        Err(e) => {
+            eprint_str("pkg install: ");
+            eprint_str(e);
+            eprint_str("\n");
+            return 1;
+        }
+    };
+    if order.is_empty() {
+        print_str("pkg install: ");
+        print_str(name);
+        print_str(": already installed\n");
+        return 0;
+    }
+
+    // Fetch blobs from the base that served the verified index first;
+    // repos.conf bases follow as fallback mirrors.
+    let mut bases: Vec<String> = Vec::new();
+    if let Ok(src) = read_file_bytes(INDEX_SRC_PATH)
+        && let Ok(src) = core::str::from_utf8(&src)
+    {
+        let src = src.trim();
+        if !src.is_empty() {
+            bases.push(src.into());
+        }
+    }
+    for b in read_repo_bases() {
+        if !bases.contains(&b) {
+            bases.push(b);
+        }
+    }
+    if bases.is_empty() {
+        eprint_str("pkg install: no repos configured in /etc/pkg/repos.conf\n");
+        return 1;
+    }
+
+    for pkg in &order {
+        let local = build_path(b"/usr/pkg/", pkg.as_bytes(), b".m3pkg\0");
+        if !file_exists(&local) {
+            let Some(entry) = find_index_entry(&entries, pkg) else {
+                eprint_str("pkg install: dependency ");
+                eprint_str(pkg);
+                eprint_str(": not in the repo index\n");
+                return 1;
+            };
+            let rc = fetch_and_check_blob(&bases, entry, &local);
+            if rc != 0 {
+                return rc;
+            }
+            // Stage the .meta sidecar from the trusted index so upgrade /
+            // future offline resolution see the same version + deps.
+            let meta_path = build_path(b"/usr/pkg/", pkg.as_bytes(), b".meta\0");
+            let dep_refs: Vec<&str> = entry.deps.iter().map(|d| d.as_str()).collect();
+            let meta_text = pkg_app::meta_serialize(&entry.version, &dep_refs);
+            let _ = write_file(&meta_path, meta_text.as_bytes());
+        }
+        let rc = install_one(pkg);
+        if rc != 0 {
+            return rc;
+        }
+    }
+    0
+}
+
+/// Fetch one blob into `dest` and require its SHA-256 to match the signed
+/// index. A hash mismatch is a hard failure (potential tamper), not a
+/// try-the-next-mirror condition; the poisoned file is removed.
+fn fetch_and_check_blob(
+    bases: &[String],
+    entry: &pkg_format::index::IndexEntry,
+    dest: &[u8],
+) -> i32 {
+    for base in bases {
+        let url = join_url(base, &entry.url);
+        print_str("pkg install: ");
+        print_str(&entry.name);
+        print_str(": fetching ");
+        syscall_lib::write_u64(STDOUT_FILENO, entry.size);
+        print_str(" bytes\n");
+        if !fetch_url(&url, dest) {
+            let _ = syscall_lib::unlink(dest);
+            continue;
+        }
+        let Ok(bytes) = read_file_bytes(dest) else {
+            let _ = syscall_lib::unlink(dest);
+            continue;
+        };
+        let got = to_hex(&content_hash(&bytes));
+        if got == entry.sha256 {
+            return 0;
+        }
+        eprint_str("pkg install: ");
+        eprint_str(&entry.name);
+        eprint_str(": SHA-256 MISMATCH vs signed index - rejecting blob\n");
+        let _ = syscall_lib::unlink(dest);
+        return 1;
+    }
+    eprint_str("pkg install: ");
+    eprint_str(&entry.name);
+    eprint_str(": fetch failed from every configured repo\n");
+    1
+}
+
+/// Spawn `curl -fsSL -o <dest> <url>` and wait. TLS (when the URL is
+/// https) lives entirely inside curl — this binary links no TLS stack.
+/// `dest` must be NUL-terminated.
+fn fetch_url(url: &str, dest: &[u8]) -> bool {
+    let mut url_buf = Vec::with_capacity(url.len() + 1);
+    url_buf.extend_from_slice(url.as_bytes());
+    url_buf.push(0);
+
+    let pid = syscall_lib::fork();
+    if pid < 0 {
+        return false;
+    }
+    if pid == 0 {
+        // Child: argv/envp are NUL-terminated strings + null-terminated
+        // pointer arrays (the shell's execve convention).
+        //
+        // Deliberately NO `--connect-timeout`/`--max-time`: with a
+        // signal-resolver curl build those arm the alarm()/SIGALRM +
+        // sigsetjmp timeout path, which wedges pre-connect on m3OS
+        // (pkg-net-smoke bisected this — a shell-run curl with those two
+        // flags hangs before its first SYN; without them it completes).
+        // The envp mirrors the shell's so curl sees the environment it is
+        // validated under.
+        let argv: [*const u8; 6] = [
+            c"curl".as_ptr().cast::<u8>(),
+            c"-fsSL".as_ptr().cast::<u8>(),
+            c"-o".as_ptr().cast::<u8>(),
+            dest.as_ptr(),
+            url_buf.as_ptr(),
+            core::ptr::null(),
+        ];
+        let envp: [*const u8; 4] = [
+            c"PATH=/usr/local/bin:/usr/bin:/bin".as_ptr().cast::<u8>(),
+            c"HOME=/root".as_ptr().cast::<u8>(),
+            c"TERM=m3os-term".as_ptr().cast::<u8>(),
+            core::ptr::null(),
+        ];
+        // Try the known install locations; execve only returns on failure.
+        for path in [
+            &b"/usr/local/bin/curl\0"[..],
+            &b"/usr/bin/curl\0"[..],
+            &b"/bin/curl\0"[..],
+        ] {
+            let _ = syscall_lib::execve(path, &argv, &envp);
+        }
+        syscall_lib::write_str(
+            STDERR_FILENO,
+            "pkg: curl not found - `pkg install curl` first\n",
+        );
+        syscall_lib::exit(127)
+    }
+    let mut status = 0i32;
+    if syscall_lib::waitpid(pid as i32, &mut status, 0) < 0 {
+        eprint_str("pkg: waitpid for curl failed\n");
+        return false;
+    }
+    // Normal exit with code 0 (the shell's status decode).
+    let ok = status & 0x7f == 0 && (status >> 8) & 0xff == 0;
+    if !ok {
+        eprint_str("pkg: curl exited with status ");
+        syscall_lib::write_u64(STDERR_FILENO, ((status >> 8) & 0xff) as u64);
+        eprint_str(" (raw ");
+        syscall_lib::write_u64(STDERR_FILENO, status as u64);
+        eprint_str(")\n");
+    }
+    ok
+}
+
+/// Parse `/etc/pkg/repos.conf` (absent file → empty list).
+fn read_repo_bases() -> Vec<String> {
+    match read_file_bytes(REPOS_CONF_PATH) {
+        Ok(bytes) => match core::str::from_utf8(&bytes) {
+            Ok(t) => pkg_app::parse_repos_conf(t),
+            Err(_) => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    }
+}
+
+fn find_index_entry<'e>(
+    entries: &'e [pkg_format::index::IndexEntry],
+    name: &str,
+) -> Option<&'e pkg_format::index::IndexEntry> {
+    entries.iter().find(|e| e.name == name)
+}
+
+fn join_url(base: &str, file: &str) -> String {
+    let mut s = String::with_capacity(base.len() + 1 + file.len());
+    s.push_str(base);
+    s.push('/');
+    s.push_str(file);
+    s
+}
+
+/// Does `path` (NUL-terminated) exist and open readably?
+fn file_exists(path: &[u8]) -> bool {
+    let fd = syscall_lib::open(path, syscall_lib::O_RDONLY, 0);
+    if (fd as i64) < 0 {
+        return false;
+    }
+    let _ = syscall_lib::close(fd as i32);
+    true
+}
+
+/// Create-or-truncate `path` (NUL-terminated) with `data`.
+fn write_file(path: &[u8], data: &[u8]) -> bool {
+    let flags = syscall_lib::O_WRONLY | syscall_lib::O_CREAT | syscall_lib::O_TRUNC;
+    let fd = syscall_lib::open(path, flags, 0o644);
+    if (fd as i64) < 0 {
+        return false;
+    }
+    let fd = fd as i32;
+    let ok = write_all(fd, data);
+    let _ = syscall_lib::close(fd);
+    ok
+}
+
+/// `mkdir -p /var/lib/pkg` (each level EEXIST-tolerant — the db_write
+/// convention).
+fn ensure_pkg_state_dirs() {
+    let _ = syscall_lib::mkdir(b"/var\0", 0o755);
+    let _ = syscall_lib::mkdir(b"/var/lib\0", 0o755);
+    let _ = syscall_lib::mkdir(b"/var/lib/pkg\0", 0o755);
+}
+
+fn clean_tmp_fetches() {
+    let _ = syscall_lib::unlink(TMP_INDEX_PATH);
+    let _ = syscall_lib::unlink(TMP_SIG_PATH);
 }
 
 // ---------------------------------------------------------------------------
@@ -860,11 +1264,12 @@ fn eprint_str(s: &str) {
 fn print_usage() {
     print_str(
         "Usage:\n  \
-         pkg install <name>   Install /usr/pkg/<name>.m3pkg + its deps (offline)\n  \
+         pkg update [url]     Fetch + ed25519-verify the repo index (fail-closed)\n  \
+         pkg install <name>   Install <name> + deps (local /usr/pkg blob, else\n                       \
+         fetch from the verified index + SHA-256 check)\n  \
          pkg remove <name>    Remove an installed package's files + DB entry\n  \
          pkg upgrade <name>   Reinstall <name>, pruning orphaned files\n  \
          pkg list             List installed packages\n  \
-         pkg verify <name>    Verify installed files against the DB\n\n\
-         Note: pkg is offline-only in Phase 85a; networked install is Phase 86.\n",
+         pkg verify <name>    Verify installed files against the DB\n",
     );
 }

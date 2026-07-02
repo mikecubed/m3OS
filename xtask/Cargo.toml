@@ -17,3 +17,7 @@ passwd = { path = "../userspace/passwd", default-features = false }
 # Phase 85a — host packer for the content-addressed .m3pkg store (default
 # features bring in the std pack/unpack surface).
 pkg-format = { path = "../pkg-format" }
+# Phase 107 Track C — ed25519 signing for `cargo xtask repo-index` (the same
+# crate whose verify half runs on-device; sign-on-host / verify-on-device
+# agree by construction).
+crypto-lib = { path = "../userspace/crypto-lib" }

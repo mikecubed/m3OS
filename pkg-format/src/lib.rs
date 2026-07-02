@@ -598,6 +598,323 @@ mod host {
 #[cfg(feature = "std")]
 pub use host::{pack, unpack};
 
+/// Phase 107 Track A — the signed repo index `index.m3idx`.
+///
+/// APKINDEX-style flat text: a two-line header (`M:m3idx1` format magic,
+/// `A:x86_64` architecture), then one record per package with
+/// single-letter field tags, records separated by one blank line,
+/// **sorted by name**. The serializer is deterministic because the
+/// signed bytes are simply the serialized text — sign-on-host and
+/// verify-on-device must agree byte-for-byte with no separate
+/// canonicalization step.
+///
+/// ```text
+/// M:m3idx1
+/// A:x86_64
+///
+/// N:tmux            package name
+/// V:3.4             version
+/// K:<64 hex>        content key (the pkgcache artifact name)
+/// S:123456          size of the .m3pkg in bytes
+/// C:<64 hex>        SHA-256 of the whole .m3pkg blob
+/// U:<key>.m3pkg     URL relative to the repo base
+/// D:libevent ncurses   direct deps, space-separated (omitted when none)
+/// ```
+///
+/// The index is the **trust root**: it is ed25519-signed (detached
+/// `index.m3idx.sig`, raw 64 bytes over the exact index text) and each
+/// package's authenticity then flows from its `C:` hash — the
+/// Alpine/apt model. The `.m3pkg` byte layout (and its reserved,
+/// still-zeroed per-package signature field) is unchanged.
+///
+/// This module realizes the design intent recorded in the crate header;
+/// it is shared by the host `cargo xtask repo-index` emitter and the
+/// on-device `pkg` parser so the format has exactly one implementation.
+/// Pure logic, `no_std` + `alloc`, no crypto dependency (the ed25519
+/// sign/verify live in the callers).
+pub mod index {
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+
+    /// Format magic for index revision 1.
+    pub const INDEX_MAGIC: &str = "m3idx1";
+    /// The only architecture published today.
+    pub const INDEX_ARCH: &str = "x86_64";
+    /// Hostile-input guard: more records than any plausible repo.
+    pub const MAX_INDEX_ENTRIES: usize = 4096;
+
+    /// One package record.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct IndexEntry {
+        pub name: String,
+        pub version: String,
+        /// Content key (`compute_package_key` output) — the blob's
+        /// name in the repo and in `target/pkgcache/`.
+        pub key: String,
+        /// Whole-blob size in bytes.
+        pub size: u64,
+        /// Lowercase SHA-256 hex of the whole `.m3pkg`.
+        pub sha256: String,
+        /// Fetch URL relative to the repo base (`<key>.m3pkg`).
+        pub url: String,
+        /// Direct dependencies (package names).
+        pub deps: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum IndexError {
+        /// Missing or wrong `M:` header line.
+        BadMagic,
+        /// Missing or unsupported `A:` architecture line.
+        BadArch,
+        /// A record is missing a required field or carries a malformed
+        /// value.
+        BadRecord,
+        /// More than [`MAX_INDEX_ENTRIES`] records.
+        TooManyEntries,
+    }
+
+    /// Serialize deterministically: header, then records sorted by
+    /// name. These exact bytes are what gets signed.
+    pub fn serialize_index(entries: &[IndexEntry]) -> String {
+        let mut sorted: Vec<&IndexEntry> = entries.iter().collect();
+        sorted.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut out = String::new();
+        out.push_str("M:");
+        out.push_str(INDEX_MAGIC);
+        out.push_str("\nA:");
+        out.push_str(INDEX_ARCH);
+        out.push('\n');
+        for e in sorted {
+            out.push('\n');
+            out.push_str("N:");
+            out.push_str(&e.name);
+            out.push_str("\nV:");
+            out.push_str(&e.version);
+            out.push_str("\nK:");
+            out.push_str(&e.key);
+            out.push_str("\nS:");
+            let mut size = e.size;
+            let mut digits = [0u8; 20];
+            let mut n = 0;
+            loop {
+                digits[n] = b'0' + (size % 10) as u8;
+                size /= 10;
+                n += 1;
+                if size == 0 {
+                    break;
+                }
+            }
+            while n > 0 {
+                n -= 1;
+                out.push(digits[n] as char);
+            }
+            out.push_str("\nC:");
+            out.push_str(&e.sha256);
+            out.push_str("\nU:");
+            out.push_str(&e.url);
+            out.push('\n');
+            if !e.deps.is_empty() {
+                out.push_str("D:");
+                for (i, d) in e.deps.iter().enumerate() {
+                    if i > 0 {
+                        out.push(' ');
+                    }
+                    out.push_str(d);
+                }
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Parse an index. Unknown field tags are skipped (forward-compat,
+    /// the `parse_meta` convention); missing required fields are
+    /// [`IndexError::BadRecord`].
+    pub fn parse_index(text: &str) -> Result<Vec<IndexEntry>, IndexError> {
+        let mut lines = text.lines();
+        match lines.next() {
+            Some(l) if l.strip_prefix("M:") == Some(INDEX_MAGIC) => {}
+            _ => return Err(IndexError::BadMagic),
+        }
+        match lines.next() {
+            Some(l) if l.strip_prefix("A:") == Some(INDEX_ARCH) => {}
+            _ => return Err(IndexError::BadArch),
+        }
+
+        let mut entries = Vec::new();
+        let mut cur: Option<IndexEntry> = None;
+        for line in lines {
+            let line = line.trim_end();
+            if line.is_empty() {
+                if let Some(e) = cur.take() {
+                    finish_record(e, &mut entries)?;
+                }
+                continue;
+            }
+            let Some((tag, value)) = line.split_once(':') else {
+                return Err(IndexError::BadRecord);
+            };
+            if tag == "N" {
+                if let Some(e) = cur.take() {
+                    finish_record(e, &mut entries)?;
+                }
+                cur = Some(IndexEntry {
+                    name: value.to_string(),
+                    version: String::new(),
+                    key: String::new(),
+                    size: 0,
+                    sha256: String::new(),
+                    url: String::new(),
+                    deps: Vec::new(),
+                });
+                continue;
+            }
+            let Some(e) = cur.as_mut() else {
+                // A field line before any N: record.
+                return Err(IndexError::BadRecord);
+            };
+            match tag {
+                "V" => e.version = value.to_string(),
+                "K" => e.key = value.to_string(),
+                "S" => {
+                    e.size = value.parse::<u64>().map_err(|_| IndexError::BadRecord)?;
+                }
+                "C" => e.sha256 = value.to_string(),
+                "U" => e.url = value.to_string(),
+                "D" => {
+                    e.deps = value
+                        .split_ascii_whitespace()
+                        .map(|d| d.to_string())
+                        .collect();
+                }
+                // Unknown single-letter tags: skip (forward-compat).
+                _ => {}
+            }
+        }
+        if let Some(e) = cur.take() {
+            finish_record(e, &mut entries)?;
+        }
+        Ok(entries)
+    }
+
+    fn finish_record(e: IndexEntry, entries: &mut Vec<IndexEntry>) -> Result<(), IndexError> {
+        if e.name.is_empty()
+            || e.version.is_empty()
+            || e.key.len() != 64
+            || e.sha256.len() != 64
+            || e.url.is_empty()
+        {
+            return Err(IndexError::BadRecord);
+        }
+        if !e.key.bytes().all(|b| b.is_ascii_hexdigit())
+            || !e.sha256.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(IndexError::BadRecord);
+        }
+        entries.push(e);
+        if entries.len() > MAX_INDEX_ENTRIES {
+            return Err(IndexError::TooManyEntries);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use alloc::vec;
+
+        fn sample() -> Vec<IndexEntry> {
+            let hex64 = "ab".repeat(32);
+            vec![
+                IndexEntry {
+                    name: "tmux".to_string(),
+                    version: "3.4".to_string(),
+                    key: hex64.clone(),
+                    size: 123456,
+                    sha256: hex64.clone(),
+                    url: alloc::format!("{hex64}.m3pkg"),
+                    deps: vec!["libevent".to_string(), "ncurses".to_string()],
+                },
+                IndexEntry {
+                    name: "libevent".to_string(),
+                    version: "2.1.12".to_string(),
+                    key: hex64.clone(),
+                    size: 999,
+                    sha256: hex64.clone(),
+                    url: alloc::format!("{hex64}.m3pkg"),
+                    deps: vec![],
+                },
+            ]
+        }
+
+        #[test]
+        fn round_trips_and_sorts_deterministically() {
+            let entries = sample();
+            let text = serialize_index(&entries);
+            // Deterministic: input order does not matter.
+            let mut reversed = entries.clone();
+            reversed.reverse();
+            assert_eq!(text, serialize_index(&reversed));
+            // Sorted by name: libevent precedes tmux.
+            let li = text.find("N:libevent").unwrap();
+            let tm = text.find("N:tmux").unwrap();
+            assert!(li < tm);
+            // Round-trip (parse yields name-sorted order).
+            let parsed = parse_index(&text).unwrap();
+            assert_eq!(parsed.len(), 2);
+            assert_eq!(parsed[0].name, "libevent");
+            assert!(parsed[0].deps.is_empty());
+            assert_eq!(parsed[1].name, "tmux");
+            assert_eq!(parsed[1].deps, vec!["libevent", "ncurses"]);
+            assert_eq!(parsed[1].size, 123456);
+        }
+
+        #[test]
+        fn rejects_malformed_input() {
+            assert_eq!(parse_index(""), Err(IndexError::BadMagic));
+            assert_eq!(
+                parse_index("M:m3idx9\nA:x86_64\n"),
+                Err(IndexError::BadMagic)
+            );
+            assert_eq!(parse_index("M:m3idx1\nA:armv8\n"), Err(IndexError::BadArch));
+            // Field before any record.
+            assert_eq!(
+                parse_index("M:m3idx1\nA:x86_64\n\nV:1.0\n"),
+                Err(IndexError::BadRecord)
+            );
+            // Record missing required fields.
+            assert_eq!(
+                parse_index("M:m3idx1\nA:x86_64\n\nN:tmux\nV:3.4\n"),
+                Err(IndexError::BadRecord)
+            );
+            // Bad size.
+            let hex64 = "ab".repeat(32);
+            let bad = alloc::format!(
+                "M:m3idx1\nA:x86_64\n\nN:t\nV:1\nK:{hex64}\nS:x9\nC:{hex64}\nU:t.m3pkg\n"
+            );
+            assert_eq!(parse_index(&bad), Err(IndexError::BadRecord));
+            // Non-hex key.
+            let badkey = "zz".repeat(32);
+            let bad = alloc::format!(
+                "M:m3idx1\nA:x86_64\n\nN:t\nV:1\nK:{badkey}\nS:9\nC:{hex64}\nU:t.m3pkg\n"
+            );
+            assert_eq!(parse_index(&bad), Err(IndexError::BadRecord));
+        }
+
+        #[test]
+        fn unknown_tags_are_skipped_forward_compat() {
+            let hex64 = "cd".repeat(32);
+            let text = alloc::format!(
+                "M:m3idx1\nA:x86_64\n\nN:t\nV:1\nK:{hex64}\nS:9\nC:{hex64}\nU:t.m3pkg\nX:future\n"
+            );
+            let parsed = parse_index(&text).unwrap();
+            assert_eq!(parsed.len(), 1);
+            assert_eq!(parsed[0].name, "t");
+        }
+    }
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;

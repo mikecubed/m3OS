@@ -303,6 +303,20 @@ if [ "${M3OS_MITIGATIONS_REGRESSION:-0}" = "1" ]; then
     cargo xtask mitigations-status-smoke --timeout 150
 fi
 
+# Phase 107 — networked + signed package distribution. Gated behind
+# M3OS_PKG_NET_REGRESSION=1 because it boots QEMU against a host-served
+# SLIRP HTTP repo and asserts the full trust pipeline: ed25519 index
+# verification, tampered-index fail-closed reject, networked install
+# (index D: solver + per-blob SHA-256 vs the signed index), and bad-blob
+# reject before extraction. Needs curl/mbedtls/zlib/ca-certificates in
+# target/pkgcache (`cargo xtask port build curl`). Set the env var on
+# branches touching pkg-format's index module, userspace/pkg's networked
+# verbs, or `cargo xtask repo-index`.
+if [ "${M3OS_PKG_NET_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask pkg-net-smoke..."
+    cargo xtask pkg-net-smoke --timeout 300
+fi
+
 # Phase 101 — ACPI platform-foundation gate. Gated behind
 # M3OS_ACPI_REGRESSION=1 because it boots QEMU and asserts the full ACPI
 # pipeline at runtime: acpid fetches the FACP/DSDT via SYS_ACPI_TABLE_GET,

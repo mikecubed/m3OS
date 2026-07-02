@@ -317,6 +317,31 @@ pub fn meta_serialize(version: &str, deps: &[&str]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 107 Track B — networked-repo helpers (pure logic, host-tested)
+// ---------------------------------------------------------------------------
+
+/// Parse `/etc/pkg/repos.conf`: one repo base URL per line, `#` comments and
+/// blank lines skipped, trailing `/` trimmed so `<base>/<file>` joins cleanly.
+pub fn parse_repos_conf(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.trim_end_matches('/').into())
+        .collect()
+}
+
+/// Build the dependency map [`topo_install_order`] consumes from a parsed
+/// index — the networked analogue of reading `.meta` sidecars.
+pub fn index_dep_map(
+    entries: &[pkg_format::index::IndexEntry],
+) -> alloc::collections::BTreeMap<String, Vec<String>> {
+    entries
+        .iter()
+        .map(|e| (e.name.clone(), e.deps.clone()))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Dependency solver — topological install order
 // ---------------------------------------------------------------------------
 
@@ -710,5 +735,44 @@ mod tests {
         let deps = deps_map(&[("ncurses", &[])]);
         let order = topo_install_order("ncurses", &deps, &BTreeSet::new()).unwrap();
         assert_eq!(order, vec!["ncurses".to_string()]);
+    }
+
+    // -- Phase 107: networked-repo helpers -----------------------------------
+
+    #[test]
+    fn repos_conf_skips_comments_and_trims_slashes() {
+        let conf = "# repos\n\nhttps://example.com/repo/\n  http://10.0.2.100:80/good  \n";
+        assert_eq!(
+            parse_repos_conf(conf),
+            vec![
+                "https://example.com/repo".to_string(),
+                "http://10.0.2.100:80/good".to_string()
+            ]
+        );
+        assert!(parse_repos_conf("# only comments\n").is_empty());
+    }
+
+    #[test]
+    fn solver_runs_from_index_dep_fields() {
+        // The charter's acceptance: topo_install_order fed from index `D:`
+        // records — tmux depends on libevent, both fetched from the index.
+        let hex64: String = core::iter::repeat('a').take(64).collect();
+        let entry = |name: &str, deps: &[&str]| pkg_format::index::IndexEntry {
+            name: name.into(),
+            version: "1".into(),
+            key: hex64.clone(),
+            size: 1,
+            sha256: hex64.clone(),
+            url: "x.m3pkg".into(),
+            deps: deps.iter().map(|d| (*d).into()).collect(),
+        };
+        let entries = vec![entry("tmux", &["libevent"]), entry("libevent", &[])];
+        let deps = index_dep_map(&entries);
+        let order = topo_install_order("tmux", &deps, &BTreeSet::new()).unwrap();
+        assert_eq!(
+            order,
+            vec!["libevent".to_string(), "tmux".to_string()],
+            "dep must precede dependent"
+        );
     }
 }
