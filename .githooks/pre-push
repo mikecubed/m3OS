@@ -291,6 +291,19 @@ if [ "${M3OS_CLIPBOARD_REGRESSION:-0}" = "1" ]; then
     cargo xtask clipboard-smoke --timeout 120
 fi
 
+# Phase 105 Track C — screen-capture gate. Gated behind
+# M3OS_SCREENSHOT_REGRESSION=1 because it boots the graphical stack and runs
+# the screenshot tool, which asks the compositor to blit the composited frame
+# into a client SHM (CaptureOutput), PNG-encodes it, writes the file, and
+# re-reads + decodes it to prove the round-trip is lossless. Set the env var
+# on branches touching the CaptureOutput protocol verb, kernel-core's capture
+# packer, display_server's capture blit, the imagefmt encoder/decoder, or
+# desktop_client's capture_output.
+if [ "${M3OS_SCREENSHOT_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask screenshot-smoke..."
+    cargo xtask screenshot-smoke --timeout 120
+fi
+
 # Phase 77 — htop process-list regression gate. Gated behind
 # M3OS_HTOP_REGRESSION=1 because the gate cross-compiles the ncurses +
 # htop ports and boots the graphical stack headlessly (QMP + VNC), then

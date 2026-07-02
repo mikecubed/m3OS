@@ -18,6 +18,9 @@ extern crate alloc;
 
 pub mod auth;
 pub mod config;
-pub mod image;
+/// Phase 105 Track C — the image decoders + blitter moved into the shared
+/// `imagefmt` crate; re-exported here so `greeter::image::…` paths (and the
+/// greeter's own render code) keep working unchanged.
+pub use imagefmt as image;
 pub mod render;
 pub mod session_desc;

@@ -227,12 +227,16 @@ members = [
     # SHM, text rendering) consumed by bar / launcher / notifyd /
     # lockscreen.
     "userspace/lib/desktop_client",
+    # Phase 105 Track C — shared image codecs (BMP/PNG/JPEG decode, PNG encode).
+    "userspace/lib/imagefmt",
     # Phase 105 Track A — immediate-mode GUI widget toolkit on desktop_client.
     "userspace/lib/m3ui",
     # Phase 105 Track A.7 — m3ui demo Toplevel (toolkit-render-probe).
     "userspace/m3ui-demo",
     # Phase 105 Track B.4 — two-client clipboard round-trip (clipboard-smoke).
     "userspace/clip-smoke",
+    # Phase 105 Track C.5 — screen capture to PNG (screenshot-smoke).
+    "userspace/screenshot",
     # Phase 76 — dynamic linker (no_std PIE). Phase 76 ships the
     # transfer-only stub; Phase 76b grows it into a real bring-up
     # linker that walks DT_NEEDED and applies relocations.

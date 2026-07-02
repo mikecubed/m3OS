@@ -1,8 +1,27 @@
-//! Phase 71 Track B — image decoders + scale-to-fit blitter.
+//! `imagefmt` — image decoders + a scale-to-fit blitter + a PNG encoder
+//! (Phase 105 Track C; the decoders originate in Phase 71 Track B's
+//! greeter).
 //!
-//! Both decoders produce a `Vec<u32>` of BGRA8888 pixels at the
-//! decoded dimensions so the blitter can paint into the surface buffer
-//! without a per-pixel format conversion.
+//! All decoders produce a `Vec<u32>` of BGRA8888 pixels at the decoded
+//! dimensions so a compositor client can paint into a surface buffer
+//! without a per-pixel format conversion. Extracted from the greeter into
+//! a shared crate so `greeter`, `imgview`, and `screenshot` reuse one
+//! implementation instead of duplicating codecs per app.
+//!
+//! - [`decode_bmp`] / [`decode_png`] — the greeter's original decoders.
+//! - [`jpeg::decode_jpeg`] — a `no_std` baseline JPEG decoder (Track C.2).
+//! - [`png_encode::encode_png`] — the first encoder in the tree (Track C.3).
+//! - [`blit_scale_to_fit`] — aspect-preserving blit into a surface.
+
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
+
+pub mod jpeg;
+pub mod png_encode;
+
+pub use jpeg::decode_jpeg;
+pub use png_encode::encode_png;
 
 use alloc::vec;
 use alloc::vec::Vec;

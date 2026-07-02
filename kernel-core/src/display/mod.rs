@@ -8,6 +8,7 @@
 //! and each client library.
 
 pub mod buffer;
+pub mod capture;
 pub mod clipboard;
 pub mod compose;
 pub mod control;
