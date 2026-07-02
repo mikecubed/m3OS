@@ -1398,6 +1398,226 @@ pub fn cmd_port_list() -> i32 {
     0
 }
 
+// ---------------------------------------------------------------------------
+// Phase 107 Track C — `cargo xtask repo-index`: emit + sign the repo index
+// ---------------------------------------------------------------------------
+
+/// Load an ed25519 signing seed from a file: either 32 raw bytes or 64 hex
+/// characters (whitespace-trimmed).
+fn load_signing_seed(path: &Path) -> Result<[u8; 32], String> {
+    let raw = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    if raw.len() == 32 {
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&raw);
+        return Ok(seed);
+    }
+    let text: String = String::from_utf8_lossy(&raw)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let mut seed = [0u8; 32];
+        for (i, chunk) in text.as_bytes().chunks(2).enumerate() {
+            let hi = (chunk[0] as char).to_digit(16).unwrap() as u8;
+            let lo = (chunk[1] as char).to_digit(16).unwrap() as u8;
+            seed[i] = (hi << 4) | lo;
+        }
+        return Ok(seed);
+    }
+    Err(format!(
+        "{}: expected 32 raw bytes or 64 hex chars, got {} bytes",
+        path.display(),
+        raw.len()
+    ))
+}
+
+/// `cargo xtask repo-index --gen-key <path>` — generate an ed25519 keypair:
+/// the seed (hex) at `<path>` (chmod 0600; NEVER commit it — it becomes the
+/// `M3OS_PKG_SIGNING_KEY` GitHub Actions secret) and the 32-byte raw public
+/// key at `<path>.pub` (committed in-repo + baked into the image at
+/// `/etc/pkg/keys/m3os-pkgs.pub`).
+fn repo_index_gen_key(path: &Path) -> i32 {
+    let mut seed = [0u8; 32];
+    let mut f = match File::open("/dev/urandom") {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("repo-index: open /dev/urandom: {e}");
+            return 1;
+        }
+    };
+    if f.read_exact(&mut seed).is_err() {
+        eprintln!("repo-index: short read from /dev/urandom");
+        return 1;
+    }
+    let key = crypto_lib::asymmetric::ed25519_signing_key_from_bytes(&seed);
+    let pubkey = key.verifying_key().to_bytes();
+    let seed_hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+    if let Err(e) = fs::write(path, format!("{seed_hex}\n")) {
+        eprintln!("repo-index: write {}: {e}", path.display());
+        return 1;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    let pub_path = PathBuf::from(format!("{}.pub", path.display()));
+    if let Err(e) = fs::write(&pub_path, pubkey) {
+        eprintln!("repo-index: write {}: {e}", pub_path.display());
+        return 1;
+    }
+    println!(
+        "repo-index: seed (SECRET — set as M3OS_PKG_SIGNING_KEY): {}",
+        path.display()
+    );
+    println!(
+        "repo-index: public key (32 raw bytes, commit + bake): {}",
+        pub_path.display()
+    );
+    let pub_hex: String = pubkey.iter().map(|b| format!("{b:02x}")).collect();
+    println!("repo-index: pubkey hex: {pub_hex}");
+    0
+}
+
+/// `cargo xtask repo-index [--out <dir>] [--gen-key <path>]` — walk the
+/// content-addressed `target/pkgcache/` for every recipe port, emit the
+/// deterministic `index.m3idx`, stage `<key>.m3pkg` blobs beside it, and
+/// ed25519-sign the index with the seed named by `M3OS_PKG_SIGNING_KEY`
+/// (path to 32 raw bytes or 64 hex chars). Without the env var the index
+/// is emitted unsigned with a warning — fine for local dry-runs, useless
+/// for distribution (the on-device `pkg update` is fail-closed).
+pub fn cmd_repo_index(args: &[String]) -> i32 {
+    // --gen-key mode.
+    if let Some(pos) = args.iter().position(|a| a == "--gen-key") {
+        let Some(path) = args.get(pos + 1) else {
+            eprintln!("Usage: cargo xtask repo-index --gen-key <path>");
+            return 1;
+        };
+        return repo_index_gen_key(Path::new(path));
+    }
+
+    let root = workspace_root();
+    let out_dir = match args.iter().position(|a| a == "--out") {
+        Some(pos) => match args.get(pos + 1) {
+            Some(p) => PathBuf::from(p),
+            None => {
+                eprintln!("Usage: cargo xtask repo-index [--out <dir>]");
+                return 1;
+            }
+        },
+        None => root.join("target/repo"),
+    };
+    if let Err(e) = fs::create_dir_all(&out_dir) {
+        eprintln!("repo-index: create {}: {e}", out_dir.display());
+        return 1;
+    }
+
+    let mut entries: Vec<pkg_format::index::IndexEntry> = Vec::new();
+    let mut staged = 0usize;
+    let mut skipped = 0usize;
+    for &name in BUILDABLE_PORTS {
+        let artifact = match pkgcache_artifact_path(name) {
+            Ok(p) => p,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        if !artifact.exists() {
+            skipped += 1;
+            continue;
+        }
+        let bytes = match fs::read(&artifact) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("repo-index: read {}: {e}", artifact.display());
+                return 1;
+            }
+        };
+        if !pkg_format::verify(&bytes) {
+            eprintln!(
+                "repo-index: {} fails pkg_format::verify — refusing to index a corrupt blob",
+                artifact.display()
+            );
+            return 1;
+        }
+        let key = artifact
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let sha256 = pkg_format::to_hex(&pkg_format::content_hash(&bytes));
+        let version = port_version(name).unwrap_or_else(|| "0".to_string());
+        let deps: Vec<String> = port_deps(name).iter().map(|d| d.to_string()).collect();
+        let url = format!("{key}.m3pkg");
+        let dest = out_dir.join(&url);
+        if let Err(e) = fs::copy(&artifact, &dest) {
+            eprintln!("repo-index: stage {}: {e}", dest.display());
+            return 1;
+        }
+        entries.push(pkg_format::index::IndexEntry {
+            name: name.to_string(),
+            version,
+            key,
+            size: bytes.len() as u64,
+            sha256,
+            url,
+            deps,
+        });
+        staged += 1;
+    }
+
+    let index_text = pkg_format::index::serialize_index(&entries);
+    let index_path = out_dir.join("index.m3idx");
+    if let Err(e) = fs::write(&index_path, &index_text) {
+        eprintln!("repo-index: write {}: {e}", index_path.display());
+        return 1;
+    }
+
+    match std::env::var("M3OS_PKG_SIGNING_KEY") {
+        Ok(key_path) => {
+            let seed = match load_signing_seed(Path::new(&key_path)) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("repo-index: signing key: {e}");
+                    return 1;
+                }
+            };
+            let key = crypto_lib::asymmetric::ed25519_signing_key_from_bytes(&seed);
+            let sig = crypto_lib::asymmetric::ed25519_sign(&key, index_text.as_bytes());
+            let sig_path = out_dir.join("index.m3idx.sig");
+            if let Err(e) = fs::write(&sig_path, sig) {
+                eprintln!("repo-index: write {}: {e}", sig_path.display());
+                return 1;
+            }
+            // Self-verify: parse what we wrote and check the signature with
+            // the derived public key — the exact check `pkg update` runs.
+            if pkg_format::index::parse_index(&index_text).is_err() {
+                eprintln!("repo-index: self-verify FAILED — emitted index does not parse");
+                return 1;
+            }
+            let vk = key.verifying_key();
+            if !crypto_lib::asymmetric::ed25519_verify(&vk, index_text.as_bytes(), &sig) {
+                eprintln!("repo-index: self-verify FAILED — signature does not verify");
+                return 1;
+            }
+            println!(
+                "repo-index: {staged} package(s) indexed + signed ({skipped} recipe port(s) \
+                 not in pkgcache) → {}",
+                out_dir.display()
+            );
+        }
+        Err(_) => {
+            println!(
+                "repo-index: {staged} package(s) indexed UNSIGNED ({skipped} recipe port(s) \
+                 not in pkgcache) → {} — set M3OS_PKG_SIGNING_KEY to sign",
+                out_dir.display()
+            );
+        }
+    }
+    0
+}
+
 /// `cargo xtask port build all` — build every recipe port in dependency order,
 /// skipping pkgcache hits. A failed port causes its (in-set) dependents to be
 /// skipped; the run continues and prints a PASS/FAIL/SKIP summary. Exit code is
@@ -7679,6 +7899,65 @@ mod tests {
     }
 
     // ── B.2 — port_deps ──────────────────────────────────────────────────
+
+    #[test]
+    /// Phase 107 — the index-level trust chain: sign the exact serialized
+    /// index text, verify it, and reject any flipped byte in either the
+    /// index or the signature (the `pkg update` fail-closed contract).
+    #[test]
+    fn repo_index_sign_verify_and_tamper_reject() {
+        let hex64: String = "ab".repeat(32);
+        let entries = vec![pkg_format::index::IndexEntry {
+            name: "tmux".to_string(),
+            version: "3.4".to_string(),
+            key: hex64.clone(),
+            size: 42,
+            sha256: hex64.clone(),
+            url: format!("{hex64}.m3pkg"),
+            deps: vec!["libevent".to_string()],
+        }];
+        let text = pkg_format::index::serialize_index(&entries);
+        let seed = [7u8; 32];
+        let key = crypto_lib::asymmetric::ed25519_signing_key_from_bytes(&seed);
+        let sig = crypto_lib::asymmetric::ed25519_sign(&key, text.as_bytes());
+        let vk = key.verifying_key();
+        assert!(crypto_lib::asymmetric::ed25519_verify(
+            &vk,
+            text.as_bytes(),
+            &sig
+        ));
+        // Emitted text still parses (the repo-index self-verify pair).
+        assert_eq!(pkg_format::index::parse_index(&text).unwrap().len(), 1);
+        // Flip one byte of the index → reject.
+        let mut bent = text.clone().into_bytes();
+        bent[text.len() / 2] ^= 0x01;
+        assert!(!crypto_lib::asymmetric::ed25519_verify(&vk, &bent, &sig));
+        // Flip one byte of the signature → reject.
+        let mut bent_sig = sig;
+        bent_sig[10] ^= 0x80;
+        assert!(!crypto_lib::asymmetric::ed25519_verify(
+            &vk,
+            text.as_bytes(),
+            &bent_sig
+        ));
+    }
+
+    /// Phase 107 — `load_signing_seed` accepts both on-disk encodings.
+    #[test]
+    fn signing_seed_accepts_raw_and_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw_path = dir.path().join("raw");
+        let hex_path = dir.path().join("hex");
+        let seed: [u8; 32] = core::array::from_fn(|i| i as u8);
+        fs::write(&raw_path, seed).unwrap();
+        let hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+        fs::write(&hex_path, format!("{hex}\n")).unwrap();
+        assert_eq!(load_signing_seed(&raw_path).unwrap(), seed);
+        assert_eq!(load_signing_seed(&hex_path).unwrap(), seed);
+        let bad = dir.path().join("bad");
+        fs::write(&bad, "nope").unwrap();
+        assert!(load_signing_seed(&bad).is_err());
+    }
 
     #[test]
     fn port_deps_known_ports() {

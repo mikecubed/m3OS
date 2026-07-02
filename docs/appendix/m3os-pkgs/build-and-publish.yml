@@ -1,0 +1,78 @@
+# Phase 107 Track C — CI publish pipeline for the public `m3os-pkgs` repo.
+#
+# Copy this file to `.github/workflows/build-and-publish.yml` in a separate
+# PUBLIC repository (GitHub Releases are $0 for public repos: no bandwidth
+# charge, no total-size cap, 2 GiB/asset). Setup, once:
+#
+#   1. Create the public repo (e.g. mikecubed/m3os-pkgs) and push this file.
+#   2. Add the ed25519 signing seed as an Actions secret named
+#      M3OS_PKG_SIGNING_KEY_HEX (the 64-hex-char line from
+#      `cargo xtask repo-index --gen-key`; the matching public key is
+#      committed in the m3OS tree at keys/m3os-pkgs.pub and baked into the
+#      image at /etc/pkg/keys/m3os-pkgs.pub).
+#   3. Create the rolling release once: `gh release create repo-x86_64
+#      --title "m3OS x86_64 package repo" --notes "rolling"` (the tag name
+#      is what /etc/pkg/repos.conf points at:
+#      https://github.com/<owner>/m3os-pkgs/releases/download/repo-x86_64).
+#
+# The pkgcache is content-addressed (pkg_format::compute_package_key), so
+# `actions/cache` means an unchanged port is never rebuilt or re-uploaded —
+# only changed-key blobs move.
+
+name: build-and-publish
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 1" # weekly rebuild sweep (toolchain/rebuild drift)
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release upload
+    steps:
+      - name: Check out m3OS source
+        uses: actions/checkout@v4
+        with:
+          repository: mikecubed/m3OS
+          ref: main
+
+      - name: Install Rust toolchain
+        run: rustup show # rust-toolchain.toml pins the version
+
+      - name: Install musl cross toolchain + build deps
+        # The ports build needs x86_64-linux-musl-gcc (see
+        # docs/appendix/codebase-map.md for accepted toolchains) plus
+        # debugfs/e2fsprogs for image tooling. musl-tools provides
+        # musl-gcc; the shared musl-toolchain plumbing in
+        # xtask/src/port_build.rs handles missing static-compat archives.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools e2fsprogs qemu-utils
+
+      - name: Restore content-addressed pkgcache
+        uses: actions/cache@v4
+        with:
+          path: target/pkgcache
+          key: pkgcache-${{ runner.os }}-${{ hashFiles('ports/**', 'xtask/src/port_build.rs') }}
+          restore-keys: |
+            pkgcache-${{ runner.os }}-
+
+      - name: Build all recipe ports (pkgcache hits skip)
+        run: cargo xtask port build all
+
+      - name: Emit + sign the repo index
+        env:
+          M3OS_PKG_SIGNING_KEY_HEX: ${{ secrets.M3OS_PKG_SIGNING_KEY_HEX }}
+        run: |
+          umask 077
+          printf '%s' "$M3OS_PKG_SIGNING_KEY_HEX" > /tmp/signing-key
+          M3OS_PKG_SIGNING_KEY=/tmp/signing-key cargo xtask repo-index --out target/repo
+          rm -f /tmp/signing-key
+
+      - name: Upload to the rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload repo-x86_64 target/repo/* \
+            --repo "$GITHUB_REPOSITORY" --clobber

@@ -1559,6 +1559,7 @@ dependencies = [
 name = "pkg"
 version = "0.99.0"
 dependencies = [
+ "crypto-lib",
  "pkg-format",
  "syscall-lib",
 ]
@@ -2942,6 +2943,7 @@ version = "0.99.0"
 dependencies = [
  "anyhow",
  "bootloader",
+ "crypto-lib",
  "fatfs",
  "gpt",
  "passwd",

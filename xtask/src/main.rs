@@ -207,6 +207,11 @@ const SMOKE_EXIT_TUI_APP_SMOKE_FAILED: i32 = 69;
 /// the offline `/usr/pkg/` repo, and asserts `pkg list`/`pkg verify` see it.
 const SMOKE_EXIT_PKG_SMOKE_FAILED: i32 = 73;
 
+/// Phase 107 — `cargo xtask pkg-net-smoke` exit code (networked + signed
+/// package distribution: index verify, tamper-reject, fetch+SHA-check,
+/// bad-blob-reject).
+const SMOKE_EXIT_PKG_NET_SMOKE_FAILED: i32 = 96;
+
 /// Phase 85b — `cargo xtask git-local-smoke` exit code. Distinct from the other
 /// gates so CI can route a git-workflow failure separately. Boots m3OS,
 /// `pkg install git` from the bundled `.m3pkg`, then drives a scripted local
@@ -1135,6 +1140,18 @@ fn main() {
             });
             cmd_pkg_smoke(&smoke_args);
         }
+        // Phase 107 — networked + signed package distribution: serves a
+        // freshly-signed index + blobs over SLIRP HTTP and asserts
+        // update-verify, tamper-reject, networked install, bad-blob-reject.
+        Some("pkg-net-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("pkg-net-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_pkg_net_smoke(&smoke_args);
+        }
         // Phase 85b — `cargo xtask git-local-smoke` boots m3OS, installs the
         // bundled `git` `.m3pkg` via `pkg install git` (as of 86c the
         // HTTPS-capable build pulling the curl chain), then drives a scripted
@@ -1432,6 +1449,11 @@ fn main() {
         // builds. `cargo xtask port build <name>` fetches the upstream
         // tarball, verifies SHA-256, applies patches, and cross-compiles
         // for x86_64-linux-musl. Outputs stage to target/port-stage/<name>.
+        // Phase 107 Track C — emit + ed25519-sign the networked repo index
+        // from target/pkgcache/ (`--gen-key <path>` generates the keypair).
+        Some("repo-index") => {
+            std::process::exit(port_build::cmd_repo_index(&args[2..]));
+        }
         Some("port") => match args.get(2).map(String::as_str) {
             Some("build") => {
                 let name = args.get(3).cloned().unwrap_or_else(|| {
@@ -18149,6 +18171,425 @@ fn termios_smoke_steps() -> Vec<SmokeStep> {
 /// install/list/verify/upgrade/remove + solver against bundled `.m3pkg`
 /// artifacts) and exercises the full D.1 staging round-trip (pack at build →
 /// bundle into the image → unpack/install in-OS).
+/// Phase 107 Track D — `pkg-net-smoke`: the CI-deterministic core of the
+/// networked + signed package pipeline, no real internet required.
+///
+/// The gate generates a **per-run ed25519 keypair**, packs two synthetic
+/// packages (`nettest` → `netdep`), signs three index variants, and serves
+/// them from a host HTTP thread the guest reaches at `10.0.2.100:80` over
+/// SLIRP `guestfwd` (the `node-smoke`/`go-runtime-smoke` pattern). The data
+/// disk is built with `M3OS_PKG_TEST_PUBKEY`/`M3OS_PKG_TEST_REPO_URL` so
+/// the image trusts the session key and points at the host server. Then,
+/// on-device:
+///
+/// 1. `pkg install curl` — the fetch transport, from the bundled repo.
+/// 2. `pkg update` — fetches `/good`, ed25519-verifies, caches.
+/// 3. `pkg update <tampered>` — flipped index byte → **rejected** fail-closed.
+/// 4. `pkg install nettest` — resolves `netdep` from index `D:`, fetches
+///    both blobs, SHA-256-checks each, installs; payload file readable.
+/// 5. `pkg update <bad>` + `pkg install badpkg` — valid signature but the
+///    served blob's hash ≠ index `C:` → **rejected before extraction**.
+///
+/// The live-HTTPS arm (real GitHub Releases repo) is opt-in via
+/// `M3OS_PKG_NET=1` and intentionally not part of this deterministic core.
+fn cmd_pkg_net_smoke(args: &SmokeBootArgs) {
+    use std::io::{Read as _, Write as _};
+
+    // ---- Preconditions: bundled curl chain must exist in pkgcache --------
+    if let Err(msg) = port_build::build_phase_69d_ports() {
+        eprintln!("pkg-net-smoke: precondition failed (port build): {msg}");
+        std::process::exit(SMOKE_EXIT_PKG_NET_SMOKE_FAILED);
+    }
+    for dep in ["curl", "mbedtls", "zlib", "ca-certificates"] {
+        let ok = port_build::pkgcache_artifact_path(dep)
+            .map(|p| p.exists())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!(
+                "pkg-net-smoke: {dep}.m3pkg not in target/pkgcache — run \
+                 `cargo xtask port build curl` first (the guest fetch transport)"
+            );
+            std::process::exit(SMOKE_EXIT_PKG_NET_SMOKE_FAILED);
+        }
+    }
+
+    let root = workspace_root();
+    let work = root.join("target/pkg-net-smoke");
+    let _ = fs::remove_dir_all(&work);
+    fs::create_dir_all(&work).expect("create pkg-net-smoke workdir");
+
+    // ---- Session keypair (no secrets: fresh per run) ----------------------
+    let mut seed = [0u8; 32];
+    File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut seed))
+        .expect("read /dev/urandom");
+    let signing_key = crypto_lib::asymmetric::ed25519_signing_key_from_bytes(&seed);
+    let pubkey_path = work.join("test-key.pub");
+    fs::write(&pubkey_path, signing_key.verifying_key().to_bytes()).expect("write test pubkey");
+
+    // ---- Two synthetic packages: nettest depends on netdep ----------------
+    let mk_pkg = |name: &str, payload: &str| -> (Vec<u8>, String) {
+        let stage = work.join(format!("stage-{name}"));
+        let dir = stage.join("usr/local/share/pkg-net-smoke");
+        fs::create_dir_all(&dir).expect("stage dir");
+        fs::write(dir.join(format!("{name}.txt")), payload).expect("stage payload");
+        let blob = pkg_format::pack(&stage).expect("pack synthetic pkg");
+        let sha = pkg_format::to_hex(&pkg_format::content_hash(&blob));
+        (blob, sha)
+    };
+    let (netdep_blob, netdep_sha) = mk_pkg("netdep", "m3os-pkg-net-netdep-payload\n");
+    let (nettest_blob, nettest_sha) = mk_pkg("nettest", "m3os-pkg-net-nettest-payload\n");
+
+    let entry = |name: &str, sha: &str, size: usize, deps: &[&str]| pkg_format::index::IndexEntry {
+        name: name.to_string(),
+        version: "1.0".to_string(),
+        key: sha.to_string(), // content-addressed: key = blob SHA-256
+        size: size as u64,
+        sha256: sha.to_string(),
+        url: format!("{sha}.m3pkg"),
+        deps: deps.iter().map(|d| d.to_string()).collect(),
+    };
+
+    // /good — the real index over the two blobs.
+    let good_entries = vec![
+        entry("netdep", &netdep_sha, netdep_blob.len(), &[]),
+        entry("nettest", &nettest_sha, nettest_blob.len(), &["netdep"]),
+    ];
+    let good_index = pkg_format::index::serialize_index(&good_entries);
+    let good_sig = crypto_lib::asymmetric::ed25519_sign(&signing_key, good_index.as_bytes());
+
+    // /tampered — one flipped byte in the index text, the GOOD signature.
+    let mut tampered_index = good_index.clone().into_bytes();
+    let flip = tampered_index.len() / 2;
+    tampered_index[flip] ^= 0x20;
+
+    // /bad — a validly-signed index whose C: hash does not match the blob
+    // it points at (the bad-blob / substituted-download case).
+    let wrong_sha = "0".repeat(64);
+    let bad_entries = vec![pkg_format::index::IndexEntry {
+        name: "badpkg".to_string(),
+        version: "1.0".to_string(),
+        key: wrong_sha.clone(),
+        size: 17,
+        sha256: wrong_sha.clone(),
+        url: "badpkg.m3pkg".to_string(),
+        deps: vec![],
+    }];
+    let bad_index = pkg_format::index::serialize_index(&bad_entries);
+    let bad_sig = crypto_lib::asymmetric::ed25519_sign(&signing_key, bad_index.as_bytes());
+
+    // ---- Host HTTP server on an ephemeral loopback port -------------------
+    let mut routes: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    routes.insert("/good/index.m3idx".into(), good_index.clone().into_bytes());
+    routes.insert("/good/index.m3idx.sig".into(), good_sig.to_vec());
+    routes.insert(format!("/good/{netdep_sha}.m3pkg"), netdep_blob);
+    routes.insert(format!("/good/{nettest_sha}.m3pkg"), nettest_blob);
+    routes.insert("/tampered/index.m3idx".into(), tampered_index);
+    routes.insert("/tampered/index.m3idx.sig".into(), good_sig.to_vec());
+    routes.insert("/bad/index.m3idx".into(), bad_index.into_bytes());
+    routes.insert("/bad/index.m3idx.sig".into(), bad_sig.to_vec());
+    routes.insert(
+        "/bad/badpkg.m3pkg".into(),
+        b"definitely not that blob".to_vec(),
+    );
+    let routes = std::sync::Arc::new(routes);
+
+    // FIXED port: the guest reaches this server at http://10.0.2.2:18923
+    // (10.0.2.2 = the SLIRP host alias). guestfwd is deliberately NOT used:
+    // libslirp's guestfwd completes the guest-side handshake itself but
+    // only wires the FIRST flow to the tcp: target — every later
+    // connection "Connects" into a black hole (bisected 2026-07-02 with
+    // byte-identical back-to-back curl probes; reproduced at -smp 1, so
+    // not an SMP artifact). The host-alias path has no such limit, and a
+    // fixed port keeps every guest-side URL a &'static str.
+    const PKG_NET_SMOKE_PORT: u16 = 18923;
+    let listener =
+        std::net::TcpListener::bind(("127.0.0.1", PKG_NET_SMOKE_PORT)).unwrap_or_else(|e| {
+            eprintln!(
+                "pkg-net-smoke: cannot bind 127.0.0.1:{PKG_NET_SMOKE_PORT} ({e}) — \
+                 something else holds the fixed gate port"
+            );
+            std::process::exit(SMOKE_EXIT_PKG_NET_SMOKE_FAILED);
+        });
+    let http_port = listener.local_addr().unwrap().port();
+    {
+        let routes = routes.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let routes = routes.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 2048];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    eprintln!("pkg-net-smoke: http GET {path}");
+                    match routes.get(&path) {
+                        Some(body) => {
+                            let hdr = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\
+                                 Content-Type: application/octet-stream\r\n\
+                                 Connection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = s.write_all(hdr.as_bytes());
+                            let _ = s.write_all(body);
+                        }
+                        None => {
+                            let _ = s.write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\
+                                  Connection: close\r\n\r\n",
+                            );
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    // ---- Build the image with the session trust root + repo URL -----------
+    // SAFETY (Rust 2024 set_var): single-threaded configuration phase — the
+    // HTTP thread above never reads the environment, and create_data_disk
+    // reads these in-process before any further threads start.
+    unsafe {
+        std::env::set_var("M3OS_PKG_TEST_PUBKEY", pubkey_path.display().to_string());
+        std::env::set_var("M3OS_PKG_TEST_REPO_URL", "http://10.0.2.2:18923/good");
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+    unsafe {
+        std::env::remove_var("M3OS_PKG_TEST_PUBKEY");
+        std::env::remove_var("M3OS_PKG_TEST_REPO_URL");
+    }
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    // Strip hostfwd to avoid port conflicts in CI (same as device-smoke).
+    // No guestfwd (see the fixed-port comment above) and no -smp pin: this
+    // gate runs the Phase-99 default core count on purpose — a package
+    // manager that only fetches single-core is not a package manager.
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let steps = pkg_net_smoke_steps();
+    println!(
+        "pkg-net-smoke: launching QEMU (timeout {}s, {} steps, repo on 127.0.0.1:{http_port})",
+        args.timeout_secs,
+        steps.len()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "pkg-net-smoke: PASSED ({} steps in {elapsed}s) — signed index verified, \
+                 tampered index rejected fail-closed, networked install fetched + \
+                 SHA-checked via the index D: solver, and a bad blob was rejected \
+                 before extraction",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("pkg-net-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_PKG_NET_SMOKE_FAILED);
+        }
+    }
+
+    if std::env::var("M3OS_PKG_NET").as_deref() == Ok("1") {
+        println!(
+            "pkg-net-smoke: NOTE — live HTTPS arm (M3OS_PKG_NET=1) is validated manually: \
+             boot `cargo xtask run`, then `pkg install curl && pkg update && pkg install <name>` \
+             against the published GitHub Releases repo (docs/appendix/m3os-pkgs/)"
+        );
+    } else {
+        println!("pkg-net-smoke: live HTTPS arm SKIPPED (set M3OS_PKG_NET=1 after publishing)");
+    }
+}
+
+fn pkg_net_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/pkg-net-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // 1. The fetch transport: curl (+ mbedtls/zlib/ca-certificates deps)
+    //    installs from the bundled offline repo — the Phase 85a path.
+    steps.push(SmokeStep::Send {
+        input: "pkg install curl\n",
+        label: "pkg-net-smoke: install curl transport",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "pkg install: curl: OK",
+        fail_prefixes: &["pkg install: cannot", "pkg install: integrity"],
+        timeout_secs: 180,
+        label: "pkg-net-smoke: curl installed",
+        exit_code_on_fail: SMOKE_EXIT_PKG_NET_SMOKE_FAILED,
+    });
+
+    // 1b. Transport sanity: drive curl DIRECTLY from the shell against the
+    //     SLIRP-served repo before involving pkg's spawn seam. `-v` traces
+    //     resolve/connect/request phases to stderr, so a hang localizes.
+    steps.push(SmokeStep::Send {
+        input: "curl -sS -v -o /tmp/idx.probe http://10.0.2.2:18923/good/index.m3idx\n",
+        label: "pkg-net-smoke: direct curl transport probe",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "HTTP/1.1 200",
+        timeout_secs: 60,
+        label: "pkg-net-smoke: transport probe got HTTP 200",
+    });
+    // 1c. SECOND connection, byte-identical flags to the working probe:
+    //     tests whether SLIRP guestfwd serves more than one TCP
+    //     connection per boot (every prior in-tree gate makes exactly
+    //     one). `-w` prints the marker+code ONLY on completion, so the
+    //     wait cannot false-match the tty input echo.
+    steps.push(SmokeStep::Send {
+        input: "curl -sS -v -o /tmp/p2 -w 'P2DONE %{http_code}\\n' http://10.0.2.2:18923/good/index.m3idx\n",
+        label: "pkg-net-smoke: probe 2 (second connection, same flags)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "P2DONE 200",
+        timeout_secs: 45,
+        label: "pkg-net-smoke: second guestfwd connection works",
+    });
+
+    // 2. `pkg update` against /good: fetch + ed25519 verify + cache.
+    steps.push(SmokeStep::Send {
+        input: "pkg update\n",
+        label: "pkg-net-smoke: pkg update (good repo)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "pkg update: index verified (2 packages)",
+        fail_prefixes: &["pkg update: signature", "pkg update: fetch failed"],
+        timeout_secs: 60,
+        label: "pkg-net-smoke: signed index verified",
+        exit_code_on_fail: SMOKE_EXIT_PKG_NET_SMOKE_FAILED,
+    });
+
+    // 3. Tampered index (flipped byte, real signature) → fail-closed reject.
+    steps.push(SmokeStep::Send {
+        input: "pkg update http://10.0.2.2:18923/tampered\n",
+        label: "pkg-net-smoke: pkg update (tampered repo)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "pkg update: signature verification FAILED - keeping previous index",
+        timeout_secs: 60,
+        label: "pkg-net-smoke: tampered index rejected",
+    });
+
+    // 4. Networked install: nettest resolves netdep from the index D:
+    //    fields, fetches both blobs, SHA-checks each, installs dep-first.
+    steps.push(SmokeStep::Send {
+        input: "pkg install nettest\n",
+        label: "pkg-net-smoke: networked install nettest",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "pkg install: netdep: OK",
+        fail_prefixes: &[
+            "pkg install: netdep: SHA-256 MISMATCH",
+            "pkg install: netdep: fetch failed",
+        ],
+        timeout_secs: 90,
+        label: "pkg-net-smoke: netdep fetched + installed first",
+        exit_code_on_fail: SMOKE_EXIT_PKG_NET_SMOKE_FAILED,
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "pkg install: nettest: OK",
+        fail_prefixes: &[
+            "pkg install: nettest: SHA-256 MISMATCH",
+            "pkg install: nettest: fetch failed",
+        ],
+        timeout_secs: 90,
+        label: "pkg-net-smoke: nettest fetched + installed",
+        exit_code_on_fail: SMOKE_EXIT_PKG_NET_SMOKE_FAILED,
+    });
+    steps.push(SmokeStep::Send {
+        input: "cat /usr/local/share/pkg-net-smoke/nettest.txt\n",
+        label: "pkg-net-smoke: read installed payload",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "m3os-pkg-net-nettest-payload",
+        timeout_secs: 30,
+        label: "pkg-net-smoke: payload extracted to the filesystem",
+    });
+    steps.push(SmokeStep::Send {
+        input: "pkg list\n",
+        label: "pkg-net-smoke: list after networked install",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "nettest",
+        timeout_secs: 30,
+        label: "pkg-net-smoke: networked install recorded in the DB",
+    });
+
+    // 5. Bad blob: a validly-signed index whose C: hash does not match the
+    //    served bytes — rejected before extraction.
+    steps.push(SmokeStep::Send {
+        input: "pkg update http://10.0.2.2:18923/bad\n",
+        label: "pkg-net-smoke: pkg update (bad-blob repo)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "pkg update: index verified (1 packages)",
+        timeout_secs: 60,
+        label: "pkg-net-smoke: bad-blob repo index verifies (signature IS valid)",
+    });
+    steps.push(SmokeStep::Send {
+        input: "pkg install badpkg\n",
+        label: "pkg-net-smoke: install badpkg (hash must mismatch)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "SHA-256 MISMATCH vs signed index - rejecting blob",
+        timeout_secs: 90,
+        label: "pkg-net-smoke: bad blob rejected before extraction",
+    });
+    steps
+}
+
 fn cmd_pkg_smoke(args: &SmokeBootArgs) {
     // Build the host ports so their `.m3pkg` artifacts exist for Track D to
     // bundle into `/usr/pkg/` (zero compiler invocations on a warm pkgcache).
@@ -27293,6 +27734,7 @@ fn populate_ext2_files(
     let resolv_conf_tmp = output_dir.join("_tmp_resolv_conf");
     let etc_hosts_tmp = output_dir.join("_tmp_etc_hosts");
     let gitconfig_tmp = output_dir.join("_tmp_gitconfig");
+    let pkg_repos_conf_tmp = output_dir.join("_tmp_pkg_repos_conf");
     let known_hosts_tmp = output_dir.join("_tmp_known_hosts");
     let fibonacci_py_tmp = output_dir.join("_tmp_fibonacci_py");
     let hello_c_tmp = output_dir.join("_tmp_hello_c");
@@ -27307,6 +27749,22 @@ fn populate_ext2_files(
     fs::write(&resolv_conf_tmp, resolv_conf_content).expect("write temp resolv.conf");
     fs::write(&etc_hosts_tmp, etc_hosts_content).expect("write temp etc/hosts");
     fs::write(&gitconfig_tmp, gitconfig_content).expect("write temp gitconfig");
+    // Phase 107 — networked pkg: the repo list and the index-signing trust
+    // root. Both are overridable for the pkg-net-smoke gate, which serves a
+    // freshly-signed index from a SLIRP host server under a per-run keypair:
+    // M3OS_PKG_TEST_REPO_URL replaces the default GitHub Releases base URL,
+    // M3OS_PKG_TEST_PUBKEY points at the gate's session public key.
+    let pkg_repos_conf_content = match std::env::var("M3OS_PKG_TEST_REPO_URL") {
+        Ok(url) => format!("# m3OS package repos — one base URL per line, # comments\n{url}\n"),
+        Err(_) => "# m3OS package repos — one base URL per line, # comments\n\
+                   https://github.com/mikecubed/m3os-pkgs/releases/download/repo-x86_64\n"
+            .to_string(),
+    };
+    fs::write(&pkg_repos_conf_tmp, pkg_repos_conf_content).expect("write temp pkg repos.conf");
+    let pkg_pubkey_src = match std::env::var("M3OS_PKG_TEST_PUBKEY") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => workspace_root().join("keys/m3os-pkgs.pub"),
+    };
     fs::write(&known_hosts_tmp, github_known_hosts_content).expect("write temp known_hosts");
     fs::write(&fibonacci_py_tmp, fibonacci_py_content).expect("write temp fibonacci.py");
     fs::write(&hello_c_tmp, hello_c_content).expect("write temp hello.c");
@@ -27950,6 +28408,18 @@ fn populate_ext2_files(
          sif etc/gitconfig mode 0x81A4\n\
          sif etc/gitconfig uid 0\n\
          sif etc/gitconfig gid 0\n\
+         mkdir etc/pkg\n\
+         sif etc/pkg mode 0x41ED\n\
+         mkdir etc/pkg/keys\n\
+         sif etc/pkg/keys mode 0x41ED\n\
+         write \"{pkg_repos_conf}\" etc/pkg/repos.conf\n\
+         sif etc/pkg/repos.conf mode 0x81A4\n\
+         sif etc/pkg/repos.conf uid 0\n\
+         sif etc/pkg/repos.conf gid 0\n\
+         write \"{pkg_pubkey}\" etc/pkg/keys/m3os-pkgs.pub\n\
+         sif etc/pkg/keys/m3os-pkgs.pub mode 0x81A4\n\
+         sif etc/pkg/keys/m3os-pkgs.pub uid 0\n\
+         sif etc/pkg/keys/m3os-pkgs.pub gid 0\n\
          sif root/.ssh mode 0x41C0\n\
          sif root/.ssh uid 0\n\
          sif root/.ssh gid 0\n\
@@ -28261,6 +28731,8 @@ fn populate_ext2_files(
         resolv_conf = resolv_conf_tmp.display(),
         etc_hosts = etc_hosts_tmp.display(),
         gitconfig = gitconfig_tmp.display(),
+        pkg_repos_conf = pkg_repos_conf_tmp.display(),
+        pkg_pubkey = pkg_pubkey_src.display(),
         known_hosts = known_hosts_tmp.display(),
         ssh_identity_cmds = ssh_identity_cmds,
         sshd_conf = sshd_conf_tmp.display(),
@@ -28371,6 +28843,7 @@ fn populate_ext2_files(
     let _ = fs::remove_file(&resolv_conf_tmp);
     let _ = fs::remove_file(&etc_hosts_tmp);
     let _ = fs::remove_file(&gitconfig_tmp);
+    let _ = fs::remove_file(&pkg_repos_conf_tmp);
     let _ = fs::remove_file(&known_hosts_tmp);
     // (_tmp_id_dropbear, _tmp_gh_token, _tmp_gh_hosts_yml, _tmp_claude_cred, and
     // _tmp_claude_json are scrubbed earlier — immediately after debugfs — so they
