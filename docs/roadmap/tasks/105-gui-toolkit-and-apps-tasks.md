@@ -1,6 +1,6 @@
 # Phase 105 — Native GUI Toolkit & Core Desktop Apps: Task List
 
-**Status:** In progress — **Track A landed and green** (`m3ui` toolkit: pure-logic layout solver + input/focus + text-edit + widgets, all host-tested via a `RecordingPainter` mock; `render` layer over `desktop_client`; `m3ui-demo` Toplevel; `toolkit-render-probe` PASS — the toolkit composes a widget frame and keyboard Enter activates the focused button + repaints the counter on the QMP/PPM framebuffer). Tracks B (clipboard) / C (imagefmt + screenshot) / D (imgview + settings; settings' Network/Display/Power sections gate on Phase 103/104) / E (TUI ports) are follow-ups. Handoff: `docs/handoffs/2026-07-02-phase-105-gui-toolkit.md`.
+**Status:** In progress — **Tracks A + B landed and green** (`m3ui` toolkit: pure-logic layout solver + input/focus + text-edit + widgets, all host-tested via a `RecordingPainter` mock; `render` layer over `desktop_client`; `m3ui-demo` Toplevel; `toolkit-render-probe` PASS — the toolkit composes a widget frame and keyboard Enter activates the focused button + repaints the counter on the QMP/PPM framebuffer). Tracks B (clipboard) / C (imagefmt + screenshot) / D (imgview + settings; settings' Network/Display/Power sections gate on Phase 103/104) / E (TUI ports) are follow-ups. Handoff: `docs/handoffs/2026-07-02-phase-105-gui-toolkit.md`.
 **Source Ref:** phase-105
 **Depends on:** Phase 100 (Bare-Metal GUI Session — compositor + session in init, WC framebuffer, USB-mouse cursor) ✅, Phase 99 (SMP & Scheduler Robustness) ✅ via 100. The **settings panel** is additionally sequenced after Phase 103 (power: brightness/battery) and Phase 104 (Wi-Fi AX201 + connect daemon); Tracks A/B/C and the `imgview` app are **not** gated on 103/104.
 **Goal:** Ship a minimal native immediate-mode Rust widget toolkit (`m3ui`) on `desktop_client`, a compositor-brokered clipboard, a shared `imagefmt` crate (extracted BMP/PNG + new JPEG decode + PNG encode) with an output-capture screenshot tool, and the two core desktop apps (image viewer + settings/control panel) that make the GUI usable — the settings panel being the user-facing consumer of the Phase 103 power and Phase 104 Wi-Fi backends. Toolkit layout, protocol codecs, and the image codecs are host-tested; rendering/interaction are proven by QMP/PPM render probes; the live Wi-Fi/brightness arm is validated on the reference Dell per `docs/appendix/bare-metal-validation.md`.
@@ -116,9 +116,9 @@
 **Why it matters:** No clipboard exists in the tree today; the transfer must be a compositor-brokered offer/request with bytes on the bulk channel (the `pull_event`/`ipc_take_pending_bulk` pattern), never shared writable memory.
 
 **Acceptance:**
-- [ ] `SetClipboard { mime_tag, len }`, `RequestClipboard { mime_tag }`, and `ClipboardData { mime_tag, len }` added to the protocol enums with `encode`/`decode`.
-- [ ] Host tests round-trip all three new variants through `encode`→`decode` (matching the existing protocol codec tests).
-- [ ] `mime_tag` enumerates at least `TextPlainUtf8`; the wire format is documented inline.
+- [x] `SetClipboard { mime_tag, len }`, `RequestClipboard { mime_tag }`, and `ClipboardData { mime_tag, len }` added to the protocol enums with `encode`/`decode`.
+- [x] Host tests round-trip all three new variants through `encode`→`decode` (matching the existing protocol codec tests).
+- [x] `mime_tag` enumerates at least `TextPlainUtf8`; the wire format is documented inline.
 
 ### B.2 — Compositor clipboard store + verb handlers
 
@@ -127,9 +127,9 @@
 **Why it matters:** `display_server` is the only process that can broker a clipboard (clients share no memory); it must store the last offer and answer paste requests, dropping the offer on client `Goodbye`.
 
 **Acceptance:**
-- [ ] An offer's bytes are stored up to a documented cap (e.g. 64 KiB); a larger offer is rejected, not truncated silently.
-- [ ] A `RequestClipboard` returns the stored bytes via `ClipboardData` + the bulk channel; an empty clipboard returns a zero-length `ClipboardData`.
-- [ ] The store is bounded and freed; a client `Goodbye` that owned the offer does not leave a dangling buffer (host-tested store logic where extractable).
+- [x] An offer's bytes are stored up to a documented cap (e.g. 64 KiB); a larger offer is rejected, not truncated silently.
+- [x] A `RequestClipboard` returns the stored bytes via `ClipboardData` + the bulk channel; an empty clipboard returns a zero-length `ClipboardData`.
+- [x] The store is bounded and freed; a client `Goodbye` that owned the offer does not leave a dangling buffer (host-tested store logic where extractable).
 
 ### B.3 — `desktop_client` clipboard helpers + `m3ui` editing keys
 
@@ -141,8 +141,8 @@
 **Why it matters:** Apps need an ergonomic copy/paste call, and the toolkit text field is where a user expects Ctrl+C/V/X to work.
 
 **Acceptance:**
-- [ ] `set_clipboard(&str)` sends `SetClipboard` + the bytes; `get_clipboard() -> Option<Vec<u8>>` issues `RequestClipboard` and reads `ClipboardData`.
-- [ ] `m3ui::text_field` copies its selection/content on Ctrl+C, cuts on Ctrl+X, and pastes `get_clipboard()` text at the cursor on Ctrl+V.
+- [x] `set_clipboard(&str)` sends `SetClipboard` + the bytes; `get_clipboard() -> Option<Vec<u8>>` issues `RequestClipboard` and reads `ClipboardData`.
+- [x] `m3ui::text_field` copies its selection/content on Ctrl+C, cuts on Ctrl+X, and pastes `get_clipboard()` text at the cursor on Ctrl+V.
 
 ### B.4 — `clipboard-smoke` gate
 
@@ -151,8 +151,8 @@
 **Why it matters:** Proves the end-to-end round-trip between two independent clients — the phase's clipboard acceptance — rather than just the codec.
 
 **Acceptance:**
-- [ ] Two `desktop_client` clients run; client A `set_clipboard("M3OS_CLIP_OK")`, client B `get_clipboard()` returns exactly those bytes → serial sentinel `CLIP_ROUNDTRIP_OK`.
-- [ ] The gate fails (no `CLIP_ROUNDTRIP_OK`) if the bytes differ or the request returns empty.
+- [x] Two `desktop_client` clients run; client A `set_clipboard("M3OS_CLIP_OK")`, client B `get_clipboard()` returns exactly those bytes → serial sentinel `CLIP_ROUNDTRIP_OK`.
+- [x] The gate fails (no `CLIP_ROUNDTRIP_OK`) if the bytes differ or the request returns empty.
 
 ---
 

@@ -101,6 +101,7 @@ This sets `core.hooksPath` to `.githooks/`. **pre-commit** runs `cargo xtask che
 | `tui-app-smoke` | `M3OS_TUI_APP_REGRESSION=1` | ncurses TUI apps (htop, tmux, less) render correctly over the terminal. |
 | `doom-concurrent-smoke` | `M3OS_DOOM_CONCURRENT_REGRESSION=1` | DOOM runs concurrently with other ring-3 processes; no scheduler starvation. |
 | `tiling-smoke` | `M3OS_TILING_REGRESSION=1` | `display_server` tiling layout and multi-window compositor work correctly. |
+| `clipboard-smoke` | `M3OS_CLIPBOARD_REGRESSION=1` | Compositor-brokered clipboard round-trips text between two independent clients (copy in A, paste in B). |
 | `htop-render-probe` | `M3OS_HTOP_REGRESSION=1` | htop process list renders visible rows on the QMP/PPM framebuffer dump. |
 | `toolkit-render-probe` | `M3OS_M3UI_REGRESSION=1` | m3ui toolkit composes a widget frame; keyboard Enter activates the focused button and repaints the counter on the QMP/PPM dump. |
 | `xhci-bringup-smoke` + `xhci-enum-smoke` + `usb-smoke` + `usb-report-smoke` + `usb-hotplug-smoke` + `usb-storage-smoke` + `usb-hub-smoke` + `usb-mount-smoke` + `usb-unmount-smoke` + `usb-storage-dual-smoke` + `usb-multi-controller-smoke` + `usb-eth-smoke` | `M3OS_USB_REGRESSION=1` | Full xHCI USB suite: HID (Boot+Report), mass-storage, hub, hot-plug, multi-controller, USB-Ethernet. |

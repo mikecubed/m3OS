@@ -1,0 +1,13 @@
+[package]
+name = "clip-smoke"
+version.workspace = true
+edition.workspace = true
+description = "Phase 105 Track B.4 — two-client clipboard round-trip helper (drives clipboard-smoke)."
+
+[[bin]]
+name = "clip-smoke"
+path = "src/main.rs"
+
+[dependencies]
+desktop_client = { path = "../lib/desktop_client" }
+syscall-lib = { path = "../syscall-lib", features = ["alloc"] }

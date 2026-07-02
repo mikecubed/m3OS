@@ -10,6 +10,17 @@ use alloc::vec::Vec;
 
 use crate::input::{InputState, KeyCode};
 
+/// The result of applying a frame of input to a [`TextBuffer`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EditOutcome {
+    /// The buffer text changed this frame (insert/delete/paste/cut).
+    pub text_changed: bool,
+    /// `Some(text)` when the user pressed Ctrl+C (copy) or Ctrl+X (cut)
+    /// — the caller should publish `text` to the clipboard. For a cut,
+    /// `text_changed` is also set (the content was cleared).
+    pub copy: Option<String>,
+}
+
 /// A single-line editable string with a cursor.
 #[derive(Debug, Clone, Default)]
 pub struct TextBuffer {
@@ -99,47 +110,60 @@ impl TextBuffer {
         self.cursor = self.chars.len();
     }
 
+    /// Empty the buffer and reset the cursor.
+    pub fn clear(&mut self) {
+        self.chars.clear();
+        self.cursor = 0;
+    }
+
     /// Apply every key press queued this frame. `clipboard` supplies the
     /// paste text for Ctrl+V (the render layer fetches it from the
-    /// compositor); a `None` return from the closure is a no-op paste.
-    /// Returns whether the buffer text changed (so callers can report a
-    /// `changed` interaction result).
+    /// compositor); a `None` return is a no-op paste. Returns an
+    /// [`EditOutcome`]: whether the text changed, and a copy/cut request
+    /// the caller publishes to the clipboard.
     pub fn apply_input(
         &mut self,
         input: &InputState,
         mut clipboard: impl FnMut() -> Option<String>,
-    ) -> bool {
-        let before_len = self.chars.len();
-        let before_cursor = self.cursor;
-        let mut text_changed = false;
+    ) -> EditOutcome {
+        let mut outcome = EditOutcome::default();
         for key in input.keys() {
-            // Ctrl chords: paste (V), and Home/End style motion.
+            // Ctrl chords: copy/cut/paste, and Home/End motion.
             if key.mods.ctrl {
-                if key.ch == Some('v') || key.ch == Some('V') {
-                    if let Some(text) = clipboard() {
-                        // Single-line field: take up to the first newline.
-                        let line = text.split(['\n', '\r']).next().unwrap_or("");
-                        self.insert_str(line);
-                        text_changed = true;
+                match key.ch.map(|c| c.to_ascii_lowercase()) {
+                    // Copy the whole field (no selection model → content).
+                    Some('c') => outcome.copy = Some(self.as_string()),
+                    // Cut: copy then clear.
+                    Some('x') => {
+                        outcome.copy = Some(self.as_string());
+                        if !self.chars.is_empty() {
+                            self.clear();
+                            outcome.text_changed = true;
+                        }
                     }
-                }
-                // Ctrl+A/E emacs-style bol/eol as a convenience.
-                if key.ch == Some('a') || key.ch == Some('A') {
-                    self.move_home();
-                }
-                if key.ch == Some('e') || key.ch == Some('E') {
-                    self.move_end();
+                    // Paste the clipboard's first line at the cursor.
+                    Some('v') => {
+                        if let Some(text) = clipboard() {
+                            let line = text.split(['\n', '\r']).next().unwrap_or("");
+                            self.insert_str(line);
+                            outcome.text_changed = true;
+                        }
+                    }
+                    // Ctrl+A/E emacs-style bol/eol.
+                    Some('a') => self.move_home(),
+                    Some('e') => self.move_end(),
+                    _ => {}
                 }
                 continue;
             }
             match key.code {
                 KeyCode::Backspace => {
                     self.backspace();
-                    text_changed = true;
+                    outcome.text_changed = true;
                 }
                 KeyCode::Delete => {
                     self.delete();
-                    text_changed = true;
+                    outcome.text_changed = true;
                 }
                 KeyCode::Left => self.move_left(),
                 KeyCode::Right => self.move_right(),
@@ -151,15 +175,14 @@ impl TextBuffer {
                         && !ch.is_control()
                     {
                         self.insert_char(ch);
-                        text_changed = true;
+                        outcome.text_changed = true;
                     }
                 }
                 // Tab/Enter/Escape are focus/submit concerns, not edits.
                 _ => {}
             }
         }
-        let _ = (before_len, before_cursor);
-        text_changed
+        outcome
     }
 }
 
@@ -168,12 +191,14 @@ mod tests {
     use super::*;
     use crate::input::{KeyCode, KeyPress, Mods};
 
+    /// Feed keys and return whether the text changed (most tests only
+    /// care about that; the copy/cut tests call `apply_input` directly).
     fn feed(buf: &mut TextBuffer, keys: &[KeyPress]) -> bool {
         let mut input = InputState::new();
         for k in keys {
             input.push_key(k.clone());
         }
-        buf.apply_input(&input, || None)
+        buf.apply_input(&input, || None).text_changed
     }
 
     fn ch_key(c: char) -> KeyPress {
@@ -253,9 +278,43 @@ mod tests {
                 ..Default::default()
             },
         });
-        let changed = b.apply_input(&input, || Some(String::from("paste\nsecond")));
-        assert!(changed);
+        let out = b.apply_input(&input, || Some(String::from("paste\nsecond")));
+        assert!(out.text_changed);
+        assert!(out.copy.is_none());
         assert_eq!(b.as_string(), "xpaste");
+    }
+
+    fn ctrl_key(c: char) -> KeyPress {
+        KeyPress {
+            code: KeyCode::Char,
+            ch: Some(c),
+            mods: Mods {
+                ctrl: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn ctrl_c_copies_content_without_changing_it() {
+        let mut b = TextBuffer::from_str("hello");
+        let mut input = InputState::new();
+        input.push_key(ctrl_key('c'));
+        let out = b.apply_input(&input, || None);
+        assert_eq!(out.copy.as_deref(), Some("hello"));
+        assert!(!out.text_changed);
+        assert_eq!(b.as_string(), "hello");
+    }
+
+    #[test]
+    fn ctrl_x_cuts_content() {
+        let mut b = TextBuffer::from_str("cutme");
+        let mut input = InputState::new();
+        input.push_key(ctrl_key('x'));
+        let out = b.apply_input(&input, || None);
+        assert_eq!(out.copy.as_deref(), Some("cutme"));
+        assert!(out.text_changed);
+        assert!(b.is_empty());
     }
 
     #[test]

@@ -489,6 +489,8 @@ static LAUNCHER_ELF: &[u8] = generated_initrd_asset!("launcher");
 static NOTIFYD_ELF: &[u8] = generated_initrd_asset!("notifyd");
 // Phase 105 Track A.7 — m3ui toolkit demo Toplevel.
 static M3UI_DEMO_ELF: &[u8] = generated_initrd_asset!("m3ui-demo");
+// Phase 105 Track B.4 — two-client clipboard round-trip helper.
+static CLIP_SMOKE_ELF: &[u8] = generated_initrd_asset!("clip-smoke");
 static NOTIFY_SEND_ELF: &[u8] = generated_initrd_asset!("notify-send");
 
 // Phase 73 — lockscreen Layer-shell stub (exclusive keyboard grab).
@@ -1223,6 +1225,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "m3ui-demo",
         RamdiskNode::File {
             content: M3UI_DEMO_ELF,
+        },
+    ),
+    // Phase 105 Track B.4 — two-client clipboard round-trip helper.
+    (
+        "clip-smoke",
+        RamdiskNode::File {
+            content: CLIP_SMOKE_ELF,
         },
     ),
     // Phase 73 — lockscreen stub.

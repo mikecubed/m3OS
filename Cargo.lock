@@ -371,6 +371,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "clip-smoke"
+version = "0.99.0"
+dependencies = [
+ "desktop_client",
+ "syscall-lib",
+]
+
+[[package]]
 name = "console_server"
 version = "0.99.0"
 dependencies = [
