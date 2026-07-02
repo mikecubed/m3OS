@@ -40,7 +40,7 @@ use alloc::vec::Vec;
 
 use kernel_core::display::pixel_chunk::{CHUNK_HEADER_LEN, PixelChunkHeader};
 use kernel_core::display::protocol::{
-    BufferId, ClientMessage, MAX_FRAME_BODY_LEN, ProtocolError, ServerMessage, SurfaceId,
+    BufferId, ClientMessage, MAX_FRAME_BODY_LEN, MimeTag, ProtocolError, ServerMessage, SurfaceId,
     SurfaceRole,
 };
 use syscall_lib::IpcMessage;
@@ -134,6 +134,15 @@ pub struct DispatchOutcome {
     /// can call `SurfaceRegistry::destroy_client_surfaces(token)` to
     /// scope teardown to the disconnecting client's own surfaces.
     pub closed_client_token: Option<u32>,
+    /// Phase 105 Track B — a `SetClipboard` offer: (tag, bytes, owner
+    /// token). `main.rs` writes it into its `ClipboardStore`. The bytes
+    /// are copied out of the borrowed bulk since the outcome outlives the
+    /// receive buffer.
+    pub clipboard_set: Option<(MimeTag, Vec<u8>, u32)>,
+    /// Phase 105 Track B — a `RequestClipboard` (its tag). `main.rs`
+    /// answers by staging `[ClipboardData frame][bytes]` as the reply
+    /// bulk before replying to this message.
+    pub clipboard_request: Option<MimeTag>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,6 +271,33 @@ pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> Disp
                 ClientMessage::Goodbye { client_token } => {
                     out.closed = true;
                     out.closed_client_token = Some(client_token);
+                }
+                // Phase 105 Track B — clipboard verbs. The offer bytes ride
+                // the same IPC bulk, trailing the SetClipboard frame; both
+                // verbs are terminal effects the loop applies against its
+                // ClipboardStore (there is no per-surface state to touch, so
+                // they bypass `handle_message`).
+                ClientMessage::SetClipboard {
+                    mime_tag,
+                    len,
+                    client_token,
+                } => {
+                    let (_, consumed) = match ClientMessage::decode(frame.bulk) {
+                        Ok(pair) => pair,
+                        Err(_) => return DispatchOutcome::fatal(FatalReason::VerbDecode),
+                    };
+                    let want = len as usize;
+                    let avail = frame.bulk.len().saturating_sub(consumed);
+                    if want > avail {
+                        // The declared offer length exceeds the bytes that
+                        // actually arrived — a malformed frame.
+                        return DispatchOutcome::fatal(FatalReason::VerbDecode);
+                    }
+                    let bytes = frame.bulk[consumed..consumed + want].to_vec();
+                    out.clipboard_set = Some((mime_tag, bytes, client_token));
+                }
+                ClientMessage::RequestClipboard { mime_tag } => {
+                    out.clipboard_request = Some(mime_tag);
                 }
                 ref other => {
                     // Phase 74 Track F.1 — publish the IPC cap_slots

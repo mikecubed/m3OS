@@ -45,9 +45,11 @@ pub struct Ui<'a, P: Painter> {
     bounds: Rect,
     /// Current y offset (column cursor) within `bounds`.
     cursor_y: i32,
-    /// Optional clipboard fetch for text-field paste (render layer wires
-    /// it to the compositor; tests pass `None`).
-    clipboard: Option<&'a dyn Fn() -> Option<String>>,
+    /// Optional clipboard fetch for text-field paste (Ctrl+V). The render
+    /// layer wires it to the compositor; tests leave it `None`.
+    clipboard_get: Option<&'a dyn Fn() -> Option<String>>,
+    /// Optional clipboard publish for text-field copy/cut (Ctrl+C/X).
+    clipboard_set: Option<&'a dyn Fn(&str)>,
 }
 
 impl<'a, P: Painter> Ui<'a, P> {
@@ -68,13 +70,21 @@ impl<'a, P: Painter> Ui<'a, P> {
             theme,
             bounds,
             cursor_y: bounds.y + theme.pad_y,
-            clipboard: None,
+            clipboard_get: None,
+            clipboard_set: None,
         }
     }
 
-    /// Provide a clipboard source for text-field paste (Ctrl+V).
-    pub fn with_clipboard(mut self, cb: &'a dyn Fn() -> Option<String>) -> Ui<'a, P> {
-        self.clipboard = Some(cb);
+    /// Wire the toolkit to the compositor clipboard: `get` supplies paste
+    /// text (Ctrl+V), `set` publishes copy/cut text (Ctrl+C/Ctrl+X). The
+    /// render app passes closures over `DisplayConnection::{get,set}_clipboard`.
+    pub fn with_clipboard(
+        mut self,
+        get: &'a dyn Fn() -> Option<String>,
+        set: &'a dyn Fn(&str),
+    ) -> Ui<'a, P> {
+        self.clipboard_get = Some(get);
+        self.clipboard_set = Some(set);
         self
     }
 
@@ -273,8 +283,13 @@ impl<'a, P: Painter> Ui<'a, P> {
         let focused = self.focus.is_focused(id);
         let mut changed = false;
         if focused {
-            let cb = self.clipboard;
-            changed = buf.apply_input(self.input, || cb.and_then(|f| f()));
+            let get = self.clipboard_get;
+            let outcome = buf.apply_input(self.input, || get.and_then(|f| f()));
+            changed = outcome.text_changed;
+            // Publish a Ctrl+C/Ctrl+X copy to the compositor clipboard.
+            if let (Some(text), Some(set)) = (outcome.copy, self.clipboard_set) {
+                set(&text);
+            }
         }
         // Field chrome.
         self.painter.fill_rect(rect, self.theme.field_bg);

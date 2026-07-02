@@ -50,7 +50,7 @@ pub use geom::{Color, Point, Rect};
 pub use input::{Focus, InputState, KeyCode, KeyPress, Mods, MouseButton};
 pub use layout::{ClipStack, Dir, Item, LayoutSpec, Padding, Size, solve};
 pub use paint::Painter;
-pub use text_edit::TextBuffer;
+pub use text_edit::{EditOutcome, TextBuffer};
 pub use theme::{Theme, Visual};
 pub use ui::{Response, Ui};
 

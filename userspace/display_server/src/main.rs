@@ -38,6 +38,7 @@ mod surface;
 mod workspace;
 
 use core::alloc::Layout;
+use kernel_core::display::clipboard::ClipboardStore;
 use kernel_core::display::fb_owner::FramebufferOwner;
 use kernel_core::display::protocol::{Rect, ServerMessage, SurfaceId, SurfaceRole};
 use kernel_core::display::stats::FrameStatsRing;
@@ -546,6 +547,11 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     // `MAX_BULK_BYTES`.
     let mut event_reply_buf = [0u8; 128];
 
+    // Phase 105 Track B — the single clipboard offer the compositor brokers.
+    // `SetClipboard` writes it; `RequestClipboard` reads it back; a client's
+    // `Goodbye` drops the offer it owned.
+    let mut clipboard = ClipboardStore::new();
+
     let reg = syscall_lib::ipc_register_service(ep_handle, "display");
     if reg == u64::MAX {
         syscall_lib::write_str(
@@ -725,12 +731,21 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                     // explicit DestroySurface verbs.
                     compose_ctx.force_full_repaint_clearing_background();
                 }
+                // Phase 105 Track B — drop the departing client's offer.
+                clipboard.clear_owned_by(token);
             } else {
                 syscall_lib::write_str(
                     STDOUT_FILENO,
                     "display_server: client Goodbye without token (legacy v2 protocol; registry preserved)\n",
                 );
             }
+        }
+        // Phase 105 Track B — apply a clipboard offer from this dispatch.
+        if let Some((tag, bytes, owner)) = &outcome.clipboard_set {
+            let stored = clipboard.set(*tag, bytes, *owner);
+            syscall_lib::write_str(STDOUT_FILENO, "display_server: clipboard set len=");
+            write_u32(bytes.len() as u32);
+            syscall_lib::write_str(STDOUT_FILENO, if stored { " ok\n" } else { " REJECTED\n" });
         }
         // Phase 72 — keep the workspace manager in sync with surface
         // lifecycle: every newly-rolled Toplevel joins the active
@@ -891,10 +906,40 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         //    that verb has its own reply shape and replying here would
         //    panic the kernel on a double-reply.
         if had_graphical && !pull_handled {
-            let reply_label = if outcome.fatal { RESP_FATAL } else { RESP_OK };
             let reply_cap = header.data[3] as u32;
-            if reply_cap != 0 {
-                let _ = syscall_lib::ipc_reply(reply_cap, reply_label, 0);
+            // Phase 105 Track B — a `RequestClipboard` answers synchronously
+            // with `[ClipboardData frame][offer bytes]` staged as the reply
+            // bulk (the control-socket reply shape), so `get_clipboard`
+            // reads the bytes straight off its `ipc_call_buf` return. An
+            // empty clipboard yields a zero-length `ClipboardData` (no
+            // bytes follow).
+            if let Some(req_tag) = outcome.clipboard_request {
+                let tag = if clipboard.has_offer() {
+                    clipboard.tag()
+                } else {
+                    req_tag
+                };
+                let bytes = clipboard.bytes();
+                let hdr = ServerMessage::ClipboardData {
+                    mime_tag: tag,
+                    len: bytes.len() as u32,
+                };
+                // Frame (9 bytes) + the offer bytes into one reply buffer.
+                let mut reply = alloc::vec::Vec::with_capacity(16 + bytes.len());
+                let mut frame = [0u8; 16];
+                if let Ok(n) = hdr.encode(&mut frame) {
+                    reply.extend_from_slice(&frame[..n]);
+                    reply.extend_from_slice(bytes);
+                    let _ = syscall_lib::ipc_store_reply_bulk(&reply);
+                }
+                if reply_cap != 0 {
+                    let _ = syscall_lib::ipc_reply(reply_cap, RESP_OK, 0);
+                }
+            } else {
+                let reply_label = if outcome.fatal { RESP_FATAL } else { RESP_OK };
+                if reply_cap != 0 {
+                    let _ = syscall_lib::ipc_reply(reply_cap, reply_label, 0);
+                }
             }
         }
 

@@ -231,6 +231,8 @@ members = [
     "userspace/lib/m3ui",
     # Phase 105 Track A.7 — m3ui demo Toplevel (toolkit-render-probe).
     "userspace/m3ui-demo",
+    # Phase 105 Track B.4 — two-client clipboard round-trip (clipboard-smoke).
+    "userspace/clip-smoke",
     # Phase 76 — dynamic linker (no_std PIE). Phase 76 ships the
     # transfer-only stub; Phase 76b grows it into a real bring-up
     # linker that walks DT_NEEDED and applies relocations.

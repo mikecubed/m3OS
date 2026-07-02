@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-02 (living doc — update each session)
 **Branch:** `feat/phase-105-gui-toolkit-core` (off `main` at `8a49f97a`)
-**State:** **Track A COMPLETE + green** — committed/PR'd. `m3ui` toolkit +
+**State:** **Tracks A + B COMPLETE + green** — committed/PR'd. `m3ui` toolkit +
 `m3ui-demo` + `toolkit-render-probe` gate PASS (widget frame composed;
 keyboard Enter activates the focused button, counter repaints 35 scanlines
 on the QMP/PPM dump). `cargo xtask check` clean, 41 m3ui host tests pass.
@@ -90,7 +90,32 @@ Tracks B/C/D/E are the follow-ups (below).
   serial sentinels are the oracle alongside `changed_rows_in_band` PPM
   diffs.
 
-## RESUME HERE — Track B (clipboard) next
+## Track B — what landed (clipboard)
+
+- Protocol (`kernel-core/src/display/protocol.rs`): `MimeTag` enum +
+  `ClientMessage::{SetClipboard{tag,len,client_token}, RequestClipboard}` +
+  `ServerMessage::ClipboardData{tag,len}`, opcodes 0x0019/0x001A/0x0143,
+  codec + round-trip host tests.
+- Store (`kernel-core/src/display/clipboard.rs`): `ClipboardStore` (64 KiB
+  cap, reject-not-truncate, owner-scoped clear), host-tested.
+- Compositor (`display_server`): the offer bytes ride the SAME IPC bulk
+  trailing the `SetClipboard` frame (`frame.bulk[consumed..]`); handled in
+  `client::dispatch` via new `DispatchOutcome.clipboard_{set,request}`
+  fields; `RequestClipboard` answers SYNCHRONOUSLY by staging
+  `[ClipboardData frame][bytes]` as the reply bulk (the control-socket
+  reply shape), NOT the async 96-byte event queue. Offer dropped on the
+  owner's Goodbye.
+- `desktop_client::{set_clipboard(&str), get_clipboard()->Option<Vec<u8>>}`;
+  single-IPC transport cap `CLIPBOARD_MAX_BYTES=3900` (frame+bytes < the
+  4096 decode guard — multi-frame transfer for larger blobs is a follow-up).
+- m3ui: `TextBuffer::apply_input` now returns `EditOutcome{text_changed,
+  copy}`; `Ui::with_clipboard(get, set)` wires both; text_field does
+  Ctrl+C (copy content), Ctrl+X (cut), Ctrl+V (paste first line).
+- Gate: `clip-smoke` (fork: parent copies, child pastes as a distinct
+  client) + `cmd_clipboard_smoke` asserting `CLIP_ROUNDTRIP_OK`
+  (`M3OS_CLIPBOARD_REGRESSION`, exit 95). PASS.
+
+## RESUME HERE — Track C (imagefmt + screenshot) next
 
 Follow the charter B.1–B.4: add `SetClipboard`/`RequestClipboard`/
 `ClipboardData` verbs to `kernel-core/src/display/protocol.rs`, a bounded

@@ -19,8 +19,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use kernel_core::display::protocol::{
-    BufferId, ClientMessage, KeyboardInteractivity, Layer, LayerConfig, PROTOCOL_VERSION, Rect,
-    ServerMessage, SurfaceId, SurfaceRole,
+    BufferId, ClientMessage, KeyboardInteractivity, Layer, LayerConfig, MimeTag, PROTOCOL_VERSION,
+    Rect, ServerMessage, SurfaceId, SurfaceRole,
 };
 use kernel_core::input::events::KeyEvent;
 use kernel_core::session::font::{BasicBitmapFont, FontProvider, Glyph};
@@ -30,6 +30,14 @@ pub use kernel_core::input::events::{MOD_ALT, MOD_CTRL, MOD_SHIFT, MOD_SUPER};
 const LABEL_VERB: u64 = 1;
 const LABEL_CLIENT_EVENT_PULL: u64 = 3;
 const VERB_ENCODE_BUF_LEN: usize = 128;
+
+/// Phase 105 Track B — the largest clipboard offer carried in one IPC
+/// bulk. The frame + bytes must fit under the protocol's
+/// `MAX_FRAME_BODY_LEN` (4096) `decode_message` guard; 3900 leaves room
+/// for the 13-byte frame and a safety margin. Text clipboards are far
+/// smaller in practice; multi-frame transfer for larger blobs is a
+/// documented follow-up.
+pub const CLIPBOARD_MAX_BYTES: usize = 3900;
 
 /// Connection to `display_server`. Wraps an IPC handle plus a single
 /// surface id; clients that need more than one surface hold multiple
@@ -177,6 +185,72 @@ impl DisplayConnection {
         }
         let len = (n as usize).min(buf.len());
         ServerMessage::decode(&buf[..len]).ok().map(|(m, _)| m)
+    }
+
+    /// Phase 105 Track B — publish `text` as the clipboard offer
+    /// (`text/plain;charset=utf-8`). The compositor stores it until a
+    /// later offer replaces it or this client disconnects. Returns
+    /// `false` if `text` exceeds the single-IPC transport cap
+    /// ([`CLIPBOARD_MAX_BYTES`]) or the IPC send fails.
+    pub fn set_clipboard(&self, text: &str) -> bool {
+        let bytes = text.as_bytes();
+        if bytes.len() > CLIPBOARD_MAX_BYTES {
+            return false;
+        }
+        // Frame (13 bytes: 4 header + 9 body) followed by the offer bytes,
+        // in one IPC bulk. The compositor reads the trailing bytes after
+        // decoding the frame.
+        let msg = ClientMessage::SetClipboard {
+            mime_tag: MimeTag::TextPlainUtf8,
+            len: bytes.len() as u32,
+            client_token: self.token,
+        };
+        let mut frame = [0u8; 16];
+        let n = match msg.encode(&mut frame) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        let mut combined: Vec<u8> = Vec::with_capacity(n + bytes.len());
+        combined.extend_from_slice(&frame[..n]);
+        combined.extend_from_slice(bytes);
+        let reply = syscall_lib::ipc_call_buf(self.handle, LABEL_VERB, 0, &combined);
+        reply != u64::MAX
+    }
+
+    /// Phase 105 Track B — fetch the current clipboard offer's bytes, or
+    /// `None` when the clipboard is empty or the request fails. The
+    /// compositor answers synchronously with `[ClipboardData frame][bytes]`
+    /// staged as the reply bulk.
+    pub fn get_clipboard(&self) -> Option<Vec<u8>> {
+        let msg = ClientMessage::RequestClipboard {
+            mime_tag: MimeTag::TextPlainUtf8,
+        };
+        let mut frame = [0u8; 16];
+        let n = msg.encode(&mut frame).ok()?;
+        let reply = syscall_lib::ipc_call_buf(self.handle, LABEL_VERB, 0, &frame[..n]);
+        if reply == u64::MAX {
+            return None;
+        }
+        let mut buf = [0u8; CLIPBOARD_MAX_BYTES + 16];
+        let got = syscall_lib::ipc_take_pending_bulk(&mut buf);
+        if got == 0 || got == u64::MAX {
+            return None;
+        }
+        let got = (got as usize).min(buf.len());
+        // Decode the ClipboardData frame; the offer bytes follow it.
+        let (data_hdr, consumed) = ServerMessage::decode(&buf[..got]).ok()?;
+        let len = match data_hdr {
+            ServerMessage::ClipboardData { len, .. } => len as usize,
+            _ => return None,
+        };
+        if len == 0 {
+            return None; // empty clipboard
+        }
+        let end = (consumed + len).min(got);
+        if end <= consumed {
+            return None;
+        }
+        Some(buf[consumed..end].to_vec())
     }
 
     /// Politely tell `display_server` we are done.

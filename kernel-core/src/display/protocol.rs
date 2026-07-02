@@ -100,6 +100,11 @@ const OP_CLIENT_ATTACH_SHARED_BUFFER: u16 = 0x0017;
 /// without any byte-by-byte copy. Replaces the chunked-pixel path for
 /// the highest-bandwidth use case (1080p+ framebuffer surfaces).
 const OP_CLIENT_ATTACH_PAGE_GRANT_BUFFER: u16 = 0x0018;
+// Phase 105 Track B — clipboard offer / paste request (bytes ride the bulk
+// channel, never inline: the offer's data follows the `SetClipboard` frame
+// via the same pending-bulk transport as pixel/event payloads).
+const OP_CLIENT_SET_CLIPBOARD: u16 = 0x0019;
+const OP_CLIENT_REQUEST_CLIPBOARD: u16 = 0x001A;
 
 // Server → client (0x0100..=0x01FF)
 const OP_SERVER_WELCOME: u16 = 0x0101;
@@ -121,6 +126,9 @@ const OP_SERVER_SURFACE_RESIZED: u16 = 0x0141;
 /// resets; DOOM triggers its normal quit sequence). Body layout
 /// (4 bytes LE): `surface_id (u32)`.
 const OP_SERVER_CLOSE_REQUEST: u16 = 0x0142;
+// Phase 105 Track B — the compositor's answer to `RequestClipboard`; the
+// offered bytes follow on the bulk channel (a zero `len` = empty clipboard).
+const OP_SERVER_CLIPBOARD_DATA: u16 = 0x0143;
 
 // Control commands (0x0200..=0x02FF)
 const OP_CTL_VERSION: u16 = 0x0201;
@@ -204,6 +212,38 @@ pub struct SurfaceId(pub u32);
 /// page grant). Present in `AttachBuffer` / `BufferReleased`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, PartialOrd, Ord, Hash)]
 pub struct BufferId(pub u32);
+
+/// Phase 105 Track B — the content type of a clipboard offer. Encoded as
+/// a single wire byte. Only `TextPlainUtf8` is defined today; the enum
+/// exists so a future rich-text / image offer needs no new opcode. An
+/// unknown byte decodes to [`MimeTag::Unknown`] rather than erroring, so
+/// a newer client's offer degrades gracefully on an older compositor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MimeTag {
+    /// `text/plain;charset=utf-8` — the only tag brokered today.
+    #[default]
+    TextPlainUtf8,
+    /// A tag this build does not recognize (forward-compat).
+    Unknown(u8),
+}
+
+impl MimeTag {
+    /// The wire byte for this tag.
+    pub fn to_byte(self) -> u8 {
+        match self {
+            MimeTag::TextPlainUtf8 => 0x01,
+            MimeTag::Unknown(b) => b,
+        }
+    }
+
+    /// Decode a wire byte (never fails — unknown → [`MimeTag::Unknown`]).
+    pub fn from_byte(b: u8) -> MimeTag {
+        match b {
+            0x01 => MimeTag::TextPlainUtf8,
+            other => MimeTag::Unknown(other),
+        }
+    }
+}
 
 /// Rectangle in surface-local or output coordinates. `w` / `h` are
 /// unsigned and may be zero.
@@ -463,6 +503,22 @@ pub enum ClientMessage {
         surface_id: SurfaceId,
         serial: u32,
     },
+    /// Phase 105 Track B — publish a clipboard offer. The `len` bytes of
+    /// content follow this frame in the same IPC bulk; the compositor
+    /// stores the last offer. `client_token` scopes ownership so the
+    /// offer is dropped on that client's `Goodbye`. A `len` of 0 clears
+    /// the offer.
+    SetClipboard {
+        mime_tag: MimeTag,
+        len: u32,
+        client_token: u32,
+    },
+    /// Phase 105 Track B — request the current clipboard offer. The
+    /// compositor answers with [`ServerMessage::ClipboardData`] + bytes on
+    /// the bulk channel.
+    RequestClipboard {
+        mime_tag: MimeTag,
+    },
 }
 
 /// Server → client message (A.3 / A.4).
@@ -516,6 +572,13 @@ pub enum ServerMessage {
     /// init/session_manager if at all.
     CloseRequest {
         surface_id: SurfaceId,
+    },
+    /// Phase 105 Track B — the answer to `RequestClipboard`: `len` bytes of
+    /// clipboard content follow on the bulk channel. `len == 0` means the
+    /// clipboard is empty (no bytes follow).
+    ClipboardData {
+        mime_tag: MimeTag,
+        len: u32,
     },
 }
 
@@ -1155,6 +1218,20 @@ impl ClientMessage {
                     body[4..8].copy_from_slice(&serial.to_le_bytes());
                 })
             }
+            Self::SetClipboard {
+                mime_tag,
+                len,
+                client_token,
+            } => encode_fixed_body(buf, OP_CLIENT_SET_CLIPBOARD, 9, |body| {
+                body[0] = mime_tag.to_byte();
+                body[1..5].copy_from_slice(&len.to_le_bytes());
+                body[5..9].copy_from_slice(&client_token.to_le_bytes());
+            }),
+            Self::RequestClipboard { mime_tag } => {
+                encode_fixed_body(buf, OP_CLIENT_REQUEST_CLIPBOARD, 1, |body| {
+                    body[0] = mime_tag.to_byte();
+                })
+            }
         }
     }
 
@@ -1251,6 +1328,20 @@ impl ClientMessage {
                     serial: read_u32(body, 4)?,
                 }
             }
+            OP_CLIENT_SET_CLIPBOARD => {
+                expect_body_len(body_len, 9)?;
+                Self::SetClipboard {
+                    mime_tag: MimeTag::from_byte(*body.first().ok_or(ProtocolError::Truncated)?),
+                    len: read_u32(body, 1)?,
+                    client_token: read_u32(body, 5)?,
+                }
+            }
+            OP_CLIENT_REQUEST_CLIPBOARD => {
+                expect_body_len(body_len, 1)?;
+                Self::RequestClipboard {
+                    mime_tag: MimeTag::from_byte(*body.first().ok_or(ProtocolError::Truncated)?),
+                }
+            }
             _ => return Err(ProtocolError::UnknownOpcode(opcode)),
         };
         Ok((msg, total))
@@ -1340,6 +1431,12 @@ impl ServerMessage {
                     body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
                 })
             }
+            Self::ClipboardData { mime_tag, len } => {
+                encode_fixed_body(buf, OP_SERVER_CLIPBOARD_DATA, 5, |body| {
+                    body[0] = mime_tag.to_byte();
+                    body[1..5].copy_from_slice(&len.to_le_bytes());
+                })
+            }
         }
     }
 
@@ -1415,6 +1512,13 @@ impl ServerMessage {
                 expect_body_len(body_len, 4)?;
                 Self::CloseRequest {
                     surface_id: SurfaceId(read_u32(body, 0)?),
+                }
+            }
+            OP_SERVER_CLIPBOARD_DATA => {
+                expect_body_len(body_len, 5)?;
+                Self::ClipboardData {
+                    mime_tag: MimeTag::from_byte(*body.first().ok_or(ProtocolError::Truncated)?),
+                    len: read_u32(body, 1)?,
                 }
             }
             _ => return Err(ProtocolError::UnknownOpcode(opcode)),
@@ -2108,6 +2212,53 @@ mod tests {
             surface_id: SurfaceId(9),
             serial: 0xdead_beef,
         });
+    }
+
+    // Phase 105 Track B — clipboard verbs round-trip through the codec.
+
+    #[test]
+    fn client_set_clipboard_round_trips() {
+        encode_decode_round_trip_client(ClientMessage::SetClipboard {
+            mime_tag: MimeTag::TextPlainUtf8,
+            len: 0x0001_2345,
+            client_token: 0xCAFE,
+        });
+        // A zero-length offer (clear) and an unknown tag both round-trip.
+        encode_decode_round_trip_client(ClientMessage::SetClipboard {
+            mime_tag: MimeTag::Unknown(0x42),
+            len: 0,
+            client_token: 1,
+        });
+    }
+
+    #[test]
+    fn client_request_clipboard_round_trips() {
+        encode_decode_round_trip_client(ClientMessage::RequestClipboard {
+            mime_tag: MimeTag::TextPlainUtf8,
+        });
+    }
+
+    #[test]
+    fn server_clipboard_data_round_trips() {
+        encode_decode_round_trip_server(ServerMessage::ClipboardData {
+            mime_tag: MimeTag::TextPlainUtf8,
+            len: 12,
+        });
+        encode_decode_round_trip_server(ServerMessage::ClipboardData {
+            mime_tag: MimeTag::TextPlainUtf8,
+            len: 0,
+        });
+    }
+
+    #[test]
+    fn mime_tag_byte_round_trips_and_is_forward_compatible() {
+        assert_eq!(
+            MimeTag::from_byte(MimeTag::TextPlainUtf8.to_byte()),
+            MimeTag::TextPlainUtf8
+        );
+        // An unrecognized byte degrades to Unknown, never panics/errors.
+        assert_eq!(MimeTag::from_byte(0x99), MimeTag::Unknown(0x99));
+        assert_eq!(MimeTag::Unknown(0x99).to_byte(), 0x99);
     }
 
     #[test]
