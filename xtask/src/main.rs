@@ -201,6 +201,11 @@ const SMOKE_EXIT_TERMIOS_SMOKE_FAILED: i32 = 68;
 /// immediately rather than letting the step time out.
 const SMOKE_EXIT_TUI_APP_SMOKE_FAILED: i32 = 69;
 
+/// Phase 105 Track A.7 — `toolkit-render-probe` failed: the `m3ui` demo
+/// did not compose a widget frame, or an Enter-driven counter increment
+/// did not visibly repaint the composited framebuffer.
+const SMOKE_EXIT_M3UI_RENDER_FAILED: i32 = 70;
+
 /// Phase 85a Track C/D — `cargo xtask pkg-smoke` exit code. Distinct from the
 /// other gates (70 = doom-concurrent, 72 = tiling) so CI can route a
 /// pkg-install failure separately. Boots m3OS, installs a bundled `.m3pkg` from
@@ -1525,6 +1530,15 @@ fn main() {
             });
             cmd_less_render_probe(&probe_args);
         }
+        // Phase 105 Track A.7 — m3ui toolkit render probe.
+        Some("toolkit-render-probe") => {
+            let probe_args = parse_less_render_probe_args(&args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_toolkit_render_probe(&probe_args);
+        }
         // Phase 77 Track H.2 — headless htop process-row render probe.
         Some("htop-render-probe") => {
             let probe_args = parse_less_render_probe_args(&args[2..]).unwrap_or_else(|err| {
@@ -2066,6 +2080,7 @@ fn build_userspace_bins() {
         // Phase 73 — notification daemon + companion `notify-send`
         // CLI. Both bins ship from the `notifyd` crate.
         ("notifyd", "notifyd", true),
+        ("m3ui-demo", "m3ui-demo", true), // Phase 105 A.7: toolkit demo Toplevel
         ("notifyd", "notify-send", true),
         // Phase 73 — lockscreen Layer-shell stub.
         ("lockscreen", "lockscreen", true),
@@ -17281,6 +17296,195 @@ fn cmd_less_render_probe(args: &LessRenderProbeArgs) {
 /// htop-render-probe`.
 // The QEMU child is killed + waited on the normal path; clippy cannot prove
 // reaping across the panic/`expect` paths in this harness (false positive).
+/// Phase 105 Track A.7 — `toolkit-render-probe`: the falsifiable proof
+/// that `m3ui` actually draws widgets and responds to keyboard input,
+/// which a serial `Wait` cannot see. Boots the graphical session, launches
+/// `m3ui-demo` from the term prompt, and asserts on the composited
+/// framebuffer over QMP/PPM:
+///
+/// 1. `M3UI_DEMO:ready`  — the toolkit composed + committed a full frame
+///    (layout pass + every widget + surface present, end to end).
+/// 2. keyboard `Enter` on the default-focused `+1` button →
+///    `M3UI_DEMO:count=1` on serial (input routing + widget interaction),
+///    and the composited frame changes ≥ a threshold of scanlines vs the
+///    pre-Enter baseline (the on-screen counter repainted).
+/// 3. `Tab` moves focus → the frame changes again (the focus ring moved).
+///
+/// The pointer-click activation path is covered by the host-side
+/// `m3ui::ui` unit test `button_click_by_pointer` (the toolkit's hit-test
+/// logic); driving QEMU's absolute pointer through the guest input stack
+/// is an input-plumbing concern owned by `usb-smoke`, not the toolkit.
+#[allow(clippy::zombie_processes)]
+fn cmd_toolkit_render_probe(args: &LessRenderProbeArgs) {
+    /// Minimum changed scanlines (vs the pre-interaction baseline) that
+    /// prove a widget repainted. The demo window is ~380px tall; a label
+    /// row is ~16px, so an incremented counter + focus ring change dozens
+    /// of scanlines. 12 cleanly separates "a widget redrew" from noise.
+    const MIN_CHANGED_SCANLINES: u32 = 12;
+
+    let exit_fail = SMOKE_EXIT_M3UI_RENDER_FAILED;
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+    let ovmf = find_ovmf();
+    if let Err(e) = std::fs::create_dir_all(&args.out_dir) {
+        eprintln!(
+            "toolkit-render-probe: cannot create out dir {}: {e}",
+            args.out_dir.display()
+        );
+        std::process::exit(exit_fail);
+    }
+
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let vnc_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&vnc_socket);
+    let mut qemu_args = qemu_args_with_devices(
+        &uefi_image,
+        &ovmf,
+        QemuDisplayMode::Headless,
+        DeviceSet::default(),
+    );
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // Same VNC+QMP+VGA render path as the htop/less probes: the *act of
+    // having a display* makes QEMU render the framebuffer into a surface
+    // `screendump` can read.
+    let mut idx = 0;
+    while idx + 1 < qemu_args.len() {
+        if qemu_args[idx] == "-display" && qemu_args[idx + 1] == "none" {
+            qemu_args[idx + 1] = format!("vnc=unix:{}", vnc_socket.display());
+            break;
+        }
+        idx += 1;
+    }
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+    qemu_args.push("-vga".to_string());
+    qemu_args.push("std".to_string());
+
+    println!(
+        "toolkit-render-probe: launching QEMU (timeout {}s, qmp {})",
+        args.timeout_secs,
+        qmp_socket.display()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+
+    let result: Result<(u32, u32), String> = (|| {
+        let step = std::time::Duration::from_secs(args.timeout_secs.min(180));
+        let wait = |pat: &str, buf: &mut String, hist: &mut String| {
+            wait_for_serial_pattern(&rx, buf, hist, pat, step, global_start, global_timeout)
+        };
+        wait(
+            "display_server: registered as 'display.input-owner'",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        wait(
+            "TERM_SMOKE:prompt-ready",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        println!("toolkit-render-probe: session ready — launching m3ui-demo");
+
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Launch the toolkit demo as a Toplevel from the shell.
+        q.type_text("/bin/m3ui-demo\n")
+            .map_err(|e| format!("type demo launch: {e}"))?;
+        wait("M3UI_DEMO:ready", &mut serial_buf, &mut serial_history)?;
+        println!("toolkit-render-probe: demo composed its first frame");
+        // Give the compositor a moment to map + focus the new Toplevel.
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        capture_frame(&mut q, &args.out_dir, "00-baseline")?;
+        let baseline = ppm::read_ppm(&args.out_dir.join("00-baseline.ppm"))?;
+
+        // Keyboard: Enter activates the default-focused +1 button.
+        q.press_key("ret", 30).map_err(|e| format!("enter: {e}"))?;
+        wait("M3UI_DEMO:count=1", &mut serial_buf, &mut serial_history)?;
+        println!("toolkit-render-probe: Enter activated the focused button (count=1)");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        capture_frame(&mut q, &args.out_dir, "01-after-enter")?;
+        let after_enter = ppm::read_ppm(&args.out_dir.join("01-after-enter.ppm"))?;
+        // The counter label sits in the upper part of the window; scan the
+        // whole frame's changed scanlines to be position-robust.
+        let enter_rows = changed_rows_in_band(&baseline, &after_enter, 0.0, 1.0);
+        println!("toolkit-render-probe: counter repaint changed {enter_rows} scanlines");
+
+        // Tab moves focus → the focus ring moves → the frame changes.
+        q.press_key("tab", 30).map_err(|e| format!("tab: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        capture_frame(&mut q, &args.out_dir, "02-after-tab")?;
+        let after_tab = ppm::read_ppm(&args.out_dir.join("02-after-tab.ppm"))?;
+        let tab_rows = changed_rows_in_band(&after_enter, &after_tab, 0.0, 1.0);
+        println!("toolkit-render-probe: focus-ring move changed {tab_rows} scanlines");
+
+        Ok((enter_rows, tab_rows))
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let _ = std::fs::remove_file(&vnc_socket);
+    let _ = std::fs::write(args.out_dir.join("serial.log"), &serial_history);
+
+    match result {
+        Ok((enter_rows, tab_rows)) if enter_rows >= MIN_CHANGED_SCANLINES => {
+            let _ = tab_rows;
+            println!(
+                "toolkit-render-probe: PASS — m3ui composed a widget frame, keyboard Enter \
+                 activated the focused button (count=1) and repainted {enter_rows} scanlines \
+                 (min {MIN_CHANGED_SCANLINES}); Tab moved focus ({tab_rows} scanlines). Frames in {}",
+                args.out_dir.display()
+            );
+        }
+        Ok((enter_rows, _)) => {
+            eprintln!(
+                "toolkit-render-probe: FAIL — the Enter-driven counter repaint changed only \
+                 {enter_rows} scanlines (< {MIN_CHANGED_SCANLINES}); the toolkit did not visibly \
+                 update. Frames in {}",
+                args.out_dir.display()
+            );
+            std::process::exit(exit_fail);
+        }
+        Err(msg) => {
+            eprintln!("toolkit-render-probe: FAILED\n{msg}");
+            std::process::exit(exit_fail);
+        }
+    }
+}
+
 #[allow(clippy::zombie_processes)]
 fn cmd_htop_render_probe(args: &LessRenderProbeArgs) {
     /// Minimum changed scanlines in htop's process-table band (vs the empty

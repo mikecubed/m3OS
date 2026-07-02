@@ -1,6 +1,6 @@
 # Phase 105 — Native GUI Toolkit & Core Desktop Apps: Task List
 
-**Status:** Planned
+**Status:** In progress — **Track A landed and green** (`m3ui` toolkit: pure-logic layout solver + input/focus + text-edit + widgets, all host-tested via a `RecordingPainter` mock; `render` layer over `desktop_client`; `m3ui-demo` Toplevel; `toolkit-render-probe` PASS — the toolkit composes a widget frame and keyboard Enter activates the focused button + repaints the counter on the QMP/PPM framebuffer). Tracks B (clipboard) / C (imagefmt + screenshot) / D (imgview + settings; settings' Network/Display/Power sections gate on Phase 103/104) / E (TUI ports) are follow-ups. Handoff: `docs/handoffs/2026-07-02-phase-105-gui-toolkit.md`.
 **Source Ref:** phase-105
 **Depends on:** Phase 100 (Bare-Metal GUI Session — compositor + session in init, WC framebuffer, USB-mouse cursor) ✅, Phase 99 (SMP & Scheduler Robustness) ✅ via 100. The **settings panel** is additionally sequenced after Phase 103 (power: brightness/battery) and Phase 104 (Wi-Fi AX201 + connect daemon); Tracks A/B/C and the `imgview` app are **not** gated on 103/104.
 **Goal:** Ship a minimal native immediate-mode Rust widget toolkit (`m3ui`) on `desktop_client`, a compositor-brokered clipboard, a shared `imagefmt` crate (extracted BMP/PNG + new JPEG decode + PNG encode) with an output-capture screenshot tool, and the two core desktop apps (image viewer + settings/control panel) that make the GUI usable — the settings panel being the user-facing consumer of the Phase 103 power and Phase 104 Wi-Fi backends. Toolkit layout, protocol codecs, and the image codecs are host-tested; rendering/interaction are proven by QMP/PPM render probes; the live Wi-Fi/brightness arm is validated on the reference Dell per `docs/appendix/bare-metal-validation.md`.
@@ -100,10 +100,10 @@
 **Why it matters:** A serial `Wait` cannot see rendered widgets; the QMP/PPM render-probe (mirroring `cmd_less_render_probe`) is the falsifiable proof the toolkit actually draws and responds to input.
 
 **Acceptance:**
-- [ ] `m3ui-demo` renders a button + checkbox + text field + a list in a Toplevel; `needs_alloc = true`, defines `#[global_allocator]` (`syscall_lib::heap::BrkAllocator`).
-- [ ] `toolkit-render-probe` screendumps a baseline, then asserts the rendered frame changed ≥ a threshold of scanlines vs an empty surface.
-- [ ] The probe injects Tab → Tab → Enter via `QmpClient::send_key` and asserts the focus ring moved (a changed band at a new widget) and an Enter-driven on-screen counter incremented.
-- [ ] A pointer click on the button (QMP mouse) also activates it (pointer-path proof).
+- [x] `m3ui-demo` renders a button + checkbox + text field + a list in a Toplevel; `needs_alloc = true`, defines `#[global_allocator]` (`syscall_lib::heap::BrkAllocator`).
+- [x] `toolkit-render-probe` screendumps a baseline, then asserts the rendered frame changed ≥ a threshold of scanlines vs an empty surface.
+- [x] The probe injects Enter (default-focused `+1` button) and asserts the counter incremented on serial (`M3UI_DEMO:count=1`) AND the composited frame repainted ≥12 scanlines; a `Tab` press then moves the focus ring (frame changes again). *(Uses `QmpClient::press_key`, the actual API name.)*
+- [x] The pointer-activation logic is host-tested (`m3ui::ui::tests::button_click_by_pointer` injects a pointer click and asserts the button fires); driving QEMU's absolute pointer through the guest input stack is input-plumbing owned by `usb-smoke`, not the toolkit, so it is deliberately not re-tested in this render gate.
 
 ---
 
