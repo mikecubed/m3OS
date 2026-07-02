@@ -935,6 +935,23 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                 if reply_cap != 0 {
                     let _ = syscall_lib::ipc_reply(reply_cap, RESP_OK, 0);
                 }
+            } else if let Some((shm_id, max_w, max_h)) = outcome.capture_request {
+                // Phase 105 Track C — blit the composited frame into the
+                // client's SHM as packed BGRA8888 and answer with a
+                // `CaptureReply` (dims only; the pixels rode the SHM, not
+                // the reply bulk). `0×0` = rejected (unmappable/undersized).
+                let (cap_w, cap_h) = perform_capture(&owner, shm_id, max_w, max_h);
+                let hdr = ServerMessage::CaptureReply {
+                    width: cap_w,
+                    height: cap_h,
+                };
+                let mut frame = [0u8; 16];
+                if let Ok(n) = hdr.encode(&mut frame) {
+                    let _ = syscall_lib::ipc_store_reply_bulk(&frame[..n]);
+                }
+                if reply_cap != 0 {
+                    let _ = syscall_lib::ipc_reply(reply_cap, RESP_OK, 0);
+                }
             } else {
                 let reply_label = if outcome.fatal { RESP_FATAL } else { RESP_OK };
                 if reply_cap != 0 {
@@ -2268,6 +2285,60 @@ fn emit_render_fingerprint(fp: &kernel_core::display::render_fp::RenderFingerpri
     syscall_lib::write_str(STDOUT_FILENO, " hash=0x");
     write_hex_u32(fp.hash);
     syscall_lib::write_str(STDOUT_FILENO, "\n");
+}
+
+/// Phase 105 Track C — service a `CaptureOutput` request: map the client's
+/// SHM region, blit the compositor's most-recently-composed frame into it as
+/// packed BGRA8888, and unmap. Returns the `(width, height)` actually
+/// captured, or `(0, 0)` if the request was rejected — an unmappable id, or
+/// an SHM too small for even one clamped row.
+///
+/// The client sizes its SHM from `framebuffer_info`, so the common path
+/// captures the full screen; `max_w`/`max_h` clamp the blit so a smaller
+/// SHM is never overrun. The pixel packing (stride removal + format swap)
+/// lives in `kernel_core::display::capture` where it is host-tested.
+fn perform_capture(
+    owner: &KernelFramebufferOwner,
+    shm_id: u32,
+    max_w: u32,
+    max_h: u32,
+) -> (u32, u32) {
+    let meta = owner.metadata();
+    let out_w = meta.width.min(max_w);
+    let out_h = meta.height.min(max_h);
+    if out_w == 0 || out_h == 0 {
+        return (0, 0);
+    }
+    let needed = (out_w as usize)
+        .saturating_mul(out_h as usize)
+        .saturating_mul(4);
+
+    // Reject before mapping if the client's region cannot hold the frame.
+    match syscall_lib::shm_size(shm_id) {
+        Some(sz) if sz >= needed => {}
+        _ => return (0, 0),
+    }
+    let va = syscall_lib::shm_map(shm_id);
+    if va == 0 {
+        return (0, 0);
+    }
+
+    // SAFETY: `shm_map` returned a valid mapping and `shm_size` confirmed the
+    // region is at least `needed` bytes, so a `&mut [u8; needed]` over it is
+    // in-bounds. The region is client-shared but the compositor is its sole
+    // writer for the duration of this synchronous blit (the client is blocked
+    // in its `ipc_call` awaiting our reply), so there is no concurrent access.
+    let dst = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, needed) };
+    let view = kernel_core::display::capture::FrameView {
+        pixels: owner.back_buffer_pixels(),
+        width: meta.width,
+        height: meta.height,
+        stride_bytes: meta.stride_bytes,
+        pixel_format: meta.pixel_format,
+    };
+    let (w, h) = kernel_core::display::capture::pack_capture_bgra(&view, max_w, max_h, dst);
+    let _ = syscall_lib::shm_unmap(va);
+    (w, h)
 }
 
 /// Map the kernel's reported pixel-format tag onto

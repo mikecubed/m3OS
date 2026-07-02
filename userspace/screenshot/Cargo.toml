@@ -1,0 +1,14 @@
+[package]
+name = "screenshot"
+version.workspace = true
+edition.workspace = true
+description = "Phase 105 Track C.5 — capture the composited screen to a PNG file (drives screenshot-smoke)."
+
+[[bin]]
+name = "screenshot"
+path = "src/main.rs"
+
+[dependencies]
+desktop_client = { path = "../lib/desktop_client" }
+imagefmt = { path = "../lib/imagefmt" }
+syscall-lib = { path = "../syscall-lib", features = ["alloc"] }

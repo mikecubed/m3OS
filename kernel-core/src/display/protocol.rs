@@ -105,6 +105,12 @@ const OP_CLIENT_ATTACH_PAGE_GRANT_BUFFER: u16 = 0x0018;
 // via the same pending-bulk transport as pixel/event payloads).
 const OP_CLIENT_SET_CLIPBOARD: u16 = 0x0019;
 const OP_CLIENT_REQUEST_CLIPBOARD: u16 = 0x001A;
+// Phase 105 Track C — capture the composited output. The client provides a
+// shared-memory region (by id) large enough for the screen; the compositor
+// blits its most-recently-composed frame into it as packed BGRA8888 and
+// answers with [`ServerMessage::CaptureReply`] carrying the captured dims.
+// The compositor owns the framebuffer, so this is the only screenshot path.
+const OP_CLIENT_CAPTURE_OUTPUT: u16 = 0x001B;
 
 // Server → client (0x0100..=0x01FF)
 const OP_SERVER_WELCOME: u16 = 0x0101;
@@ -129,6 +135,10 @@ const OP_SERVER_CLOSE_REQUEST: u16 = 0x0142;
 // Phase 105 Track B — the compositor's answer to `RequestClipboard`; the
 // offered bytes follow on the bulk channel (a zero `len` = empty clipboard).
 const OP_SERVER_CLIPBOARD_DATA: u16 = 0x0143;
+// Phase 105 Track C — the compositor's answer to `CaptureOutput`: the
+// composited frame was blitted into the client's SHM as packed BGRA8888.
+// Carries the captured width/height (`0×0` on a rejected/undersized request).
+const OP_SERVER_CAPTURE_REPLY: u16 = 0x0144;
 
 // Control commands (0x0200..=0x02FF)
 const OP_CTL_VERSION: u16 = 0x0201;
@@ -519,6 +529,18 @@ pub enum ClientMessage {
     RequestClipboard {
         mime_tag: MimeTag,
     },
+    /// Phase 105 Track C — capture the composited output into a client
+    /// shared-memory region. `shm_id` identifies a region the client
+    /// created and sized to hold `max_width * max_height * 4` bytes of
+    /// packed BGRA8888. The compositor maps it, writes the current frame
+    /// (clamped to `max_width × max_height`), and answers with
+    /// [`ServerMessage::CaptureReply`]. `max_width`/`max_height` bound the
+    /// blit so a client SHM smaller than the screen is never overrun.
+    CaptureOutput {
+        shm_id: u32,
+        max_width: u32,
+        max_height: u32,
+    },
 }
 
 /// Server → client message (A.3 / A.4).
@@ -579,6 +601,15 @@ pub enum ServerMessage {
     ClipboardData {
         mime_tag: MimeTag,
         len: u32,
+    },
+    /// Phase 105 Track C — the answer to `CaptureOutput`: the compositor
+    /// wrote a `width × height` packed BGRA8888 frame into the client's
+    /// SHM (row stride = `width * 4`, top-to-bottom). `width == 0 ||
+    /// height == 0` means the request was rejected (unmappable/undersized
+    /// SHM) and no pixels were written.
+    CaptureReply {
+        width: u32,
+        height: u32,
     },
 }
 
@@ -1232,6 +1263,15 @@ impl ClientMessage {
                     body[0] = mime_tag.to_byte();
                 })
             }
+            Self::CaptureOutput {
+                shm_id,
+                max_width,
+                max_height,
+            } => encode_fixed_body(buf, OP_CLIENT_CAPTURE_OUTPUT, 12, |body| {
+                body[0..4].copy_from_slice(&shm_id.to_le_bytes());
+                body[4..8].copy_from_slice(&max_width.to_le_bytes());
+                body[8..12].copy_from_slice(&max_height.to_le_bytes());
+            }),
         }
     }
 
@@ -1342,6 +1382,14 @@ impl ClientMessage {
                     mime_tag: MimeTag::from_byte(*body.first().ok_or(ProtocolError::Truncated)?),
                 }
             }
+            OP_CLIENT_CAPTURE_OUTPUT => {
+                expect_body_len(body_len, 12)?;
+                Self::CaptureOutput {
+                    shm_id: read_u32(body, 0)?,
+                    max_width: read_u32(body, 4)?,
+                    max_height: read_u32(body, 8)?,
+                }
+            }
             _ => return Err(ProtocolError::UnknownOpcode(opcode)),
         };
         Ok((msg, total))
@@ -1437,6 +1485,12 @@ impl ServerMessage {
                     body[1..5].copy_from_slice(&len.to_le_bytes());
                 })
             }
+            Self::CaptureReply { width, height } => {
+                encode_fixed_body(buf, OP_SERVER_CAPTURE_REPLY, 8, |body| {
+                    body[0..4].copy_from_slice(&width.to_le_bytes());
+                    body[4..8].copy_from_slice(&height.to_le_bytes());
+                })
+            }
         }
     }
 
@@ -1519,6 +1573,13 @@ impl ServerMessage {
                 Self::ClipboardData {
                     mime_tag: MimeTag::from_byte(*body.first().ok_or(ProtocolError::Truncated)?),
                     len: read_u32(body, 1)?,
+                }
+            }
+            OP_SERVER_CAPTURE_REPLY => {
+                expect_body_len(body_len, 8)?;
+                Self::CaptureReply {
+                    width: read_u32(body, 0)?,
+                    height: read_u32(body, 4)?,
                 }
             }
             _ => return Err(ProtocolError::UnknownOpcode(opcode)),
@@ -2247,6 +2308,36 @@ mod tests {
         encode_decode_round_trip_server(ServerMessage::ClipboardData {
             mime_tag: MimeTag::TextPlainUtf8,
             len: 0,
+        });
+    }
+
+    // Phase 105 Track C — screen-capture verbs round-trip through the codec.
+
+    #[test]
+    fn client_capture_output_round_trips() {
+        encode_decode_round_trip_client(ClientMessage::CaptureOutput {
+            shm_id: 0x0011_2233,
+            max_width: 1920,
+            max_height: 1080,
+        });
+        // A zero-dimension request (degenerate but well-formed) round-trips.
+        encode_decode_round_trip_client(ClientMessage::CaptureOutput {
+            shm_id: 1,
+            max_width: 0,
+            max_height: 0,
+        });
+    }
+
+    #[test]
+    fn server_capture_reply_round_trips() {
+        encode_decode_round_trip_server(ServerMessage::CaptureReply {
+            width: 1024,
+            height: 768,
+        });
+        // 0×0 signals a rejected capture; it must still round-trip.
+        encode_decode_round_trip_server(ServerMessage::CaptureReply {
+            width: 0,
+            height: 0,
         });
     }
 

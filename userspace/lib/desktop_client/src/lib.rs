@@ -253,6 +253,92 @@ impl DisplayConnection {
         Some(buf[consumed..end].to_vec())
     }
 
+    /// Phase 105 Track C — capture the composited screen into an owned
+    /// pixel buffer. Queries the framebuffer geometry (no ownership
+    /// required), allocates a client SHM region sized for the full screen,
+    /// asks the compositor to blit its current frame into it via
+    /// `CaptureOutput`, and copies the packed BGRA8888 pixels back out.
+    ///
+    /// Returns `(width, height, pixels)` with `pixels.len() == width *
+    /// height` (each `u32` is `0xAARRGGBB`, ready for
+    /// `imagefmt::encode_png`), or `None` on any failure (no framebuffer,
+    /// SHM exhaustion, IPC error, or a `0×0` rejected reply). The SHM
+    /// region is always destroyed before returning.
+    pub fn capture_output(&self) -> Option<(u32, u32, Vec<u32>)> {
+        // Screen geometry — `framebuffer_info` is a query, not FB ownership.
+        let mut info = [0u8; 20];
+        if syscall_lib::framebuffer_info(&mut info) < 0 {
+            return None;
+        }
+        let width = u32::from_le_bytes([info[0], info[1], info[2], info[3]]);
+        let height = u32::from_le_bytes([info[4], info[5], info[6], info[7]]);
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let byte_len = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|px| px.checked_mul(4))?;
+
+        let shm_id = syscall_lib::shm_create(byte_len);
+        if shm_id == 0 {
+            return None;
+        }
+        let result = self.capture_into_shm(shm_id, width, height);
+        // Release the creator reference regardless of outcome.
+        let _ = syscall_lib::shm_destroy(shm_id);
+        result
+    }
+
+    /// Inner half of [`capture_output`]: drive the `CaptureOutput` verb
+    /// against an already-created SHM `shm_id` and read the result back.
+    /// Split out so the caller can `shm_destroy` on every path.
+    fn capture_into_shm(
+        &self,
+        shm_id: u32,
+        width: u32,
+        height: u32,
+    ) -> Option<(u32, u32, Vec<u32>)> {
+        let msg = ClientMessage::CaptureOutput {
+            shm_id,
+            max_width: width,
+            max_height: height,
+        };
+        let mut frame = [0u8; 16];
+        let n = msg.encode(&mut frame).ok()?;
+        let reply = syscall_lib::ipc_call_buf(self.handle, LABEL_VERB, 0, &frame[..n]);
+        if reply == u64::MAX {
+            return None;
+        }
+        // The `CaptureReply` frame rides the reply bulk (dims only; the
+        // pixels went straight into the SHM).
+        let mut rbuf = [0u8; 16];
+        let got = syscall_lib::ipc_take_pending_bulk(&mut rbuf);
+        if got == 0 || got == u64::MAX {
+            return None;
+        }
+        let got = (got as usize).min(rbuf.len());
+        let (hdr, _) = ServerMessage::decode(&rbuf[..got]).ok()?;
+        let (cw, ch) = match hdr {
+            ServerMessage::CaptureReply { width, height } => (width, height),
+            _ => return None,
+        };
+        if cw == 0 || ch == 0 {
+            return None; // rejected capture
+        }
+        let cap_px = (cw as usize).checked_mul(ch as usize)?;
+
+        let va = syscall_lib::shm_map(shm_id);
+        if va == 0 {
+            return None;
+        }
+        // SAFETY: the region was created with `width*height*4` bytes and the
+        // compositor wrote `cw*ch <= width*height` packed BGRA pixels. The
+        // mapping is page-aligned (u32-aligned) and lives until `shm_unmap`.
+        let pixels = unsafe { core::slice::from_raw_parts(va as *const u32, cap_px) }.to_vec();
+        let _ = syscall_lib::shm_unmap(va);
+        Some((cw, ch, pixels))
+    }
+
     /// Politely tell `display_server` we are done.
     pub fn goodbye(&self) {
         let _ = send_verb(

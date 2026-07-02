@@ -491,6 +491,8 @@ static NOTIFYD_ELF: &[u8] = generated_initrd_asset!("notifyd");
 static M3UI_DEMO_ELF: &[u8] = generated_initrd_asset!("m3ui-demo");
 // Phase 105 Track B.4 — two-client clipboard round-trip helper.
 static CLIP_SMOKE_ELF: &[u8] = generated_initrd_asset!("clip-smoke");
+// Phase 105 Track C.5 — screen capture to PNG.
+static SCREENSHOT_ELF: &[u8] = generated_initrd_asset!("screenshot");
 static NOTIFY_SEND_ELF: &[u8] = generated_initrd_asset!("notify-send");
 
 // Phase 73 — lockscreen Layer-shell stub (exclusive keyboard grab).
@@ -1232,6 +1234,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "clip-smoke",
         RamdiskNode::File {
             content: CLIP_SMOKE_ELF,
+        },
+    ),
+    // Phase 105 Track C.5 — screen capture to PNG.
+    (
+        "screenshot",
+        RamdiskNode::File {
+            content: SCREENSHOT_ELF,
         },
     ),
     // Phase 73 — lockscreen stub.

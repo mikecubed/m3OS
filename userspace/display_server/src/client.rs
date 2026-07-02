@@ -143,6 +143,13 @@ pub struct DispatchOutcome {
     /// answers by staging `[ClipboardData frame][bytes]` as the reply
     /// bulk before replying to this message.
     pub clipboard_request: Option<MimeTag>,
+    /// Phase 105 Track C — a `CaptureOutput` request: `(shm_id, max_width,
+    /// max_height)`. `main.rs` maps the SHM, blits the composited frame
+    /// into it as packed BGRA8888, and answers by staging a `CaptureReply`
+    /// frame as the reply bulk. The blit needs the live `FramebufferOwner`
+    /// and SHM syscalls, so — like the clipboard verbs — this is surfaced
+    /// as a terminal effect rather than handled in pure logic here.
+    pub capture_request: Option<(u32, u32, u32)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,6 +305,13 @@ pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> Disp
                 }
                 ClientMessage::RequestClipboard { mime_tag } => {
                     out.clipboard_request = Some(mime_tag);
+                }
+                ClientMessage::CaptureOutput {
+                    shm_id,
+                    max_width,
+                    max_height,
+                } => {
+                    out.capture_request = Some((shm_id, max_width, max_height));
                 }
                 ref other => {
                     // Phase 74 Track F.1 — publish the IPC cap_slots

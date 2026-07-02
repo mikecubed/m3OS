@@ -1,6 +1,6 @@
 # Phase 105 — Native GUI Toolkit & Core Desktop Apps: Task List
 
-**Status:** In progress — **Tracks A + B landed and green** (`m3ui` toolkit: pure-logic layout solver + input/focus + text-edit + widgets, all host-tested via a `RecordingPainter` mock; `render` layer over `desktop_client`; `m3ui-demo` Toplevel; `toolkit-render-probe` PASS — the toolkit composes a widget frame and keyboard Enter activates the focused button + repaints the counter on the QMP/PPM framebuffer). Tracks B (clipboard) / C (imagefmt + screenshot) / D (imgview + settings; settings' Network/Display/Power sections gate on Phase 103/104) / E (TUI ports) are follow-ups. Handoff: `docs/handoffs/2026-07-02-phase-105-gui-toolkit.md`.
+**Status:** In progress — **Tracks A + B + C landed and green.** A/B merged; C (`imagefmt` shared crate = extracted BMP/PNG + new baseline JPEG decode + PNG encode; `CaptureOutput`/`CaptureReply` protocol verbs + pure `pack_capture_bgra`; compositor SHM blit; `screenshot` tool; `screenshot-smoke` gate) is complete on `feat/phase-105-imagefmt-screenshot` — `xtask check` clean, 15 imagefmt + 10 kernel-core capture/protocol host tests pass, `screenshot-smoke` PASSES end-to-end on a default multi-core boot. Remaining: D (imgview + audio `SetMasterVolume`; settings' Network/Display/Power sections gate on Phase 103/104 → Dell) / E (TUI ports). Handoff: `docs/handoffs/2026-07-02-phase-105-gui-toolkit.md`.
 **Source Ref:** phase-105
 **Depends on:** Phase 100 (Bare-Metal GUI Session — compositor + session in init, WC framebuffer, USB-mouse cursor) ✅, Phase 99 (SMP & Scheduler Robustness) ✅ via 100. The **settings panel** is additionally sequenced after Phase 103 (power: brightness/battery) and Phase 104 (Wi-Fi AX201 + connect daemon); Tracks A/B/C and the `imgview` app are **not** gated on 103/104.
 **Goal:** Ship a minimal native immediate-mode Rust widget toolkit (`m3ui`) on `desktop_client`, a compositor-brokered clipboard, a shared `imagefmt` crate (extracted BMP/PNG + new JPEG decode + PNG encode) with an output-capture screenshot tool, and the two core desktop apps (image viewer + settings/control panel) that make the GUI usable — the settings panel being the user-facing consumer of the Phase 103 power and Phase 104 Wi-Fi backends. Toolkit layout, protocol codecs, and the image codecs are host-tested; rendering/interaction are proven by QMP/PPM render probes; the live Wi-Fi/brightness arm is validated on the reference Dell per `docs/appendix/bare-metal-validation.md`.
@@ -9,9 +9,9 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | `m3ui` immediate-mode toolkit (layout solver, widgets, input/focus, theme, proportional text) — host-tested layout | 100 | Planned |
-| B | Clipboard / data-transfer protocol (`display_server` broker + protocol verbs + `desktop_client` helpers + `m3ui` Ctrl+C/V/X) | 100 | Planned |
-| C | `imagefmt` shared crate (extract BMP/PNG, add JPEG + PNG encode) + `CaptureOutput` in `display_server` + `screenshot` tool | B (capture) | Planned |
+| A | `m3ui` immediate-mode toolkit (layout solver, widgets, input/focus, theme, proportional text) — host-tested layout | 100 | **Done + green** |
+| B | Clipboard / data-transfer protocol (`display_server` broker + protocol verbs + `desktop_client` helpers + `m3ui` Ctrl+C/V/X) | 100 | **Done + green** |
+| C | `imagefmt` shared crate (extract BMP/PNG, add JPEG + PNG encode) + `CaptureOutput` in `display_server` + `screenshot` tool | B (capture) | **Done + green** |
 | D | `imgview` image viewer + `settings` control panel (Wi-Fi/brightness/volume/battery) + audio `SetMasterVolume` | A, C; settings also 103, 104 | Planned |
 | E | TUI-in-`term` parallel ports charter (`nnn`/`lf`, `nano`/`vim`, `bsdtar`, `symphonia`); browser/office deferral | — | Planned |
 
@@ -169,8 +169,8 @@
 **Why it matters:** The greeter decoders are the only image codecs in the tree and are buried in one app; extracting them (with their host tests) into a shared crate lets `imgview` and `screenshot` reuse them and stops per-app duplication.
 
 **Acceptance:**
-- [ ] `decode_bmp`/`decode_png`/`blit_scale_to_fit`/`ImageError` live in `imagefmt`; the existing `image.rs` host tests move with them and pass (`cargo test -p imagefmt`).
-- [ ] `greeter` depends on `imagefmt` and still decodes + renders its background; the session/`tiling-smoke` render path is unchanged.
+- [x] `decode_bmp`/`decode_png`/`blit_scale_to_fit`/`ImageError` live in `imagefmt` (git-mv of `greeter/src/image.rs` → `imagefmt/src/lib.rs`); the existing `image.rs` host tests move with them and pass (`cargo test -p imagefmt`). Added to `USERSPACE_LIB_HOST_TEST_PACKAGES` so `xtask check` gates them.
+- [x] `greeter` depends on `imagefmt` (`pub use imagefmt as image;`) and still decodes + renders its background; the session/`tiling-smoke` render path is unchanged.
 
 ### C.2 — Baseline JPEG decoder
 
@@ -179,9 +179,9 @@
 **Why it matters:** The image viewer must cover the three common formats; JPEG is the only one not already present, and a `no_std` baseline decoder rounds out `imagefmt`.
 
 **Acceptance:**
-- [ ] Decodes baseline (SOF0) Huffman JPEG: SOI/APP0/DQT/DHT/SOF0/SOS parse, dequant + 8×8 IDCT + YCbCr→BGRA; returns `ImageError::Unsupported` for progressive/arithmetic/CMYK.
-- [ ] Host test: a small synthetic/bundled baseline JPEG decodes to the expected dimensions and a sane (non-uniform, in-gamut) pixel buffer.
-- [ ] Re-expressed for `no_std`+`alloc` (modeled on `jpeg-decoder`); provenance noted in the module header.
+- [x] Decodes baseline (SOF0) Huffman JPEG: SOI/APP0/DQT/DHT/SOF0/SOS parse, dequant + 8×8 IDCT + YCbCr→BGRA; returns `ImageError::Unsupported` for progressive (SOF2)/arithmetic/CMYK.
+- [x] Host test: a bundled 16×16 baseline JPEG (`tests/fixtures/tiny16.jpg`, generated by the committed `tools/mkjpeg.py`) decodes to the expected dimensions and a sane (non-uniform, in-gamut, opaque) pixel buffer; a truncation-fuzz test asserts no panic.
+- [x] Re-expressed for `no_std`+`alloc`; provenance noted in the module header. **no_std gotcha:** `f32::{round,floor,clamp}` are std-only, so the IDCT rounds via `(val + 0.5) as i32` + integer `.clamp(0,255)`.
 
 ### C.3 — PNG encoder
 
@@ -190,8 +190,8 @@
 **Why it matters:** The first encoder in the tree; the screenshot tool needs to write a real PNG, and the encode→decode round-trip is a clean falsifiable test.
 
 **Acceptance:**
-- [ ] Emits a valid PNG (signature, IHDR RGBA8/RGB8, IDAT with a stored-or-fixed-Huffman deflate stream + Adler-32, IEND with per-chunk CRC-32).
-- [ ] Host test: `decode_png(encode_png(w, h, px))` returns the same `(w, h)` and pixel values (round-trip).
+- [x] Emits a valid PNG (signature, IHDR RGBA8, IDAT with a **stored** deflate stream + Adler-32, IEND with per-chunk CRC-32). A >64 KiB raw image spans multiple stored blocks (host-tested).
+- [x] Host test: `decode_png(encode_png(w, h, px))` returns the same `(w, h)` and pixel values (round-trip); an Adler-32 known-answer test pins the checksum.
 
 ### C.4 — `CaptureOutput` verb in `display_server`
 
@@ -199,12 +199,12 @@
 - `kernel-core/src/display/protocol.rs`
 - `userspace/display_server/src/main.rs`
 
-**Symbol:** `ClientMessage::CaptureOutput { shm_id }`, the dispatch arm blitting `display::compose` output
+**Symbol:** `ClientMessage::CaptureOutput { shm_id, max_width, max_height }` (opcode 0x001B) + `ServerMessage::CaptureReply { width, height }` (opcode 0x0144); the dispatch arm blitting `owner.back_buffer_pixels()`. Pure packer: `kernel_core::display::capture::pack_capture_bgra`.
 **Why it matters:** Clients cannot read the kernel framebuffer (`display::fb_owner` makes the compositor the sole reader), so the only way to screenshot is a compositor-side blit of the composited output into a client-provided SHM.
 
 **Acceptance:**
-- [ ] `CaptureOutput { shm_id }` validates the client SHM is ≥ `output_size()`×4 bytes and blits the current composited output into it, replying with width/height.
-- [ ] Codec round-trip host-tested; an undersized/invalid `shm_id` is rejected, not a partial write.
+- [x] `CaptureOutput` validates the client SHM is ≥ `width*height*4` bytes (via `shm_size`) and blits the most-recently-composed frame into it as packed BGRA8888 (stride padding dropped, R/B swapped for RGBA8888 framebuffers), replying `CaptureReply { width, height }`. Pixels ride the SHM (the 4 KiB reply bulk can't hold a frame).
+- [x] Codec round-trip host-tested (both verbs, incl. the `0×0` reject); the pure packer has 6 host tests (padding-drop, RGBA swap, max-dim clamp, undersized-`dst` row clamp, sub-row reject, zero-area). An undersized/unmappable `shm_id` yields a `0×0` reply, not a partial write.
 
 ### C.5 — `screenshot` tool + `screenshot-smoke` gate
 
@@ -212,12 +212,12 @@
 - `userspace/screenshot/{Cargo.toml,src/main.rs}` (new — four-place new-binary wiring)
 - `xtask/src/main.rs` (`cmd_screenshot_smoke`, new)
 
-**Symbol:** `main` (allocate SHM → `CaptureOutput` → `encode_png` → write file), `cmd_screenshot_smoke`
+**Symbol:** `main` (`framebuffer_info` → `desktop_client::capture_output` (allocate SHM → `CaptureOutput`) → `encode_png` → write file → re-read + `decode_png` self-check), `cmd_screenshot_smoke`
 **Why it matters:** Closes the screenshot path end-to-end and gives the phase its "a screenshot writes a valid PNG of the current output" acceptance.
 
 **Acceptance:**
-- [ ] `screenshot` writes `/tmp/screenshot-N.png` (or `-o <path>`); exits non-zero on capture/encode/write failure.
-- [ ] `screenshot-smoke` runs it, then `imagefmt::decode_png`s the written file and asserts dimensions == `output_size()` and the buffer is non-uniform → `SHOT_PNG_OK`.
+- [x] `screenshot [PATH]` writes `/tmp/screenshot.png` (or the arg path); exits non-zero on capture/encode/write failure (`SCREENSHOT_FAIL reason=<why>`).
+- [x] `screenshot-smoke` runs it; the tool itself re-reads + `imagefmt::decode_png`s the written file, asserts dimensions == the captured `(w,h)` and pixels equal the capture (lossless round-trip), and counts non-corner pixels to reject a blank blit → `SCREENSHOT_OK <w>x<h> nonblank=<N> bytes=<B> path=<P>`. Gate `M3OS_SCREENSHOT_REGRESSION=1`, exit 96. **PASS on a default multi-core boot.**
 
 ---
 

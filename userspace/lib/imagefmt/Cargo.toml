@@ -1,0 +1,15 @@
+[package]
+name = "imagefmt"
+version.workspace = true
+edition.workspace = true
+description = "Phase 105 Track C — shared image codecs: BMP/PNG/JPEG decode, PNG encode, scale-to-fit blit."
+
+[lib]
+name = "imagefmt"
+path = "src/lib.rs"
+
+# Pure logic (byte-buffer in, pixel-buffer out): no syscalls, no display
+# dependency. `#![cfg_attr(not(test), no_std)]` so `cargo test -p imagefmt`
+# runs the codec round-trips on the host, and the OS binaries link it no_std.
+
+[dependencies]
