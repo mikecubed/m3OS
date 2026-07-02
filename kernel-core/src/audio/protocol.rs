@@ -85,6 +85,8 @@ const OP_SERVER_CONTROL_EVENT: u16 = 0x0107;
 
 // Control commands (0x0200..=0x02FF)
 const OP_CTL_GET_STATS: u16 = 0x0201;
+// Phase 105 Track D.2 — set the mixer master gain (Q15 fixed-point).
+const OP_CTL_SET_MASTER_VOLUME: u16 = 0x0202;
 
 // Control events (0x0300..=0x03FF)
 const OP_CTL_EVT_STATS: u16 = 0x0301;
@@ -286,6 +288,13 @@ where
     Ok(total)
 }
 
+fn read_u16_at(body: &[u8], offset: usize) -> Result<u16, ProtocolError> {
+    let s = body
+        .get(offset..offset + 2)
+        .ok_or(ProtocolError::Truncated)?;
+    Ok(u16::from_le_bytes([s[0], s[1]]))
+}
+
 fn read_u32_at(body: &[u8], offset: usize) -> Result<u32, ProtocolError> {
     let s = body
         .get(offset..offset + 4)
@@ -375,6 +384,12 @@ pub enum ServerMessage {
 pub enum AudioControlCommand {
     /// Return the latest stream-stats sample.
     GetStats,
+    /// Phase 105 Track D.2 — set the mixer master gain as a Q15
+    /// fixed-point multiplier applied to the final mixed S16LE output.
+    /// `0` mutes, `0x8000` (`audio_mixer::MASTER_GAIN_UNITY_Q15`) is
+    /// unity; the mixer clamps values above unity, so this is a
+    /// `0..=1.0` attenuator (the settings-panel volume slider).
+    SetMasterVolume { q15_gain: u16 },
 }
 
 /// Control-socket reply / subscribed-event payload. Phase 57 surface
@@ -596,15 +611,29 @@ impl AudioControlCommand {
     pub fn encode(&self, buf: &mut [u8]) -> Result<usize, ProtocolError> {
         match self {
             Self::GetStats => encode_fixed(buf, OP_CTL_GET_STATS, 0, |_| {}),
+            Self::SetMasterVolume { q15_gain } => {
+                encode_fixed(buf, OP_CTL_SET_MASTER_VOLUME, 2, |body| {
+                    body[0..2].copy_from_slice(&q15_gain.to_le_bytes());
+                })
+            }
         }
     }
 
     pub fn decode(buf: &[u8]) -> Result<(Self, usize), ProtocolError> {
-        let (body_len, opcode, _body, total) = parse_frame_header(buf)?;
+        let (body_len, opcode, body, total) = parse_frame_header(buf)?;
         match opcode {
             OP_CTL_GET_STATS => {
                 expect_body_len(body_len, 0)?;
                 Ok((Self::GetStats, total))
+            }
+            OP_CTL_SET_MASTER_VOLUME => {
+                expect_body_len(body_len, 2)?;
+                Ok((
+                    Self::SetMasterVolume {
+                        q15_gain: read_u16_at(body, 0)?,
+                    },
+                    total,
+                ))
             }
             _ => Err(ProtocolError::UnknownOpcode(opcode)),
         }
@@ -786,6 +815,21 @@ mod tests {
     }
 
     #[test]
+    fn ctl_command_set_master_volume_roundtrip() {
+        // Boundary + representative gains all round-trip through the codec.
+        for q15_gain in [0u16, 0x4000, 0x8000, 0xFFFF] {
+            roundtrip_ctl_cmd(AudioControlCommand::SetMasterVolume { q15_gain });
+        }
+    }
+
+    #[test]
+    fn client_control_command_set_master_volume_roundtrip() {
+        roundtrip_client(ClientMessage::ControlCommand(
+            AudioControlCommand::SetMasterVolume { q15_gain: 0x4000 },
+        ));
+    }
+
+    #[test]
     fn ctl_event_stats_roundtrip() {
         roundtrip_ctl_evt(AudioControlEvent::Stats {
             underrun_count: 0,
@@ -876,7 +920,10 @@ mod tests {
     }
 
     fn any_ctl_command() -> impl Strategy<Value = AudioControlCommand> {
-        Just(AudioControlCommand::GetStats)
+        prop_oneof![
+            Just(AudioControlCommand::GetStats),
+            any::<u16>().prop_map(|q15_gain| AudioControlCommand::SetMasterVolume { q15_gain }),
+        ]
     }
 
     fn any_ctl_event() -> impl Strategy<Value = AudioControlEvent> {

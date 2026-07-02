@@ -1067,6 +1067,17 @@ name = "imagefmt"
 version = "0.99.0"
 
 [[package]]
+name = "imgview"
+version = "0.99.0"
+dependencies = [
+ "desktop_client",
+ "imagefmt",
+ "kernel-core",
+ "m3ui",
+ "syscall-lib",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -304,6 +304,17 @@ if [ "${M3OS_SCREENSHOT_REGRESSION:-0}" = "1" ]; then
     cargo xtask screenshot-smoke --timeout 120
 fi
 
+# Phase 105 Track D.1 — image-viewer gate. Gated behind
+# M3OS_IMGVIEW_REGRESSION=1 because it boots the graphical stack and runs
+# imgview against a PNG, a BMP, and a JPEG fixture, asserting each decodes
+# (imagefmt) and scale-to-fit-renders to non-blank content. Set the env var
+# on branches touching userspace/imgview, the imagefmt decoders, or the
+# blit_scale_to_fit path.
+if [ "${M3OS_IMGVIEW_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask imgview-smoke..."
+    cargo xtask imgview-smoke --timeout 120
+fi
+
 # Phase 77 — htop process-list regression gate. Gated behind
 # M3OS_HTOP_REGRESSION=1 because the gate cross-compiles the ncurses +
 # htop ports and boots the graphical stack headlessly (QMP + VNC), then
