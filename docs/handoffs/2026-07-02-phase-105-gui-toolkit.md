@@ -341,5 +341,9 @@ Dell-gated remainder. `cargo xtask check` clean.
 `wifi.control` + ScanResult rows + passphrase text_field — moves with
 D.4's backend clients), **D.4** live Wi-Fi (104) + brightness/battery
 (103) backends, **D.5** on-metal validation. Those wait on Phases
-103/104 landing first. When merging stacked PRs, remember the gotcha in
-the State block: branch slices off `main` directly.
+103/104 landing first. **Phase 101's hardware-free remainder landed
+after this phase's Track E** (D.5 Notify routing + E.4 Subscribe push +
+E.3 RegionSpace backend — see the Phase 101 tasks doc), which unblocks
+starting Phase 103 (power) whenever the Dell arc resumes. When merging
+stacked PRs, remember the gotcha in the State block: branch slices off
+`main` directly.

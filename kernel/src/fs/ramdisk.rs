@@ -491,6 +491,8 @@ static NOTIFYD_ELF: &[u8] = generated_initrd_asset!("notifyd");
 static M3UI_DEMO_ELF: &[u8] = generated_initrd_asset!("m3ui-demo");
 // Phase 105 Track B.4 — two-client clipboard round-trip helper.
 static CLIP_SMOKE_ELF: &[u8] = generated_initrd_asset!("clip-smoke");
+// Phase 101 D.5/E.4 — acpi-smoke's Notify test subscriber.
+static ACPI_SUB_SMOKE_ELF: &[u8] = generated_initrd_asset!("acpi-sub-smoke");
 // Phase 105 Track C.5 — screen capture to PNG.
 static SCREENSHOT_ELF: &[u8] = generated_initrd_asset!("screenshot");
 // Phase 105 Track D.1 — image viewer Toplevel.
@@ -1238,6 +1240,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "clip-smoke",
         RamdiskNode::File {
             content: CLIP_SMOKE_ELF,
+        },
+    ),
+    // Phase 101 D.5/E.4 — acpi-smoke's Notify test subscriber.
+    (
+        "acpi-sub-smoke",
+        RamdiskNode::File {
+            content: ACPI_SUB_SMOKE_ELF,
         },
     ),
     // Phase 105 Track C.5 — screen capture to PNG.

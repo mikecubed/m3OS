@@ -12,6 +12,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "acpi-sub-smoke"
+version = "0.99.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
 name = "acpid"
 version = "0.99.0"
 dependencies = [

@@ -2012,6 +2012,28 @@ mod tests {
         );
     }
 
+    // Phase 101 D.5 — Device(DEV0) {}; Method(NTFY) { Notify(\DEV0, 0x80) }:
+    // a GPE-style method's Notify must land in `pending_notify` carrying
+    // the device node + code, ready for acpid's subscriber routing, and
+    // `full_path` must render the ASL path subscribers filter against.
+    #[test]
+    fn notify_records_device_and_code_for_routing() {
+        let body: &[u8] = &[
+            0x5B, 0x82, 0x05, b'D', b'E', b'V', b'0', // Device(DEV0) {}
+            0x14, 0x0E, b'N', b'T', b'F', b'Y', 0x00, // Method(NTFY, 0) {
+            0x86, 0x5C, b'D', b'E', b'V', b'0', //   Notify(\DEV0,
+            0x0A, 0x80, //     0x80) }
+        ];
+        let (mut ns, mut mock) = load(body);
+        let dev = ns.resolve_str("\\DEV0").expect("device exists");
+        assert!(ns.pending_notify.is_empty());
+        let m = ns.resolve_str("\\NTFY").expect("method exists");
+        let mut interp = Interp::new(&mut ns, &mut mock);
+        interp.invoke_method(m, Vec::new()).expect("NTFY evaluates");
+        assert_eq!(ns.pending_notify, alloc::vec![(dev, 0x80u64)]);
+        assert_eq!(ns.full_path(dev), "\\DEV0");
+    }
+
     // OperationRegion(GPR0, SystemIO, 0x62, 4) + Field → read/write via mock.
     #[test]
     fn opregion_field_round_trip() {

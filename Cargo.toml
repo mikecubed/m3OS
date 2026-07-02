@@ -235,6 +235,8 @@ members = [
     "userspace/m3ui-demo",
     # Phase 105 Track B.4 — two-client clipboard round-trip (clipboard-smoke).
     "userspace/clip-smoke",
+    # Phase 101 D.5/E.4 — acpi-smoke's Notify test subscriber.
+    "userspace/acpi-sub-smoke",
     # Phase 105 Track C.5 — screen capture to PNG (screenshot-smoke).
     "userspace/screenshot",
     # Phase 105 Track D.1 — image viewer Toplevel (imgview-render-probe).

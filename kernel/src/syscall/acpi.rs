@@ -197,3 +197,123 @@ pub fn sys_acpi_pm_write(reg_sel: u64, byte_index: u64, value: u64) -> isize {
     }
     0
 }
+
+// ---------------------------------------------------------------------------
+// Phase 101 Track E.3 — the acpid RegionSpace backend surface
+// ---------------------------------------------------------------------------
+//
+// AML `OperationRegion`s name arbitrary I/O ports (EC 0x62/0x66, GPIO
+// blocks, …) and physical MMIO windows, which the role-named PM selectors
+// above deliberately cannot express and the PCI-BAR-scoped
+// `SYS_DEVICE_PIO_*` cannot reach. These four calls give the `/drivers/`-
+// gated `acpid` (the machine's AML interpreter — firmware-trusted by
+// construction, exactly like a kernel-hosted interpreter would be) raw
+// port and physical-memory access for `Field` reads/writes. Width is in
+// BYTES (1/2/4); 64-bit AML field chunks are split ring-3 side so the
+// returned value always fits the positive `isize` range.
+
+/// Validate an E.3 access width (bytes). Returns `false` for anything
+/// other than 1, 2, or 4.
+fn valid_e3_width(width: u64) -> bool {
+    matches!(width, 1 | 2 | 4)
+}
+
+/// `sys_acpi_io_read(port, width_bytes) -> isize` — the port value,
+/// zero-extended.
+pub fn sys_acpi_io_read(port: u64, width: u64) -> isize {
+    if let Err(e) = gate() {
+        return e;
+    }
+    if port > u64::from(u16::MAX) || !valid_e3_width(width) {
+        return NEG_EINVAL;
+    }
+    let port = port as u16;
+    // SAFETY: raw port I/O on behalf of the firmware's own AML — the
+    // same trust boundary as evaluating that AML in ring 0 would be.
+    unsafe {
+        match width {
+            1 => Port::<u8>::new(port).read() as isize,
+            2 => Port::<u16>::new(port).read() as isize,
+            _ => Port::<u32>::new(port).read() as isize,
+        }
+    }
+}
+
+/// `sys_acpi_io_write(port, width_bytes, value) -> isize` — 0 on success.
+pub fn sys_acpi_io_write(port: u64, width: u64, value: u64) -> isize {
+    if let Err(e) = gate() {
+        return e;
+    }
+    if port > u64::from(u16::MAX) || !valid_e3_width(width) {
+        return NEG_EINVAL;
+    }
+    let port = port as u16;
+    // SAFETY: see sys_acpi_io_read.
+    unsafe {
+        match width {
+            1 => Port::<u8>::new(port).write(value as u8),
+            2 => Port::<u16>::new(port).write(value as u16),
+            _ => Port::<u32>::new(port).write(value as u32),
+        }
+    }
+    0
+}
+
+/// Resolve a physical address for an E.3 memory access through the
+/// kernel's linear physical map. Rejects null and addresses whose
+/// access would wrap.
+fn e3_phys_virt(phys: u64, width: u64) -> Result<usize, isize> {
+    if phys == 0 || phys.checked_add(width).is_none() {
+        return Err(NEG_EINVAL);
+    }
+    let offset = crate::mm::phys_offset();
+    Ok((offset + phys) as usize)
+}
+
+/// `sys_acpi_mem_read(phys_addr, width_bytes) -> isize` — the value.
+pub fn sys_acpi_mem_read(phys: u64, width: u64) -> isize {
+    if let Err(e) = gate() {
+        return e;
+    }
+    if !valid_e3_width(width) {
+        return NEG_EINVAL;
+    }
+    let virt = match e3_phys_virt(phys, width) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    // SAFETY: volatile read through the kernel's linear physical map on
+    // behalf of firmware AML (an `OperationRegion(SystemMemory)` field).
+    // The address comes from the firmware's own tables via acpid.
+    unsafe {
+        match width {
+            1 => core::ptr::read_volatile(virt as *const u8) as isize,
+            2 => core::ptr::read_volatile(virt as *const u16) as isize,
+            _ => core::ptr::read_volatile(virt as *const u32) as isize,
+        }
+    }
+}
+
+/// `sys_acpi_mem_write(phys_addr, width_bytes, value) -> isize` — 0 on
+/// success.
+pub fn sys_acpi_mem_write(phys: u64, width: u64, value: u64) -> isize {
+    if let Err(e) = gate() {
+        return e;
+    }
+    if !valid_e3_width(width) {
+        return NEG_EINVAL;
+    }
+    let virt = match e3_phys_virt(phys, width) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    // SAFETY: see sys_acpi_mem_read.
+    unsafe {
+        match width {
+            1 => core::ptr::write_volatile(virt as *mut u8, value as u8),
+            2 => core::ptr::write_volatile(virt as *mut u16, value as u16),
+            _ => core::ptr::write_volatile(virt as *mut u32, value as u32),
+        }
+    }
+    0
+}

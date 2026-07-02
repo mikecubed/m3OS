@@ -54,6 +54,17 @@ Gates are ordered identically to the AGENTS.md lean table.
 
 **Env var:** `M3OS_SETTINGS_REGRESSION=1`
 
+Boots the graphical stack headlessly (QMP + VNC) with the AC'97 device
+attached so `audio_server` runs its real io loop, launches the `settings`
+Toplevel from the term prompt, and drives the default-focused volume slider
+with QMP keyboard `Left` presses. Asserts the full keyboard → widget → IPC →
+server path twice (100%→99%→98%): the client ack sentinel
+(`SETTINGS:volume=<pct> q15=<q> ack=ok`), the server gain-state sentinel
+(`AUDIO_SMOKE:master_gain q15=<q>`), and a ≥12-scanline repaint of the
+composited frame (the volume label + slider knob visibly updated). The gain
+*application* to PCM is host-tested (kernel-core `audio::gain`,
+`audio_server` `gained_pcm`, `audio_mixer`); this gate owns the live path.
+
 ## symphonia-smoke
 
 **Env var:** `M3OS_SYMPHONIA_REGRESSION=1`
@@ -68,17 +79,6 @@ single-client Open/Close cycle re-opens), asserts the per-file
 WAV is non-silent via `assert_wav_non_silent` — the same audible-output
 oracle as `doom-audio-smoke`/`hda-smoke`. A silent capture exits with
 the shared `SMOKE_EXIT_WAV_SILENT` code.
-
-Boots the graphical stack headlessly (QMP + VNC) with the AC'97 device
-attached so `audio_server` runs its real io loop, launches the `settings`
-Toplevel from the term prompt, and drives the default-focused volume slider
-with QMP keyboard `Left` presses. Asserts the full keyboard → widget → IPC →
-server path twice (100%→99%→98%): the client ack sentinel
-(`SETTINGS:volume=<pct> q15=<q> ack=ok`), the server gain-state sentinel
-(`AUDIO_SMOKE:master_gain q15=<q>`), and a ≥12-scanline repaint of the
-composited frame (the volume label + slider knob visibly updated). The gain
-*application* to PCM is host-tested (kernel-core `audio::gain`,
-`audio_server` `gained_pcm`, `audio_mixer`); this gate owns the live path.
 
 ### Bundle: M3OS_USB_REGRESSION=1
 
@@ -365,3 +365,23 @@ Phase 93 — **CI-deterministic**, no network/hardware: builds the musl `libc.so
 **Env var:** `M3OS_DYNAMIC_C_REGRESSION=1`
 
 The heavy opt-in arm: builds the dynamic CPython + libffi, an `M3OS_WITH_DYNAMIC_PYTHON` image, `pkg install python-dynamic` (solver installs `musl`/libc.so first via `DEPS=musl`), then asserts a dynamic `python3` boots (`Python 3.12.8`), imports a `lib-dynload` `.so` via `dlopen` (`DYNPY:import-ok`), and `ctypes.CDLL('/usr/lib/libc.so')` opens + calls `strlen` (`CTYPES:ok`); runs at `--timeout 5400` for the ~30-min cold cross-build + slow-VFS install. Set on branches touching `userspace/ld-musl-x86_64.so.1`, `ports/lib/musl`|`libffi`, `ports/lang/python-dynamic`, xtask `build_musl`/`build_libffi`/`build_python_dynamic` or the `dynamic-*` gates, the kernel `mremap`/`arch_prctl`/startup paths a dynamic libc exercises, or the fatal-fault thread-group teardown (`fault_kill_trampoline`/`terminate_thread_group_and_exit`/`do_full_process_exit`) — the `dynamic-tls`/`thread-fault` fixtures require a musl cross-compiler, else the gate SKIPs
+
+## acpi-smoke
+
+**Env var:** `M3OS_ACPI_REGRESSION=1`
+
+Boots QEMU q35 and asserts the full Phase 101 ACPI pipeline at runtime:
+`acpid` fetches FACP/DSDT via `SYS_ACPI_TABLE_GET` and builds the AML
+namespace from the live firmware bytecode; the E.3 `RegionSpace` boot
+self-probes pass (a `SystemIO` read of the FADT's PM1a status port and a
+`SystemMemory` read of the DSDT signature through the
+`SYS_ACPI_{IO,MEM}_*` syscalls); the SCI routes and the ACPI-enable
+handshake completes; then the gate logs in on the serial console, starts
+the `acpi-sub-smoke` test subscriber (service-registry `Subscribe` — the
+D.5/E.4 push path), fires a QMP `system_powerdown`, and asserts the
+power-button event traversed kernel demux → acpid → the subscribed
+client (`ACPI_SUB:event path=\FIXED.PWRBTN code=0x80`).
+
+## pkg-net-smoke
+
+**Env var:** `M3OS_PKG_NET_REGRESSION=1`

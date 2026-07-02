@@ -1,6 +1,6 @@
 # Phase 101 — ACPI Platform Foundation (AML + device/resource enumeration + SCI): Task List
 
-**Status:** In progress — Tracks A/B/C landed (host-tested `kernel-core/src/acpi/`; QEMU q35 DSDT + synthetic Dell-shaped fixtures green in CI); Track D/E cores landed (kernel FADT/SCI demux + `SYS_ACPI_*` surface + ring-3 `acpid` with `FindByHid`/`GetCrs`/`Sta` queries) with the QEMU `acpi-smoke` power-button arm green. Remaining: D.5/E.4 `Notify()`-subscriber routing, E.3 real `RegionSpace` backend, EC `_Qxx`, and the Dell capture + HW arms on [`docs/handoffs/next-dell-session.md`](../../handoffs/next-dell-session.md).
+**Status:** In progress — Tracks A/B/C landed (host-tested `kernel-core/src/acpi/`; QEMU q35 DSDT + synthetic Dell-shaped fixtures green in CI); Track D/E cores landed (kernel FADT/SCI demux + `SYS_ACPI_*` surface + ring-3 `acpid` with `FindByHid`/`GetCrs`/`Sta` queries); **D.5 `Notify()`-subscriber routing + E.4 `Subscribe` push + E.3 real `RegionSpace` backend landed** (cap-transfer Subscribe → `ipc_send_buf` event push; four new `/drivers/`-gated `SYS_ACPI_{IO,MEM}_{READ,WRITE}` syscalls with boot self-probes) with the extended `acpi-smoke` (power button → subscribed client + regionspace probes) green. Remaining: EC `_Qxx` (deliberately with the Phase 103 EC work), the `PCI_Config` region residual (needs interpreter `_ADR` context), and the Dell capture + HW arms on [`docs/handoffs/next-dell-session.md`](../../handoffs/next-dell-session.md).
 **Source Ref:** phase-101
 **Depends on:** Phase 15 (ACPI table parse — RSDP/RSDT/XSDT, MADT, FADT) ✅, Phase 55a (DMAR/IVRS decode + the `kernel-core` host-tested table-decoder pattern) ✅, Phase 55b (capability-gated device-host syscalls + `Notification` IRQ objects) ✅
 **Goal:** Build an ACPI **namespace** on top of the existing static-table parse: a pragmatic AML interpreter (Track A), the namespace + `_HID`/`_CID` device tree (Track B), `_CRS` resource decode (Track C), SCI/GPE event handling + `Notify()` routing (Track D), a ring-3 `acpid` hosting the interpreter over a thin kernel surface (Track E), and host + bare-metal validation (Track F). The end state: on the Dell Tiger Lake, an `_HID` lookup for `DLL0945` finds the touchpad node and its `_CRS` yields the I2C address + `GpioInt` the Phase 102 driver needs, and a lid/power SCI is demuxed and routed to userspace.
@@ -12,8 +12,8 @@
 | A | AML interpreter (device-enumeration subset) in `kernel-core` — host-tested | — | Landed (`kernel-core/src/acpi/aml/{decode,interp,object}.rs`) |
 | B | Namespace build + device tree + `_HID`/`_CID` matching + `_STA` | A | Landed (`kernel-core/src/acpi/namespace.rs`) |
 | C | `_CRS` resource decode (I2C SerialBus / GpioInt / IRQ / Memory) | A, B | Landed (`kernel-core/src/acpi/resource.rs`) |
-| D | SCI handler + GPE dispatch + `_Lxx`/`_Exx`/`_Qxx` + `Notify()` routing | A, B, E | Landed core (D.1 FADT fields, D.2 route+ISR, D.3 demux+mask+notification, D.4 GPE `_Lxx`/`_Exx` eval + PM1 fixed events — QEMU power-button arm green via `acpi-smoke`); D.4 EC `_Qxx` + D.5 `Notify()` subscriber routing pending |
-| E | Ring-3 `acpid` hosting + thin kernel surface + IPC query/event service (the split decision) | A, B, C | Landed core (E.1 scaffold/wiring, E.2 `SYS_ACPI_TABLE_GET`/`SYS_ACPI_SCI_SUBSCRIBE`/`SYS_ACPI_PM_*`, E.4 `FindByHid`/`GetCrs`/`Sta` queries, E.5 split record); E.3 real `RegionSpace` backend (stub today) + E.4 `Subscribe` push pending |
+| D | SCI handler + GPE dispatch + `_Lxx`/`_Exx`/`_Qxx` + `Notify()` routing | A, B, E | Landed incl. **D.5 `Notify()` subscriber routing** (`route_notify` push + fixed-power-button pseudo-path; host + `acpi-smoke` proven); D.4 EC `_Qxx` deliberately pends the Phase 103 EC work |
+| E | Ring-3 `acpid` hosting + thin kernel surface + IPC query/event service (the split decision) | A, B, C | Landed incl. **E.3 real `RegionSpace` backend** (new `SYS_ACPI_{IO,MEM}_*` syscalls + boot self-probes) and **E.4 `Subscribe` cap-transfer push**; residuals: `PCI_Config` region `_ADR` context, GPE_EN re-arm consumer, `/drivers/`-gate negative test |
 | F | Validation — host tests on captured DSDT, QEMU `acpi-smoke`, bare-metal run | A, B, C, D, E | Partial (host tests on the QEMU q35 DSDT + synthetic Dell-shaped fixtures green; `acpi-smoke` gate green + `M3OS_ACPI_REGRESSION` row live; Dell DSDT capture + HW arms pend the next Dell session) |
 
 ---
@@ -215,13 +215,13 @@
 
 ### D.5 — `Notify()` routing to ring-3 subscribers
 
-**File:** `userspace/acpid/src/notify.rs` (new)
-**Symbol:** `route_notify(device_path, code)`, the subscriber table
+**File:** `userspace/drivers/acpid/src/main.rs` (`route_notify`, `Subscriber`, `handle_subscribe` — acpid stayed single-file)
+**Symbol:** `route_notify(subscribers, device_path, code)`, the bounded subscriber table
 **Why it matters:** AML control methods emit `Notify(device, code)` (battery `0x80` status-change, lid/dock changes); these must reach the Phase 103 power daemon / session over IPC, or events are evaluated and dropped.
 
 **Acceptance:**
-- [ ] A `Notify(dev, code)` executed by a GPE method is delivered to every subscriber of `dev` (or a wildcard) as `(device_path, notify_code)` over the E.4 IPC service.
-- [ ] Host/integration test: a synthetic GPE method issuing `Notify` reaches a subscribed test client with the correct path + code.
+- [x] A `Notify(dev, code)` executed by a GPE method is delivered to every subscriber of `dev` (ASL-path prefix filter; empty = wildcard) as `(device_path, notify_code)` over the E.4 IPC service — the GPE drain in `service_gpe` calls `route_notify` (`ipc_send_buf` push; a dead subscriber is dropped on send failure). The PM1 **fixed** power button (no AML device on q35) rides the same push with the pseudo-path `\FIXED.PWRBTN` + code `0x80`.
+- [x] Host/integration test: host arm = `notify_records_device_and_code_for_routing` (kernel-core interp — hand-assembled `Device(DEV0)` + `Method(NTFY){Notify(\DEV0,0x80)}` lands in `pending_notify` with node + code); integration arm = `acpi-smoke`'s tail — `acpi-sub-smoke` subscribes, the QMP power button fires, and `ACPI_SUB:event path=\FIXED.PWRBTN code=0x80` is asserted. (q35's power button is a fixed event, so the in-VM arm exercises the fixed-event push; GPE-method `Notify` shares `route_notify` and is host-proven.)
 
 ---
 
@@ -257,14 +257,23 @@
 - [x] `acpid` subscribes the SCI `Notification` and is woken when D.3 signals it.
 - [ ] `acpid` reads `PM1_STS` / re-enables a `GPE_EN` bit through the surface (PIO/MMIO, capability-gated) — and a non-`acpid` process is denied. *(PM1_STS read/clear + PM1_EN re-arm proven live by `acpi-smoke`; the GPE_EN selector exists but no GPE re-arm consumer yet, and the `/drivers/`-gate denial arm has no negative test yet.)*
 
-### E.3 — `RegionSpace` backend over `device_host` syscalls
+### E.3 — `RegionSpace` backend (dedicated ACPI io/mem syscalls)
 
-**File:** `userspace/acpid/src/region.rs` (new)
-**Symbol:** `impl RegionSpace for DeviceHostRegions` (`SystemIO`/`SystemMemory`/`PCI_Config`/`EmbeddedController`)
-**Why it matters:** AML `OperationRegion` reads/writes (e.g. a `_STA` that consults an EC register) must hit real hardware; this is the production implementation of the Track A.3 trait, delegating to the existing capability-gated `device_host` PIO/MMIO/config syscalls.
+**File:** `userspace/drivers/acpid/src/main.rs` (`SyscallRegionSpace`) + `kernel/src/syscall/acpi.rs` (`sys_acpi_{io,mem}_{read,write}`)
+**Symbol:** `impl RegionSpace for SyscallRegionSpace` (`SystemIO`/`SystemMemory`)
+**Why it matters:** AML `OperationRegion` reads/writes (e.g. a `_STA` that consults an EC register) must hit real hardware; this is the production implementation of the Track A.3 trait.
+
+> **Charter correction (found during implementation):** delegating to the
+> `device_host` syscalls does not hold — `SYS_DEVICE_PIO_*` is scoped to a
+> *claimed PCI BAR* and no arbitrary phys-map syscall exists, while AML
+> names raw ports (EC `0x62`/`0x66`) and raw physical windows. The slice
+> added four `/drivers/`-gated platform-ACPI syscalls instead
+> (`SYS_ACPI_IO_READ/WRITE` `0x1130/31`, `SYS_ACPI_MEM_READ/WRITE`
+> `0x1132/33`, number-pinned by kernel-core tests), mirroring the
+> `sys_acpi_pm_*` pattern.
 
 **Acceptance:**
-- [ ] `SystemIO`/`SystemMemory`/`PCI_Config` reads/writes route to `SYS_DEVICE_PIO_*` / `SYS_DEVICE_MMIO_MAP` / `SYS_DEVICE_CONFIG_*`.
+- [x] `SystemIO`/`SystemMemory` reads/writes route to the dedicated ACPI io/mem syscalls (64-bit field chunks split into two 32-bit accesses); `PCI_Config`/`EmbeddedControl` return `AmlError::RegionAccess` — PCI regions need the enclosing device's `_ADR`/`_SEG`/`_BBN` context the interpreter does not yet thread through (documented residual); the EC transport is the Phase 103 work. Boot self-probes prove the path end-to-end every boot: a `SystemIO` read of the FADT's PM1a status port + a `SystemMemory` read of the DSDT signature (`ACPI_SMOKE:regionspace-{io,mem} ok`, asserted by `acpi-smoke`).
 - [ ] A `Field`-backed `_STA` reading a real EC/PM register evaluates against hardware on the Dell (`Validated-on-HW`); an `EmbeddedController` region read returns the EC byte.
 
 ### E.4 — `acpid` IPC query/event service
@@ -275,7 +284,7 @@
 
 **Acceptance:**
 - [ ] A client resolves `FindByHid("DLL0945")` → a device handle, `GetResources` → a `DeviceResources` (I2C addr + GpioInt), over IPC. *(`FindByHid`/`GetCrs`/`Sta` labels are served (path + raw `_CRS` bytes; decode client-side via `kernel-core`); the first real client lands with Phase 102.)*
-- [ ] A client `Subscribe`s to a device and receives a `Notify()` event pushed from D.5.
+- [x] A client `Subscribe`s to a device and receives a `Notify()` event pushed from D.5 — the `ACPI_SUBSCRIBE` verb (label 5) carries the subscriber's **registered event-service name** in the bulk; acpid resolves it via `ipc_lookup_service` for its own send handle and pushes events as `ACPI_EVENT` (label 6, `data0` = code, bulk = path). Proven end-to-end by `acpi-smoke` + `userspace/acpi-sub-smoke`. **Two findings from landing this arm:** (1) a raw cap-transfer subscribe does NOT work — `grant_task_cap` is move-semantics, so transferring the endpoint cap strips the subscriber's only receive handle and orphans the endpoint (acpid's push then parks in `BlockedOnSend` forever); the registry hands out independent send handles while the owner keeps receiving, which is the established m3OS push idiom. (2) **Latent kernel bug found + fixed:** `ipc_recv_with_caps` lacked the bound-notification classification `ipc_recv_msg` has — a server with a bound notification using the cap-receiving variant had notification wakes returned as ordinary labels and silently dropped (fixed in `kernel/src/ipc/mod.rs::ipc_recv_with_caps`; acpid's serve loop deliberately stays on that variant so every SCI event regression-tests the fix).
 - [ ] The protocol is documented in the crate header (the contract Phase 102/103 consume).
 
 ### E.5 — Split-decision record (ring-3 interpreter, ring-0 SCI demux)
@@ -315,7 +324,7 @@
 
 **Acceptance:**
 - [x] Boots m3OS, asserts `acpid` built the namespace from QEMU's DSDT and enumerated the emulated devices (a sentinel line).
-- [ ] A `qmp system_powerdown` raises the power-button SCI; the gate asserts the kernel demux signalled `acpid`, the power-button method ran, and a `Notify()` reached a test subscriber. *(Green through "acpid dispatched the power-button event"; the `Notify()`-to-subscriber tail pends D.5/E.4 `Subscribe`.)*
+- [x] A `qmp system_powerdown` raises the power-button SCI; the gate asserts the kernel demux signalled `acpid`, the power-button event was dispatched, and the event reached a subscribed test client (`acpi-sub-smoke`, launched from the serial console before the button fires; `ACPI_SUB:event path=\FIXED.PWRBTN code=0x80`). The gate also asserts the E.3 boot self-probes (`ACPI_SMOKE:regionspace-{io,mem} ok`).
 - [x] `M3OS_ACPI_REGRESSION=1` row added to the `AGENTS.md` gate table; the laptop-device arms skip-with-reason in QEMU.
 
 ### F.3 — Bare-metal validation run (Dell Tiger Lake)

@@ -1,0 +1,12 @@
+[package]
+name = "acpi-sub-smoke"
+version.workspace = true
+edition.workspace = true
+description = "Phase 101 D.5/E.4 — acpi-smoke's test subscriber: Subscribe (cap-transfer) to acpid's event service, print the first pushed (path, code) event."
+
+[[bin]]
+name = "acpi-sub-smoke"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib", features = ["alloc"] }

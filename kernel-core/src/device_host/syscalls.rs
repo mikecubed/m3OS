@@ -290,6 +290,32 @@ pub const SYS_ACPI_PM_READ: u64 = 0x112E;
 /// `sys_acpi_pm_write(reg_sel, byte_index, value) -> isize`.
 pub const SYS_ACPI_PM_WRITE: u64 = 0x112F;
 
+/// Read a raw I/O port for an AML `OperationRegion(SystemIO)` access:
+/// `sys_acpi_io_read(port, width_bytes) -> isize` (the value,
+/// zero-extended; `width_bytes` ∈ {1, 2, 4}).
+///
+/// Phase 101 Track E.3: unlike the role-named PM selectors below, AML
+/// declares arbitrary ports (EC `0x62`/`0x66`, GPIO blocks, …), so the
+/// `acpid` `RegionSpace` backend needs raw-port access. Gated on the
+/// `/drivers/` exec path like every platform-ACPI syscall.
+pub const SYS_ACPI_IO_READ: u64 = 0x1130;
+
+/// Write a raw I/O port for an AML `OperationRegion(SystemIO)` access:
+/// `sys_acpi_io_write(port, width_bytes, value) -> isize` (0 on success).
+pub const SYS_ACPI_IO_WRITE: u64 = 0x1131;
+
+/// Read physical memory for an AML `OperationRegion(SystemMemory)`
+/// access: `sys_acpi_mem_read(phys_addr, width_bytes) -> isize` (the
+/// value; `width_bytes` ∈ {1, 2, 4} — a 64-bit field chunk is split into
+/// two 32-bit accesses ring-3 side so the value always fits the positive
+/// `isize` range).
+pub const SYS_ACPI_MEM_READ: u64 = 0x1132;
+
+/// Write physical memory for an AML `OperationRegion(SystemMemory)`
+/// access: `sys_acpi_mem_write(phys_addr, width_bytes, value) -> isize`
+/// (0 on success).
+pub const SYS_ACPI_MEM_WRITE: u64 = 0x1133;
+
 /// `reg_sel` values for [`SYS_ACPI_PM_READ`]/[`SYS_ACPI_PM_WRITE`]. The
 /// kernel resolves each selector to its FADT-declared port and access
 /// width — ring 3 never names a raw port number.
@@ -316,7 +342,7 @@ pub const DEVICE_HOST_BASE: u64 = SYS_DEVICE_CLAIM;
 ///
 /// Adjust upward when adding new device-host syscalls; the Track B acceptance
 /// items pin this constant as the authoritative upper bound.
-pub const DEVICE_HOST_LAST: u64 = SYS_ACPI_PM_WRITE;
+pub const DEVICE_HOST_LAST: u64 = SYS_ACPI_MEM_WRITE;
 
 #[cfg(test)]
 mod tests {
@@ -348,7 +374,12 @@ mod tests {
         assert_eq!(SYS_ACPI_SCI_SUBSCRIBE, 0x112D);
         assert_eq!(SYS_ACPI_PM_READ, 0x112E);
         assert_eq!(SYS_ACPI_PM_WRITE, 0x112F);
-        assert_eq!(DEVICE_HOST_LAST, SYS_ACPI_PM_WRITE);
+        // Phase 101 E.3 — raw-port + physical-memory region backend.
+        assert_eq!(SYS_ACPI_IO_READ, 0x1130);
+        assert_eq!(SYS_ACPI_IO_WRITE, 0x1131);
+        assert_eq!(SYS_ACPI_MEM_READ, 0x1132);
+        assert_eq!(SYS_ACPI_MEM_WRITE, 0x1133);
+        assert_eq!(DEVICE_HOST_LAST, SYS_ACPI_MEM_WRITE);
     }
 
     #[test]
@@ -370,6 +401,10 @@ mod tests {
             SYS_ACPI_SCI_SUBSCRIBE,
             SYS_ACPI_PM_READ,
             SYS_ACPI_PM_WRITE,
+            SYS_ACPI_IO_READ,
+            SYS_ACPI_IO_WRITE,
+            SYS_ACPI_MEM_READ,
+            SYS_ACPI_MEM_WRITE,
         ];
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate() {
@@ -399,6 +434,10 @@ mod tests {
             SYS_ACPI_SCI_SUBSCRIBE,
             SYS_ACPI_PM_READ,
             SYS_ACPI_PM_WRITE,
+            SYS_ACPI_IO_READ,
+            SYS_ACPI_IO_WRITE,
+            SYS_ACPI_MEM_READ,
+            SYS_ACPI_MEM_WRITE,
         ];
         for n in all {
             assert!(
@@ -424,12 +463,17 @@ mod tests {
         // Phase 92a H.4 pin: the shm-DMA map/unmap pair follows CONFIG_WRITE.
         assert_eq!(SYS_DEVICE_DMA_MAP_SHM, SYS_DEVICE_CONFIG_WRITE + 1);
         assert_eq!(SYS_DEVICE_DMA_UNMAP_SHM, SYS_DEVICE_DMA_MAP_SHM + 1);
-        // Phase 101 D/E pin: the platform-ACPI quartet closes the block.
+        // Phase 101 D/E pin: the platform-ACPI quartet.
         assert_eq!(SYS_ACPI_TABLE_GET, SYS_DEVICE_DMA_UNMAP_SHM + 1);
         assert_eq!(SYS_ACPI_SCI_SUBSCRIBE, SYS_ACPI_TABLE_GET + 1);
         assert_eq!(SYS_ACPI_PM_READ, SYS_ACPI_SCI_SUBSCRIBE + 1);
         assert_eq!(SYS_ACPI_PM_WRITE, SYS_ACPI_PM_READ + 1);
-        assert_eq!(DEVICE_HOST_LAST, SYS_ACPI_PM_WRITE);
+        // Phase 101 E.3 pin: the RegionSpace io/mem quartet closes the block.
+        assert_eq!(SYS_ACPI_IO_READ, SYS_ACPI_PM_WRITE + 1);
+        assert_eq!(SYS_ACPI_IO_WRITE, SYS_ACPI_IO_READ + 1);
+        assert_eq!(SYS_ACPI_MEM_READ, SYS_ACPI_IO_WRITE + 1);
+        assert_eq!(SYS_ACPI_MEM_WRITE, SYS_ACPI_MEM_READ + 1);
+        assert_eq!(DEVICE_HOST_LAST, SYS_ACPI_MEM_WRITE);
     }
 
     #[test]

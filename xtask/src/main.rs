@@ -2168,6 +2168,7 @@ fn build_userspace_bins() {
         ("notifyd", "notifyd", true),
         ("m3ui-demo", "m3ui-demo", true), // Phase 105 A.7: toolkit demo Toplevel
         ("clip-smoke", "clip-smoke", true), // Phase 105 B.4: clipboard round-trip helper
+        ("acpi-sub-smoke", "acpi-sub-smoke", true), // Phase 101 D.5/E.4: Notify test subscriber
         ("screenshot", "screenshot", true), // Phase 105 C.5: screen capture to PNG
         ("imgview", "imgview", true),     // Phase 105 D.1: image viewer Toplevel
         ("settings", "settings", true),   // Phase 105 D.3: settings/control-panel Toplevel
@@ -10949,41 +10950,81 @@ fn cmd_acpi_smoke(args: &SmokeBootArgs) {
     let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
     let step = std::time::Duration::from_secs(args.timeout_secs);
 
+    let mut stdin = child.stdin.take().expect("qemu stdin");
     let result: Result<(), String> = (|| {
-        wait_for_serial_pattern(
-            &rx,
+        let wait = |pat: &str, buf: &mut String, hist: &mut String| {
+            wait_for_serial_pattern(&rx, buf, hist, pat, step, global_start, global_timeout)
+        };
+        let send = |stdin: &mut std::process::ChildStdin, s: &str| -> Result<(), String> {
+            use std::io::Write;
+            stdin
+                .write_all(s.as_bytes())
+                .and_then(|_| stdin.flush())
+                .map_err(|e| format!("serial send failed: {e}"))
+        };
+        wait(
+            "ACPI_SMOKE:namespace-built",
             &mut serial_buf,
             &mut serial_history,
-            "ACPI_SMOKE:namespace-built",
-            step,
-            global_start,
-            global_timeout,
         )?;
         println!("acpi-smoke: namespace built from the live QEMU DSDT");
-        wait_for_serial_pattern(
-            &rx,
+        // Phase 101 E.3 — the boot self-probes prove the real RegionSpace
+        // backend (SystemIO port read + SystemMemory DSDT-signature read)
+        // traversed the new /drivers/-gated syscalls.
+        wait(
+            "ACPI_SMOKE:regionspace-io ok",
             &mut serial_buf,
             &mut serial_history,
-            "ACPI_SMOKE:sci-armed",
-            step,
-            global_start,
-            global_timeout,
         )?;
-        println!("acpi-smoke: SCI armed — firing power button via QMP system_powerdown");
+        wait(
+            "ACPI_SMOKE:regionspace-mem ok",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        println!("acpi-smoke: RegionSpace io+mem self-probes passed (E.3 backend live)");
+        wait("ACPI_SMOKE:sci-armed", &mut serial_buf, &mut serial_history)?;
+        // Phase 101 D.5/E.4 — log in on the serial console and start the
+        // test subscriber BEFORE firing the power button, so the event
+        // push has a registered consumer. (Inline replica of
+        // boot_and_login_steps — this driver predates run_smoke_script's
+        // step model and owns its own serial reader.)
+        wait(
+            "init: started 'net_udp' pid=",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        std::thread::sleep(std::time::Duration::from_secs(25));
+        wait("m3OS login:", &mut serial_buf, &mut serial_history)?;
+        send(&mut stdin, "root\n")?;
+        wait("Password:", &mut serial_buf, &mut serial_history)?;
+        send(&mut stdin, "root\n")?;
+        wait(
+            "[security] credential transition complete",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        send(&mut stdin, "/bin/acpi-sub-smoke\n")?;
+        wait("ACPI_SUB:subscribed", &mut serial_buf, &mut serial_history)?;
+        println!("acpi-smoke: test subscriber registered (service-registry Subscribe ok)");
+        println!("acpi-smoke: firing power button via QMP system_powerdown");
         let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
             .map_err(|e| format!("qmp connect: {e}"))?;
         q.execute("system_powerdown", serde_json::json!({}))
             .map_err(|e| format!("qmp system_powerdown: {e}"))?;
-        wait_for_serial_pattern(
-            &rx,
+        wait(
+            "ACPI_SMOKE:power-button",
             &mut serial_buf,
             &mut serial_history,
-            "ACPI_SMOKE:power-button",
-            step,
-            global_start,
-            global_timeout,
         )?;
+        // The D.5 tail: the event reached the subscribed client.
+        wait(
+            "ACPI_SUB:event path=\\FIXED.PWRBTN code=0x80",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        println!("acpi-smoke: power-button event pushed to the subscribed client");
         Ok(())
     })();
 
@@ -10996,7 +11037,9 @@ fn cmd_acpi_smoke(args: &SmokeBootArgs) {
             let elapsed = global_start.elapsed().as_secs();
             println!(
                 "acpi-smoke: PASSED ({elapsed}s) — namespace built from live firmware AML, \
-                 SCI routed, and a QMP power-button event traversed kernel demux → acpid"
+                 the E.3 RegionSpace io+mem self-probes passed, SCI routed, and a QMP \
+                 power-button event traversed kernel demux → acpid → a subscribed client \
+                 (D.5/E.4 push)"
             );
         }
         Err(msg) => {
