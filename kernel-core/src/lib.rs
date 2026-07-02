@@ -37,6 +37,7 @@ pub mod nvme;
 pub mod pci;
 pub mod pipe;
 pub mod pkey;
+pub mod power;
 pub mod preempt_frame;
 pub mod preempt_model;
 pub mod pty;

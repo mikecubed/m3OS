@@ -96,6 +96,13 @@ pub enum ParsedVerb {
     /// status, the compiled-in retpoline line, the UNADDRESSED classes, and
     /// the Grimsdal microkernel-isolation caveat.
     MitigationsStatus,
+    /// Phase 103 (A.5) — `m3ctl power status`. Queries `powerd`'s
+    /// `power` service (`kernel_core::power::control`) and prints the
+    /// AC/battery snapshot.
+    PowerStatus,
+    /// Phase 103 (A.5) — `m3ctl battery`: the battery-focused view of
+    /// the same `POWER_STATUS` query.
+    Battery,
 }
 
 /// Service-registry name of the mt792x Wi-Fi driver's userspace control
@@ -106,6 +113,63 @@ pub const WIFI_CONTROL_SERVICE_NAME: &str = "wifi.control";
 /// Message printed by `m3ctl wifi status` when the driver reports it is not
 /// associated (or no Wi-Fi driver is present).
 pub const WIFI_NOT_ASSOCIATED_MSG: &str = "wifi: not associated";
+
+/// Message printed by the power verbs when `powerd` is not running.
+pub const POWER_UNAVAILABLE_MSG: &str = "power: powerd not running";
+
+/// Render a [`kernel_core::power::control::PowerStatusWire`] for
+/// `m3ctl power status` (pure formatter — host-tested).
+pub fn format_power_status(status: &kernel_core::power::control::PowerStatusWire) -> String {
+    use kernel_core::power::control::AcState;
+    let mut out = String::new();
+    out.push_str("power:\n  ac: ");
+    out.push_str(match status.ac {
+        AcState::Online => "online",
+        AcState::Offline => "offline",
+        AcState::AssumedOnline => "assumed-online (no adapter device)",
+    });
+    out.push('\n');
+    out.push_str("  battery: ");
+    if status.battery_present {
+        out.push_str(&format_battery_line(status));
+    } else {
+        out.push_str("none");
+    }
+    out.push('\n');
+    out
+}
+
+/// Render the battery view for `m3ctl battery`.
+pub fn format_battery(status: &kernel_core::power::control::PowerStatusWire) -> String {
+    let mut out = String::new();
+    out.push_str("battery: ");
+    if status.battery_present {
+        out.push_str(&format_battery_line(status));
+    } else {
+        out.push_str("none");
+    }
+    out.push('\n');
+    out
+}
+
+fn format_battery_line(status: &kernel_core::power::control::PowerStatusWire) -> String {
+    use alloc::string::ToString;
+    use kernel_core::power::battery::{BST_STATE_CHARGING, BST_STATE_DISCHARGING};
+    use kernel_core::power::control::PERCENT_UNKNOWN;
+    let mut line = String::new();
+    if status.percent == PERCENT_UNKNOWN {
+        line.push_str("present (percent unknown)");
+    } else {
+        line.push_str(&status.percent.to_string());
+        line.push('%');
+    }
+    if status.state & BST_STATE_CHARGING != 0 {
+        line.push_str(" charging");
+    } else if status.state & BST_STATE_DISCHARGING != 0 {
+        line.push_str(" discharging");
+    }
+    line
+}
 
 /// Render a [`wifi_core::control::WifiStatus`] into the human-readable lines
 /// `m3ctl wifi status` prints. Pure + host-tested (`wifi_status_format`).
@@ -285,6 +349,13 @@ pub fn parse_verb(verb: &str, args: &[&str]) -> Result<ParsedVerb, ParseError> {
                 "mitigations: expected `status`",
             )),
         },
+        // Phase 103 (A.5) — `m3ctl power status` / `m3ctl battery`.
+        "power" => match args.first().copied() {
+            Some("status") => Ok(ParsedVerb::PowerStatus),
+            Some(_) => Err(ParseError::BadArgument("power: only `status` is supported")),
+            None => Err(ParseError::MissingArgument("power: expected `status`")),
+        },
+        "battery" => Ok(ParsedVerb::Battery),
         // Phase 56 — display control verbs.
         "version" => Ok(ParsedVerb::Display(ControlCommand::Version)),
         "list-surfaces" => Ok(ParsedVerb::Display(ControlCommand::ListSurfaces)),

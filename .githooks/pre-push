@@ -1014,3 +1014,16 @@ if [ "${M3OS_VFS_THROUGHPUT_REGRESSION:-0}" = "1" ]; then
         exit 1
     fi
 fi
+
+# Phase 103 — laptop-power gate. Gated behind M3OS_POWER_REGRESSION=1
+# because it boots QEMU and asserts the slice-1 pipeline on the VM-modelable
+# platform: powerd serves the no-battery posture through acpid's ACPI_EVAL
+# surface, `m3ctl power status` renders it over the `power` IPC service, and
+# a QMP power-button event traverses acpid -> powerd's event subscription.
+# The live battery/brightness/thermal arms are hardware-only. Set the env
+# var on branches touching kernel-core/src/power/, userspace/powerd,
+# acpid's EVAL verb, or the m3ctl power verbs.
+if [ "${M3OS_POWER_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask power-smoke..."
+    cargo xtask power-smoke --timeout 240
+fi

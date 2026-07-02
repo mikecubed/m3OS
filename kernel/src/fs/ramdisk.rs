@@ -487,6 +487,8 @@ static LAUNCHER_ELF: &[u8] = generated_initrd_asset!("launcher");
 // Phase 73 — notification daemon (AF_UNIX listener) and companion
 // `notify-send` CLI.
 static NOTIFYD_ELF: &[u8] = generated_initrd_asset!("notifyd");
+// Phase 103 — ring-3 power policy daemon.
+static POWERD_ELF: &[u8] = generated_initrd_asset!("powerd");
 // Phase 105 Track A.7 — m3ui toolkit demo Toplevel.
 static M3UI_DEMO_ELF: &[u8] = generated_initrd_asset!("m3ui-demo");
 // Phase 105 Track B.4 — two-client clipboard round-trip helper.
@@ -1220,6 +1222,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "notifyd",
         RamdiskNode::File {
             content: NOTIFYD_ELF,
+        },
+    ),
+    // Phase 103 — ring-3 power policy daemon.
+    (
+        "powerd",
+        RamdiskNode::File {
+            content: POWERD_ELF,
         },
     ),
     (

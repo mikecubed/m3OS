@@ -385,3 +385,19 @@ client (`ACPI_SUB:event path=\FIXED.PWRBTN code=0x80`).
 ## pkg-net-smoke
 
 **Env var:** `M3OS_PKG_NET_REGRESSION=1`
+
+## power-smoke
+
+**Env var:** `M3OS_POWER_REGRESSION=1`
+
+Boots QEMU q35 and asserts the Phase 103 slice-1 pipeline on the
+platform QEMU can model (the desktop/VM "no battery" case): `powerd`
+finds acpid, walks the namespace for `PNP0C0A`/`ACPI0003` (absent on
+q35), and announces `POWERD:ready battery=none ac=assumed-online`;
+after a serial login, `m3ctl power status` renders that posture over
+the `power` IPC service; finally a QMP `system_powerdown` power button
+traverses acpid → powerd's event subscription
+(`POWERD:event path=\FIXED.PWRBTN code=0x80`) — the Track D event
+spine, live in CI. The live battery/brightness/thermal/lid arms have
+no QEMU model and are hardware-only (`Validated-on-HW` per the
+charter's Track G).

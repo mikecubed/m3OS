@@ -219,6 +219,8 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/mt792x_driver.conf\0",
     // Phase 101 Track E: ring-3 ACPI daemon.
     b"/etc/services.d/acpid.conf\0",
+    // Phase 103 — power policy daemon.
+    b"/etc/services.d/powerd.conf\0",
     // Phase 78a B.2: ring-3 xHCI USB host-controller driver.
     b"/etc/services.d/xhci_driver.conf\0",
     // Phase 78b Track B: ring-3 USB hub class driver.

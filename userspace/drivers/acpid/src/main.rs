@@ -122,6 +122,12 @@ const ACPI_STA: u64 = 4;
 const ACPI_SUBSCRIBE: u64 = 5;
 /// Label on every event message pushed to a subscriber's endpoint.
 const ACPI_EVENT: u64 = 6;
+/// Phase 103 A — evaluate a control method / named object. `data[0]` =
+/// path length, bulk = the ASL path (`"\\_SB.BAT0._BST"`). Reply label 0
+/// with bulk = the `kernel_core::acpi::aml::wire`-encoded [`AmlValue`],
+/// or [`REPLY_ERR`] (unresolved path, evaluation error, oversize result).
+/// Any `Notify()` the evaluation queues is routed to subscribers.
+const ACPI_EVAL: u64 = 7;
 /// Reply label for any failure (unknown label, bad request, no match).
 const REPLY_ERR: u64 = u64::MAX;
 /// `ACPI_STA` success replies are `REPLY_STA_BASE | sta`.
@@ -489,6 +495,43 @@ fn service_gpe(
     }
 }
 
+/// `ACPI_EVAL` handler (Phase 103 A): evaluate the named object through
+/// the interpreter + the real RegionSpace backend and reply with the
+/// wire-encoded result. Consumers: `powerd` (`_BST`/`_BIF`/`_PSR`/…).
+fn handle_eval(
+    ns: &mut Namespace,
+    regions: &mut SyscallRegionSpace,
+    subscribers: &mut Vec<Subscriber>,
+    msg: &IpcMessage,
+    bulk: &[u8],
+    reply_cap: u32,
+) {
+    let Some(path) = req_str(msg, bulk) else {
+        syscall_lib::ipc_reply(reply_cap, REPLY_ERR, 0);
+        return;
+    };
+    match ns
+        .evaluate(regions, &path)
+        .ok()
+        .and_then(|v| kernel_core::acpi::aml::wire::encode(&v).ok())
+    {
+        Some(bytes) => {
+            syscall_lib::ipc_store_reply_bulk(&bytes);
+            syscall_lib::ipc_reply(reply_cap, 0, bytes.len() as u64);
+        }
+        None => {
+            syscall_lib::ipc_reply(reply_cap, REPLY_ERR, 0);
+        }
+    }
+    // A method evaluated on a client's behalf may itself Notify —
+    // route exactly like the GPE drain.
+    for (node, code) in core::mem::take(&mut ns.pending_notify) {
+        let path = ns.full_path(node);
+        announce(&format!("acpid: Notify({path}, {code:#x})\n"));
+        route_notify(subscribers, &path, code);
+    }
+}
+
 /// `ACPI_SUBSCRIBE` handler (Phase 101 E.4): the bulk carries the
 /// subscriber's REGISTERED event-service name (`data[0]` = length);
 /// acpid resolves it via `ipc_lookup_service` to obtain its own send
@@ -698,6 +741,14 @@ fn program_main(_args: &[&str]) -> i32 {
             ACPI_GET_CRS => handle_get_crs(&mut ns, &mut regions, &msg, &bulk, reply_cap),
             ACPI_STA => handle_sta(&mut ns, &mut regions, &msg, &bulk, reply_cap),
             ACPI_SUBSCRIBE => handle_subscribe(&mut subscribers, &msg, &bulk, reply_cap),
+            ACPI_EVAL => handle_eval(
+                &mut ns,
+                &mut regions,
+                &mut subscribers,
+                &msg,
+                &bulk,
+                reply_cap,
+            ),
             _ => {
                 syscall_lib::ipc_reply(reply_cap, REPLY_ERR, 0);
             }
