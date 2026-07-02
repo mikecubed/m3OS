@@ -1,0 +1,16 @@
+[package]
+name = "settings"
+version.workspace = true
+edition.workspace = true
+description = "Phase 105 Track D.3 — settings/control-panel Toplevel (m3ui). Sound section drives audio_server SetMasterVolume; Network/Display/Power sections await the Phase 103/104 backends."
+
+[[bin]]
+name = "settings"
+path = "src/main.rs"
+
+[dependencies]
+m3ui = { path = "../lib/m3ui", features = ["render"] }
+desktop_client = { path = "../lib/desktop_client" }
+audio_client = { path = "../lib/audio_client" }
+kernel-core = { path = "../../kernel-core", default-features = false }
+syscall-lib = { path = "../syscall-lib", features = ["alloc"] }

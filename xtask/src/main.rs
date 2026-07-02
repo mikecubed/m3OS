@@ -434,6 +434,13 @@ const SMOKE_EXIT_SCREENSHOT_SMOKE_FAILED: i32 = 96;
 /// appeared for some format).
 const SMOKE_EXIT_IMGVIEW_SMOKE_FAILED: i32 = 97;
 
+/// Phase 105 Track D.3 — `settings-smoke` failed: the `settings` panel did
+/// not compose (`SETTINGS:ready` missing), its volume slider did not push a
+/// keyboard-driven change through `SetMasterVolume` (client `SETTINGS:volume=`
+/// / server `AUDIO_SMOKE:master_gain` sentinels missing), or the panel did
+/// not visibly repaint the changed volume on the composited frame.
+const SMOKE_EXIT_SETTINGS_SMOKE_FAILED: i32 = 98;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -1591,6 +1598,16 @@ fn main() {
             });
             cmd_toolkit_render_probe(&probe_args);
         }
+        // Phase 105 Track D.3 — settings panel Sound section drives
+        // SetMasterVolume end to end (keyboard → slider → IPC → server).
+        Some("settings-smoke") => {
+            let probe_args = parse_less_render_probe_args(&args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_settings_smoke(&probe_args);
+        }
         // Phase 77 Track H.2 — headless htop process-row render probe.
         Some("htop-render-probe") => {
             let probe_args = parse_less_render_probe_args(&args[2..]).unwrap_or_else(|err| {
@@ -1778,7 +1795,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm.\n\
      USB passthrough: --usb-passthrough <vid:pid> (e.g. `--usb-passthrough 0bda:8156`) passes a physical USB device into the guest's emulated xHCI (qemu-xhci,id=xhci_pt). The QEMU process must have access to the USB device node — add a udev rule granting the user/group read-write on the device, or run with sudo. The device is claimed from the host kernel while QEMU runs and is released on exit."
@@ -2136,6 +2153,7 @@ fn build_userspace_bins() {
         ("clip-smoke", "clip-smoke", true), // Phase 105 B.4: clipboard round-trip helper
         ("screenshot", "screenshot", true), // Phase 105 C.5: screen capture to PNG
         ("imgview", "imgview", true),     // Phase 105 D.1: image viewer Toplevel
+        ("settings", "settings", true),   // Phase 105 D.3: settings/control-panel Toplevel
         ("notifyd", "notify-send", true),
         // Phase 73 — lockscreen Layer-shell stub.
         ("lockscreen", "lockscreen", true),
@@ -17535,6 +17553,227 @@ fn cmd_toolkit_render_probe(args: &LessRenderProbeArgs) {
         }
         Err(msg) => {
             eprintln!("toolkit-render-probe: FAILED\n{msg}");
+            std::process::exit(exit_fail);
+        }
+    }
+}
+
+/// Phase 105 Track D.3 — `settings-smoke`: proves the settings panel's
+/// Sound section drives the audio master volume end to end, keyboard to
+/// server. Boots the graphical session with the AC'97 device attached
+/// (so `audio_server` runs its real io loop, not the silent stub),
+/// launches `settings` from the term prompt, and asserts over QMP +
+/// serial:
+///
+/// 1. `SETTINGS:audio=ok` + `SETTINGS:ready` — the panel connected to
+///    `audio.cmd` and composed + committed its first frame.
+/// 2. keyboard `Left` on the default-focused volume slider →
+///    `AUDIO_SMOKE:master_gain q15=32440` on serial (the server decoded
+///    `SetMasterVolume` and updated its gain state) AND
+///    `SETTINGS:volume=99 q15=32440 ack=ok` (the client's ack round-trip),
+///    AND the composited frame changed ≥ a threshold of scanlines (the
+///    volume label + slider knob repainted).
+/// 3. a second `Left` repeats the path at 98% / q15=32112 (updates are
+///    repeatable, not a one-shot).
+///
+/// The q15 values are pinned to `settings`' `pct_to_q15` mapping
+/// (`pct * 0x8000 / 100`, truncating): 99% → 32440, 98% → 32112. The
+/// gain *application* to PCM is host-tested (kernel-core `audio::gain`,
+/// `audio_server::gained_pcm`, `audio_mixer`) — this gate owns the live
+/// keyboard→widget→IPC→server-state path.
+#[allow(clippy::zombie_processes)]
+fn cmd_settings_smoke(args: &LessRenderProbeArgs) {
+    /// Minimum changed scanlines (vs the pre-keypress baseline) that prove
+    /// the volume label + slider knob visibly repainted. The label row is
+    /// ~16px and the knob band ~24px; 12 separates "repainted" from noise
+    /// (same threshold as `toolkit-render-probe`).
+    const MIN_CHANGED_SCANLINES: u32 = 12;
+
+    let exit_fail = SMOKE_EXIT_SETTINGS_SMOKE_FAILED;
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+    let ovmf = find_ovmf();
+    if let Err(e) = std::fs::create_dir_all(&args.out_dir) {
+        eprintln!(
+            "settings-smoke: cannot create out dir {}: {e}",
+            args.out_dir.display()
+        );
+        std::process::exit(exit_fail);
+    }
+
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let vnc_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&vnc_socket);
+    let mut qemu_args = qemu_args_with_devices(
+        &uefi_image,
+        &ovmf,
+        QemuDisplayMode::Headless,
+        DeviceSet::default(),
+    );
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // AC'97 attached (output discarded) so the ring-3 `ac97` driver claims
+    // it and `audio_server` runs the real io loop — the gate's
+    // `AUDIO_SMOKE:master_gain` oracle lives there, not in the silent stub.
+    append_ac97_audio_flags_headless(&mut qemu_args);
+    // Same VNC+QMP+VGA render path as the toolkit/htop/less probes: the
+    // *act of having a display* makes QEMU render the framebuffer into a
+    // surface `screendump` can read.
+    let mut idx = 0;
+    while idx + 1 < qemu_args.len() {
+        if qemu_args[idx] == "-display" && qemu_args[idx + 1] == "none" {
+            qemu_args[idx + 1] = format!("vnc=unix:{}", vnc_socket.display());
+            break;
+        }
+        idx += 1;
+    }
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+    qemu_args.push("-vga".to_string());
+    qemu_args.push("std".to_string());
+
+    println!(
+        "settings-smoke: launching QEMU (timeout {}s, qmp {})",
+        args.timeout_secs,
+        qmp_socket.display()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+
+    let result: Result<(u32, u32), String> = (|| {
+        let step = std::time::Duration::from_secs(args.timeout_secs.min(180));
+        let wait = |pat: &str, buf: &mut String, hist: &mut String| {
+            wait_for_serial_pattern(&rx, buf, hist, pat, step, global_start, global_timeout)
+        };
+        wait(
+            "display_server: registered as 'display.input-owner'",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        // The real io loop must be live before settings sends control
+        // verbs (the stub also prints READY, but then the master_gain
+        // sentinel below can never fire — a genuine gate failure).
+        wait(
+            "AUDIO_SMOKE:server:READY",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        wait(
+            "TERM_SMOKE:prompt-ready",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        println!("settings-smoke: session ready — launching settings");
+
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Launch the settings panel as a Toplevel from the shell.
+        q.type_text("/bin/settings\n")
+            .map_err(|e| format!("type settings launch: {e}"))?;
+        wait("SETTINGS:audio=ok", &mut serial_buf, &mut serial_history)?;
+        wait("SETTINGS:ready", &mut serial_buf, &mut serial_history)?;
+        println!("settings-smoke: panel composed its first frame (audio connected)");
+        // Give the compositor a moment to map + focus the new Toplevel.
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        capture_frame(&mut q, &args.out_dir, "00-panel")?;
+        let baseline = ppm::read_ppm(&args.out_dir.join("00-panel.ppm"))?;
+
+        // Keyboard: Left nudges the default-focused slider 100% → 99%.
+        q.press_key("left", 30).map_err(|e| format!("left: {e}"))?;
+        wait(
+            "AUDIO_SMOKE:master_gain q15=32440",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        wait(
+            "SETTINGS:volume=99 q15=32440 ack=ok",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        println!("settings-smoke: Left drove SetMasterVolume to 99% (q15=32440)");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        capture_frame(&mut q, &args.out_dir, "01-after-left")?;
+        let after_left = ppm::read_ppm(&args.out_dir.join("01-after-left.ppm"))?;
+        let left_rows = changed_rows_in_band(&baseline, &after_left, 0.0, 1.0);
+        println!("settings-smoke: volume repaint changed {left_rows} scanlines");
+
+        // A second Left proves updates repeat (99% → 98%).
+        q.press_key("left", 30)
+            .map_err(|e| format!("second left: {e}"))?;
+        wait(
+            "AUDIO_SMOKE:master_gain q15=32112",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        wait(
+            "SETTINGS:volume=98 q15=32112 ack=ok",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        println!("settings-smoke: second Left drove SetMasterVolume to 98% (q15=32112)");
+
+        Ok((left_rows, 0))
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let _ = std::fs::remove_file(&vnc_socket);
+    let _ = std::fs::write(args.out_dir.join("serial.log"), &serial_history);
+
+    match result {
+        Ok((left_rows, _)) if left_rows >= MIN_CHANGED_SCANLINES => {
+            println!(
+                "settings-smoke: PASS — settings composed, keyboard Left drove the volume \
+                 slider through SetMasterVolume twice (99%/q15=32440, 98%/q15=32112) with \
+                 server-side gain-state confirmation, and the volume repaint changed \
+                 {left_rows} scanlines (min {MIN_CHANGED_SCANLINES}). Frames in {}",
+                args.out_dir.display()
+            );
+        }
+        Ok((left_rows, _)) => {
+            eprintln!(
+                "settings-smoke: FAIL — SetMasterVolume round-tripped but the volume repaint \
+                 changed only {left_rows} scanlines (< {MIN_CHANGED_SCANLINES}); the panel did \
+                 not visibly update. Frames in {}",
+                args.out_dir.display()
+            );
+            std::process::exit(exit_fail);
+        }
+        Err(msg) => {
+            eprintln!("settings-smoke: FAILED\n{msg}");
             std::process::exit(exit_fail);
         }
     }

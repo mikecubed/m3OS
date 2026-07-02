@@ -315,6 +315,19 @@ if [ "${M3OS_IMGVIEW_REGRESSION:-0}" = "1" ]; then
     cargo xtask imgview-smoke --timeout 120
 fi
 
+# Phase 105 Track D.3 — settings-panel Sound gate. Gated behind
+# M3OS_SETTINGS_REGRESSION=1 because it boots the graphical stack headlessly
+# (QMP + VNC) with the AC'97 device attached, launches the settings Toplevel,
+# and asserts a keyboard Left on the volume slider round-trips
+# SetMasterVolume (client ack + server gain-state sentinel) and visibly
+# repaints the panel. Set the env var on branches touching
+# userspace/settings, the audio control protocol/audio_client, or
+# audio_server's control dispatch.
+if [ "${M3OS_SETTINGS_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask settings-smoke..."
+    cargo xtask settings-smoke --timeout 300
+fi
+
 # Phase 77 — htop process-list regression gate. Gated behind
 # M3OS_HTOP_REGRESSION=1 because the gate cross-compiles the ncurses +
 # htop ports and boots the graphical stack headlessly (QMP + VNC), then
