@@ -290,6 +290,18 @@ if [ "${M3OS_HTOP_REGRESSION:-0}" = "1" ]; then
     cargo xtask htop-render-probe --timeout 300
 fi
 
+# Phase 105 — m3ui toolkit render gate. Gated behind M3OS_M3UI_REGRESSION=1
+# because it boots the graphical stack headlessly (QMP + VNC), launches the
+# m3ui-demo Toplevel, and asserts on the composited framebuffer that the
+# toolkit drew a widget frame and that a keyboard Enter activated the focused
+# button and repainted the on-screen counter. Set the env var on branches
+# that touch userspace/lib/m3ui, userspace/m3ui-demo, or the desktop_client
+# surface/event API the toolkit rides.
+if [ "${M3OS_M3UI_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask toolkit-render-probe..."
+    cargo xtask toolkit-render-probe --timeout 300
+fi
+
 # Phase 84 — Spectre mitigations reporter gate. Gated behind
 # M3OS_MITIGATIONS_REGRESSION=1 because it boots the OS and asserts, at runtime,
 # the boot mitigation-policy log (`[sec] mitigations=... global_kernel_ptes=0`)

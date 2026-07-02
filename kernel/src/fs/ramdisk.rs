@@ -487,6 +487,8 @@ static LAUNCHER_ELF: &[u8] = generated_initrd_asset!("launcher");
 // Phase 73 — notification daemon (AF_UNIX listener) and companion
 // `notify-send` CLI.
 static NOTIFYD_ELF: &[u8] = generated_initrd_asset!("notifyd");
+// Phase 105 Track A.7 — m3ui toolkit demo Toplevel.
+static M3UI_DEMO_ELF: &[u8] = generated_initrd_asset!("m3ui-demo");
 static NOTIFY_SEND_ELF: &[u8] = generated_initrd_asset!("notify-send");
 
 // Phase 73 — lockscreen Layer-shell stub (exclusive keyboard grab).
@@ -1214,6 +1216,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "notify-send",
         RamdiskNode::File {
             content: NOTIFY_SEND_ELF,
+        },
+    ),
+    // Phase 105 Track A.7 — m3ui toolkit demo Toplevel.
+    (
+        "m3ui-demo",
+        RamdiskNode::File {
+            content: M3UI_DEMO_ELF,
         },
     ),
     // Phase 73 — lockscreen stub.

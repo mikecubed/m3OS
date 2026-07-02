@@ -1,0 +1,26 @@
+[package]
+name = "m3ui"
+version.workspace = true
+edition.workspace = true
+description = "Phase 105 Track A — minimal immediate-mode GUI toolkit (widgets + layout + event routing) on desktop_client."
+
+[lib]
+name = "m3ui"
+path = "src/lib.rs"
+
+[dependencies]
+# desktop_client: the SharedSurface + DisplayConnection + ServerMessage
+# primitives m3ui layers a widget/layout/event model over. Optional so the
+# pure-logic layout/input core (the host-tested falsifiable surface) builds
+# and tests without pulling the framebuffer/IPC client.
+desktop_client = { path = "../desktop_client", optional = true }
+# kernel-core: the TTF atlas/rasterizer for proportional text (render feature).
+kernel-core = { path = "../../../kernel-core", default-features = false, optional = true }
+syscall-lib = { path = "../../syscall-lib", features = ["alloc"], optional = true }
+
+[features]
+# `render` pulls in the framebuffer/IPC + font stack; the default (no
+# features) is the pure-logic core: layout solver + input folding + widget
+# state, all host-testable via `cargo test -p m3ui --target x86_64-unknown-linux-gnu`.
+default = []
+render = ["dep:desktop_client", "dep:kernel-core", "dep:syscall-lib"]
