@@ -1990,6 +1990,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "settings"
+version = "0.99.0"
+dependencies = [
+ "audio_client",
+ "desktop_client",
+ "kernel-core",
+ "m3ui",
+ "syscall-lib",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

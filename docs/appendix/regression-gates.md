@@ -30,9 +30,40 @@ Gates are ordered identically to the AGENTS.md lean table.
 
 **Env var:** `M3OS_TILING_REGRESSION=1`
 
+## clipboard-smoke
+
+**Env var:** `M3OS_CLIPBOARD_REGRESSION=1`
+
+## screenshot-smoke
+
+**Env var:** `M3OS_SCREENSHOT_REGRESSION=1`
+
+## imgview-smoke
+
+**Env var:** `M3OS_IMGVIEW_REGRESSION=1`
+
 ## htop-render-probe
 
 **Env var:** `M3OS_HTOP_REGRESSION=1`
+
+## toolkit-render-probe
+
+**Env var:** `M3OS_M3UI_REGRESSION=1`
+
+## settings-smoke
+
+**Env var:** `M3OS_SETTINGS_REGRESSION=1`
+
+Boots the graphical stack headlessly (QMP + VNC) with the AC'97 device
+attached so `audio_server` runs its real io loop, launches the `settings`
+Toplevel from the term prompt, and drives the default-focused volume slider
+with QMP keyboard `Left` presses. Asserts the full keyboard → widget → IPC →
+server path twice (100%→99%→98%): the client ack sentinel
+(`SETTINGS:volume=<pct> q15=<q> ack=ok`), the server gain-state sentinel
+(`AUDIO_SMOKE:master_gain q15=<q>`), and a ≥12-scanline repaint of the
+composited frame (the volume label + slider knob visibly updated). The gain
+*application* to PCM is host-tested (kernel-core `audio::gain`,
+`audio_server` `gained_pcm`, `audio_mixer`); this gate owns the live path.
 
 ### Bundle: M3OS_USB_REGRESSION=1
 
