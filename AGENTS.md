@@ -141,7 +141,7 @@ This sets `core.hooksPath` to `.githooks/`. **pre-commit** runs `cargo xtask che
 | `vfs-bulkio-smoke` | `M3OS_VFS_BULKIO_REGRESSION=1` | mbedtls install read/write block-call deltas stay under thresholds after coalescing. |
 | `ipv6-smoke` | `M3OS_IPV6_REGRESSION=1` | IPv6 link-local, NDP Neighbor Advertisement, AF_INET6 sockets, ICMPv6, TCP/UDP all pass. |
 | `dynamic-hello-smoke` (+ `dynamic-python-smoke` opt-in) | `M3OS_DYNAMIC_C_REGRESSION=1` | Dynamic C binary loads via PT_INTERP + libc.so + dlopen; TLS and thread-fault arms pass. |
-| `acpi-smoke` | `M3OS_ACPI_REGRESSION=1` | acpid builds the AML namespace from live firmware tables; a QMP power-button SCI traverses kernel demux → acpid dispatch. |
+| `acpi-smoke` | `M3OS_ACPI_REGRESSION=1` | acpid builds the AML namespace from live firmware tables, the RegionSpace io/mem self-probes pass, and a QMP power-button SCI traverses kernel demux → acpid → a subscribed client (service-registry Subscribe + event push). |
 | `pkg-net-smoke` | `M3OS_PKG_NET_REGRESSION=1` | Networked signed packages: ed25519 index verify, tamper-reject fail-closed, fetch+SHA-check install over SLIRP HTTP, bad-blob reject. |
 
 ## Architecture

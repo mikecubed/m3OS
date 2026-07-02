@@ -1685,11 +1685,12 @@ mod syscall_nr {
     // to match against once they land.
     #[allow(unused_imports)]
     pub use kernel_core::device_host::syscalls::{
-        DEVICE_HOST_BASE, DEVICE_HOST_LAST, SYS_ACPI_PM_READ, SYS_ACPI_PM_WRITE,
-        SYS_ACPI_SCI_SUBSCRIBE, SYS_ACPI_TABLE_GET, SYS_DEVICE_CLAIM, SYS_DEVICE_CONFIG_READ,
-        SYS_DEVICE_CONFIG_WRITE, SYS_DEVICE_DMA_ALLOC, SYS_DEVICE_DMA_HANDLE_INFO,
-        SYS_DEVICE_DMA_MAP_SHM, SYS_DEVICE_DMA_UNMAP_SHM, SYS_DEVICE_IRQ_SUBSCRIBE,
-        SYS_DEVICE_MMIO_MAP, SYS_DEVICE_PCI_ENUMERATE, SYS_DEVICE_PIO_READ, SYS_DEVICE_PIO_WRITE,
+        DEVICE_HOST_BASE, DEVICE_HOST_LAST, SYS_ACPI_IO_READ, SYS_ACPI_IO_WRITE, SYS_ACPI_MEM_READ,
+        SYS_ACPI_MEM_WRITE, SYS_ACPI_PM_READ, SYS_ACPI_PM_WRITE, SYS_ACPI_SCI_SUBSCRIBE,
+        SYS_ACPI_TABLE_GET, SYS_DEVICE_CLAIM, SYS_DEVICE_CONFIG_READ, SYS_DEVICE_CONFIG_WRITE,
+        SYS_DEVICE_DMA_ALLOC, SYS_DEVICE_DMA_HANDLE_INFO, SYS_DEVICE_DMA_MAP_SHM,
+        SYS_DEVICE_DMA_UNMAP_SHM, SYS_DEVICE_IRQ_SUBSCRIBE, SYS_DEVICE_MMIO_MAP,
+        SYS_DEVICE_PCI_ENUMERATE, SYS_DEVICE_PIO_READ, SYS_DEVICE_PIO_WRITE,
     };
 
     // -- Phase 84 Spectre mitigations (Track D.3 reporter / C.4 STIBP opt-in) --
@@ -2504,6 +2505,23 @@ pub extern "C" fn syscall_handler(
         SYS_ACPI_PM_WRITE => {
             // Signature: sys_acpi_pm_write(reg_sel, byte_index, value) -> isize.
             crate::syscall::acpi::sys_acpi_pm_write(arg0, arg1, arg2) as u64
+        }
+        // -- Phase 101 E.3: acpid RegionSpace backend (raw port + phys mem) --
+        SYS_ACPI_IO_READ => {
+            // Signature: sys_acpi_io_read(port, width_bytes) -> isize.
+            crate::syscall::acpi::sys_acpi_io_read(arg0, arg1) as u64
+        }
+        SYS_ACPI_IO_WRITE => {
+            // Signature: sys_acpi_io_write(port, width_bytes, value) -> isize.
+            crate::syscall::acpi::sys_acpi_io_write(arg0, arg1, arg2) as u64
+        }
+        SYS_ACPI_MEM_READ => {
+            // Signature: sys_acpi_mem_read(phys_addr, width_bytes) -> isize.
+            crate::syscall::acpi::sys_acpi_mem_read(arg0, arg1) as u64
+        }
+        SYS_ACPI_MEM_WRITE => {
+            // Signature: sys_acpi_mem_write(phys_addr, width_bytes, value) -> isize.
+            crate::syscall::acpi::sys_acpi_mem_write(arg0, arg1, arg2) as u64
         }
         // -- Phase 84 Spectre mitigations --
         SYS_MITIGATIONS_STATUS => sys_mitigations_status(arg0, arg1),

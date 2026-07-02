@@ -1630,16 +1630,32 @@ fn ipc_recv_with_caps(
     buf_len: u64,
 ) -> u64 {
     use crate::task::scheduler;
+    use kernel_core::ipc::wake_kind::{RECV_KIND_MESSAGE, RECV_KIND_NOTIFICATION};
 
-    let msg = endpoint::recv_msg(task_id, ep_id);
-    if msg.label == u64::MAX {
+    // Phase 101 D.5 fix — mirror `ipc_recv_msg`'s bound-notification
+    // classification. This variant originally plain-received, so a server
+    // with a bound notification that moved its serve loop here (acpid, for
+    // the cap-transfer Subscribe verb) had its notification wakes returned
+    // as ordinary message labels and silently dropped them — the SCI
+    // power-button event never dispatched.
+    let (kind, msg) = if let Some(task_sched_idx) = scheduler::get_current_task_idx() {
+        if let Some(notif_id) = notification::lookup_bound_notif(task_sched_idx) {
+            endpoint::recv_msg_with_notif(task_id, ep_id, notif_id)
+        } else {
+            (RECV_KIND_MESSAGE, endpoint::recv_msg(task_id, ep_id))
+        }
+    } else {
+        (RECV_KIND_MESSAGE, endpoint::recv_msg(task_id, ep_id))
+    };
+    if msg.label == u64::MAX && kind == RECV_KIND_MESSAGE {
         return u64::MAX;
     }
     if !write_cap_msg_to_user(msg_ptr, &msg) {
         return u64::MAX;
     }
 
-    if buf_ptr != 0
+    if kind == RECV_KIND_MESSAGE
+        && buf_ptr != 0
         && let Some(bulk) = scheduler::take_bulk_data(task_id)
     {
         let copy_len = bulk.len().min(buf_len as usize);
@@ -1652,7 +1668,11 @@ fn ipc_recv_with_caps(
         }
     }
 
-    msg.label
+    if kind == RECV_KIND_NOTIFICATION {
+        u64::from(RECV_KIND_NOTIFICATION)
+    } else {
+        msg.label
+    }
 }
 
 // ---------------------------------------------------------------------------

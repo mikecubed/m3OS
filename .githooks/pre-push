@@ -394,11 +394,15 @@ fi
 # M3OS_ACPI_REGRESSION=1 because it boots QEMU and asserts the full ACPI
 # pipeline at runtime: acpid fetches the FACP/DSDT via SYS_ACPI_TABLE_GET,
 # the kernel-core AML interpreter builds the namespace from QEMU's live
-# firmware bytecode, the SCI is routed + the ACPI-enable handshake completes,
-# and a QMP `system_powerdown` power-button event traverses kernel demux →
-# bound notification → acpid PM1 dispatch. Set the env var on branches that
-# touch kernel-core/src/acpi/, kernel/src/acpi/, the platform-ACPI syscalls
-# (kernel/src/syscall/acpi.rs), or userspace/drivers/acpid.
+# firmware bytecode, the E.3 RegionSpace io/mem boot self-probes pass
+# (SYS_ACPI_{IO,MEM}_* end-to-end), the SCI is routed + the ACPI-enable
+# handshake completes, and a QMP `system_powerdown` power-button event
+# traverses kernel demux → bound notification → acpid PM1 dispatch → a
+# subscribed test client (acpi-sub-smoke registers an event service acpid
+# resolves for its send handle — the D.5/E.4 push).
+# Set the env var on branches that touch kernel-core/src/acpi/,
+# kernel/src/acpi/, the platform-ACPI syscalls (kernel/src/syscall/acpi.rs),
+# or userspace/drivers/acpid.
 if [ "${M3OS_ACPI_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask acpi-smoke..."
     cargo xtask acpi-smoke --timeout 240
