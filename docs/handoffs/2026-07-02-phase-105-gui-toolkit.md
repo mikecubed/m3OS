@@ -1,15 +1,15 @@
 # Handoff — Phase 105: Native GUI Toolkit & Core Desktop Apps
 
 **Date:** 2026-07-02 (living doc — update each session)
-**Branch:** `feat/phase-105-settings-sound` (D.3 Sound slice; stacked on
-`feat/phase-105-imgview-audio-volume` = PR #278, which is D.1+D.2 off `main`)
-**State:** **Tracks A + B + C COMPLETE + green; Track D.1 + D.2 COMPLETE +
-green (PR #278 open); D.3 Sound slice COMPLETE + green (this branch).**
+**Branch:** `feat/phase-105-track-e-tui-ports` (Track E slice 1; stacked on
+`feat/phase-105-settings-sound` = PR #279 (D.3 Sound), itself stacked on
+`feat/phase-105-imgview-audio-volume` = PR #278 (D.1+D.2) off `main`)
+**State:** **Tracks A + B + C COMPLETE + green; D.1 + D.2 COMPLETE + green
+(PR #278); D.3 Sound slice COMPLETE + green (PR #279); Track E slice 1
+(`nano` + `nnn` ports) COMPLETE + green (this branch).**
 A/B/C merged. D.3's remaining Wi-Fi-stub CI arm moves with D.4; D.4–D.5 are
-the Dell-gated remainder. This branch adds the `settings` control-panel
-Toplevel with the Sound section wired end to end
-(slider → `audio_client::set_master_volume` → `audio_server` gain state) +
-the `settings-smoke` gate. `cargo xtask check` clean.
+the Dell-gated remainder; Track E's `bsdtar`/`symphonia`/`vim` are follow-on
+Portfiles. `cargo xtask check` clean.
 **Charter:** `docs/roadmap/105-gui-toolkit-and-apps.md`
 **Tasks:** `docs/roadmap/tasks/105-gui-toolkit-and-apps-tasks.md`
 
@@ -244,13 +244,45 @@ the `settings-smoke` gate. `cargo xtask check` clean.
   missing Phase 105 gate stanzas (clipboard/screenshot/imgview/toolkit)
   + a full `settings-smoke` description; tasks doc D.3 updated.
 
-## RESUME HERE — Track D.3 Wi-Fi-stub arm → D.4 / Track E next
+## Track E slice 1 — what landed (branch `feat/phase-105-track-e-tui-ports`)
 
-The D.3 Sound slice is done + green (`settings-smoke` PASS). What's left
-in Track D is **Dell-adjacent**: the D.3 **Wi-Fi stub-service CI arm**
-(stub `wifi.control` service + ScanResult rows + passphrase text_field
-in the Network section — moves with D.4's backend clients), **D.4** live
+- **`nano` 8.7 port** (`ports/util/nano/Portfile`, `build_nano`):
+  autotools on the `less` template + htop's two tricks — the
+  `-idirafter` Linux-UAPI injection (nano.c includes `<sys/vt.h>`, a
+  musl shim over `<linux/vt.h>`) and wide-curses pinning, done via
+  nano's documented pkg-config overrides `NCURSESW_CFLAGS`/`NCURSESW_LIBS`
+  (`-lncursesw -ltinfow`; the narrow-tinfo TERMTYPE SIGSEGV hazard).
+  Flags: `--enable-utf8 --disable-nls --disable-libmagic`.
+- **`nnn` 5.2 port** (`ports/util/nnn/Portfile`, `build_nnn`): plain
+  Makefile — command-line make vars override its `?=` pkg-config
+  probes (`CFLAGS_CURSES`/`LDLIBS_CURSES` pin the wide pair). Knobs
+  `O_NORL=1` (no readline port; also dodges `O_STATIC`'s `-lgpm` —
+  `-static` rides LDFLAGS), `O_NOX11=1`, `O_NOFIFO=1`.
+  **`patches/0001-inotify-optional.patch`**: m3OS has no inotify
+  syscalls and upstream nnn hard-exits when `inotify_init1` fails; the
+  patch degrades to no-directory-watching (safe — every downstream use
+  is guarded by `inotify_wd >= 0`). Host-PTY-validated before the gate.
+- **Registration** (the six places, current line anchors in the E.1
+  task entry): dispatch `match name`, `BUILDABLE_PORTS`, `port_deps`,
+  `build_recipe_id` (cache-key transcription), `build_phase_69d_ports`,
+  `populate_phase_69d_ports` `PORTS` (disk staging).
+- **`tui-app-smoke`** grew nano + nnn arms between htop and tmux:
+  nano opens a seeded `/tmp/nano-smoke.txt`, waits for the `GNU nano`
+  title bar AND the seeded buffer line, exits with `^X` (unmodified —
+  no save prompt); nnn browses a seeded two-file dir, waits for both
+  entries, quits with `q`. Sentinels `TUI_APP_SMOKE:{nano,nnn}:ok`.
+- Docs: `tui-app-port-notes.md` matrix + capability + flags + tricky
+  sections; AGENTS.md `tui-app-smoke` row now names nano/nnn.
+
+## RESUME HERE — Track E follow-ons / D.3 Wi-Fi-stub arm → D.4
+
+Track E slice 1 (`nano` + `nnn`) is done + green in `tui-app-smoke`.
+**Track E follow-ons** (parallel, land anytime): `bsdtar` (libarchive)
+port, the `symphonia`-based Rust terminal audio player feeding
+`audio_server` (a new app, not just a Portfile), `vim` as an editor
+alternate. What's left in Track D is **Dell-adjacent**: the D.3
+**Wi-Fi stub-service CI arm** (stub `wifi.control` + ScanResult rows +
+passphrase text_field — moves with D.4's backend clients), **D.4** live
 Wi-Fi (104) + brightness/battery (103) backends, **D.5** on-metal
-validation. **Track E** (TUI-in-`term` ports) is parallel ports-infra
-work that can land anytime. Merge order: PR #278 (D.1+D.2) first, then
-this branch's PR (D.3 Sound).
+validation. Merge order: PR #278 (D.1+D.2) → PR #279 (D.3 Sound) →
+this branch's PR (Track E slice 1).

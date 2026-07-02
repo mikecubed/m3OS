@@ -16786,6 +16786,137 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
         exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
     });
 
+    // ---- nano (Phase 105 Track E): open a seeded file, verify the file
+    //      content via cat first, observe the buffer + chrome render,
+    //      quit unmodified (^X needs no save prompt), sentinel.
+    //
+    //      The waits are fenced: the serial matcher only advances forward,
+    //      and the PTY echoes every typed command — so a wait on a string
+    //      that also occurs in a typed line must first consume past that
+    //      echo. The `:seeded` fence (matched at its own command echo)
+    //      sits after the seed echo; the `cat` output then verifies the
+    //      file really has content (a failed redirect leaves an empty
+    //      file — nano would render `[ Read 0 lines ]` and no buffer
+    //      text); after that wait consumes cat's output, the only
+    //      remaining source of the marker line is nano's own render.
+    //      (`printf` is deliberately avoided — it is not part of the
+    //      in-OS command set; `echo x > file` is the proven idiom, see
+    //      the AHCI/git smokes.)
+    steps.push(SmokeStep::Send {
+        input: "echo m3os nano smoke line > /tmp/nano-smoke.txt\n",
+        label: "guest/tui-app-smoke: seed nano smoke file",
+    });
+    steps.push(SmokeStep::Sleep { millis: 250 });
+    steps.push(SmokeStep::Send {
+        input: "cat /tmp/nano-smoke.txt && echo TUI_APP_SMOKE:nano:seeded\n",
+        label: "guest/tui-app-smoke: verify nano seed file",
+    });
+    steps.push(SmokeStep::Wait {
+        // Matches this command's own echo — consumes past the seed echo.
+        pattern: "TUI_APP_SMOKE:nano:seeded",
+        timeout_secs: 15,
+        label: "guest/tui-app-smoke: nano seed fence",
+    });
+    steps.push(SmokeStep::Wait {
+        // cat's output — proves the redirect actually wrote the line.
+        pattern: "m3os nano smoke line",
+        timeout_secs: 15,
+        label: "guest/tui-app-smoke: nano seed file has content",
+    });
+    steps.push(SmokeStep::Send {
+        input: "TERM=m3os-term TERMINFO=/usr/share/terminfo /usr/local/bin/nano /tmp/nano-smoke.txt\n",
+        label: "guest/tui-app-smoke: nano /tmp/nano-smoke.txt",
+    });
+    steps.push(SmokeStep::Wait {
+        // The launch echo contains no marker and cat's output is consumed,
+        // so this can only be nano rendering the buffer.
+        pattern: "m3os nano smoke line",
+        timeout_secs: 30,
+        label: "guest/tui-app-smoke: nano rendered the buffer",
+    });
+    steps.push(SmokeStep::Send {
+        input: "\x0c", // ^L — full repaint, re-emits the title bar chrome
+        label: "guest/tui-app-smoke: nano refresh (^L)",
+    });
+    steps.push(SmokeStep::Wait {
+        // Title-bar chrome ("GNU nano <version>") — order-robust: either
+        // the first paint's title (if it followed the buffer text) or the
+        // ^L repaint satisfies this.
+        pattern: "GNU nano",
+        timeout_secs: 15,
+        label: "guest/tui-app-smoke: nano title bar rendered",
+    });
+    steps.push(SmokeStep::Send {
+        input: "\x18", // ^X — exit; the buffer is unmodified, so no prompt
+        label: "guest/tui-app-smoke: nano quit (^X)",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "echo TUI_APP_SMOKE:nano:ok\n",
+        label: "guest/tui-app-smoke: nano sentinel",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "TUI_APP_SMOKE:nano:ok",
+        fail_prefixes: &["TUI_APP_SMOKE:nano:fail"],
+        timeout_secs: 15,
+        label: "guest/tui-app-smoke: nano :ok",
+        exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
+    });
+
+    // ---- nnn (Phase 105 Track E): browse a seeded directory, observe
+    //      both entries render, quit, sentinel. Runs without inotify
+    //      (ports/util/nnn/patches/0001-inotify-optional.patch) — the
+    //      listing itself is plain readdir. Same fence discipline as
+    //      nano: the seed command's echo contains both filenames, so a
+    //      fence consumes past it before the render waits.
+    steps.push(SmokeStep::Send {
+        input: "mkdir -p /tmp/nnn-smoke && touch /tmp/nnn-smoke/alpha.txt /tmp/nnn-smoke/bravo.txt\n",
+        label: "guest/tui-app-smoke: seed nnn smoke dir",
+    });
+    steps.push(SmokeStep::Sleep { millis: 250 });
+    steps.push(SmokeStep::Send {
+        input: "echo TUI_APP_SMOKE:nnn:seeded\n",
+        label: "guest/tui-app-smoke: nnn seed fence echo",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "TUI_APP_SMOKE:nnn:seeded",
+        timeout_secs: 15,
+        label: "guest/tui-app-smoke: nnn seed fence",
+    });
+    steps.push(SmokeStep::Send {
+        input: "TERM=m3os-term TERMINFO=/usr/share/terminfo /usr/local/bin/nnn /tmp/nnn-smoke\n",
+        label: "guest/tui-app-smoke: nnn /tmp/nnn-smoke",
+    });
+    steps.push(SmokeStep::Wait {
+        // Post-fence, the only remaining source is nnn's listing (the
+        // launch echo names only the directory). Entries render
+        // alphabetically top-down, so alpha precedes bravo in the stream.
+        pattern: "alpha.txt",
+        timeout_secs: 30,
+        label: "guest/tui-app-smoke: nnn rendered first entry",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "bravo.txt",
+        timeout_secs: 15,
+        label: "guest/tui-app-smoke: nnn rendered second entry",
+    });
+    steps.push(SmokeStep::Send {
+        input: "q",
+        label: "guest/tui-app-smoke: nnn quit",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "echo TUI_APP_SMOKE:nnn:ok\n",
+        label: "guest/tui-app-smoke: nnn sentinel",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "TUI_APP_SMOKE:nnn:ok",
+        fail_prefixes: &["TUI_APP_SMOKE:nnn:fail"],
+        timeout_secs: 15,
+        label: "guest/tui-app-smoke: nnn :ok",
+        exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
+    });
+
     // ---- sendmsg-test: SCM_RIGHTS regression run before tmux.
     //
     // Phase 69d follow-up Track F — validates the kernel sendmsg /
@@ -30250,7 +30381,9 @@ fn populate_ports_tree(part_path: &Path, workspace_root: &Path, ports_src: &Path
 /// `build_zlib`, verified Portfile SHA), bundled and pre-installed exactly like
 /// the other five ports.
 fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
-    const PORTS: &[&str] = &["zlib", "ncurses", "libevent", "less", "htop", "tmux"];
+    const PORTS: &[&str] = &[
+        "zlib", "ncurses", "libevent", "less", "htop", "nano", "nnn", "tmux",
+    ];
     let stage_root = workspace_root.join("target/port-stage");
     let preinstall_root = workspace_root.join("target/pkg-preinstall");
     // Fresh pre-install scratch each run so a stale unpack never leaks in.
