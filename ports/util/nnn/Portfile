@@ -1,0 +1,14 @@
+# Phase 105 Track E — nnn, the workstation's TUI file manager.
+# Built static against the in-tree ncursesw (wide) + tinfow. Readline, X11
+# integration, and the FIFO previewer are disabled (no readline port; no X;
+# no mkfifo guarantee). patches/0001-inotify-optional.patch makes the
+# missing-inotify case (m3OS has no inotify syscalls) degrade to
+# no-directory-watching instead of exiting at startup.
+NAME=nnn
+VERSION=5.2
+DESCRIPTION="nnn terminal file manager (built against ncursesw)"
+CATEGORY=util
+DEPS=ncurses
+URL=https://github.com/jarun/nnn/archive/refs/tags/v5.2.tar.gz
+SHA256=f166eda5093ac8dcf8cbbc6224123a32c53cf37b82c5c1cb48e2e23352754030
+MAINTAINER=m3os

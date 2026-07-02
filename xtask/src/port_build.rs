@@ -357,6 +357,16 @@ fn build_recipe_id(name: &str) -> &'static str {
              --disable-capabilities --disable-sensors --disable-static --enable-static-link \
              --host=x86_64-linux-musl --prefix=/usr/local"
         }
+        // Phase 105 Track E — the two TUI-workstation ports.
+        "nano" => {
+            "configure:--enable-utf8 --disable-nls --disable-libmagic \
+             --host=x86_64-linux-musl --prefix=/usr/local;libs:-lncursesw -ltinfow;\
+             cflags:uapi-idirafter"
+        }
+        "nnn" => {
+            "make:O_NORL=1 O_NOX11=1 O_NOFIFO=1 PREFIX=/usr/local;\
+             cflags:-O2;libs:-lncursesw -ltinfow -lpthread;ldflags:-static"
+        }
         "tmux" => {
             "configure:--enable-utempter=no --enable-systemd=no --disable-utf8proc \
              --host=x86_64-linux-musl --prefix=/usr/local"
@@ -911,6 +921,9 @@ pub fn port_deps(name: &str) -> &'static [&'static str] {
     match name {
         "less" => &["ncurses"],
         "htop" => &["ncurses"],
+        // Phase 105 Track E — TUI editor + file manager.
+        "nano" => &["ncurses"],
+        "nnn" => &["ncurses"],
         // Phase 93: musl (libc.so) is self-contained (no deps).
         "musl" => &[],
         // Phase 93 Track D — the DYNAMIC python's only RUNTIME dep is musl
@@ -1272,6 +1285,9 @@ pub const BUILDABLE_PORTS: &[&str] = &[
     "python",
     "less",
     "htop",
+    // Phase 105 Track E — TUI editor + file manager.
+    "nano",
+    "nnn",
     "tmux",
     "curl",
     "git",
@@ -1890,6 +1906,9 @@ fn port_build(name: &str) -> Result<(), String> {
         "libffi" => build_libffi(&extracted, &stage, &toolchain)?,
         "less" => build_less(&extracted, &stage, &toolchain, &ncurses_stage)?,
         "htop" => build_htop(&extracted, &stage, &toolchain, &ncurses_stage)?,
+        // Phase 105 Track E — TUI editor + file manager.
+        "nano" => build_nano(&extracted, &stage, &toolchain, &ncurses_stage)?,
+        "nnn" => build_nnn(&extracted, &stage, &toolchain, &ncurses_stage)?,
         "tmux" => build_tmux(
             &extracted,
             &stage,
@@ -3778,6 +3797,173 @@ fn build_htop(
     }
     println!(
         "htop: produced /usr/local/bin/htop ({} bytes)",
+        file_size(&bin)
+    );
+    Ok(())
+}
+
+/// Phase 105 Track E — GNU nano (autotools, ncursesw consumer).
+///
+/// The `less` template with htop's wide-curses pinning: nano's configure
+/// honors `NCURSESW_CFLAGS`/`NCURSESW_LIBS` verbatim (they are the
+/// documented pkg-config overrides), which keeps the narrow `libtinfo.a`
+/// off the link line — the same TERMTYPE/TERMTYPE2 narrow/wide SIGSEGV
+/// hazard htop's recipe documents. NLS and libmagic are disabled (no
+/// gettext/libmagic in the tree); UTF-8 stays on (ncursesw).
+fn build_nano(
+    src: &Path,
+    stage: &Path,
+    (cc, ar, ranlib): &(&'static str, String, String),
+    ncurses_stage: &Path,
+) -> Result<(), String> {
+    let ncurses_prefix = ncurses_stage.join("usr/local");
+    if !ncurses_prefix.join("lib/libncursesw.a").exists() {
+        return Err(format!(
+            "nano build: ncursesw stage not found at {}",
+            ncurses_prefix.display()
+        ));
+    }
+    let stage_prefix = stage.join("usr/local");
+    fs::create_dir_all(&stage_prefix).map_err(|e| format!("mkdir: {e}"))?;
+
+    // Same Linux-UAPI need as htop: nano.c includes <sys/vt.h> (console
+    // VT_GETSTATE detection), and musl's sys/vt.h is a shim over
+    // <linux/vt.h> — the -idirafter pair supplies the kernel UAPI headers
+    // without shadowing musl's own libc headers.
+    let arch_include = linux_uapi_arch_include();
+    let cflags = format!(
+        "-O2 -I{0}/include -I{0}/include/ncursesw -idirafter /usr/include -idirafter {1}",
+        ncurses_prefix.display(),
+        arch_include.display()
+    );
+    let extra_ld = musl_extra_ldflags_joined();
+    let ldflags = if extra_ld.is_empty() {
+        format!("-static -L{}/lib", ncurses_prefix.display())
+    } else {
+        format!("-static -L{}/lib {extra_ld}", ncurses_prefix.display())
+    };
+    let ncursesw_cflags = format!(
+        "-I{0}/include -I{0}/include/ncursesw",
+        ncurses_prefix.display()
+    );
+    let ncursesw_libs = format!("-L{}/lib -lncursesw -ltinfow", ncurses_prefix.display());
+
+    let mut configure_cmd = Command::new("sh");
+    configure_cmd
+        .current_dir(src)
+        .arg("./configure")
+        .args([
+            "--enable-utf8",
+            "--disable-nls",
+            "--disable-libmagic",
+            "--host=x86_64-linux-musl",
+        ])
+        .arg("--prefix=/usr/local")
+        .env("CC", cc)
+        .env("AR", ar)
+        .env("RANLIB", ranlib)
+        .env("CFLAGS", &cflags)
+        .env("LDFLAGS", &ldflags)
+        .env("NCURSESW_CFLAGS", &ncursesw_cflags)
+        .env("NCURSESW_LIBS", &ncursesw_libs)
+        .env("LIBS", "-lncursesw -ltinfow");
+    run(&mut configure_cmd, "nano configure")?;
+
+    let mut make_cmd = Command::new("make");
+    make_cmd.current_dir(src).arg(format!("-j{}", num_jobs()));
+    run(&mut make_cmd, "nano make")?;
+
+    let mut install_cmd = Command::new("make");
+    install_cmd
+        .current_dir(src)
+        .arg("install")
+        .arg(format!("DESTDIR={}", stage.display()));
+    run(&mut install_cmd, "nano install")?;
+
+    let bin = stage_prefix.join("bin/nano");
+    if !bin.exists() {
+        return Err(format!("nano build missing {}", bin.display()));
+    }
+    println!(
+        "nano: produced /usr/local/bin/nano ({} bytes)",
+        file_size(&bin)
+    );
+    Ok(())
+}
+
+/// Phase 105 Track E — nnn file manager (plain Makefile, ncursesw consumer).
+///
+/// No `./configure`: command-line make variables override the Makefile's
+/// `?=` pkg-config probes, so the wide-curses pair is pinned the same way
+/// htop pins `CURSES_LIBS` (narrow-tinfo SIGSEGV hazard). Knobs: `O_NORL`
+/// (no readline port in the tree — and skipping `O_STATIC` avoids its
+/// `-lgpm` requirement; `-static` rides `LDFLAGS` instead), `O_NOX11`
+/// (no X11), `O_NOFIFO` (the FIFO previewer wants mkfifo). The Portfile's
+/// `patches/0001-inotify-optional.patch` keeps startup alive without
+/// kernel inotify support (degrades to no directory-change watching).
+fn build_nnn(
+    src: &Path,
+    stage: &Path,
+    (cc, _ar, _ranlib): &(&'static str, String, String),
+    ncurses_stage: &Path,
+) -> Result<(), String> {
+    let ncurses_prefix = ncurses_stage.join("usr/local");
+    if !ncurses_prefix.join("lib/libncursesw.a").exists() {
+        return Err(format!(
+            "nnn build: ncursesw stage not found at {}",
+            ncurses_prefix.display()
+        ));
+    }
+    let stage_prefix = stage.join("usr/local");
+    fs::create_dir_all(&stage_prefix).map_err(|e| format!("mkdir: {e}"))?;
+
+    let curses_cflags = format!(
+        "-I{0}/include -I{0}/include/ncursesw",
+        ncurses_prefix.display()
+    );
+    let extra_ld = musl_extra_ldflags_joined();
+    let ldflags = if extra_ld.is_empty() {
+        format!("-static -L{}/lib", ncurses_prefix.display())
+    } else {
+        format!("-static -L{}/lib {extra_ld}", ncurses_prefix.display())
+    };
+
+    // `make` and `make install` must see identical variables or the
+    // install's `all` prerequisite would relink with different flags.
+    let common_args = [
+        format!("CC={cc}"),
+        "PKG_CONFIG=false".to_string(),
+        "O_NORL=1".to_string(),
+        "O_NOX11=1".to_string(),
+        "O_NOFIFO=1".to_string(),
+        "CFLAGS_OPTIMIZATION=-O2".to_string(),
+        format!("CFLAGS_CURSES={curses_cflags}"),
+        "LDLIBS_CURSES=-lncursesw -ltinfow".to_string(),
+        format!("LDFLAGS={ldflags}"),
+        "PREFIX=/usr/local".to_string(),
+    ];
+
+    let mut make_cmd = Command::new("make");
+    make_cmd
+        .current_dir(src)
+        .args(&common_args)
+        .arg(format!("-j{}", num_jobs()));
+    run(&mut make_cmd, "nnn make")?;
+
+    let mut install_cmd = Command::new("make");
+    install_cmd
+        .current_dir(src)
+        .args(&common_args)
+        .arg("install")
+        .arg(format!("DESTDIR={}", stage.display()));
+    run(&mut install_cmd, "nnn install")?;
+
+    let bin = stage_prefix.join("bin/nnn");
+    if !bin.exists() {
+        return Err(format!("nnn build missing {}", bin.display()));
+    }
+    println!(
+        "nnn: produced /usr/local/bin/nnn ({} bytes)",
         file_size(&bin)
     );
     Ok(())
@@ -7464,7 +7650,9 @@ pub fn build_phase_69d_ports() -> Result<(), String> {
             "no musl cross-compiler on PATH (install musl-tools or musl-gcc-cross-bin)".to_string(),
         );
     }
-    for name in &["zlib", "ncurses", "libevent", "less", "htop", "tmux"] {
+    for name in &[
+        "zlib", "ncurses", "libevent", "less", "htop", "nano", "nnn", "tmux",
+    ] {
         port_build(name).map_err(|e| format!("port {name}: {e}"))?;
     }
     Ok(())

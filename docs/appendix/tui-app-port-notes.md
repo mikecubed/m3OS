@@ -19,6 +19,8 @@ broke.
 | `less` | 668 | `greenwoodsoftware.com/less/less-668.tar.gz` | `2819f55564d86d54` | `/usr/local/bin/less` |
 | `htop` | 3.4.0 | `github.com/htop-dev/.../htop-3.4.0.tar.xz` | `feaabd2d31ca27c0` | `/usr/local/bin/htop` |
 | `tmux` | 3.5a | `github.com/tmux/.../tmux-3.5a.tar.gz` | `16216bd087717ddf` | `/usr/local/bin/tmux` |
+| `nano` | 8.7 | `nano-editor.org/dist/v8/nano-8.7.tar.xz` | `afd287aa672c48b8` | `/usr/local/bin/nano` |
+| `nnn` | 5.2 | `github.com/jarun/nnn/archive/refs/tags/v5.2.tar.gz` | `f166eda5093ac8dc` | `/usr/local/bin/nnn` |
 
 Full SHA-256 lives in each port's `Portfile`. The host-side
 `cargo xtask port build <name>` driver re-verifies the SHA on every
@@ -31,6 +33,8 @@ fetch and refuses to extract a tarball whose hash doesn't match.
 | `less` | narrow (`libncurses.a` + `libtinfo.a`) | `smcup`/`rmcup` (?1049), `clear`, `el`, `civis`/`cnorm`, `setaf`/`setab`, `cup`, `cuf`/`cub`/`cuu`/`cud` | `ICANON` off, `ECHO` off, `VMIN`=1, `VTIME`=0 | ASCII-only on the /etc/passwd smoke; UTF-8 viewing path exists for `less -R` but is not exercised in 69d | none |
 | `htop` | wide (`libncursesw.a` + `libtinfow.a`) | `cup`, `setaf`/`setab` 256-color, `civis`/`cnorm`, `smcup`/`rmcup`, box-drawing | `ICANON` off, `ECHO` off, `VMIN`=1, `VTIME`=1, `SIGWINCH` handler | Box-drawing characters (U+2500..=U+257F) for CPU/mem gauges | optional theme glyphs (not exercised) |
 | `tmux` | wide | full `setaf`/`setab` truecolor, `csr` (scrolling region), `cup`, mouse encoding via `XM`/`xm`, bracketed paste `BE`/`BD` | nested PTY raw mode, `IUTF8`, `IXON` per-pane, `SIGWINCH` per-pane | Box-drawing for pane dividers; UTF-8 status line if themes use it | optional Nerd Font theme glyphs |
+| `nano` | wide (`libncursesw.a` + `libtinfow.a`) | `smcup`/`rmcup`, `cup`, `el`, `setaf`/`setab`, `civis`/`cnorm`, function-key sequences (`kf1`..) | `ICANON` off, `ECHO` off, `VMIN`=1, `SIGWINCH` handler | UTF-8 buffer editing (`--enable-utf8`); ASCII-only in the smoke | none |
+| `nnn` | wide | `cup`, `setaf`/`setab`, `smcup`/`rmcup`, `civis`/`cnorm`, box-drawing | `ICANON` off, `ECHO` off, `VMIN`=1, `SIGWINCH` handler | Box-drawing + wide-char filename cells; ASCII-only in the smoke | optional (`O_NERD` off) |
 
 ## Build flags worth knowing
 
@@ -66,6 +70,26 @@ the kernel UAPI under `/usr/include/linux/` and the arch-specific
 bison/yacc, the xtask `ensure_yacc()` helper downloads byacc 20240109
 into `target/host-bin/yacc` and prepends it to PATH before tmux's
 configure runs.
+
+### nano (Phase 105 Track E)
+`--enable-utf8 --disable-nls --disable-libmagic`. Uses the same
+`-idirafter` Linux-UAPI injection as htop — `nano.c` includes
+`<sys/vt.h>` (console VT detection), and musl's `sys/vt.h` is a shim
+over `<linux/vt.h>`. The wide-curses pair is pinned via nano's
+documented pkg-config overrides `NCURSESW_CFLAGS`/`NCURSESW_LIBS`
+(`-lncursesw -ltinfow`) — same narrow-tinfo hazard as htop below.
+
+### nnn (Phase 105 Track E)
+Plain Makefile (no autotools): command-line make variables override the
+`?=` pkg-config probes, so `CFLAGS_CURSES`/`LDLIBS_CURSES` pin
+`-lncursesw -ltinfow` directly. Knobs: `O_NORL=1` (no readline port in
+the tree; also sidesteps `O_STATIC`'s `-lgpm` requirement — `-static`
+rides `LDFLAGS` instead), `O_NOX11=1`, `O_NOFIFO=1` (FIFO previewer
+wants `mkfifo`). `ports/util/nnn/patches/0001-inotify-optional.patch`
+makes startup survive missing kernel inotify support (m3OS has none):
+upstream exits if `inotify_init1` fails; the patch degrades to
+no-directory-watching, which is safe because every downstream inotify
+use is guarded by `inotify_wd >= 0`.
 
 ## What proved tricky during the port
 

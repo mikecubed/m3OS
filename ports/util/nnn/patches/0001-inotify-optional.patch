@@ -1,0 +1,25 @@
+m3OS: make inotify optional — the kernel has no inotify syscalls, so
+inotify_init1 returns -1 (ENOSYS via musl) and upstream nnn exits at
+startup. Every downstream inotify use is already guarded by
+`inotify_wd >= 0`, which stays -1 forever because
+inotify_add_watch(-1, ...) fails — so simply not exiting degrades
+cleanly to "no automatic directory-change refresh".
+
+--- a/src/nnn.c
++++ b/src/nnn.c
+@@ -9901,10 +9901,11 @@
+ #ifdef LINUX_INOTIFY
+ 	/* Initialize inotify */
+ 	inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+-	if (inotify_fd < 0) {
+-		xerror();
+-		return EXIT_FAILURE;
+-	}
++	/* m3OS: no inotify — run without directory-change watching.
++	 * All uses are guarded by inotify_wd >= 0, which stays -1
++	 * because inotify_add_watch(-1, ...) always fails. */
++	if (inotify_fd < 0)
++		inotify_fd = -1;
+ #elif defined(BSD_KQUEUE)
+ 	kq = kqueue();
+ 	if (kq < 0) {
