@@ -1,18 +1,19 @@
 # Handoff — Phase 105: Native GUI Toolkit & Core Desktop Apps
 
 **Date:** 2026-07-02 (living doc — update each session)
-**Branch:** `feat/phase-105-track-e-bsdtar` (Track E slice 2, off `main`)
+**Branch:** `feat/phase-105-track-e-symphonia` (Track E slice 3, off `main`)
 **State:** **Tracks A + B + C, D.1 + D.2 (#278), D.3 Sound slice (#281,
-re-filed #279), and Track E slice 1 `nano` + `nnn` (#282, re-filed #280)
-are ALL MERGED to `main`. Track E slice 2 (`bsdtar`) COMPLETE + green
-(this branch).**
+re-filed #279), Track E slice 1 `nano` + `nnn` (#282, re-filed #280), and
+slice 2 `bsdtar` (#283) are ALL MERGED to `main`. Track E slice 3
+(`symphonia-play`) COMPLETE + green (this branch) — the Track E charter
+builds are DONE.**
 Stacked-PR gotcha recorded: squash-merging a stack base with
 `--delete-branch` makes GitHub **close** (not retarget) child PRs — #279/
 #280 had to be re-filed as #281/#282 after rebasing onto the new `main`
-(rebase auto-drops the already-applied commits; identical trees).
+(rebase auto-drops the already-applied commits; identical trees). Branch
+new slices off `main` directly.
 D.3's remaining Wi-Fi-stub CI arm moves with D.4; D.4–D.5 are the
-Dell-gated remainder; Track E's `symphonia` player (+ `vim` alt) is the
-follow-on. `cargo xtask check` clean.
+Dell-gated remainder. `cargo xtask check` clean.
 **Charter:** `docs/roadmap/105-gui-toolkit-and-apps.md`
 **Tasks:** `docs/roadmap/tasks/105-gui-toolkit-and-apps-tasks.md`
 
@@ -307,15 +308,38 @@ follow-on. `cargo xtask check` clean.
   execution (keystrokes vanish). `SmokeStep::SendPaced` (new, both
   runners) paces longer lines at 5 ms/byte.
 
-## RESUME HERE — Track E symphonia player / D.3 Wi-Fi-stub arm → D.4
+## Track E slice 3 — what landed (branch `feat/phase-105-track-e-symphonia`)
 
-Track E slices 1+2 (`nano`, `nnn`, `bsdtar`) are merged/green. The
-remaining Track E item is the **`symphonia`-based Rust terminal audio
-player** feeding `audio_server` — a new userspace app (four-place
-wiring + audio_client), not just a Portfile; `vim` stays an optional
-editor alternate. What's left in Track D is **Dell-adjacent**: the D.3
-**Wi-Fi stub-service CI arm** (stub `wifi.control` + ScanResult rows +
-passphrase text_field — moves with D.4's backend clients), **D.4** live
-Wi-Fi (104) + brightness/battery (103) backends, **D.5** on-metal
-validation. When merging stacked PRs, remember the gotcha in the State
-block: merge children before deleting bases, or stack onto `main`.
+- **`symphonia-play` 0.1.0** — the charter's symphonia player and the
+  tree's **first local-source port** (`URL=local`; `port_build` gained a
+  local-source branch: the crate lives under
+  `ports/util/symphonia-play/src`, copied to the work dir per build,
+  hashed into the pkgcache key by `recipe_digest`). A musl-`std` Rust
+  cargo port (uutils mold: static ET_EXEC, `--locked`).
+- **Architecture find worth keeping:** symphonia needs `std`, but the
+  kernel's flat personality-free syscall table means a Linux-ABI musl
+  binary can invoke m3OS IPC directly — `m3ipc.rs` re-declares the three
+  IPC syscalls (0x1109/0x110D/0x1112) via raw `asm!`, `player.rs`
+  re-expresses the Phase 57 audio wire protocol, and a linear resampler
+  (host-unit-tested) converts everything to the protocol's only format
+  (48 kHz S16LE stereo). No kernel or server changes.
+- **Fixtures**: `xtask/assets/symphonia/{sample.wav,sample.flac}`
+  (48 kHz sine; `mkwav.py` + a hand-written verbatim-subframe FLAC
+  encoder `mkflac.py`, validated by symphonia itself via
+  `--decode-only` on the host). Staged to `/usr/share/symphonia/`.
+- **Gate `symphonia-smoke`** (exit 99, `M3OS_SYMPHONIA_REGRESSION=1`,
+  pre-push wired): builds the port, boots the AC'97 WAV-capture backend
+  (`audio_smoke_qemu_args`), plays WAV then FLAC in separate invocations
+  (single-client re-open proven), asserts per-file `SYMPHONIA_PLAY:ok`
+  sentinels + `assert_wav_non_silent` on the capture.
+
+## RESUME HERE — Track D.3 Wi-Fi-stub arm → D.4/D.5 (Dell)
+
+**Track E is complete** (nano, nnn, bsdtar, symphonia-play all landed;
+`vim`/`lf` remain optional alternates). What's left in Phase 105 is
+**Dell-adjacent Track D**: the D.3 **Wi-Fi stub-service CI arm** (stub
+`wifi.control` + ScanResult rows + passphrase text_field — moves with
+D.4's backend clients), **D.4** live Wi-Fi (104) + brightness/battery
+(103) backends, **D.5** on-metal validation. Those wait on Phases
+103/104 landing first. When merging stacked PRs, remember the gotcha in
+the State block: branch slices off `main` directly.

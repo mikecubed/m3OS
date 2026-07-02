@@ -376,6 +376,12 @@ fn build_recipe_id(name: &str) -> &'static str {
              --without-cng --without-xml2 --without-expat --without-iconv \
              --host=x86_64-linux-musl --prefix=/usr/local;make-ldflags:-all-static"
         }
+        // Phase 105 Track E — local-source cargo port; the source itself is
+        // hashed by recipe_digest, so this only pins the cargo invocation.
+        "symphonia-play" => {
+            "cargo:--release --target x86_64-unknown-linux-musl --locked;\
+             rustflags:-C relocation-model=static -C target-feature=+crt-static"
+        }
         "tmux" => {
             "configure:--enable-utempter=no --enable-systemd=no --disable-utf8proc \
              --host=x86_64-linux-musl --prefix=/usr/local"
@@ -930,10 +936,11 @@ pub fn port_deps(name: &str) -> &'static [&'static str] {
     match name {
         "less" => &["ncurses"],
         "htop" => &["ncurses"],
-        // Phase 105 Track E — TUI editor + file manager + archiver.
+        // Phase 105 Track E — TUI editor + file manager + archiver + player.
         "nano" => &["ncurses"],
         "nnn" => &["ncurses"],
         "bsdtar" => &["zlib"],
+        "symphonia-play" => &[],
         // Phase 93: musl (libc.so) is self-contained (no deps).
         "musl" => &[],
         // Phase 93 Track D — the DYNAMIC python's only RUNTIME dep is musl
@@ -1103,6 +1110,8 @@ fn compute_port_key_inner(
         // cross-gcc. Fold the rustc identity so a toolchain bump invalidates the
         // cache and a musl-gcc change does not spuriously invalidate it.
         "coreutils" => rust_toolchain_id(),
+        // Phase 105 Track E — symphonia-play is also a Rust-cargo port.
+        "symphonia-play" => rust_toolchain_id(),
         _ => toolchain_id(),
     };
     let dep_keys: Vec<String> = port_deps(name)
@@ -1295,10 +1304,11 @@ pub const BUILDABLE_PORTS: &[&str] = &[
     "python",
     "less",
     "htop",
-    // Phase 105 Track E — TUI editor + file manager + archiver.
+    // Phase 105 Track E — TUI editor + file manager + archiver + player.
     "nano",
     "nnn",
     "bsdtar",
+    "symphonia-play",
     "tmux",
     "curl",
     "git",
@@ -1772,27 +1782,49 @@ fn port_build(name: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let blob = fetch_tarball(&url, &sha, &cache_dir)?;
+    // Phase 105 Track E — LOCAL-SOURCE ports (`URL=local`): the source is
+    // first-party and lives in-tree under ports/<cat>/<name>/src (hashed
+    // into the content key by recipe_digest, so edits invalidate the
+    // cached .m3pkg). Nothing to fetch or SHA-verify; the "extracted"
+    // tree is a fresh copy of src/ under the work dir so a build never
+    // mutates the checked-in source.
+    let extracted = if url == "local" {
+        let src_dir = port_dir.join("src");
+        if !src_dir.is_dir() {
+            return Err(format!(
+                "local-source port {name}: missing {}",
+                src_dir.display()
+            ));
+        }
+        let _ = fs::remove_dir_all(&work);
+        let dest = work.join("src");
+        fs::create_dir_all(&dest).map_err(|e| format!("mkdir work: {e}"))?;
+        crate::copy_dir_recursive(&src_dir, &dest)
+            .map_err(|e| format!("copy local source: {e}"))?;
+        dest
+    } else {
+        let blob = fetch_tarball(&url, &sha, &cache_dir)?;
 
-    // Phase 86a Track C.2 — bundle-only (data-blob) ports: no tarball to
-    // extract, no compiler needed. Fetch + SHA-256-verify the single file
-    // (done above by `fetch_tarball`), stage it, seal, stamp, and return
-    // before the extract / toolchain / configure paths run.
-    if name == "ca-certificates" {
-        // Reset stage dir.
-        let _ = fs::remove_dir_all(&stage);
-        fs::create_dir_all(&stage).map_err(|e| format!("mkdir stage: {e}"))?;
-        build_ca_certificates(&blob, &stage)?;
-        seal_package(name, &stage, &key)?;
-        fs::write(&stamp, &fingerprint).map_err(|e| format!("write stamp: {e}"))?;
-        println!(
-            "ports: {name}-{version} build complete (staged at {})",
-            stage.display()
-        );
-        return Ok(());
-    }
+        // Phase 86a Track C.2 — bundle-only (data-blob) ports: no tarball to
+        // extract, no compiler needed. Fetch + SHA-256-verify the single file
+        // (done above by `fetch_tarball`), stage it, seal, stamp, and return
+        // before the extract / toolchain / configure paths run.
+        if name == "ca-certificates" {
+            // Reset stage dir.
+            let _ = fs::remove_dir_all(&stage);
+            fs::create_dir_all(&stage).map_err(|e| format!("mkdir stage: {e}"))?;
+            build_ca_certificates(&blob, &stage)?;
+            seal_package(name, &stage, &key)?;
+            fs::write(&stamp, &fingerprint).map_err(|e| format!("write stamp: {e}"))?;
+            println!(
+                "ports: {name}-{version} build complete (staged at {})",
+                stage.display()
+            );
+            return Ok(());
+        }
 
-    let extracted = extract_tarball(&blob, &work)?;
+        extract_tarball(&blob, &work)?
+    };
     let n = apply_patches(&port_dir.join("patches"), &extracted)?;
     if n > 0 {
         println!("ports: applied {n} patch(es) to {}", extracted.display());
@@ -1870,6 +1902,20 @@ fn port_build(name: &str) -> Result<(), String> {
     // musl binary runs on m3OS.)
     if name == "coreutils" {
         build_uutils(&extracted, &stage, &port_dir)?;
+        seal_package(name, &stage, &key)?;
+        fs::write(&stamp, &fingerprint).map_err(|e| format!("write stamp: {e}"))?;
+        println!(
+            "ports: {name}-{version} build complete (staged at {})",
+            stage.display()
+        );
+        return Ok(());
+    }
+
+    // Phase 105 Track E — symphonia-play is a local-source Rust-cargo port
+    // (self-contained musl target, no musl-gcc), so it branches before the
+    // musl_toolchain() requirement like coreutils.
+    if name == "symphonia-play" {
+        build_symphonia_play(&extracted, &stage)?;
         seal_package(name, &stage, &key)?;
         fs::write(&stamp, &fingerprint).map_err(|e| format!("write stamp: {e}"))?;
         println!(
@@ -2097,6 +2143,63 @@ fn build_go(extracted: &Path, stage: &Path, port_dir: &Path) -> Result<(), Strin
 /// precedent that de-risks this. Stages `/usr/local/bin/coreutils` + one relative
 /// symlink per enabled applet (derived from the binary's own `--list`, so the
 /// symlink set can never drift from the compiled feature set).
+/// Phase 105 Track E — `symphonia-play`, the terminal audio player.
+///
+/// A local-source (`URL=local`) std-Rust cargo port in the uutils mold:
+/// pure-Rust crate + crates.io deps (`--locked` against the committed
+/// Cargo.lock), built for the self-contained musl target as a static
+/// ET_EXEC. See the crate's module docs for how a musl-`std` binary
+/// speaks the m3OS audio IPC (flat personality-free syscall table).
+fn build_symphonia_play(extracted: &Path, stage: &Path) -> Result<(), String> {
+    const TARGET: &str = "x86_64-unknown-linux-musl";
+
+    let target_installed = Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(TARGET))
+        .unwrap_or(false);
+    if !target_installed {
+        return Err(format!(
+            "{TARGET} target not installed — run `rustup target add {TARGET}`"
+        ));
+    }
+
+    // Stable cargo target dir OUTSIDE the (re-copied-every-run) source
+    // tree so re-runs stay incremental — the uutils/go pattern.
+    let root = workspace_root();
+    let cargo_target = root.join("target/port-build/symphonia-play-cargo-target");
+    fs::create_dir_all(&cargo_target).map_err(|e| format!("mkdir cargo target: {e}"))?;
+
+    println!("ports: symphonia-play — cross-building for {TARGET} (release, static, --locked)");
+    let mut cargo = Command::new(env!("CARGO"));
+    cargo
+        .current_dir(extracted)
+        .env("CARGO_TARGET_DIR", &cargo_target)
+        // Same rationale as build_uutils: non-PIE ET_EXEC + embedded musl.
+        .env(
+            "RUSTFLAGS",
+            "-C relocation-model=static -C target-feature=+crt-static",
+        )
+        .args(["build", "--release", "--target", TARGET, "--locked"]);
+    run(&mut cargo, "cargo build symphonia-play")?;
+
+    let built = cargo_target.join(TARGET).join("release/symphonia-play");
+    if !built.is_file() {
+        return Err(format!(
+            "cargo build produced no symphonia-play binary at {}",
+            built.display()
+        ));
+    }
+    let bindir = stage.join("usr/local/bin");
+    fs::create_dir_all(&bindir).map_err(|e| format!("mkdir {}: {e}", bindir.display()))?;
+    fs::copy(&built, bindir.join("symphonia-play")).map_err(|e| format!("copy: {e}"))?;
+    println!(
+        "symphonia-play: produced /usr/local/bin/symphonia-play ({} bytes)",
+        fs::metadata(&built).map(|m| m.len()).unwrap_or(0)
+    );
+    Ok(())
+}
+
 fn build_uutils(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), String> {
     const TARGET: &str = "x86_64-unknown-linux-musl";
     // The curated applet feature set (task B.3). `feat_os_unix_musl` is uutils'

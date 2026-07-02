@@ -22,6 +22,7 @@ broke.
 | `nano` | 8.7 | `nano-editor.org/dist/v8/nano-8.7.tar.xz` | `afd287aa672c48b8` | `/usr/local/bin/nano` |
 | `nnn` | 5.2 | `github.com/jarun/nnn/archive/refs/tags/v5.2.tar.gz` | `f166eda5093ac8dc` | `/usr/local/bin/nnn` |
 | `bsdtar` | 3.8.8 | `github.com/libarchive/.../libarchive-3.8.8.tar.gz` | `038918ea315cdd44` | `/usr/local/bin/bsdtar` |
+| `symphonia-play` | 0.1.0 | *local source* (`ports/util/symphonia-play/src`) | n/a (`URL=local`) | `/usr/local/bin/symphonia-play` |
 
 Full SHA-256 lives in each port's `Portfile`. The host-side
 `cargo xtask port build <name>` driver re-verifies the SHA on every
@@ -147,6 +148,43 @@ rules below apply to ANY smoke step typed at the sh0 serial console):**
    to the byte — shortening + pacing + the rules above made it moot).
 5. `printf` and `touch` are not part of the in-OS command set — seed
    files with the proven `echo text > file` idiom.
+
+### symphonia-play (Phase 105 Track E)
+The tree's **first local-source port** (`URL=local`): the Rust crate
+lives under `ports/util/symphonia-play/src` (no tarball; `recipe_digest`
+hashes the source into the pkgcache key, so edits invalidate the cached
+`.m3pkg`). Built exactly like the Phase 94 uutils port: pure cargo for
+the self-contained `x86_64-unknown-linux-musl` target with
+`RUSTFLAGS="-C relocation-model=static -C target-feature=+crt-static"`
+(static ET_EXEC), `--locked` against the committed `Cargo.lock`.
+
+Architecture note worth remembering: **symphonia requires `std`, yet the
+player feeds `audio_server` over m3OS-native IPC.** That works because
+the kernel's syscall dispatch is one flat table with no personality gate
+— Linux-numbered and m3OS-native (0x1000+) syscalls dispatch identically
+for every process, and the m3OS convention is register-identical to
+Linux x86_64. The crate's `m3ipc.rs` re-declares the three IPC syscall
+numbers (`0x1109` lookup / `0x110D` call-buf / `0x1112` take-bulk, with
+provenance to `syscall-lib`) via raw `asm!`, and `player.rs` re-expresses
+the Phase 57 audio wire protocol (`audio_client`/`kernel-core::audio`
+are `x86_64-unknown-none` workspace crates a musl crate cannot link).
+Decoded audio is converted to the protocol's ONLY format — 48 kHz S16LE
+stereo — by a small linear resampler (host-unit-tested in the crate).
+
+Fixtures: `xtask/assets/symphonia/{sample.wav,sample.flac}` (1 s 440 Hz
+sine, 48 kHz stereo), regenerable by `mkwav.py`/`mkflac.py` — the FLAC
+generator is a hand-written **verbatim-subframe** encoder (~100 lines,
+no host flac binary needed; CRC-8/CRC-16 per spec), validated by
+decoding it with symphonia itself on the host (`--decode-only`).
+
+**Gotcha for every std-Rust port that sleeps:** `std::thread::sleep`
+on Linux targets is implemented via `clock_nanosleep` (syscall 230),
+which m3OS does NOT dispatch — std `assert!`s the return is 0/EINTR and
+**panics on the ENOSYS** (`thread/unix.rs` assertion `left: 38,
+right: 4`, found live by symphonia-smoke: the player decoded fine, hit
+one retryable submit, slept, died). m3OS DOES implement plain
+`nanosleep` (35), so sleep via a raw timespec-pointer syscall (the
+crate's `m3ipc::nanosleep_ms`) instead of `std::thread::sleep`.
 
 ## What proved tricky during the port
 

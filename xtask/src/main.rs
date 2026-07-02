@@ -441,6 +441,12 @@ const SMOKE_EXIT_IMGVIEW_SMOKE_FAILED: i32 = 97;
 /// not visibly repaint the changed volume on the composited frame.
 const SMOKE_EXIT_SETTINGS_SMOKE_FAILED: i32 = 98;
 
+/// Phase 105 Track E — `symphonia-smoke` failed: `symphonia-play` did not
+/// decode or play one of the WAV/FLAC fixtures through `audio_server`
+/// (a `SYMPHONIA_PLAY:error` fired or an `:ok` never appeared). A silent
+/// captured WAV exits [`SMOKE_EXIT_WAV_SILENT`] instead.
+const SMOKE_EXIT_SYMPHONIA_SMOKE_FAILED: i32 = 99;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -1598,6 +1604,17 @@ fn main() {
             });
             cmd_toolkit_render_probe(&probe_args);
         }
+        // Phase 105 Track E — symphonia-play decodes WAV+FLAC and plays them
+        // audibly through audio_server (WAV-capture backend + non-silent check).
+        Some("symphonia-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("symphonia-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_symphonia_smoke(&smoke_args);
+        }
         // Phase 105 Track D.3 — settings panel Sound section drives
         // SetMasterVolume end to end (keyboard → slider → IPC → server).
         Some("settings-smoke") => {
@@ -1795,7 +1812,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm.\n\
      USB passthrough: --usb-passthrough <vid:pid> (e.g. `--usb-passthrough 0bda:8156`) passes a physical USB device into the guest's emulated xHCI (qemu-xhci,id=xhci_pt). The QEMU process must have access to the USB device node — add a udev rule granting the user/group read-write on the device, or run with sudo. The device is claimed from the host kernel while QEMU runs and is released on exit."
@@ -26526,6 +26543,138 @@ const SMOKE_EXIT_TILING_SMOKE_FAILED: i32 = 72;
 /// would. The `DSPPISTOL` SFX submission noted in the design doc is
 /// replaced by Tier 2a title-music output as the audible signal;
 /// the WAV non-silent check covers both equally.
+/// Phase 105 Track E — `symphonia-smoke`: proves the `symphonia-play` port
+/// decodes real audio files (WAV + FLAC fixtures under
+/// `/usr/share/symphonia/`) and plays them through `audio_server` to the
+/// AC'97 device, audibly. Boots the WAV-capture backend
+/// (`audio_smoke_qemu_args`), plays each fixture in its own invocation
+/// (also proving the single-client open/close cycle re-opens cleanly),
+/// asserts the `SYMPHONIA_PLAY:ok` serial sentinels, then verifies the
+/// captured WAV is non-silent (`assert_wav_non_silent`) — the same
+/// audible-output oracle as doom-audio-smoke/hda-smoke.
+fn cmd_symphonia_smoke(args: &SmokeBootArgs) {
+    // Precondition: the player port (pkgcache-hit fast on rebuilds).
+    if port_build::cmd_port_build("symphonia-play") != 0 {
+        eprintln!("symphonia-smoke: precondition failed: symphonia-play port build");
+        std::process::exit(SMOKE_EXIT_SYMPHONIA_SMOKE_FAILED);
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+
+    let smoke_dir = prepare_audio_smoke_dir();
+    let wav_path = smoke_dir.join("audio.wav");
+    let _ = fs::remove_file(&wav_path);
+
+    let ovmf = find_ovmf();
+    let qemu_args = audio_smoke_qemu_args(&smoke_dir, &uefi_image, &ovmf, args.display);
+    let steps = symphonia_smoke_steps();
+
+    println!(
+        "symphonia-smoke: launching QEMU with AC'97 WAV backend (timeout {}s, {} steps)",
+        args.timeout_secs,
+        steps.len()
+    );
+    println!("symphonia-smoke: WAV output → {}", wav_path.display());
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "symphonia-smoke: serial script PASSED ({} steps in {elapsed}s) — WAV + FLAC \
+                 decoded and played through audio_server",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("symphonia-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_SYMPHONIA_SMOKE_FAILED);
+        }
+    }
+
+    // Post-QEMU audible-output oracle — same shape as doom-audio-smoke.
+    match assert_wav_non_silent(&wav_path) {
+        Ok(()) => {
+            println!("symphonia-smoke: WAV non-silent check PASSED");
+        }
+        Err(msg) => {
+            eprintln!("symphonia-smoke: captured WAV is silent\n{msg}");
+            std::process::exit(SMOKE_EXIT_WAV_SILENT);
+        }
+    }
+}
+
+/// Serial step list for [`cmd_symphonia_smoke`]: boot → login → play the
+/// WAV fixture → play the FLAC fixture. One file per invocation (separate
+/// Open/Close cycles); paced sends per the serial-shell rules in
+/// `docs/appendix/tui-app-port-notes.md`; the `SYMPHONIA_PLAY:` sentinels
+/// are output-only (the colon form never appears in a typed line).
+fn symphonia_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/symphonia: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::SendPaced {
+        input: "/usr/local/bin/symphonia-play /usr/share/symphonia/sample.wav\n",
+        char_delay_ms: 5,
+        label: "guest/symphonia: play sample.wav",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "SYMPHONIA_PLAY:ok file=sample.wav",
+        fail_prefixes: &["SYMPHONIA_PLAY:error"],
+        timeout_secs: 120,
+        label: "guest/symphonia: WAV decoded + played + drained",
+        exit_code_on_fail: SMOKE_EXIT_SYMPHONIA_SMOKE_FAILED,
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::SendPaced {
+        input: "/usr/local/bin/symphonia-play /usr/share/symphonia/sample.flac\n",
+        char_delay_ms: 5,
+        label: "guest/symphonia: play sample.flac",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "SYMPHONIA_PLAY:ok file=sample.flac",
+        fail_prefixes: &["SYMPHONIA_PLAY:error"],
+        timeout_secs: 120,
+        label: "guest/symphonia: FLAC decoded + played + drained",
+        exit_code_on_fail: SMOKE_EXIT_SYMPHONIA_SMOKE_FAILED,
+    });
+    steps
+}
+
 fn cmd_doom_audio_smoke(args: &SmokeBootArgs) {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
@@ -29257,6 +29406,38 @@ fn populate_ext2_files(
         }
     }
 
+    // Phase 105 Track E — stage the `symphonia-play` audio fixtures under
+    // `/usr/share/symphonia/` so `symphonia-smoke` can decode + play a real
+    // WAV and FLAC in-guest. Committed under `xtask/assets/symphonia/`
+    // (each regenerable by its `mk*.py`).
+    let symphonia_assets_root = workspace_root().join("xtask/assets/symphonia");
+    let mut symphonia_cmds = String::new();
+    {
+        let fixtures = [
+            ("sample.wav", symphonia_assets_root.join("sample.wav")),
+            ("sample.flac", symphonia_assets_root.join("sample.flac")),
+        ];
+        if fixtures.iter().any(|(_, p)| p.is_file()) {
+            symphonia_cmds.push_str(
+                "mkdir usr/share/symphonia\n\
+                 sif usr/share/symphonia mode 0x41ED\n\
+                 sif usr/share/symphonia uid 0\n\
+                 sif usr/share/symphonia gid 0\n",
+            );
+            for (name, path) in fixtures.iter() {
+                if path.is_file() {
+                    symphonia_cmds.push_str(&format!(
+                        "write \"{}\" usr/share/symphonia/{name}\n\
+                         sif usr/share/symphonia/{name} mode 0x81A4\n\
+                         sif usr/share/symphonia/{name} uid 0\n\
+                         sif usr/share/symphonia/{name} gid 0\n",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+
     // Phase 71 — graphical-session entry point. In every non-smoke mode
     // we write BOTH `term.conf` and `greeter.conf` to the disk image;
     // init then chooses which manifest to load at boot via
@@ -29870,6 +30051,7 @@ fn populate_ext2_files(
          {graphical_only_cmds}\
          {greeter_bg_cmds}\
          {imgview_cmds}\
+         {symphonia_cmds}\
          {skip_tcc_cmds}\
          {disable_display_cmds}\
          {debug_crash_cmds}\
@@ -29931,6 +30113,7 @@ fn populate_ext2_files(
         graphical_only_cmds = graphical_only_cmds,
         greeter_bg_cmds = greeter_bg_cmds,
         imgview_cmds = imgview_cmds,
+        symphonia_cmds = symphonia_cmds,
         skip_tcc_cmds = skip_tcc_cmds,
         disable_display_cmds = disable_display_cmds,
         debug_crash_cmds = debug_crash_cmds,
@@ -30550,7 +30733,16 @@ fn populate_ports_tree(part_path: &Path, workspace_root: &Path, ports_src: &Path
 /// the other five ports.
 fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
     const PORTS: &[&str] = &[
-        "zlib", "ncurses", "libevent", "less", "htop", "nano", "nnn", "bsdtar", "tmux",
+        "zlib",
+        "ncurses",
+        "libevent",
+        "less",
+        "htop",
+        "nano",
+        "nnn",
+        "bsdtar",
+        "symphonia-play",
+        "tmux",
     ];
     let stage_root = workspace_root.join("target/port-stage");
     let preinstall_root = workspace_root.join("target/pkg-preinstall");

@@ -107,6 +107,7 @@ This sets `core.hooksPath` to `.githooks/`. **pre-commit** runs `cargo xtask che
 | `htop-render-probe` | `M3OS_HTOP_REGRESSION=1` | htop process list renders visible rows on the QMP/PPM framebuffer dump. |
 | `toolkit-render-probe` | `M3OS_M3UI_REGRESSION=1` | m3ui toolkit composes a widget frame; keyboard Enter activates the focused button and repaints the counter on the QMP/PPM dump. |
 | `settings-smoke` | `M3OS_SETTINGS_REGRESSION=1` | `settings` panel volume slider drives audio `SetMasterVolume` end to end (keyboard → widget → IPC → server gain state) with a visible repaint on the QMP/PPM dump. |
+| `symphonia-smoke` | `M3OS_SYMPHONIA_REGRESSION=1` | `symphonia-play` decodes the WAV + FLAC fixtures and plays them audibly through `audio_server` (captured WAV non-silent). |
 | `xhci-bringup-smoke` + `xhci-enum-smoke` + `usb-smoke` + `usb-report-smoke` + `usb-hotplug-smoke` + `usb-storage-smoke` + `usb-hub-smoke` + `usb-mount-smoke` + `usb-unmount-smoke` + `usb-storage-dual-smoke` + `usb-multi-controller-smoke` + `usb-eth-smoke` | `M3OS_USB_REGRESSION=1` | Full xHCI USB suite: HID (Boot+Report), mass-storage, hub, hot-plug, multi-controller, USB-Ethernet. |
 | `tls-smoke` PASS (not SKIP) | `M3OS_TLS_REGRESSION=1` | PT_TLS/pthread smoke PASSED (not skipped); musl cross-compiler was present at build. |
 | `dns-smoke` PASS (not SKIP) | `M3OS_DNS_REGRESSION=1` | DNS/recvmsg smoke PASSED (not skipped); musl cross-compiler was present at build. |
