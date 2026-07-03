@@ -26,9 +26,9 @@
 **Why it matters:** Today `cmd_image` emits two separate files — `create_uefi_image` (GPT+ESP kernel) and `create_data_disk` (a separate MBR+ext2 `disk.img`) — and no combiner lays both on one disk, so a USB-only boot has no rootfs partition. One GPT disk with `[ESP FAT] + [ext2 rootfs]` is the M1 medium.
 
 **Acceptance:**
-- [ ] `cargo xtask image --combined` produces a single GPT disk file with exactly two partitions: an EFI System Partition (FAT, bootloader + kernel) and a Linux partition (ext2, populated by `populate_ext2_files`).
-- [ ] The ext2 partition does **not** start at LBA 0; its start LBA is discoverable by the GPT-scan in `usb_ext2_base_lba` (a host test parses the produced image's protective MBR → `EFI PART` header → ext2-magic partition).
-- [ ] `dd`-ing the image to a stick and pointing QEMU's `usb-storage` at it enumerates an ESP **and** an ext2 partition (asserted by `usb-root-smoke`, Track E).
+- [x] `cargo xtask image --combined` produces a single GPT disk file (`m3os-usb.img`) with exactly two partitions: an EFI System Partition (FAT, unsigned bootloader + kernel — the `--sign` path's `create_fat_filesystem` recipe) and a Linux partition (ext2 — the rootfs partition lifted from the freshly built `disk.img` at its 1 MiB MBR offset, so `populate_ext2_files` content carries over unchanged). Real-image probe: ESP @ LBA 34 (FAT jump `EB 3C 90`), ext2 root @ LBA 34850 (magic `53EF`).
+- [x] The ext2 partition does **not** start at LBA 0; its start LBA is discoverable by the GPT-scan in `usb_ext2_base_lba` — the `combined_gpt_image_is_kernel_probe_discoverable` host test builds a synthetic combined image and replays the kernel's exact probe (protective-MBR `0xEE` → `EFI PART` → 128-byte entry walk → ext2 magic at `first_lba + 2`).
+- [ ] `dd`-ing the image to a stick and pointing QEMU's `usb-storage` at it enumerates an ESP **and** an ext2 partition (asserted by `usb-root-smoke`, Track E — pends A.2–A.4).
 
 ### A.2 — Root slot 0 accepts a `usbN.block` backend
 

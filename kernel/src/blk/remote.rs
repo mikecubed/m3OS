@@ -222,7 +222,15 @@ pub fn is_registered() -> bool {
             Some((ep, owner)) => ("nvme.block", "nvme0", ep, owner),
             None => match registry::lookup_endpoint_with_owner("ahci.block") {
                 Some((ep, owner)) => ("ahci.block", "ahci0", ep, owner),
-                None => return false,
+                // Phase 106 A.2 — last-resort root backend: the boot USB
+                // stick's mass-storage device (the combined GPT image).
+                // Strictly lowest priority so an internal NVMe/AHCI disk
+                // always wins when present; the same `/drivers/` owner
+                // gate below applies to the registrant (usb-storage).
+                None => match registry::lookup_endpoint_with_owner("usb0.block") {
+                    Some((ep, owner)) => ("usb0.block", "usb0", ep, owner),
+                    None => return false,
+                },
             },
         };
     // Owner gate: reject registrations from processes whose `exec_path` is not

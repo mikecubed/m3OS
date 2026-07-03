@@ -1840,7 +1840,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm.\n\
      USB passthrough: --usb-passthrough <vid:pid> (e.g. `--usb-passthrough 0bda:8156`) passes a physical USB device into the guest's emulated xHCI (qemu-xhci,id=xhci_pt). The QEMU process must have access to the USB device node — add a udev rule granting the user/group read-write on the device, or run with sudo. The device is claimed from the host kernel while QEMU runs and is released on exit."
@@ -28166,6 +28166,9 @@ fn cmd_fmt(fix: bool) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ImageArgs {
     sign: bool,
+    /// Phase 106 A.1 — also emit the single-disk `[ESP FAT | ext2 root]`
+    /// GPT image (`m3os-usb.img`), the dd-able USB installer medium.
+    combined: bool,
     key: PathBuf,
     cert: PathBuf,
     enable_telnet: bool,
@@ -28230,6 +28233,7 @@ fn parse_image_args(args: &[String], workspace_root: &Path) -> Result<ImageArgs,
     let mut cert = None;
     let mut enable_telnet = false;
     let mut skip_login = false;
+    let mut combined = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -28264,6 +28268,9 @@ fn parse_image_args(args: &[String], workspace_root: &Path) -> Result<ImageArgs,
             "--skip-login" => {
                 skip_login = true;
             }
+            "--combined" => {
+                combined = true;
+            }
             _ => {
                 return Err(format!("unknown image flag `{arg}`"));
             }
@@ -28277,6 +28284,7 @@ fn parse_image_args(args: &[String], workspace_root: &Path) -> Result<ImageArgs,
 
     Ok(ImageArgs {
         sign,
+        combined,
         key: key.unwrap_or_else(|| default_key_path(workspace_root)),
         cert: cert.unwrap_or_else(|| default_cert_path(workspace_root)),
         enable_telnet,
@@ -32269,6 +32277,17 @@ fn cmd_image(image_args: &ImageArgs) {
         graphical_login, // Phase 71 — gated by --skip-login
     );
 
+    // Phase 106 A.1 — the single-disk USB installer medium: rebuild the
+    // ESP FAT from the unsigned bootloader + kernel (the `--sign` path's
+    // recipe) and lay it plus disk.img's ext2 partition (raw ext2 at the
+    // 1 MiB MBR offset) onto one GPT disk.
+    if image_args.combined
+        && let Err(err) = build_combined_usb_image(&kernel_binary, output_dir)
+    {
+        eprintln!("Error: failed to build combined USB image: {err:#}");
+        std::process::exit(1);
+    }
+
     if !image_args.sign {
         return;
     }
@@ -32623,6 +32642,152 @@ fn create_gpt_disk(mut fat_image: File, out_gpt_path: &Path) -> anyhow::Result<(
         .context("failed to seek to start offset")?;
     io::copy(&mut fat_image, &mut disk).context("failed to copy FAT image to GPT disk")?;
 
+    Ok(())
+}
+
+/// Phase 106 A.1 — compose `m3os-usb.img`: build the ESP FAT (unsigned
+/// bootloader + kernel — the signing path's `create_fat_filesystem`
+/// recipe), lift the ext2 rootfs partition out of the freshly built
+/// `disk.img` (raw ext2 at the 1 MiB MBR offset), and lay both onto one
+/// GPT disk via [`create_combined_gpt_disk`].
+fn build_combined_usb_image(kernel_binary: &Path, output_dir: &Path) -> anyhow::Result<()> {
+    let bootloader = find_uefi_bootloader();
+    let mut files = BTreeMap::new();
+    files.insert(UEFI_BOOT_FILENAME, FileDataSource::File(bootloader));
+    files.insert(
+        KERNEL_FILE_NAME,
+        FileDataSource::File(kernel_binary.to_path_buf()),
+    );
+    let fat_partition = NamedTempFile::new().context("failed to create temporary FAT image")?;
+    create_fat_filesystem(
+        &files,
+        fat_partition
+            .reopen()
+            .context("failed to reopen temporary FAT image for formatting")?,
+    )
+    .context("failed to create combined-image FAT filesystem")?;
+
+    let disk_img = output_dir.join("disk.img");
+    let mut ext2 = fs::File::open(&disk_img)
+        .with_context(|| format!("failed to open `{}`", disk_img.display()))?;
+    let disk_len = ext2.metadata().context("failed to stat disk.img")?.len();
+    // create_data_disk's layout: MBR at LBA 0, raw ext2 from LBA 2048.
+    const EXT2_OFFSET: u64 = 2048 * 512;
+    anyhow::ensure!(
+        disk_len > EXT2_OFFSET,
+        "disk.img smaller than its partition offset"
+    );
+
+    let mut fat = fat_partition
+        .reopen()
+        .context("failed to reopen temporary FAT image for GPT packaging")?;
+    let out = output_dir.join("m3os-usb.img");
+    create_combined_gpt_disk(
+        &mut fat,
+        &mut ext2,
+        EXT2_OFFSET,
+        disk_len - EXT2_OFFSET,
+        &out,
+    )?;
+    fat_partition
+        .close()
+        .context("failed to delete temporary FAT image")?;
+    Ok(())
+}
+
+/// Phase 106 A.1 — lay a FAT ESP and an ext2 rootfs onto ONE GPT disk:
+/// `[protective MBR | GPT | ESP (EFI type) | rootfs (Linux type) | backup GPT]`.
+/// The M1 installer medium: `dd` the result to a stick and the firmware
+/// boots the ESP while the kernel's `usb_ext2_base_lba` GPT scan finds
+/// the rootfs partition (protective-MBR `0xEE` → `EFI PART` → entry
+/// walk → ext2 magic at `first_lba`). Factored from [`create_gpt_disk`]
+/// (single-partition, the signing path) and unit-tested host-side with
+/// synthetic partition contents.
+fn create_combined_gpt_disk(
+    fat_image: &mut File,
+    ext2_image: &mut File,
+    ext2_offset: u64,
+    ext2_len: u64,
+    out_gpt_path: &Path,
+) -> anyhow::Result<()> {
+    let mut disk = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(out_gpt_path)
+        .with_context(|| format!("failed to create GPT file at `{}`", out_gpt_path.display()))?;
+
+    let fat_size = fat_image
+        .metadata()
+        .context("failed to read metadata of FAT image")?
+        .len();
+    // Slack covers both GPT tables plus partition alignment.
+    let disk_size = fat_size + ext2_len + 1024 * 1024 * 4;
+    disk.set_len(disk_size)
+        .context("failed to set GPT image file length")?;
+
+    let mbr = gpt::mbr::ProtectiveMBR::with_lb_size(
+        u32::try_from((disk_size / 512) - 1).unwrap_or(0xFF_FF_FF_FF),
+    );
+    mbr.overwrite_lba0(&mut disk)
+        .context("failed to write protective MBR")?;
+
+    let block_size = gpt::disk::LogicalBlockSize::Lb512;
+    let mut gpt = gpt::GptConfig::new()
+        .writable(true)
+        .initialized(false)
+        .logical_block_size(block_size)
+        .create_from_device(Box::new(&mut disk), None)
+        .context("failed to create GPT structure in file")?;
+    gpt.update_partitions(Default::default())
+        .context("failed to update GPT partitions")?;
+
+    let esp_id = gpt
+        .add_partition("boot", fat_size, gpt::partition_types::EFI, 0, None)
+        .context("failed to add boot EFI partition")?;
+    let root_id = gpt
+        .add_partition("root", ext2_len, gpt::partition_types::LINUX_FS, 0, None)
+        .context("failed to add root ext2 partition")?;
+
+    let esp_offset = gpt
+        .partitions()
+        .get(&esp_id)
+        .context("failed to open boot partition after creation")?
+        .bytes_start(block_size)
+        .context("failed to get start offset of boot partition")?;
+    let root_offset = gpt
+        .partitions()
+        .get(&root_id)
+        .context("failed to open root partition after creation")?
+        .bytes_start(block_size)
+        .context("failed to get start offset of root partition")?;
+
+    gpt.write().context("failed to write out GPT changes")?;
+
+    fat_image
+        .seek(io::SeekFrom::Start(0))
+        .context("failed to seek to start of FAT image")?;
+    disk.seek(io::SeekFrom::Start(esp_offset))
+        .context("failed to seek to ESP offset")?;
+    io::copy(&mut io::Read::take(&mut *fat_image, fat_size), &mut disk)
+        .context("failed to copy FAT image to GPT disk")?;
+
+    ext2_image
+        .seek(io::SeekFrom::Start(ext2_offset))
+        .context("failed to seek to ext2 partition source")?;
+    disk.seek(io::SeekFrom::Start(root_offset))
+        .context("failed to seek to root offset")?;
+    io::copy(&mut io::Read::take(&mut *ext2_image, ext2_len), &mut disk)
+        .context("failed to copy ext2 rootfs to GPT disk")?;
+
+    println!(
+        "Combined GPT image: {} (ESP @ LBA {}, ext2 root @ LBA {}, {} bytes)",
+        out_gpt_path.display(),
+        esp_offset / 512,
+        root_offset / 512,
+        disk_size
+    );
     Ok(())
 }
 
@@ -37300,6 +37465,91 @@ mod tests {
             QEMU_EXIT_FAILURE
         );
         assert_eq!(normalize_run_qemu_exit(None), 1);
+    }
+
+    /// Phase 106 A.1 acceptance — the combined image's layout is
+    /// discoverable by the exact probe the kernel's `usb_ext2_base_lba`
+    /// runs in-OS: protective MBR (type 0xEE) → `EFI PART` at LBA 1 →
+    /// 128-byte partition entries → ext2 magic (0xEF53) in the
+    /// superblock two sectors past the partition's `first_lba`.
+    #[test]
+    fn combined_gpt_image_is_kernel_probe_discoverable() {
+        use std::io::{Read as _, Seek as _, Write as _};
+
+        // Synthetic partition contents: a 1 MiB "FAT" with a marker
+        // prefix, and a 1 MiB "ext2" carrying the magic at superblock
+        // offset 1024+56 (byte 0x438 within the partition).
+        let mut fat = tempfile::NamedTempFile::new().unwrap();
+        fat.write_all(b"FATMARKER").unwrap();
+        fat.as_file().set_len(1024 * 1024).unwrap();
+        let mut ext2 = tempfile::NamedTempFile::new().unwrap();
+        let mut ext2_bytes = vec![0u8; 1024 * 1024];
+        ext2_bytes[1024 + 56] = 0x53;
+        ext2_bytes[1024 + 57] = 0xEF;
+        ext2.write_all(&ext2_bytes).unwrap();
+
+        let out = tempfile::NamedTempFile::new().unwrap();
+        create_combined_gpt_disk(
+            fat.as_file_mut(),
+            ext2.as_file_mut(),
+            0,
+            1024 * 1024,
+            out.path(),
+        )
+        .expect("combined image builds");
+
+        let mut img = std::fs::File::open(out.path()).unwrap();
+        let mut sector = [0u8; 512];
+        let mut read_lba = |f: &mut std::fs::File, lba: u64, buf: &mut [u8; 512]| {
+            f.seek(std::io::SeekFrom::Start(lba * 512)).unwrap();
+            f.read_exact(buf).unwrap();
+        };
+
+        // Protective MBR: signature + type 0xEE in entry 1 (the kernel
+        // checks byte 450 = offset 446 + 4).
+        read_lba(&mut img, 0, &mut sector);
+        assert_eq!(&sector[510..512], &[0x55, 0xAA], "MBR signature");
+        assert_eq!(sector[450], 0xEE, "protective-MBR type");
+
+        // GPT header at LBA 1.
+        read_lba(&mut img, 1, &mut sector);
+        assert_eq!(&sector[0..8], b"EFI PART", "GPT signature");
+        let part_lba = u64::from_le_bytes(sector[72..80].try_into().unwrap());
+        let esize = u32::from_le_bytes(sector[84..88].try_into().unwrap()) as usize;
+        assert_eq!(esize, 128, "standard entry size");
+
+        // Walk the entries the way the kernel does; collect the
+        // non-empty partitions' first_lba values.
+        let mut firsts = Vec::new();
+        for sec in 0..4u64 {
+            read_lba(&mut img, part_lba + sec, &mut sector);
+            for k in 0..4usize {
+                let off = k * 128;
+                let first = u64::from_le_bytes(sector[off + 32..off + 40].try_into().unwrap());
+                if first != 0 {
+                    firsts.push(first);
+                }
+            }
+        }
+        assert_eq!(firsts.len(), 2, "exactly two partitions (ESP + root)");
+
+        // Exactly one partition carries the ext2 magic at sb offset 56,
+        // and the other starts with the FAT marker.
+        let mut ext2_hits = 0;
+        let mut fat_hits = 0;
+        for &first in &firsts {
+            read_lba(&mut img, first + 2, &mut sector);
+            if sector[56] == 0x53 && sector[57] == 0xEF {
+                ext2_hits += 1;
+                continue;
+            }
+            read_lba(&mut img, first, &mut sector);
+            if sector.starts_with(b"FATMARKER") {
+                fat_hits += 1;
+            }
+        }
+        assert_eq!(ext2_hits, 1, "one ext2-magic partition (the root)");
+        assert_eq!(fat_hits, 1, "one ESP carrying the FAT contents");
     }
 
     #[test]
