@@ -315,6 +315,15 @@ impl Namespace {
             .collect()
     }
 
+    /// Phase 103 C — only the `ThermalZone` nodes, in arena order (the
+    /// zone-enumeration surface behind acpid's `ACPI_LIST_TZ` verb).
+    pub fn thermal_zones(&self) -> Vec<NodeId> {
+        (0..self.nodes.len() as u32)
+            .map(NodeId)
+            .filter(|&id| matches!(self.node(id).object, NodeObject::ThermalZone))
+            .collect()
+    }
+
     // -- Track B query surface -------------------------------------------
 
     /// Load one definition block (DSDT or SSDT): validates the 36-byte

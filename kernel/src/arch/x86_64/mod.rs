@@ -1,6 +1,7 @@
 use core::arch::global_asm;
 
 pub mod apic;
+pub mod cpufreq;
 pub mod cpuid;
 pub mod gdt;
 pub mod interrupts;

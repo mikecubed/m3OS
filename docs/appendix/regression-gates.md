@@ -390,14 +390,21 @@ client (`ACPI_SUB:event path=\FIXED.PWRBTN code=0x80`).
 
 **Env var:** `M3OS_POWER_REGRESSION=1`
 
-Boots QEMU q35 and asserts the Phase 103 slice-1 pipeline on the
-platform QEMU can model (the desktop/VM "no battery" case): `powerd`
-finds acpid, walks the namespace for `PNP0C0A`/`ACPI0003` (absent on
-q35), and announces `POWERD:ready battery=none ac=assumed-online`;
-after a serial login, `m3ctl power status` renders that posture over
-the `power` IPC service; finally a QMP `system_powerdown` power button
-traverses acpid → powerd's event subscription
-(`POWERD:event path=\FIXED.PWRBTN code=0x80`) — the Track D event
-spine, live in CI. The live battery/brightness/thermal/lid arms have
-no QEMU model and are hardware-only (`Validated-on-HW` per the
-charter's Track G).
+Boots QEMU q35 and asserts the Phase 103 pipeline on the platform QEMU
+can model (the desktop/VM posture): `powerd` finds acpid, walks the
+namespace for `PNP0C0A`/`ACPI0003` (absent on q35) and thermal zones
+(`ACPI_LIST_TZ` — q35 declares none), probes the kernel cpufreq
+mechanism (`SYS_POWER_CPUFREQ_STATUS` — no HWP under QEMU), and
+announces `POWERD:ready battery=none ac=assumed-online zones=0
+mech=none`; the ring-3 conservative governor's first 1 s tick reports
+`POWERD:governor mode=conservative target=` (proving the recv-timeout
+wake, the CPU-times load sample, and the `SYS_POWER_SET_PERF` no-op
+apply); after a serial login, `m3ctl power status` renders the
+battery/thermal/governor posture over the `power` IPC service; finally
+a QMP `system_powerdown` power button traverses acpid → powerd's event
+subscription (`POWERD:event path=\FIXED.PWRBTN code=0x80`) — the Track
+D event spine, live in CI. The populated-thermal-zone path is covered
+host-side by a hand-assembled ThermalZone DSDT fixture
+(`kernel-core/tests/acpi_thermal_zone.rs`); the live
+battery/brightness/HWP-MSR/lid arms have no QEMU model and are
+hardware-only (`Validated-on-HW` per the charter's Track G).

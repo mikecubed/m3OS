@@ -706,6 +706,41 @@ pub fn spec_ctrl_active() -> bool {
     SPEC_CTRL_BASE.load(Ordering::Acquire) & SPEC_CTRL_IBRS != 0
 }
 
+// ---------------------------------------------------------------------------
+// Phase 103 Track E — HWP (Hardware-Controlled Performance States)
+// ---------------------------------------------------------------------------
+
+/// `CPUID.06h:EAX[7]` — HWP base (the `IA32_PM_ENABLE`/`IA32_HWP_REQUEST`
+/// MSRs exist).
+const CPUID_06_EAX_HWP: u32 = 1 << 7;
+/// `CPUID.06h:EAX[11]` — `IA32_HWP_REQUEST_PKG` (one package-wide write
+/// instead of a per-logical-processor MSR broadcast).
+const CPUID_06_EAX_HWP_PKG: u32 = 1 << 11;
+
+static HWP: Once<(bool, bool)> = Once::new();
+
+/// Probe `CPUID.06h:EAX` for HWP (bit 7) and package-level HWP request
+/// (bit 11).  Returns `(hwp_supported, hwp_pkg_supported)`.  Idempotent —
+/// first call wins.  QEMU (TCG *and* KVM's default CPU models) exposes
+/// neither, so both are `false` on every CI lane; the cpufreq module
+/// degrades to a probe-only posture there.
+///
+/// Leaf `0x06` is not probed elsewhere in this module; same max-basic-leaf
+/// guard as [`probe_smep_smap`] (an unsupported leaf echoes the highest
+/// supported leaf's registers, which could fake the feature bits).
+pub fn probe_hwp() -> (bool, bool) {
+    *HWP.call_once(|| {
+        if cpuid_raw(0, 0).eax < 0x06 {
+            return (false, false);
+        }
+        let leaf6 = cpuid_raw(0x06, 0);
+        (
+            leaf6.eax & CPUID_06_EAX_HWP != 0,
+            leaf6.eax & CPUID_06_EAX_HWP_PKG != 0,
+        )
+    })
+}
+
 #[derive(Clone, Copy)]
 struct CpuidRaw {
     eax: u32,

@@ -136,7 +136,45 @@ pub fn format_power_status(status: &kernel_core::power::control::PowerStatusWire
         out.push_str("none");
     }
     out.push('\n');
+    out.push_str("  thermal: ");
+    out.push_str(&format_thermal_field(status));
+    out.push('\n');
+    out.push_str("  governor: ");
+    out.push_str(&format_governor_field(status));
+    out.push('\n');
     out
+}
+
+/// The Phase 103 C thermal field: `none (no zones)` on QEMU/desktop, or
+/// `<state>, 42.1 C` with the hottest zone's reading.
+fn format_thermal_field(status: &kernel_core::power::control::PowerStatusWire) -> String {
+    use alloc::string::ToString;
+    use kernel_core::power::control::{TEMP_UNKNOWN_DECI_C, ThermalWire};
+    if status.thermal == ThermalWire::NoZones {
+        return String::from("none (no zones)");
+    }
+    let mut line = String::from(status.thermal.as_str());
+    if status.temp_deci_c != TEMP_UNKNOWN_DECI_C {
+        line.push_str(", ");
+        line.push_str(&(status.temp_deci_c / 10).to_string());
+        line.push('.');
+        line.push_str(&(status.temp_deci_c % 10).unsigned_abs().to_string());
+        line.push_str(" C");
+    }
+    line
+}
+
+/// The Phase 103 E governor field: mode, mechanism, and the last target
+/// on the abstract 1–255 scale.
+fn format_governor_field(status: &kernel_core::power::control::PowerStatusWire) -> String {
+    use alloc::string::ToString;
+    let mut line = String::from(status.governor.as_str());
+    line.push_str(" (mech ");
+    line.push_str(status.mech.as_str());
+    line.push_str(", target ");
+    line.push_str(&status.perf.to_string());
+    line.push(')');
+    line
 }
 
 /// Render the battery view for `m3ctl battery`.

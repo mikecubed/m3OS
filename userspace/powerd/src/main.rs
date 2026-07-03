@@ -4,24 +4,42 @@
 //! state. Per the 101 split decision the AML interpreter lives in
 //! `acpid`, so powerd is a pure IPC client of the `"acpi"` service:
 //! `ACPI_FIND_BY_HID` locates the `PNP0C0A` battery and `ACPI0003` AC
-//! adapter, `ACPI_EVAL` evaluates `_BST`/`_BIF`/`_PSR` on demand, and
-//! `ACPI_SUBSCRIBE` registers this daemon for `Notify`/fixed-event
-//! pushes (powerd is the first production consumer of the D.5/E.4 event
-//! push). The decode + percentage math is `kernel_core::power::battery`
-//! (host-tested); the client protocol is `kernel_core::power::control`.
+//! adapter, `ACPI_EVAL` evaluates `_BST`/`_BIF`/`_PSR`/`_TMP` on demand,
+//! `ACPI_LIST_TZ` enumerates thermal zones, and `ACPI_SUBSCRIBE`
+//! registers this daemon for `Notify`/fixed-event pushes (powerd is the
+//! first production consumer of the D.5/E.4 event push). The decode +
+//! percentage math is `kernel_core::power::battery`, thermal decode +
+//! trip classification `kernel_core::power::thermal`, and the governor
+//! state machine `kernel_core::power::governor` (all host-tested); the
+//! client protocol is `kernel_core::power::control`.
+//!
+//! **Track E division of labor** (charter correction, mirrors slice 1):
+//! the governor *policy* ticks here in ring 3 (userspace-first rule) —
+//! a ~1 s `ipc_recv_msg_timeout` idle wake samples the kernel's
+//! cumulative CPU times via `SYS_POWER_CPUFREQ_STATUS`, folds the load
+//! delta and the Track C thermal cap through `Governor::next`, and
+//! applies the target via `SYS_POWER_SET_PERF`. Ring 0 keeps only the
+//! HWP MSR mechanism behind those two syscalls; on QEMU (no HWP) the
+//! apply is a successful no-op so this loop is platform-independent.
 //!
 //! One endpoint, two names: registered as both `"power"` (the query
 //! service `m3ctl` / the settings panel call) and `"powerd.events"`
-//! (the name acpid resolves to push events), so a single blocking recv
-//! loop multiplexes queries and events by label.
+//! (the name acpid resolves to push events), so a single recv loop
+//! multiplexes queries, events, and governor ticks by label.
 //!
 //! On a platform with no battery/AC devices (every VM and desktop) the
 //! daemon still serves [`PowerStatusWire::no_battery`] — the
 //! `power-smoke` QEMU arm asserts exactly this posture. Serial
 //! sentinels:
 //!
-//! - `POWERD:ready battery=<none|path> ac=<assumed-online|path>`
+//! - `POWERD:ready battery=<none|path> ac=<assumed-online|path>
+//!   zones=<n> mech=<none|hwp>`
 //! - `POWERD:event path=<asl-path> code=<c>` — an acpid event arrived.
+//! - `POWERD:governor mode=<m> target=<t> load=<l>%` — first tick, then
+//!   only when the target changes (a QEMU boot settles to the floor in
+//!   a handful of lines).
+//! - `POWERD:thermal state=<passive|critical> temp_dc=<t>` — a zone
+//!   crossed a trip point (never fires on zone-less QEMU).
 
 #![no_std]
 #![no_main]
@@ -38,7 +56,16 @@ use kernel_core::acpi::aml::object::AmlValue;
 use kernel_core::acpi::aml::wire;
 use kernel_core::power::battery::{self, BatteryInfo};
 use kernel_core::power::control::{
-    AcState, PERCENT_UNKNOWN, POWER_SERVICE_NAME, POWER_STATUS, PowerStatusWire,
+    AcState, CpufreqMech, PERCENT_UNKNOWN, POWER_SERVICE_NAME, POWER_STATUS, PowerStatusWire,
+    TEMP_UNKNOWN_DECI_C, ThermalWire,
+};
+use kernel_core::power::governor::{Governor, GovernorMode, PERF_MAX, PERF_MIN};
+use kernel_core::power::syscalls::{
+    CPUFREQ_MECH_HWP, CPUFREQ_STATUS_WIRE_LEN, CpufreqStatusWire, SYS_POWER_CPUFREQ_STATUS,
+    SYS_POWER_SET_PERF,
+};
+use kernel_core::power::thermal::{
+    ThermalState, TripPoints, classify, deci_celsius_from_decikelvin, decode_temp_dk,
 };
 use syscall_lib::heap::BrkAllocator;
 use syscall_lib::{IpcMessage, STDOUT_FILENO, write_str};
@@ -73,11 +100,17 @@ const ACPI_FIND_BY_HID: u64 = 2;
 const ACPI_SUBSCRIBE: u64 = 5;
 const ACPI_EVENT: u64 = 6;
 const ACPI_EVAL: u64 = 7;
+const ACPI_LIST_TZ: u64 = 8;
 
 /// The event-endpoint name acpid resolves for its push handle.
 const EVENTS_SERVICE_NAME: &str = "powerd.events";
 
 const REPLY_BUF: usize = 4096;
+
+/// Governor tick period (the recv-timeout idle wake).
+const GOVERNOR_TICK_NS: u64 = 1_000_000_000;
+/// `ipc_recv_msg_timeout` deadline-expiry return (`-ETIMEDOUT`).
+const NEG_ETIMEDOUT: u64 = (-110_i64) as u64;
 
 /// One text-request round-trip to acpid; `Some(reply bulk)` on label-0.
 fn acpi_call(handle: u32, label: u64, text: &str) -> Option<Vec<u8>> {
@@ -85,6 +118,10 @@ fn acpi_call(handle: u32, label: u64, text: &str) -> Option<Vec<u8>> {
     if reply != 0 {
         return None;
     }
+    take_reply_bulk()
+}
+
+fn take_reply_bulk() -> Option<Vec<u8>> {
     let mut buf = alloc::vec![0u8; REPLY_BUF];
     let n = syscall_lib::ipc_take_pending_bulk(&mut buf);
     if n == u64::MAX {
@@ -104,9 +141,73 @@ fn eval(handle: u32, path: &str) -> Option<AmlValue> {
     wire::decode(&bulk).ok().map(|(v, _)| v)
 }
 
+/// `ACPI_LIST_TZ` (body-less → plain `ipc_call`, the slice-1
+/// `send_with_bulk:bad_len` lesson): newline-joined zone paths.
+fn list_thermal_zones(handle: u32) -> Vec<String> {
+    if syscall_lib::ipc_call(handle, ACPI_LIST_TZ, 0) != 0 {
+        return Vec::new();
+    }
+    let Some(bulk) = take_reply_bulk() else {
+        return Vec::new();
+    };
+    let Ok(text) = core::str::from_utf8(&bulk) else {
+        return Vec::new();
+    };
+    text.split('\n')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+// ---------------------------------------------------------------------
+// Track E — kernel cpufreq syscalls
+// ---------------------------------------------------------------------
+
+/// `SYS_POWER_CPUFREQ_STATUS` — probed mechanism + cumulative CPU times.
+fn cpufreq_status() -> Option<CpufreqStatusWire> {
+    let mut buf = [0u8; CPUFREQ_STATUS_WIRE_LEN];
+    // SAFETY: m3OS-native read-only syscall; the kernel writes at most
+    // `buf.len()` bytes and returns the count (or a negative errno).
+    let n = unsafe {
+        syscall_lib::syscall2(
+            SYS_POWER_CPUFREQ_STATUS,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    };
+    if (n as i64) < 0 {
+        return None;
+    }
+    CpufreqStatusWire::decode(&buf[..(n as usize).min(buf.len())])
+}
+
+/// `SYS_POWER_SET_PERF` — apply a governor target (root-gated; a
+/// successful no-op on mechanism-less platforms).
+fn set_perf(target: u8) {
+    // SAFETY: single-integer m3OS-native syscall, no memory arguments.
+    let rc = unsafe { syscall_lib::syscall1(SYS_POWER_SET_PERF, target as u64) };
+    if (rc as i64) < 0 {
+        announce("powerd: WARNING SYS_POWER_SET_PERF failed\n");
+    }
+}
+
 // ---------------------------------------------------------------------
 // Power state
 // ---------------------------------------------------------------------
+
+/// A thermal zone with its boot-evaluated (static) trip points.
+struct ThermalZone {
+    path: String,
+    trips: TripPoints,
+}
+
+fn severity(s: ThermalState) -> u8 {
+    match s {
+        ThermalState::Normal => 0,
+        ThermalState::Passive => 1,
+        ThermalState::Critical => 2,
+    }
+}
 
 struct PowerDevices {
     acpi: Option<u32>,
@@ -114,14 +215,57 @@ struct PowerDevices {
     ac_path: Option<String>,
     /// `_BIF`/`_BIX` info cached once (static data).
     battery_info: Option<BatteryInfo>,
+    /// Thermal zones with trips cached once (`_CRT`/`_PSV` are static;
+    /// only `_TMP` is live).
+    zones: Vec<ThermalZone>,
 }
 
 impl PowerDevices {
-    /// Evaluate the live snapshot. Every query re-reads `_BST`/`_PSR` —
-    /// no staleness, and the VM case costs nothing (no devices).
-    fn status(&self) -> PowerStatusWire {
+    /// Live thermal sample across every zone: hottest temperature and
+    /// the worst classified state. `(TEMP_UNKNOWN, NoZones)` on a
+    /// zone-less platform (QEMU q35) or when every `_TMP` read fails.
+    fn thermal_sample(&self) -> (i16, ThermalWire) {
         let Some(acpi) = self.acpi else {
-            return PowerStatusWire::no_battery();
+            return (TEMP_UNKNOWN_DECI_C, ThermalWire::NoZones);
+        };
+        let mut hottest: Option<i64> = None;
+        let mut worst: Option<ThermalState> = None;
+        for zone in &self.zones {
+            let Some(tmp_dk) =
+                eval(acpi, &format!("{}._TMP", zone.path)).and_then(|v| decode_temp_dk(&v))
+            else {
+                continue;
+            };
+            let dc = deci_celsius_from_decikelvin(tmp_dk);
+            hottest = Some(hottest.map_or(dc, |h: i64| h.max(dc)));
+            let state = classify(tmp_dk, &zone.trips);
+            worst = Some(match worst {
+                Some(w) if severity(w) >= severity(state) => w,
+                _ => state,
+            });
+        }
+        match (hottest, worst) {
+            (Some(dc), Some(state)) => (
+                dc.clamp(i16::MIN as i64 + 1, i16::MAX as i64) as i16,
+                ThermalWire::from_state(state),
+            ),
+            _ => (TEMP_UNKNOWN_DECI_C, ThermalWire::NoZones),
+        }
+    }
+
+    /// Evaluate the live snapshot. Every query re-reads `_BST`/`_PSR`/
+    /// `_TMP` — no staleness, and the VM case costs nothing (no devices).
+    /// Governor fields (`governor`/`mech`/`perf`) are the caller's — the
+    /// main loop owns that state and overlays it.
+    fn status(&self) -> PowerStatusWire {
+        let (temp_deci_c, thermal) = self.thermal_sample();
+        let base = PowerStatusWire {
+            temp_deci_c,
+            thermal,
+            ..PowerStatusWire::no_battery()
+        };
+        let Some(acpi) = self.acpi else {
+            return base;
         };
         let ac = match self.ac_path.as_deref() {
             Some(path) => {
@@ -134,10 +278,7 @@ impl PowerDevices {
             None => AcState::AssumedOnline,
         };
         let Some(bat_path) = self.battery_path.as_deref() else {
-            return PowerStatusWire {
-                ac,
-                ..PowerStatusWire::no_battery()
-            };
+            return PowerStatusWire { ac, ..base };
         };
         let bst = eval(acpi, &format!("{bat_path}._BST")).and_then(|v| battery::decode_bst(&v));
         match (bst, self.battery_info.as_ref()) {
@@ -147,16 +288,33 @@ impl PowerDevices {
                 ac,
                 state: status.state,
                 rate: status.present_rate,
+                ..base
             },
             _ => PowerStatusWire {
                 battery_present: true,
                 percent: PERCENT_UNKNOWN,
                 ac,
-                state: 0,
-                rate: 0,
+                ..base
             },
         }
     }
+}
+
+/// Map the worst thermal state onto the governor's cap: passive halves
+/// the scale, critical pins the floor (ACPI passive cooling §11.4).
+fn thermal_cap(thermal: ThermalWire) -> Option<u8> {
+    match thermal {
+        ThermalWire::Passive => Some(PERF_MAX / 2),
+        ThermalWire::Critical => Some(PERF_MIN),
+        ThermalWire::NoZones | ThermalWire::Normal => None,
+    }
+}
+
+fn monotonic_now_ns() -> u64 {
+    let (sec, nsec) = syscall_lib::clock_gettime(syscall_lib::CLOCK_MONOTONIC);
+    (sec.max(0) as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nsec.max(0) as u64)
 }
 
 fn program_main(_args: &[&str]) -> i32 {
@@ -197,6 +355,7 @@ fn program_main(_args: &[&str]) -> i32 {
         battery_path: None,
         ac_path: None,
         battery_info: None,
+        zones: Vec::new(),
     };
     if let Some(handle) = acpi {
         // PNP0C0A = Control Method Battery, ACPI0003 = AC adapter.
@@ -209,6 +368,15 @@ fn program_main(_args: &[&str]) -> i32 {
                 .or_else(|| {
                     eval(handle, &format!("{bat}._BIF")).and_then(|v| battery::decode_bif(&v))
                 });
+        }
+        // Thermal zones: trips are static — evaluate once here; only
+        // `_TMP` is re-read per sample.
+        for path in list_thermal_zones(handle) {
+            let trips = TripPoints {
+                critical_dk: eval(handle, &format!("{path}._CRT")).and_then(|v| decode_temp_dk(&v)),
+                passive_dk: eval(handle, &format!("{path}._PSV")).and_then(|v| decode_temp_dk(&v)),
+            };
+            devices.zones.push(ThermalZone { path, trips });
         }
         // Subscribe for Notify/fixed-event pushes (battery/AC/lid/button).
         let sub = syscall_lib::ipc_call_buf(
@@ -224,10 +392,22 @@ fn program_main(_args: &[&str]) -> i32 {
         announce("powerd: no acpi service — serving no-battery state\n");
     }
 
+    // ---- Track E: governor state ----------------------------------------
+    let mut governor = Governor::new(GovernorMode::Conservative);
+    let mut prev_snapshot = cpufreq_status();
+    let mech = match prev_snapshot {
+        Some(s) if s.mechanism == CPUFREQ_MECH_HWP => CpufreqMech::Hwp,
+        _ => CpufreqMech::None,
+    };
+    let mut last_announced_target: Option<u8> = None;
+    let mut last_thermal = ThermalWire::NoZones;
+
     announce(&format!(
-        "POWERD:ready battery={} ac={}\n",
+        "POWERD:ready battery={} ac={} zones={} mech={}\n",
         devices.battery_path.as_deref().unwrap_or("none"),
         devices.ac_path.as_deref().unwrap_or("assumed-online"),
+        devices.zones.len(),
+        mech.as_str(),
     ));
 
     // ---- Serve ----------------------------------------------------------
@@ -235,7 +415,38 @@ fn program_main(_args: &[&str]) -> i32 {
     let mut bulk = [0u8; REPLY_BUF];
     loop {
         bulk.fill(0);
-        let rc = syscall_lib::ipc_recv_msg(ep, &mut msg, &mut bulk);
+        let deadline_ns = monotonic_now_ns().saturating_add(GOVERNOR_TICK_NS);
+        let rc = syscall_lib::ipc_recv_msg_timeout(ep, &mut msg, &mut bulk, deadline_ns);
+        if rc == NEG_ETIMEDOUT {
+            // Governor tick: load delta + thermal cap → target → kernel.
+            let Some(snap) = cpufreq_status() else {
+                continue;
+            };
+            let load = prev_snapshot
+                .and_then(|prev| snap.load_pct_since(&prev))
+                .unwrap_or(0);
+            prev_snapshot = Some(snap);
+            let (temp_dc, thermal) = devices.thermal_sample();
+            if severity_wire(thermal) > severity_wire(ThermalWire::Normal)
+                && thermal != last_thermal
+            {
+                announce(&format!(
+                    "POWERD:thermal state={} temp_dc={temp_dc}\n",
+                    thermal.as_str()
+                ));
+            }
+            last_thermal = thermal;
+            let target = governor.next(load, thermal_cap(thermal));
+            set_perf(target);
+            if last_announced_target != Some(target) {
+                announce(&format!(
+                    "POWERD:governor mode={} target={target} load={load}%\n",
+                    governor.mode.as_str()
+                ));
+                last_announced_target = Some(target);
+            }
+            continue;
+        }
         if rc == u64::MAX {
             continue;
         }
@@ -253,13 +464,28 @@ fn program_main(_args: &[&str]) -> i32 {
             continue;
         };
         if rc == u64::from(POWER_STATUS) {
-            let status = devices.status();
+            let status = PowerStatusWire {
+                governor: governor.mode,
+                mech,
+                perf: governor.current(),
+                ..devices.status()
+            };
             let encoded = status.encode();
             syscall_lib::ipc_store_reply_bulk(&encoded);
             syscall_lib::ipc_reply(reply_cap, 0, encoded.len() as u64);
         } else {
             syscall_lib::ipc_reply(reply_cap, u64::MAX, 0);
         }
+    }
+}
+
+/// [`ThermalWire`] ordered by severity (`NoZones` and `Normal` both
+/// benign).
+fn severity_wire(t: ThermalWire) -> u8 {
+    match t {
+        ThermalWire::NoZones | ThermalWire::Normal => 0,
+        ThermalWire::Passive => 1,
+        ThermalWire::Critical => 2,
     }
 }
 

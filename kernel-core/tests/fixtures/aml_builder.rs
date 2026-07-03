@@ -54,6 +54,15 @@ pub fn device(name: &str, body: &[u8]) -> Vec<u8> {
     out
 }
 
+/// `ThermalZone(SEG) { body }` (Phase 103 C).
+pub fn thermal_zone(name: &str, body: &[u8]) -> Vec<u8> {
+    let mut inner = seg(name);
+    inner.extend_from_slice(body);
+    let mut out = vec![0x5B, 0x85];
+    out.extend_from_slice(&pkg(&inner));
+    out
+}
+
 /// `Method(SEG, argc) { body }`.
 pub fn method(name: &str, argc: u8, body: &[u8]) -> Vec<u8> {
     let mut inner = seg(name);
