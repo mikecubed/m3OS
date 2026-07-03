@@ -1027,3 +1027,17 @@ if [ "${M3OS_POWER_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask power-smoke..."
     cargo xtask power-smoke --timeout 240
 fi
+
+# Phase 103 F.3 — S3 suspend/resume gate. Gated behind
+# M3OS_SUSPEND_REGRESSION=1 because it boots QEMU and drives the full
+# suspend-to-RAM round trip: \_S3 registration, kernel quiesce (sync +
+# AP park + virtio drain + PCI config save), FACS X-vector wake through
+# the 32-bit shim, kernel re-init, \_WAK, post-resume shell/disk
+# liveness, and a still-working power button to a guest-initiated QEMU
+# exit. Set the env var on branches touching the suspend path
+# (kernel/src/arch/x86_64/suspend.rs, smp park/trampoline, virtio
+# resume, powerd's suspend arm).
+if [ "${M3OS_SUSPEND_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask suspend-smoke..."
+    cargo xtask suspend-smoke --timeout 240
+fi

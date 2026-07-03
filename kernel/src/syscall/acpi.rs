@@ -388,3 +388,15 @@ pub fn try_acpi_poweroff() -> bool {
     log::warn!("[acpi] S5 write did not power off; falling back to halt");
     false
 }
+
+/// `sys_acpi_register_s3(slp_typa, slp_typb) -> isize` — 0 on success
+/// (Phase 103 F.3, the [`sys_acpi_register_s5`] shape): acpid evaluates
+/// the `\_S3` package at boot and registers the sleep-type values the
+/// suspend path writes into PM1a_CNT.
+pub fn sys_acpi_register_s3(slp_typa: u64, slp_typb: u64) -> isize {
+    if let Err(e) = gate() {
+        return e;
+    }
+    crate::arch::x86_64::suspend::register_s3(slp_typa, slp_typb);
+    0
+}

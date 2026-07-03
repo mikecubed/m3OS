@@ -1825,3 +1825,80 @@ pub fn probe_all_drivers() {
         }
     }
 }
+
+/// Phase 103 F.3 — re-program a device's MSI/MSI-X capability after the
+/// S3 wake-side machine reset wiped PCI config space, reusing the
+/// vector registered at boot (the IDT-side registration is RAM state
+/// and survives the suspend). Returns `false` when the capability is
+/// gone or the table BAR is unmappable — the caller logs and the
+/// device stays IRQ-less until the next boot (fail-visible, not
+/// fail-silent).
+pub fn reprogram_msi_after_resume(dev: &PciDevice, vector: u8, kind: MsiKind) -> bool {
+    let apic_id = crate::arch::x86_64::apic::current_lapic_id();
+    match kind {
+        MsiKind::MsiX => {
+            if let Some(msix) = find_msix(dev.bus, dev.device, dev.function)
+                && msix.program_entry(dev.bars, 0, apic_id, vector)
+            {
+                msix.enable();
+                return true;
+            }
+            false
+        }
+        MsiKind::Msi => {
+            if let Some(msi) = find_msi(dev.bus, dev.device, dev.function) {
+                msi.program_single(apic_id, vector, 1);
+                return true;
+            }
+            false
+        }
+    }
+}
+
+/// Phase 103 F.3 — OS-side PCI config save/restore across S3. OVMF's S3
+/// boot script does not restore OS-visible config space — post-wake
+/// reads returned all-ones for the virtio BARs (found live) — so the
+/// kernel snapshots the first 64 bytes of every function on bus 0
+/// before the sleep and rewrites them after: BARs and friends first,
+/// the command register last (the Linux `pci_save_state` /
+/// `pci_restore_state` contract). Capability registers above 0x40
+/// (MSI/MSI-X) are per-driver state and re-armed by
+/// [`reprogram_msi_after_resume`].
+static SAVED_PCI_CONFIG: spin::Mutex<alloc::vec::Vec<(u8, u8, [u32; 16])>> =
+    spin::Mutex::new(alloc::vec::Vec::new());
+
+pub fn save_config_for_suspend() {
+    let mut saved = SAVED_PCI_CONFIG.lock();
+    saved.clear();
+    for device in 0..32u8 {
+        for function in 0..8u8 {
+            let id = pci_config_read_u32_any(0, device, function, 0);
+            if id == 0xFFFF_FFFF {
+                if function == 0 {
+                    break; // no function 0 → no device in this slot
+                }
+                continue;
+            }
+            let mut cfg = [0u32; 16];
+            for (i, slot) in cfg.iter_mut().enumerate() {
+                *slot = pci_config_read_u32_any(0, device, function, (i * 4) as u16);
+            }
+            saved.push((device, function, cfg));
+        }
+    }
+    log::info!("[pci] saved config for {} functions (S3)", saved.len());
+}
+
+pub fn restore_config_after_resume() {
+    let saved = SAVED_PCI_CONFIG.lock();
+    for &(device, function, cfg) in saved.iter() {
+        // Dwords 2..16 cover class/latency/BARs/subsystem/INT line; the
+        // command register (dword 1) goes last so decoding re-enables
+        // only after the BARs are back.
+        for (i, val) in cfg.iter().enumerate().skip(2) {
+            pci_config_write_u32_any(0, device, function, (i * 4) as u16, *val);
+        }
+        pci_config_write_u32_any(0, device, function, 4, cfg[1]);
+    }
+    log::info!("[pci] restored config for {} functions (S3)", saved.len());
+}

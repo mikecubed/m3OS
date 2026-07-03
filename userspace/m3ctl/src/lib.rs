@@ -184,7 +184,7 @@ pub fn format_sleep_field(status: &kernel_core::power::control::PowerStatusWire)
             line.push_str(name);
         }
     }
-    line.push_str(" (firmware; resume path pending)");
+    line.push_str(" (firmware-declared)");
     line
 }
 

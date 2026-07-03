@@ -17,7 +17,7 @@ use core::sync::atomic::Ordering;
 /// Physical address where the AP trampoline is placed.
 /// Must be below 1 MiB (SIPI vector is a page number: phys = vector << 12).
 /// 0x8000 is a conventional choice — above the real-mode IVT and BIOS data area.
-const TRAMPOLINE_PHYS: u64 = 0x8000;
+pub const TRAMPOLINE_PHYS: u64 = 0x8000;
 
 /// SIPI vector = trampoline physical page number.
 const SIPI_VECTOR: u8 = (TRAMPOLINE_PHYS >> 12) as u8; // 0x08
@@ -156,6 +156,92 @@ fn build_trampoline_gdt() -> [u64; 5] {
 // ---------------------------------------------------------------------------
 // Trampoline installation
 // ---------------------------------------------------------------------------
+
+/// Offset of the S3 resume shim within the trampoline page (after the
+/// 16-bit SIPI code, before the data fields at 0xF00). The FACS **X**
+/// firmware waking vector points at `TRAMPOLINE_PHYS + this`.
+pub const RESUME_STUB_OFFSET: u64 = 0xE00;
+
+/// Phase 103 F.3 — arm the trampoline page as the S3 wake target.
+///
+/// The wake entry uses the FACS **X** firmware waking vector with OSPM
+/// flags clear, which ACPI defines deterministically: firmware enters
+/// the vector in **32-bit flat protected mode, paging off, interrupts
+/// off**. (The legacy real-mode vector is unusable on OVMF — observed
+/// live, it jumps there in 64-bit flat mode at a page-truncated
+/// address.)
+///
+/// The shim is self-contained 32-bit → 64-bit code (its own copy of
+/// the long-mode transition rather than the SIPI section, so it can
+/// emit single-byte COM1 progress markers `R`/`S`/`T` at each mode
+/// boundary — QEMU's UART pumps them even before `serial::init`, which
+/// made the resume path debuggable at all). It shares the trampoline
+/// GDT + DATA_STACK/DATA_ENTRY fields with the SIPI path.
+pub fn install_trampoline_for_resume(entry: u64, stack_top: u64) {
+    install_trampoline();
+    let phys_off = crate::mm::phys_offset();
+
+    let base = TRAMPOLINE_PHYS + RESUME_STUB_OFFSET;
+    let mut c: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(0x80);
+    // ---- 32-bit protected mode, paging off (firmware entry state) ----
+    c.push(0xFA); // cli (belt and suspenders)
+    // marker 'R': mov al,'R'; mov dx,0x3F8; out dx,al
+    c.extend_from_slice(&[0xB0, b'R', 0x66, 0xBA, 0xF8, 0x03, 0xEE]);
+    // lgdt [TRAMPOLINE_PHYS + DATA_GDTR]
+    c.extend_from_slice(&[0x0F, 0x01, 0x15]);
+    c.extend_from_slice(&((TRAMPOLINE_PHYS + DATA_GDTR as u64) as u32).to_le_bytes());
+    // Reload data segments with the trampoline data32 selector.
+    c.extend_from_slice(&[0x66, 0xB8, 0x10, 0x00]); // mov ax, 0x10
+    c.extend_from_slice(&[0x8E, 0xD8, 0x8E, 0xC0, 0x8E, 0xD0]); // ds/es/ss
+    // marker 'S'
+    c.extend_from_slice(&[0xB0, b'S', 0x66, 0xBA, 0xF8, 0x03, 0xEE]);
+    // CR4.PAE
+    c.extend_from_slice(&[0x0F, 0x20, 0xE0, 0x83, 0xC8, 0x20, 0x0F, 0x22, 0xE0]);
+    // CR3 = [DATA_PML4]
+    c.push(0xA1);
+    c.extend_from_slice(&((TRAMPOLINE_PHYS + DATA_PML4 as u64) as u32).to_le_bytes());
+    c.extend_from_slice(&[0x0F, 0x22, 0xD8]);
+    // EFER |= LME | NXE
+    c.push(0xB9);
+    c.extend_from_slice(&0xC000_0080u32.to_le_bytes());
+    c.extend_from_slice(&[0x0F, 0x32, 0x0D]);
+    c.extend_from_slice(&0x0000_0900u32.to_le_bytes());
+    c.extend_from_slice(&[0x0F, 0x30]);
+    // CR0 |= PG (PE already set)
+    c.extend_from_slice(&[0x0F, 0x20, 0xC0, 0x0D]);
+    c.extend_from_slice(&0x8000_0000u32.to_le_bytes());
+    c.extend_from_slice(&[0x0F, 0x22, 0xC0]);
+    // Far jump to the 64-bit continuation at base+0x60, selector 0x18.
+    c.push(0xEA);
+    c.extend_from_slice(&((base + 0x60) as u32).to_le_bytes());
+    c.extend_from_slice(&0x0018u16.to_le_bytes());
+    assert!(c.len() <= 0x60, "32-bit shim overflowed its slot");
+    c.resize(0x60, 0x90);
+
+    // ---- 64-bit long mode ----
+    // marker 'T'
+    c.extend_from_slice(&[0xB0, b'T', 0x66, 0xBA, 0xF8, 0x03, 0xEE]);
+    c.extend_from_slice(&[0x66, 0xB8, 0x20, 0x00]); // mov ax, 0x20
+    c.extend_from_slice(&[0x8E, 0xD8, 0x8E, 0xC0, 0x8E, 0xD0]); // ds/es/ss
+    c.extend_from_slice(&[0x66, 0x31, 0xC0, 0x8E, 0xE0, 0x8E, 0xE8]); // fs/gs = 0
+    // rsp = [DATA_STACK]
+    c.extend_from_slice(&[0x48, 0xA1]);
+    c.extend_from_slice(&(TRAMPOLINE_PHYS + DATA_STACK as u64).to_le_bytes());
+    c.extend_from_slice(&[0x48, 0x89, 0xC4]);
+    // rax = [DATA_ENTRY]
+    c.extend_from_slice(&[0x48, 0xA1]);
+    c.extend_from_slice(&(TRAMPOLINE_PHYS + DATA_ENTRY as u64).to_le_bytes());
+    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
+    c.extend_from_slice(&[0x50, 0xC3]); // push rax; ret
+    assert!(c.len() as u64 <= DATA_GDT as u64 - RESUME_STUB_OFFSET);
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(c.as_ptr(), (phys_off + base) as *mut u8, c.len());
+        ((phys_off + TRAMPOLINE_PHYS + DATA_ENTRY as u64) as *mut u64).write_volatile(entry);
+        ((phys_off + TRAMPOLINE_PHYS + DATA_STACK as u64) as *mut u64).write_volatile(stack_top);
+        ((phys_off + TRAMPOLINE_PHYS + DATA_PERCOREDATA as u64) as *mut u64).write_volatile(0);
+    }
+}
 
 fn install_trampoline() {
     let phys_off = crate::mm::phys_offset();

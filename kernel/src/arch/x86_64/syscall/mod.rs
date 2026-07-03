@@ -1686,11 +1686,12 @@ mod syscall_nr {
     #[allow(unused_imports)]
     pub use kernel_core::device_host::syscalls::{
         DEVICE_HOST_BASE, DEVICE_HOST_LAST, SYS_ACPI_IO_READ, SYS_ACPI_IO_WRITE, SYS_ACPI_MEM_READ,
-        SYS_ACPI_MEM_WRITE, SYS_ACPI_PM_READ, SYS_ACPI_PM_WRITE, SYS_ACPI_REGISTER_S5,
-        SYS_ACPI_SCI_SUBSCRIBE, SYS_ACPI_TABLE_GET, SYS_DEVICE_CLAIM, SYS_DEVICE_CONFIG_READ,
-        SYS_DEVICE_CONFIG_WRITE, SYS_DEVICE_DMA_ALLOC, SYS_DEVICE_DMA_HANDLE_INFO,
-        SYS_DEVICE_DMA_MAP_SHM, SYS_DEVICE_DMA_UNMAP_SHM, SYS_DEVICE_IRQ_SUBSCRIBE,
-        SYS_DEVICE_MMIO_MAP, SYS_DEVICE_PCI_ENUMERATE, SYS_DEVICE_PIO_READ, SYS_DEVICE_PIO_WRITE,
+        SYS_ACPI_MEM_WRITE, SYS_ACPI_PM_READ, SYS_ACPI_PM_WRITE, SYS_ACPI_REGISTER_S3,
+        SYS_ACPI_REGISTER_S5, SYS_ACPI_SCI_SUBSCRIBE, SYS_ACPI_TABLE_GET, SYS_DEVICE_CLAIM,
+        SYS_DEVICE_CONFIG_READ, SYS_DEVICE_CONFIG_WRITE, SYS_DEVICE_DMA_ALLOC,
+        SYS_DEVICE_DMA_HANDLE_INFO, SYS_DEVICE_DMA_MAP_SHM, SYS_DEVICE_DMA_UNMAP_SHM,
+        SYS_DEVICE_IRQ_SUBSCRIBE, SYS_DEVICE_MMIO_MAP, SYS_DEVICE_PCI_ENUMERATE,
+        SYS_DEVICE_PIO_READ, SYS_DEVICE_PIO_WRITE,
     };
 
     // -- Phase 84 Spectre mitigations (Track D.3 reporter / C.4 STIBP opt-in) --
@@ -1700,7 +1701,9 @@ mod syscall_nr {
     // -- Phase 103 Track E cpufreq mechanism --
     // m3OS-native `0x116x` block; canonically declared in
     // `kernel_core::power::syscalls` (0x1150 is the kstack debug probe).
-    pub use kernel_core::power::syscalls::{SYS_POWER_CPUFREQ_STATUS, SYS_POWER_SET_PERF};
+    pub use kernel_core::power::syscalls::{
+        SYS_POWER_CPUFREQ_STATUS, SYS_POWER_ENTER_SLEEP, SYS_POWER_SET_PERF,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -2533,12 +2536,18 @@ pub extern "C" fn syscall_handler(
             // Signature: sys_acpi_register_s5(slp_typa, slp_typb) -> isize.
             crate::syscall::acpi::sys_acpi_register_s5(arg0, arg1) as u64
         }
+        // -- Phase 103 F.3: acpid registers \_S3 SLP_TYP for suspend --
+        SYS_ACPI_REGISTER_S3 => {
+            // Signature: sys_acpi_register_s3(slp_typa, slp_typb) -> isize.
+            crate::syscall::acpi::sys_acpi_register_s3(arg0, arg1) as u64
+        }
         // -- Phase 84 Spectre mitigations --
         SYS_MITIGATIONS_STATUS => sys_mitigations_status(arg0, arg1),
         SYS_SET_SPEC_CTRL => sys_set_spec_ctrl(arg0),
         // -- Phase 103 Track E cpufreq mechanism --
         SYS_POWER_SET_PERF => sys_power_set_perf(arg0),
         SYS_POWER_CPUFREQ_STATUS => sys_power_cpufreq_status(arg0, arg1),
+        SYS_POWER_ENTER_SLEEP => sys_power_enter_sleep(),
         // -- Track D debug probe (feature `kstack-overflow-test`; absent → ENOSYS) --
         #[cfg(feature = "kstack-overflow-test")]
         SYS_KSTACK_OVERFLOW_TEST => sys_kstack_overflow_test(),
@@ -4485,6 +4494,12 @@ pub(super) fn sys_reboot(cmd: u64) -> u64 {
 /// There is no cross-core barrier stopping other CPUs from issuing new I/O
 /// after the lock is released — a full SMP quiesce would require an IPI
 /// halt sequence, which is not yet implemented.
+/// Phase 103 F.3 — the suspend path shares the shutdown sync (flush
+/// ext2 + block cache) before quiescing for S3.
+pub(crate) fn kernel_shutdown_sync() {
+    kernel_shutdown();
+}
+
 fn kernel_shutdown() {
     log::info!("kernel_shutdown: syncing filesystems...");
     // Flush ext2 volume if mounted.
@@ -19726,6 +19741,19 @@ pub(super) fn sys_power_set_perf(target: u64) -> u64 {
     }
     crate::arch::x86_64::cpufreq::apply_target(target as u8);
     0
+}
+
+/// `sys_power_enter_sleep() -> isize`: enter ACPI S3 and return after
+/// resume (Phase 103 F.3). Root-only — a suspend stops the machine for
+/// every user. 0 = resumed; -ENOSYS when the platform never registered
+/// `\_S3`/has no FACS (powerd stays fail-closed); other negative errno
+/// on a refused entry, always with the machine live.
+pub(super) fn sys_power_enter_sleep() -> u64 {
+    let (_, _, euid, _) = current_process_ids();
+    if euid != 0 {
+        return NEG_EPERM;
+    }
+    crate::arch::x86_64::suspend::enter_sleep_s3() as u64
 }
 
 /// `sys_power_cpufreq_status(buf_ptr, buf_len) -> isize`: copy the

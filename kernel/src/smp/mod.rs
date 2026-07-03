@@ -680,6 +680,16 @@ fn read_gs_base() -> u64 {
 }
 
 /// Write the IA32_GS_BASE MSR (0xC000_0101).
+/// Phase 103 F.3 — restore this core's per-core pointer after the S3
+/// machine reset wiped the GS base MSRs (the `ap_entry` pair).
+pub fn restore_bsp_gs_base() {
+    if let Some(pc) = get_core_data(0) {
+        let ptr = pc as *const PerCoreData as u64;
+        write_gs_base(ptr);
+        write_kernel_gs_base(ptr);
+    }
+}
+
 fn write_gs_base(value: u64) {
     let lo = value as u32;
     let hi = (value >> 32) as u32;
@@ -1126,4 +1136,141 @@ pub fn is_bsp() -> bool {
     // This is safe to call from interrupt context.
     let apic_id = crate::arch::x86_64::apic::current_lapic_id();
     apic_id == BSP_APIC_ID.load(Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 103 F.3 — S3 suspend AP park / resume
+// ---------------------------------------------------------------------------
+
+/// True while [`suspend_park_and_release_aps`] is asking sibling cores to
+/// park (checked by the NMI handler alongside the panic-park flag).
+static SUSPEND_PARK: AtomicBool = AtomicBool::new(false);
+
+/// Ack bitmask mirroring `PANIC_STOP_ACK` for the suspend park round.
+static SUSPEND_PARK_ACK: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the NMI handler should park this core for an S3 suspend.
+#[inline]
+pub fn suspend_should_park(my_core: u8) -> bool {
+    my_core != 0 && SUSPEND_PARK.load(Ordering::Acquire)
+}
+
+/// Acknowledge the suspend-park NMI and halt. The wake-side machine
+/// reset obliterates this core; it is rebooted through the normal SIPI
+/// path by [`resume_reboot_aps`].
+pub fn suspend_ack_and_park() -> ! {
+    if let Some(pc) = try_per_core() {
+        SUSPEND_PARK_ACK.fetch_or(1u64 << pc.core_id, Ordering::Release);
+    }
+    crate::hlt_loop()
+}
+
+/// Quiesce every AP before an S3 entry. **Cooperative, not NMI**: an
+/// NMI can catch a core mid-critical-section (scheduler/run-queue lock
+/// held) and parking it there deadlocks the BSP's drain — found live by
+/// the first suspend-smoke run. Instead the flag + a reschedule IPI
+/// steer each AP to the top of its scheduler `run()` loop — a point
+/// that by construction holds no locks — where it acks and halts. The
+/// parked APs' queued tasks migrate to the BSP and their per-core state
+/// is released (the failed-AP shape) so no IPI/TLB-shootdown can target
+/// a core that will not exist after the wake-side reset.
+///
+/// Returns `false` (with every already-parked AP rebooted and the
+/// machine fully live) if any AP failed to park in time — the caller
+/// fails the suspend closed.
+pub fn suspend_park_and_release_aps() -> bool {
+    let count = core_count();
+    if count <= 1 {
+        return true;
+    }
+    SUSPEND_PARK_ACK.store(0, Ordering::Release);
+    SUSPEND_PARK.store(true, Ordering::Release);
+
+    let mut target_mask = 0u64;
+    for core in 1..count {
+        if let Some(data) = get_core_data(core)
+            && data.is_online.load(Ordering::Acquire)
+        {
+            target_mask |= 1u64 << core;
+            data.reschedule.store(true, Ordering::Release);
+            ipi::send_ipi_to_core(core, ipi::IPI_RESCHEDULE);
+        }
+    }
+
+    // Wait for acks. Each AP reaches the run()-loop check within one
+    // timer tick (10 ms) even from a CPU-bound userspace task; the
+    // bound is generous wall-clock (~seconds under TCG).
+    let mut spins = 0u64;
+    let parked = loop {
+        if (SUSPEND_PARK_ACK.load(Ordering::Acquire) & target_mask) == target_mask {
+            break true;
+        }
+        core::hint::spin_loop();
+        spins += 1;
+        if spins > 2_000_000_000 {
+            break false;
+        }
+    };
+    SUSPEND_PARK.store(false, Ordering::Release);
+
+    if !parked {
+        log::warn!(
+            "[suspend] AP park ack timeout (mask {:#x} vs {:#x}) — aborting suspend",
+            SUSPEND_PARK_ACK.load(Ordering::Acquire),
+            target_mask
+        );
+        // Reboot whichever APs did park (they are offline in hlt); the
+        // stragglers never stopped. resume_reboot_aps re-derives the
+        // APIC map and re-runs boot_aps, which skips online cores via
+        // its own is_online wait... simplest safe cleanup: release the
+        // acked cores and reboot everything through the normal path.
+        let acked = SUSPEND_PARK_ACK.load(Ordering::Acquire);
+        for core in 1..count {
+            if acked & (1u64 << core) != 0 && get_core_data(core).is_some() {
+                crate::task::scheduler::detach_core_for_suspend(core);
+                unsafe { release_failed_ap(core) };
+            }
+        }
+        resume_reboot_aps();
+        return false;
+    }
+
+    // Migrate stranded work + retire idle tasks, then free per-core state.
+    for core in 1..count {
+        if get_core_data(core).is_some() {
+            crate::task::scheduler::detach_core_for_suspend(core);
+            unsafe { release_failed_ap(core) };
+        }
+    }
+    set_core_count(1);
+    log::info!("[suspend] APs parked and released");
+    true
+}
+
+/// After the S3 wake: re-derive the AP APIC→core mappings (released
+/// during park — must match the boot-time walk order so core ids stay
+/// stable) and reboot the APs through the normal INIT-SIPI-SIPI path.
+pub fn resume_reboot_aps() {
+    let madt = crate::acpi::madt_info();
+    let bsp = bsp_apic_id();
+    let mut next_core_id = 1u8;
+    let map_ptr = &raw mut APIC_TO_CORE;
+    for i in 0..madt.local_apic_count {
+        let Some(entry) = &madt.local_apics[i] else {
+            continue;
+        };
+        if entry.apic_id == bsp || entry.flags & 1 == 0 {
+            continue;
+        }
+        if (next_core_id as usize) >= MAX_CORES {
+            break;
+        }
+        unsafe {
+            (*map_ptr)[entry.apic_id as usize] = next_core_id;
+        }
+        next_core_id += 1;
+    }
+    if next_core_id > 1 {
+        crate::smp::boot::boot_aps();
+    }
 }

@@ -5157,6 +5157,12 @@ pub fn run() -> ! {
     let mut resume_log_budget: u32 = 1024;
 
     loop {
+        // Phase 103 F.3: an S3 suspend parks this core HERE — the top of
+        // the scheduler loop holds no locks by construction (the NMI
+        // alternative can catch a lock holder and deadlock the drain).
+        if core_id != 0 && crate::smp::suspend_should_park(core_id) {
+            crate::smp::suspend_ack_and_park();
+        }
         let reschedule = per_core_reschedule();
 
         interrupts::disable();
@@ -7801,5 +7807,92 @@ mod c4_tests {
             min_b >= 0,
             "task B's preempt_count went negative during N-cycle drive (min = {min_b})",
         );
+    }
+}
+
+/// Phase 103 F.3 — detach a parked AP's scheduler state before an S3
+/// suspend: migrate everything queued on its run queue to the BSP and
+/// retire its idle task (the slot recycles through `alloc_task_slot`'s
+/// Dead-slot reuse; the post-resume `boot_aps` spawns a fresh idle).
+/// The AP itself is already NMI-parked (interrupts off, hlt), so its
+/// queue cannot grow concurrently.
+pub fn detach_core_for_suspend(core_id: u8) {
+    if core_id == 0 || (core_id as usize) >= crate::smp::MAX_CORES {
+        return;
+    }
+    // Drain the run queue first (lock scope kept tight).
+    let mut stranded: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    if let Some(data) = crate::smp::get_core_data(core_id) {
+        interrupts::without_interrupts(|| {
+            let mut q = data.run_queue.lock();
+            while let Some(idx) = q.pop_front() {
+                stranded.push(idx);
+            }
+        });
+    }
+    {
+        let mut sched = scheduler_lock();
+        // Retire the idle task: mark Dead so the slot recycles; it was
+        // never on a run queue (idle tasks are dispatched specially).
+        if let Some(idle_idx) = sched.idle_tasks[core_id as usize].take()
+            && let Some(t) = sched.tasks.get_mut(idle_idx)
+        {
+            t.state = TaskState::Dead;
+        }
+        for &idx in &stranded {
+            if let Some(t) = sched.tasks.get_mut(idx) {
+                t.assigned_core = 0;
+            }
+        }
+    }
+    // Re-enqueue the stranded tasks on the BSP outside the scheduler lock.
+    for idx in stranded {
+        enqueue_to_core(0, idx);
+    }
+}
+
+/// Phase 103 F.3 — migrate the calling task to the BSP: the S3 entry
+/// path must run on core 0 (the wake-side machine reset restarts the
+/// boot CPU, and the resume trampoline re-establishes core-0 per-CPU
+/// state). Re-assigns the current task and yields until the scheduler
+/// dispatches it there. Returns `false` if it fails to land after a
+/// bounded number of hops.
+pub fn migrate_current_to_bsp() -> bool {
+    for _ in 0..64 {
+        if crate::smp::per_core().core_id == 0 {
+            return true;
+        }
+        {
+            let mut sched = scheduler_lock();
+            if let Some(idx) = get_current_task_idx()
+                && let Some(t) = sched.tasks.get_mut(idx)
+            {
+                t.assigned_core = 0;
+            }
+        }
+        yield_now();
+    }
+    crate::smp::per_core().core_id == 0
+}
+
+/// Phase 103 F.3 — forcibly restore the current task's preempt-disable
+/// depth after an S3 resume. The resume path's re-init code (APIC, mm,
+/// serial) runs its own `preempt_disable`/`enable` pairs while the
+/// per-core current-task pointer still targets the *suspended* task, so
+/// any imbalance in that stretch lands on the suspending task's counter
+/// and wedges its dispatch forever (found live: the task sat Ready with
+/// `preempt_count=1` and the BSP never ran it again). The suspend path
+/// snapshots the depth right before the sleep and writes it back right
+/// after the long-jump.
+pub fn force_preempt_count(value: i32) {
+    let Some(pc) = crate::smp::try_per_core() else {
+        return;
+    };
+    let ptr = pc
+        .current_preempt_count_ptr
+        .load(core::sync::atomic::Ordering::Acquire);
+    if !ptr.is_null() {
+        // SAFETY: same pointee invariant as `current_preempt_count`.
+        unsafe { (*ptr).store(value, core::sync::atomic::Ordering::Release) };
     }
 }

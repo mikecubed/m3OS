@@ -192,6 +192,26 @@ pub fn init() {
     }
 }
 
+/// Phase 103 F.3 — re-load the GDT, segments, and TSS after an S3
+/// resume. [`init`]'s first `ltr` marked the TSS descriptor **busy**
+/// in the static GDT; a second `ltr` on a busy descriptor is `#GP`
+/// (found live: the resume path triple-faulted with firmware's IDT
+/// unmapped). Clear the busy bit (bit 41: type `0xB` → `0x9`) through
+/// the *active* GDT base from `sgdt` — layout-independent of the
+/// `GlobalDescriptorTable` internals — then `ltr` normally.
+pub fn reinit_after_resume() {
+    GDT.0.load();
+    unsafe {
+        CS::set_reg(GDT.1.code);
+        DS::set_reg(GDT.1.data);
+        SS::set_reg(GDT.1.data);
+        let gdtr = x86_64::instructions::tables::sgdt();
+        let entry = (gdtr.base.as_u64() as *mut u64).add(GDT.1.tss.index() as usize);
+        entry.write_volatile(entry.read_volatile() & !(1u64 << 41));
+        load_tss(GDT.1.tss);
+    }
+}
+
 /// Return the kernel code segment selector (for use in STAR MSR setup).
 pub fn kernel_code_selector() -> SegmentSelector {
     GDT.1.code

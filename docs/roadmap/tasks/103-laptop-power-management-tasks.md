@@ -324,20 +324,49 @@
 **Symbol:** the `powerd` suspend orchestration, a driver `quiesce`/`restore` hook
 **Why it matters:** The hard part of suspend is not the register poke — it is stopping device rings + saving register state before power-down and restoring after, ordered so nothing DMAs into freed memory.
 
+> **Charter correction:** the quiesce/restore lives in the **kernel
+> suspend path**, not a powerd/session_manager choreography — the
+> devices that matter on the QEMU baseline (virtio-blk/net) are
+> in-kernel drivers, and the quiesce must run after interrupts are off
+> on the last core, which no ring-3 daemon can do. Ring-3 driver
+> quiesce hooks (AHCI/NVMe/USB) join when those device classes need S3
+> on hardware.
+
 **Acceptance:**
-- [ ] `powerd` + `session_manager` quiesce the display/input/storage/NIC drivers (stop rings, save state) before requesting the sleep, and restore them after resume.
-- [x] A quiesce failure aborts the suspend and fails closed to a live session (no half-suspended state). *(The fail-closed arm is live ahead of the choreography: `POWER_SUSPEND` (0x5703) is refused outright — `POWERD:suspend rejected reason=resume-path-unimplemented` — because entering S3 without the F.3 resume path never wakes; `power-smoke` asserts the refusal and that the session stays live. Lid-close routes to the lockscreen fallback (`POWERD:lid action=lock`) instead of suspending — the D.3 lid arm, HW-validated later since q35 models no lid.)*
+- [x] The kernel quiesces before the sleep: filesystem sync (`kernel_shutdown_sync`), cooperative AP park **at the scheduler-loop boundary** (an NMI park can catch a lock holder and deadlock the drain — found live) with run-queue drain to the BSP + idle-task retirement + per-core release, `virtio_blk::quiesce_for_suspend` (in-flight drain by polling the used ring + ring index reset — a write submitted between sync and cli otherwise dies with the reset and orphans its waiter, found live), and a PCI config-space snapshot (OVMF's S3 boot script does **not** restore OS-visible BARs — post-wake reads were all-ones, found live). Restore order on wake: PCI config → SCI reroute + PWRBTN re-arm → virtio re-handshake against the retained rings → AP reboot.
+- [x] A quiesce failure aborts the suspend and fails closed to a live session (no half-suspended state): AP-park timeout and blk-drain timeout both unwind (parked APs rebooted) and return `-EBUSY`; a refused SLP write falls through to a live return. On an S3-less platform `SYS_POWER_ENTER_SLEEP` is `-ENOSYS` — `power-smoke` (now a PIIX4 `disable_s3=1` lane) asserts that refusal and session liveness. Lid-close still routes to the lockscreen fallback (`POWERD:lid action=lock`) — HW-validated later since QEMU models no lid.
 
 ### F.3 — S3 entry + resume (S0ix noted)
 
-**File:** `kernel/src/acpi/power.rs`
-**Symbol:** `power::enter_sleep(state)` (`_PTS`/`_GTS` + `PM1a/b_CNT` `SLP_TYP|SLP_EN` + FACS waking vector), the resume path + `_WAK`
+**Files:** `kernel/src/arch/x86_64/suspend.rs` (new), `kernel/src/smp/boot.rs` (`install_trampoline_for_resume` + the 32-bit shim), `kernel/src/smp/mod.rs` (park/reboot), `kernel/src/pci/mod.rs` (config save/restore + MSI re-arm), `kernel/src/blk/virtio_blk.rs` + `kernel/src/net/virtio_net.rs` (`quiesce_for_suspend`/`resume_after_s3`), `kernel/src/acpi/{mod,sci}.rs` (FACS parse, SCI reroute), `kernel/src/arch/x86_64/{gdt,apic}.rs` (TSS busy-bit clear, TSC rebase), `userspace/drivers/acpid` + `userspace/powerd`
+**Symbol:** `suspend::enter_sleep_s3`, `SYS_POWER_ENTER_SLEEP` (0x1162), `SYS_ACPI_REGISTER_S3` (0x1134+1)
 **Why it matters:** This is the kernel mechanism for the sleep transition; the FACS waking vector + CPU-state re-establish is the resume contract.
 
+> **As-built notes (each found live by `suspend-smoke` iterations):**
+> `_PTS(3)`/`_WAK(3)` ride acpid from powerd per the 101 split (`_GTS`
+> is deprecated — skipped). The entry migrates to the BSP first (the
+> syscall can arrive on any core, and a core cannot park itself). OVMF
+> enters the **legacy** waking vector in 64-bit flat mode at a
+> page-truncated address — unusable — so the FACS **X** vector points
+> at a 32-bit shim (spec-defined entry: 32-bit flat, paging off) on the
+> SIPI trampoline page, sharing its GDT/stack/entry data fields. The
+> resume-side re-init is split: register-state only before the
+> long-jump (a heavyweight stretch there runs preempt pairs against the
+> suspended task's counter and wedges its dispatch), everything else
+> after, in task context. The suspended task's preempt depth is
+> force-restored across the jump. `gdt::init` cannot re-run (`ltr` on a
+> busy TSS descriptor is #GP) — `reinit_after_resume` clears the busy
+> bit via `sgdt`. CLOCK_MONOTONIC is TSC-based and the reset zeroes the
+> TSC — `rebase_boot_tsc` keeps it continuous. powerd must drain the
+> wake-side event burst before `\_WAK` (the wake sets `PWRBTN_STS`;
+> acpid blocks pushing it at powerd's endpoint while powerd would wait
+> on acpid's reply — a clean cross-daemon deadlock), and those wake
+> events are artifacts, not poweroff requests.
+
 **Acceptance:**
-- [ ] `enter_sleep(S3)` evaluates `_PTS(3)`/`_GTS(3)`, installs the FACS waking vector, and writes `SLP_TYP|SLP_EN` into `PM1a/b_CNT` after F.2 quiesce.
-- [ ] On resume the kernel re-establishes CPU state, evaluates `_WAK(3)`, and signals the `POWER_EVENT` resume kind so `powerd` restores brightness + drivers.
-- [ ] **Validated-on-HW**: an S3 (or S0ix) suspend/resume round-trips to a live session, **or** the attempt fails closed; the outcome is recorded in the Track G run entry (a partial/closed-fail is an acceptable stretch outcome).
+- [x] `enter_sleep_s3` (after powerd's `_PTS(3)`) installs the FACS X waking vector and writes `SLP_TYP|SLP_EN` into `PM1a_CNT` after the F.2 quiesce; QEMU reaches run state `suspended`. *(PM1b joins on hardware that declares one.)*
+- [x] On resume the kernel re-establishes CPU state (GDT/IDT/TSS/GS/syscall MSRs/XCR0/PAT, PIC/APIC, TSC rebase), powerd evaluates `_WAK(3)` and re-applies brightness (the B.3 resume hook); the `POWERD:resume` sentinel replaces the chartered `POWER_EVENT` resume kind (powerd IS the daemon that would consume it — it is the suspend caller). `suspend-smoke` proves shell + virtio-blk + power-button liveness after the round trip.
+- [ ] **Validated-on-HW**: an S3 (or S0ix) suspend/resume round-trips to a live session, **or** the attempt fails closed; the outcome is recorded in the Track G run entry (a partial/closed-fail is an acceptable stretch outcome). *(QEMU round trip green; Dell arm pends. Residuals: PS/2 keyboard/mouse re-init hangs post-resume (replug required), GPE re-arm, framebuffer re-mode-set on hardware GPUs, S0ix.)*
 
 ---
 

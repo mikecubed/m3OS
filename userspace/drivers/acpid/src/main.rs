@@ -74,7 +74,8 @@ use kernel_core::device_host::syscalls::{
     ACPI_PM_REG_GPE0_STS, ACPI_PM_REG_PM1A_CNT, ACPI_PM_REG_PM1A_EN, ACPI_PM_REG_PM1A_STS,
     ACPI_PM_REG_SMI_CMD, ACPI_SCI_BIT_GPE, ACPI_SCI_BIT_PM1, NOTIFICATION_SENTINEL_NEW,
     SYS_ACPI_IO_READ, SYS_ACPI_IO_WRITE, SYS_ACPI_MEM_READ, SYS_ACPI_MEM_WRITE, SYS_ACPI_PM_READ,
-    SYS_ACPI_PM_WRITE, SYS_ACPI_REGISTER_S5, SYS_ACPI_SCI_SUBSCRIBE, SYS_ACPI_TABLE_GET,
+    SYS_ACPI_PM_WRITE, SYS_ACPI_REGISTER_S3, SYS_ACPI_REGISTER_S5, SYS_ACPI_SCI_SUBSCRIBE,
+    SYS_ACPI_TABLE_GET,
 };
 use kernel_core::ipc::wake_kind::RECV_KIND_NOTIFICATION;
 use syscall_lib::heap::BrkAllocator;
@@ -806,8 +807,26 @@ fn program_main(_args: &[&str]) -> i32 {
     // static; S0ix shows as a `PNP0D80` Low-Power-S0-Idle device. QEMU
     // q35 declares `\_S3` + `\_S4` and no S0ix.
     let mut sleep_bits: u64 = 0;
-    if ns.evaluate(&mut regions, "\\_S3").is_ok() {
-        sleep_bits |= SLEEP_S3;
+    match ns.evaluate(&mut regions, "\\_S3") {
+        Ok(AmlValue::Package(elems)) => {
+            sleep_bits |= SLEEP_S3;
+            // F.3: register the SLP_TYP values so the kernel suspend
+            // path can write PM1a_CNT (the \_S5 registration shape).
+            let typ = |i: usize| match elems.get(i) {
+                Some(AmlValue::Integer(v)) => Some(*v & 0x7),
+                _ => None,
+            };
+            if let (Some(a), Some(b)) = (typ(0), typ(1)) {
+                let rc = unsafe { syscall_lib::syscall2(SYS_ACPI_REGISTER_S3, a, b) as isize };
+                if rc == 0 {
+                    announce(&format!("acpid: S3 registered slp_typ={a},{b}\n"));
+                } else {
+                    announce(&format!("acpid: S3 register failed ({rc})\n"));
+                }
+            }
+        }
+        Ok(_) => sleep_bits |= SLEEP_S3,
+        Err(_) => {}
     }
     if ns.evaluate(&mut regions, "\\_S4").is_ok() {
         sleep_bits |= SLEEP_S4;
