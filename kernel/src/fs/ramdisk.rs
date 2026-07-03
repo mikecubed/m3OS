@@ -186,6 +186,8 @@ static GENKEY_ELF: &[u8] = generated_initrd_asset!("genkey");
 static SERVICE_ELF: &[u8] = generated_initrd_asset!("service");
 static LOGGER_ELF: &[u8] = generated_initrd_asset!("logger");
 static SHUTDOWN_ELF: &[u8] = generated_initrd_asset!("shutdown");
+/// Phase 106 Track C — the on-device installer (`/sbin/installer`).
+static INSTALLER_ELF: &[u8] = generated_initrd_asset!("installer");
 static REBOOT_ELF: &[u8] = generated_initrd_asset!("reboot");
 static HOSTNAME_ELF: &[u8] = generated_initrd_asset!("hostname");
 static WHO_ELF: &[u8] = generated_initrd_asset!("who");
@@ -1320,7 +1322,18 @@ static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[
     ),
 ];
 
-static SBIN_ENTRIES: &[(&str, RamdiskNode)] = &[("init", RamdiskNode::File { content: INIT_ELF })];
+static SBIN_ENTRIES: &[(&str, RamdiskNode)] = &[
+    ("init", RamdiskNode::File { content: INIT_ELF }),
+    // Phase 106 Track C — the raw-block installer; its exec path
+    // (`/sbin/installer`) is the capability gate for the raw block
+    // syscalls (`kernel_core::installer`).
+    (
+        "installer",
+        RamdiskNode::File {
+            content: INSTALLER_ELF,
+        },
+    ),
+];
 
 // Phase 76 — dynamic linker (`ld-musl-x86_64.so.1`). Staged in both
 // the ramdisk and the ext2 `/lib/` so the kernel's `PT_INTERP` branch

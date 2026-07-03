@@ -134,6 +134,29 @@ static REMOTE_BLOCK_REGISTERED_MASK: AtomicU32 = AtomicU32::new(0);
 /// Kept for the existing `on_endpoint_closed` fast-path (unchanged call site).
 static REMOTE_BLOCK_REGISTERED: AtomicBool = AtomicBool::new(false);
 
+/// Phase 106 C.3 — root-service skip mask. When a root mount fails to
+/// find ext2 on the device a service auto-adopted into slot 0 (e.g. a
+/// blank internal NVMe present during a USB-image install boot),
+/// [`release_root_and_skip`] sets that service's bit here so the next
+/// [`is_registered`] cold-path re-evaluation moves on to the next
+/// candidate instead of re-adopting the same unmountable device. Only
+/// the three auto-discovered root services have bits; secondary
+/// (explicitly-registered) slots are untouched.
+static ROOT_SKIP_MASK: AtomicU32 = AtomicU32::new(0);
+const SKIP_NVME: u32 = 1 << 0;
+const SKIP_AHCI: u32 = 1 << 1;
+const SKIP_USB: u32 = 1 << 2;
+
+/// Map a root service name to its [`ROOT_SKIP_MASK`] bit.
+fn root_service_skip_bit(service: &str) -> u32 {
+    match service {
+        "nvme.block" => SKIP_NVME,
+        "ahci.block" => SKIP_AHCI,
+        "usb0.block" => SKIP_USB,
+        _ => 0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Root-slot public API (unchanged signatures — preserves all existing callers)
 // ---------------------------------------------------------------------------
@@ -217,21 +240,26 @@ pub fn is_registered() -> bool {
     // registered earlier). This is the one scoped data-path kernel change the
     // AHCI phase makes (Phase 82 D.2) — the analog of Phase 81's
     // `default_route_index_by_link`.
+    // Phase 106 C.3 — honor the skip mask: a candidate whose bit is set
+    // failed a prior root mount (no ext2 on it), so fall through to the
+    // next-priority service instead of re-adopting it.
+    let skip = ROOT_SKIP_MASK.load(Ordering::Acquire);
+    let try_lookup = |service: &'static str, dev: &'static str, bit: u32| {
+        if skip & bit != 0 {
+            return None;
+        }
+        registry::lookup_endpoint_with_owner(service).map(|(ep, owner)| (service, dev, ep, owner))
+    };
     let (service_name, device_name, ep, owner_task_id) =
-        match registry::lookup_endpoint_with_owner("nvme.block") {
-            Some((ep, owner)) => ("nvme.block", "nvme0", ep, owner),
-            None => match registry::lookup_endpoint_with_owner("ahci.block") {
-                Some((ep, owner)) => ("ahci.block", "ahci0", ep, owner),
-                // Phase 106 A.2 — last-resort root backend: the boot USB
-                // stick's mass-storage device (the combined GPT image).
-                // Strictly lowest priority so an internal NVMe/AHCI disk
-                // always wins when present; the same `/drivers/` owner
-                // gate below applies to the registrant (usb-storage).
-                None => match registry::lookup_endpoint_with_owner("usb0.block") {
-                    Some((ep, owner)) => ("usb0.block", "usb0", ep, owner),
-                    None => return false,
-                },
-            },
+        match try_lookup("nvme.block", "nvme0", SKIP_NVME)
+            .or_else(|| try_lookup("ahci.block", "ahci0", SKIP_AHCI))
+            // Phase 106 A.2 — last-resort root backend: the boot USB stick's
+            // mass-storage device (the combined GPT image). Strictly lowest
+            // priority so an internal NVMe/AHCI disk always wins when present.
+            .or_else(|| try_lookup("usb0.block", "usb0", SKIP_USB))
+        {
+            Some(v) => v,
+            None => return false,
         };
     // Owner gate: reject registrations from processes whose `exec_path` is not
     // under `/drivers/` (see `is_trusted_driver_task`). `owner == 0`
@@ -383,6 +411,41 @@ pub fn unregister_device(dev_id: u32) {
     );
     *slot = RemoteBlockEntry::empty();
     REMOTE_BLOCK_REGISTERED_MASK.fetch_and(!(1u32 << dev_id), Ordering::Release);
+}
+
+/// Phase 106 C.3 — release the auto-adopted root slot after a failed
+/// root mount and mark its service to be skipped next time.
+///
+/// Called by the `VFS_MOUNT_EXT2_ROOT` path when it finds no ext2 on the
+/// device an auto-discovery service adopted into slot 0 (the classic
+/// case: a blank internal NVMe present while booting a USB installer
+/// image — NVMe out-priorities USB but has no filesystem). Clearing the
+/// slot + skipping the service lets init's retry loop re-evaluate down
+/// to the next candidate (AHCI, then the bootable USB) without a new
+/// syscall. A no-op when slot 0 holds no auto-discovered remote service
+/// (e.g. a virtio-blk root, or an explicitly-registered device). Returns
+/// `true` when it released+skipped a service.
+pub fn release_root_and_skip() -> bool {
+    let mut g = REMOTE_BLOCK.lock();
+    let slot = &mut g.entries[0];
+    // Only auto-discovered root services participate; a `register`d root
+    // or an empty slot is left alone.
+    if slot.explicitly_registered {
+        return false;
+    }
+    let bit = root_service_skip_bit(slot.service_name.as_str());
+    if bit == 0 {
+        return false;
+    }
+    log::info!(
+        "[blk::remote] root mount found no ext2 on '{}' — releasing + skipping it",
+        slot.service_name
+    );
+    *slot = RemoteBlockEntry::empty();
+    REMOTE_BLOCK_REGISTERED.store(false, Ordering::Release);
+    REMOTE_BLOCK_REGISTERED_MASK.fetch_and(!1u32, Ordering::Release);
+    ROOT_SKIP_MASK.fetch_or(bit, Ordering::Release);
+    true
 }
 
 /// `true` when `dev_id` is in-range and its slot is occupied.

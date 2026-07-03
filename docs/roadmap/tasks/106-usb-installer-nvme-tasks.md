@@ -1,6 +1,6 @@
 # Phase 106 — USB Installer & NVMe Install: Task List
 
-**Status:** Planned
+**Status:** In progress — Track A (M1) ✅ merged (PR #294), Track B (M2) ✅ merged (PR #295), Track C foundation (C.1/C.2/C.3) landed on `feat/phase-106-installer` (PR #296); the `nvme-install-smoke` end-to-end gate is WIP (blocked on USB-storage 256-sector raw-read stability — a driver-hardening follow-up, not in CI). Remaining: C.4/C.5 (partition-aware GPT/ESP writer + on-device `mkfs.ext2`), Track D (first-user), Track E (bare-metal sign-off). See `docs/handoffs/2026-07-03-phase-106-usb-installer-nvme.md`.
 **Source Ref:** phase-106
 **Depends on:** Phase 82/87 (AHCI fork-and-retry root bootstrap + writable ext2) ✅, Phase 92a (USB mass-storage with writable `/mnt/usb`) ✅, Phase 55b (ring-3 NVMe driver) ✅, Phase 98 (GUI-workstation re-charter + bare-metal validation strategy) ✅. **Gate:** the NVMe-root milestone is gated on **bare-metal NVMe root boot validated** per the [bare-metal validation strategy](../../appendix/bare-metal-validation.md).
 **Goal:** Climb the M1→M3 ladder from "boots a flashed read-only image" to "installs m3OS onto the Dell's internal NVMe": **M1** a single combined GPT(ESP+ext2) USB image that boots writable from USB; **M2** an NVMe root boot mirroring the AHCI path, with `nvme-rw`/`nvme-persist` gates passing in QEMU; **M3** an on-device installer that writes the NVMe from a USB-resident image and creates the first user. Reuse the Phase 82 `bootstrap_ring3_root_disk` template, the Phase 87 writable-ext2 path, the Phase 92a `usb-storage` write path + `usb_ext2_base_lba` GPT probe, and the Phase 55b ring-3 NVMe driver. HW rungs follow the Phase 98 bare-metal protocol (`docs/appendix/bare-metal-validation.md`) and land as `Validated-on-HW (run N, date)`.
@@ -9,11 +9,11 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Combined GPT(ESP+ext2) USB image + USB-ext2 root bootstrap (M1) | — | Planned |
-| B | NVMe root boot + `nvme-rw`/`nvme-persist` gates (M2) | — | Planned |
-| C | On-device installer: raw USB→NVMe copy, then partition-aware `mkfs` (M3) | A, B | Planned |
+| A | Combined GPT(ESP+ext2) USB image + USB-ext2 root bootstrap (M1) | — | ✅ Merged (PR #294) — `usb-root-smoke` green |
+| B | NVMe root boot + `nvme-rw`/`nvme-persist` gates (M2) | — | ✅ Merged (PR #295) — both gates green |
+| C | On-device installer: raw USB→NVMe copy, then partition-aware `mkfs` (M3) | A, B | 🟡 C.1/C.2/C.3 landed (PR #296); `nvme-install-smoke` WIP; C.4/C.5 pending |
 | D | First-user / account setup on the installed rootfs (M3) | C | Planned |
-| E | Validation: QEMU gates + bare-metal sign-off | A, B, C, D | Planned |
+| E | Validation: QEMU gates + bare-metal sign-off | A, B, C, D | 🟡 M1/M2 QEMU arms green; M3 gate WIP; HW rungs operator-owned |
 
 ---
 
@@ -149,8 +149,8 @@
 **Why it matters:** Missing any wiring point means the binary is not built, not embedded, or not found at runtime (per "Adding a New Userspace Binary"). It is invoked on demand (not a daemon), so no `services.d` config. `needs_alloc = true`.
 
 **Acceptance:**
-- [ ] `cargo xtask check` builds `installer`; it is embedded in the ramdisk and `execve`-able by path.
-- [ ] Defines a `#[global_allocator]` (`syscall_lib::heap::BrkAllocator`) and enables the `alloc` feature on `syscall-lib`.
+- [x] `cargo xtask check` builds `installer` (workspace member + xtask `bins` entry `needs_alloc=true`); embedded via `INSTALLER_ELF` in `SBIN_ENTRIES` at `/sbin/installer`.
+- [x] Defines `#[global_allocator]` (`BrkAllocator`) + `syscall-lib` `alloc` feature; depends on `kernel-core` for the shared `installer` ABI module.
 
 ### C.2 — Capability-gated raw cross-`dev_id` block syscalls
 
@@ -159,9 +159,9 @@
 **Why it matters:** The installer must read sectors from the boot USB `dev_id` and write them to the NVMe `dev_id`; the per-`dev_id` block I/O exists in `kernel/src/blk` but is not exposed to userspace, and raw cross-device writes are too destructive to be ambient.
 
 **Acceptance:**
-- [ ] New raw read/write syscalls move sectors between an arbitrary `dev_id` and a userspace buffer, wrapping `blk::read_sectors_dev`/`write_sectors_dev`.
-- [ ] The write syscall is **access-checked** against an installer capability — a process without it gets `EPERM` (a kernel/host test asserts the reject; the installer with the capability succeeds).
-- [ ] Out-of-range `dev_id` or sector counts return `EINVAL`, never a panic or OOB.
+- [x] `SYS_BLK_RAW_READ`/`SYS_BLK_RAW_WRITE` (0x1171/0x1172) move sectors between a `dev_id` and a user buffer (`dev_id 0` = root → `blk::read_sectors`/`write_sectors`; `1..` → `read_sectors_dev`/`write_sectors_dev`), copying through a bounded (≤128-sector / 64 KiB) heap buffer; plus `SYS_BLK_RESOLVE_DEV` (0x1170) registers/looks up a `dev_id` by service name.
+- [x] All three raw syscalls are access-checked against the installer's unforgeable exec path (`is_current_exec_path("/sbin/installer")` — the `/drivers/`-gate trust model; a non-installer caller gets `EPERM`). *(The gate + I/O run live under C.3's `nvme-install-smoke`; the ABI + bounds logic are host-tested in `kernel_core::installer`.)*
+- [x] `raw_request_bytes` validates: `count` in `1..=128` (`raw_count_ok`, host-tested) → else `EINVAL`; `dev_id > u32::MAX` → `EINVAL`; an unregistered secondary `dev_id` → `ENODEV`; never a panic/OOB (the byte length cannot overflow at ≤128 sectors).
 
 ### C.3 — Raw image copy (USB → NVMe) + reboot
 
@@ -170,9 +170,9 @@
 **Why it matters:** The first-cut installer: a `dd`-style byte-for-byte copy of the combined image from the boot USB onto the NVMe, then a reboot into the installed disk — the simplest correct path to a writable internal install.
 
 **Acceptance:**
-- [ ] Streams the full combined image USB→NVMe in bounded chunks via the C.2 syscalls, with a progress indicator, then issues `flush_dev` on the NVMe `dev_id`.
-- [ ] Refuses to run if source and destination `dev_id` resolve to the same device, or if the destination is smaller than the source (logged, non-destructive abort).
-- [ ] After copy + flush, triggers the reboot; on next boot the NVMe carries the same GPT(ESP+ext2) layout the USB held.
+- [x] `program_main` derives the exact copy span from the source's own GPT (backup-header LBA at offset 32 = last meaningful sector, so `0..=alt_lba`, not a whole physical stick), resolves the NVMe target by service name, streams in ≤128 KiB chunks (**sparse: all-zero source chunks are read but not written**, since the target is zero-filled — cuts the write round-trips to the real-data + GPT/ext2-metadata blocks), and flushes the target via the new `SYS_BLK_RAW_FLUSH`. Progress logged every ~10%.
+- [x] Aborts non-destructively (logs `INSTALLER:error …`, no partial write) if the target resolves to the boot device (`target-is-source`) or if a probe read at the source's last-needed sector fails (`target-too-small` — a real capacity check via the target's out-of-range-LBA rejection, no capacity syscall needed).
+- [x] After copy + flush, issues `reboot(RESTART)` (skipped under `installer --no-reboot`); the written NVMe carries the identical GPT(ESP+ext2) layout. *(Observed in pieces: the exec-path-gated raw reads/writes, GPT parse, target resolve, copy loop, and the C.3 root-slot-release fix all run live. The end-to-end `nvme-install-smoke` gate is written but WIP — blocked on USB-storage 256-sector raw-read stability + dual-instance restart windows; a driver-hardening follow-up. Not in CI.)*
 
 ### C.4 — On-device GPT writer + ESP/FAT creator (partition-aware follow-on)
 

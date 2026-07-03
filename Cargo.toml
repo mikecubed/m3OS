@@ -223,6 +223,7 @@ members = [
     "userspace/notifyd",
     # Phase 103 — ring-3 power policy daemon.
     "userspace/powerd",
+    "userspace/installer",
     # Phase 73 — lockscreen stub.
     "userspace/lockscreen",
     # Phase 73 — shared Layer-shell client boilerplate (handshake,

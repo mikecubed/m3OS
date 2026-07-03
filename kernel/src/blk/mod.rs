@@ -212,3 +212,11 @@ pub fn write_sectors_dev(
 pub fn flush_dev(dev_id: u32) -> Result<(), u8> {
     remote::flush_dev(dev_id)
 }
+
+/// Phase 106 C.3 — release the auto-adopted root slot after a failed
+/// root mount and skip its service next time (see
+/// [`remote::release_root_and_skip`]). Returns `true` when a service was
+/// released.
+pub fn release_root_and_skip() -> bool {
+    remote::release_root_and_skip()
+}

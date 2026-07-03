@@ -1114,6 +1114,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "installer"
+version = "0.99.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "ipv6-smoke"
 version = "0.99.0"
 dependencies = [
