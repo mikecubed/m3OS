@@ -23,6 +23,7 @@ pub mod fs;
 pub mod hda;
 pub mod init;
 pub mod input;
+pub mod installer;
 pub mod iommu;
 pub mod ipc;
 pub mod kpti;

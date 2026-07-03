@@ -1704,6 +1704,11 @@ mod syscall_nr {
     pub use kernel_core::power::syscalls::{
         SYS_POWER_CPUFREQ_STATUS, SYS_POWER_ENTER_SLEEP, SYS_POWER_SET_PERF,
     };
+
+    // -- Phase 106 Track C installer raw block syscalls --
+    // m3OS-native `0x117x` block; canonically declared in
+    // `kernel_core::installer`.
+    pub use kernel_core::installer::{SYS_BLK_RAW_READ, SYS_BLK_RAW_WRITE, SYS_BLK_RESOLVE_DEV};
 }
 
 // ---------------------------------------------------------------------------
@@ -2548,6 +2553,16 @@ pub extern "C" fn syscall_handler(
         SYS_POWER_SET_PERF => sys_power_set_perf(arg0),
         SYS_POWER_CPUFREQ_STATUS => sys_power_cpufreq_status(arg0, arg1),
         SYS_POWER_ENTER_SLEEP => sys_power_enter_sleep(),
+        // -- Phase 106 Track C installer raw block syscalls --
+        SYS_BLK_RESOLVE_DEV => sys_blk_resolve_dev(arg0, arg1),
+        SYS_BLK_RAW_READ => {
+            let arg3 = per_core_syscall_arg3();
+            sys_blk_raw_read(arg0, arg1, arg2, arg3)
+        }
+        SYS_BLK_RAW_WRITE => {
+            let arg3 = per_core_syscall_arg3();
+            sys_blk_raw_write(arg0, arg1, arg2, arg3)
+        }
         // -- Track D debug probe (feature `kstack-overflow-test`; absent → ENOSYS) --
         #[cfg(feature = "kstack-overflow-test")]
         SYS_KSTACK_OVERFLOW_TEST => sys_kstack_overflow_test(),
@@ -19799,6 +19814,128 @@ pub(super) fn sys_power_cpufreq_status(buf_ptr: u64, buf_len: u64) -> u64 {
         return NEG_EFAULT;
     }
     CPUFREQ_STATUS_WIRE_LEN as u64
+}
+
+// ---------------------------------------------------------------------------
+// Phase 106 Track C — installer raw block syscalls (0x117x)
+// ---------------------------------------------------------------------------
+
+/// Every raw block syscall is gated on the installer's unforgeable exec
+/// path (`/sbin/installer`) — raw cross-device I/O bypasses the
+/// filesystem permission layer, so it must never be ambient. Same trust
+/// model as the `/drivers/` device-host gate: `exec_path` is written by
+/// the kernel at `execve`, so ring 3 cannot spoof it.
+fn is_installer_process() -> bool {
+    is_current_exec_path(kernel_core::installer::INSTALLER_EXEC_PATH)
+}
+
+/// Validate a raw request's `dev_id`, `start_lba`, and `count`, and
+/// compute the byte length. `dev_id 0` is the root device; `1..` are
+/// registered secondary slots. Returns `Err(errno)` on any violation
+/// (never a panic / OOB).
+fn raw_request_bytes(dev_id: u64, count: u64) -> Result<usize, u64> {
+    use kernel_core::installer::{SECTOR_BYTES, raw_count_ok};
+    if !raw_count_ok(count) {
+        return Err(NEG_EINVAL);
+    }
+    if dev_id > u64::from(u32::MAX) {
+        return Err(NEG_EINVAL);
+    }
+    if dev_id != 0 && !crate::blk::is_remote_device_registered(dev_id as u32) {
+        return Err(NEG_ENODEV);
+    }
+    // count ≤ MAX_SECTORS_PER_RAW_REQUEST (128) so this cannot overflow.
+    Ok((count * SECTOR_BYTES) as usize)
+}
+
+/// `sys_blk_resolve_dev(name_ptr, name_len) -> isize`: register (or
+/// look up) a block-device service by name and return its `dev_id`.
+/// Installer-gated. `name_len` is bounded to a service-name-sized
+/// buffer.
+pub(super) fn sys_blk_resolve_dev(name_ptr: u64, name_len: u64) -> u64 {
+    if !is_installer_process() {
+        return NEG_EPERM;
+    }
+    // Service names are short ("nvme.block", "usb0.block", …).
+    if name_len == 0 || name_len > 64 {
+        return NEG_EINVAL;
+    }
+    let mut buf = [0u8; 64];
+    let len = name_len as usize;
+    if UserSliceRo::new(name_ptr, len)
+        .and_then(|s| s.copy_to_kernel(&mut buf[..len]))
+        .is_err()
+    {
+        return NEG_EFAULT;
+    }
+    let Ok(name) = core::str::from_utf8(&buf[..len]) else {
+        return NEG_EINVAL;
+    };
+    // The device_name is a stable per-service handle label; reuse the
+    // service basename before ".block" as the display name.
+    let dev_name = name.strip_suffix(".block").unwrap_or(name);
+    match crate::blk::register_remote_device(name, dev_name) {
+        Some(dev_id) => dev_id as u64,
+        None => NEG_ENODEV,
+    }
+}
+
+/// `sys_blk_raw_read(dev_id, start_lba, count, buf_ptr) -> isize`:
+/// copy `count` sectors from `dev_id` into the user buffer. Returns the
+/// byte count, or a negative errno. Installer-gated.
+pub(super) fn sys_blk_raw_read(dev_id: u64, start_lba: u64, count: u64, buf_ptr: u64) -> u64 {
+    if !is_installer_process() {
+        return NEG_EPERM;
+    }
+    let bytes = match raw_request_bytes(dev_id, count) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let mut kbuf = alloc::vec![0u8; bytes];
+    let io = if dev_id == 0 {
+        crate::blk::read_sectors(start_lba, count as usize, &mut kbuf)
+    } else {
+        crate::blk::read_sectors_dev(dev_id as u32, start_lba, count as usize, &mut kbuf)
+    };
+    if io.is_err() {
+        return NEG_EIO;
+    }
+    if UserSliceWo::new(buf_ptr, bytes)
+        .and_then(|s| s.copy_from_kernel(&kbuf))
+        .is_err()
+    {
+        return NEG_EFAULT;
+    }
+    bytes as u64
+}
+
+/// `sys_blk_raw_write(dev_id, start_lba, count, buf_ptr) -> isize`:
+/// copy `count` sectors from the user buffer to `dev_id`. Destructive —
+/// installer-gated. Returns the byte count, or a negative errno.
+pub(super) fn sys_blk_raw_write(dev_id: u64, start_lba: u64, count: u64, buf_ptr: u64) -> u64 {
+    if !is_installer_process() {
+        return NEG_EPERM;
+    }
+    let bytes = match raw_request_bytes(dev_id, count) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let mut kbuf = alloc::vec![0u8; bytes];
+    if UserSliceRo::new(buf_ptr, bytes)
+        .and_then(|s| s.copy_to_kernel(&mut kbuf))
+        .is_err()
+    {
+        return NEG_EFAULT;
+    }
+    let io = if dev_id == 0 {
+        crate::blk::write_sectors(start_lba, count as usize, &kbuf)
+    } else {
+        crate::blk::write_sectors_dev(dev_id as u32, start_lba, count as usize, &kbuf)
+    };
+    if io.is_err() {
+        return NEG_EIO;
+    }
+    bytes as u64
 }
 
 // ---------------------------------------------------------------------------

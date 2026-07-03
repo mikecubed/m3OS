@@ -2040,6 +2040,7 @@ fn build_userspace_bins() {
         ("usbhub", "usbhub", true),
         ("acpid", "acpid", true), // Phase 101 E: ring-3 ACPI daemon (alloc for kernel-core namespace)
         ("powerd", "powerd", true), // Phase 103: power policy daemon (alloc for kernel-core power)
+        ("installer", "installer", true), // Phase 106 C: on-device installer (alloc for read buffers)
         // Phase 78c: ring-3 USB HID Boot-Protocol class driver (kbd + mouse).
         // `needs_alloc = true` for kernel-core + usb-core deps.
         ("usb_hid", "usb_hid", true),
