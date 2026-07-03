@@ -317,3 +317,74 @@ pub fn sys_acpi_mem_write(phys: u64, width: u64, value: u64) -> isize {
     }
     0
 }
+
+// ---------------------------------------------------------------------------
+// Phase 103 D.3 — \_S5 registration + the real ACPI S5 poweroff
+// ---------------------------------------------------------------------------
+
+/// Packed `\_S5` sleep-type registration: bit 31 = registered, bits 15:8 =
+/// SLP_TYPa, bits 7:0 = SLP_TYPb. Written once by acpid at boot; read by
+/// `sys_reboot`'s poweroff arm long after acpid has been torn down.
+static S5_SLP_TYP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// `sys_acpi_register_s5(slp_typa, slp_typb) -> isize` — 0 on success.
+///
+/// `acpid` evaluates the `\_S5` package (AML stays in ring 3 per the
+/// Phase 101 split) and registers the two sleep-type values; the kernel
+/// keeps only the final `SLP_TYPa<<10 | SLP_EN` register write, which
+/// must run *after* the shutdown sync — when no ring-3 process is left
+/// to perform it. Values are masked to the architectural 3 bits.
+pub fn sys_acpi_register_s5(slp_typa: u64, slp_typb: u64) -> isize {
+    if let Err(e) = gate() {
+        return e;
+    }
+    let packed = (1u32 << 31) | (((slp_typa & 0x7) as u32) << 8) | ((slp_typb & 0x7) as u32);
+    S5_SLP_TYP.store(packed, core::sync::atomic::Ordering::Release);
+    log::info!(
+        "[acpi] \\_S5 registered: SLP_TYPa={} SLP_TYPb={}",
+        slp_typa & 0x7,
+        slp_typb & 0x7
+    );
+    0
+}
+
+/// Attempt the ACPI S5 poweroff: `PM1a_CNT <- SLP_TYPa<<10 | SLP_EN`
+/// (and PM1b when the FADT declares one — QEMU q35 does not). Returns
+/// `false` without touching hardware when acpid never registered `\_S5`
+/// or the FADT lacks a PM1a control block, so `sys_reboot` can fall back
+/// to its legacy halt path. On success the machine is off before this
+/// returns (QEMU exits; hardware cuts power).
+pub fn try_acpi_poweroff() -> bool {
+    let packed = S5_SLP_TYP.load(core::sync::atomic::Ordering::Acquire);
+    if packed & (1 << 31) == 0 {
+        return false;
+    }
+    let Some(fadt) = crate::acpi::fadt_info() else {
+        return false;
+    };
+    if fadt.pm1a_cnt_blk == 0 {
+        return false;
+    }
+    let slp_typa = ((packed >> 8) & 0x7) as u16;
+    let value = (slp_typa << 10) | (1 << 13); // SLP_TYP bits 12:10, SLP_EN bit 13
+    log::info!(
+        "[acpi] S5 poweroff: PM1a_CNT {:#x} <- {:#06x}",
+        fadt.pm1a_cnt_blk,
+        value
+    );
+    // SAFETY: FADT-declared PM1a control port; the S5 write is the
+    // architectural poweroff (ACPI §7.4.2, "Transitioning to S5"). The
+    // caller has already synced filesystems and quiesced I/O.
+    unsafe {
+        Port::<u16>::new(fadt.pm1a_cnt_blk as u16).write(value);
+    }
+    // The write takes effect asynchronously (QEMU: immediately; hardware:
+    // within the embedded controller's latency). Spin briefly so a broken
+    // platform falls through to the caller's halt loop instead of
+    // returning into userspace.
+    for _ in 0..1_000_000 {
+        core::hint::spin_loop();
+    }
+    log::warn!("[acpi] S5 write did not power off; falling back to halt");
+    false
+}

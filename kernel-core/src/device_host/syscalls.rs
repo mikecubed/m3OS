@@ -316,6 +316,18 @@ pub const SYS_ACPI_MEM_READ: u64 = 0x1132;
 /// (0 on success).
 pub const SYS_ACPI_MEM_WRITE: u64 = 0x1133;
 
+/// Register the platform's `\_S5` sleep-type values so `sys_reboot`'s
+/// poweroff arm can perform a real ACPI S5 (`SLP_TYPa<<10 | SLP_EN` to
+/// PM1a_CNT): `sys_acpi_register_s5(slp_typa, slp_typb) -> isize`
+/// (0 on success; values masked to 3 bits).
+///
+/// Phase 103 D.3: `acpid` evaluates the `\_S5` package at boot (AML —
+/// ring 3 per the 101 split) and hands the kernel just the two integers;
+/// the final register write stays in ring 0 because it must happen
+/// *after* the kernel's own shutdown sync, long after acpid itself has
+/// been SIGTERMed by init's service teardown.
+pub const SYS_ACPI_REGISTER_S5: u64 = 0x1134;
+
 /// `reg_sel` values for [`SYS_ACPI_PM_READ`]/[`SYS_ACPI_PM_WRITE`]. The
 /// kernel resolves each selector to its FADT-declared port and access
 /// width — ring 3 never names a raw port number.
@@ -342,7 +354,7 @@ pub const DEVICE_HOST_BASE: u64 = SYS_DEVICE_CLAIM;
 ///
 /// Adjust upward when adding new device-host syscalls; the Track B acceptance
 /// items pin this constant as the authoritative upper bound.
-pub const DEVICE_HOST_LAST: u64 = SYS_ACPI_MEM_WRITE;
+pub const DEVICE_HOST_LAST: u64 = SYS_ACPI_REGISTER_S5;
 
 #[cfg(test)]
 mod tests {
@@ -379,7 +391,9 @@ mod tests {
         assert_eq!(SYS_ACPI_IO_WRITE, 0x1131);
         assert_eq!(SYS_ACPI_MEM_READ, 0x1132);
         assert_eq!(SYS_ACPI_MEM_WRITE, 0x1133);
-        assert_eq!(DEVICE_HOST_LAST, SYS_ACPI_MEM_WRITE);
+        // Phase 103 D.3 — S5 sleep-type registration for real poweroff.
+        assert_eq!(SYS_ACPI_REGISTER_S5, 0x1134);
+        assert_eq!(DEVICE_HOST_LAST, SYS_ACPI_REGISTER_S5);
     }
 
     #[test]
@@ -405,6 +419,7 @@ mod tests {
             SYS_ACPI_IO_WRITE,
             SYS_ACPI_MEM_READ,
             SYS_ACPI_MEM_WRITE,
+            SYS_ACPI_REGISTER_S5,
         ];
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate() {
@@ -438,6 +453,7 @@ mod tests {
             SYS_ACPI_IO_WRITE,
             SYS_ACPI_MEM_READ,
             SYS_ACPI_MEM_WRITE,
+            SYS_ACPI_REGISTER_S5,
         ];
         for n in all {
             assert!(
@@ -473,7 +489,9 @@ mod tests {
         assert_eq!(SYS_ACPI_IO_WRITE, SYS_ACPI_IO_READ + 1);
         assert_eq!(SYS_ACPI_MEM_READ, SYS_ACPI_IO_WRITE + 1);
         assert_eq!(SYS_ACPI_MEM_WRITE, SYS_ACPI_MEM_READ + 1);
-        assert_eq!(DEVICE_HOST_LAST, SYS_ACPI_MEM_WRITE);
+        // Phase 103 D.3 pin: S5 registration closes the block.
+        assert_eq!(SYS_ACPI_REGISTER_S5, SYS_ACPI_MEM_WRITE + 1);
+        assert_eq!(DEVICE_HOST_LAST, SYS_ACPI_REGISTER_S5);
     }
 
     #[test]

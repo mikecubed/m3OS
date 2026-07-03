@@ -181,7 +181,7 @@
 
 **Acceptance:**
 - [x] Above `_PSV` the governor's cap is clamped to half scale (`thermal_cap` → `Governor::next`) and the status wire carries `thermal=passive` + the hottest zone temp; the clamp lifts when the sample drops below `_PSV` (the conservative ramp provides the recovery hysteresis).
-- [ ] At `_CRT` the governor pins the floor and powerd logs `POWERD:thermal state=critical`; the actual critical-shutdown action (session_manager graceful stop) pends Track D.3's session routing.
+- [x] At `_CRT` the governor pins the floor, powerd logs `POWERD:thermal state=critical`, and the D.3 poweroff chain fires (`POWERD:poweroff reason=thermal-critical` → service teardown → kernel sync → ACPI S5) — the thermal-runaway safety path. *(Fires from the 1 s tick; covered by the classify host tests + the D.3 chain the gate proves via the button — no QEMU thermal model to trip it live.)*
 - [ ] A `Notify(TZ, 0x80)` re-reads `_TMP` immediately. *(Interim: the 1 s governor tick re-samples every zone, so a trip is acted on within a tick; event-driven re-read joins D.3.)*
 
 ---
@@ -209,16 +209,34 @@
 - [ ] `parse_fadt` retains the PM1a/b event + control block descriptors (extending the current `IAPC_BOOT_ARCH`-only parse; reuses the Phase 101 FADT parse where available).
 - [ ] `PWRBTN_EN` is set, and a `PWRBTN_STS` on the SCI raises the same `POWER_EVENT` power-button kind as the control-method path; the status bit is cleared (write-1-to-clear).
 
-### D.3 — `powerd` event routing → `session_manager` + `m3ctl power suspend|off`
+### D.3 — `powerd` event routing → graceful poweroff + `m3ctl power suspend|off`
 
-**Files:** `userspace/powerd/src/main.rs`, `userspace/session_manager/src/lifecycle.rs`, `userspace/m3ctl/src/{lib,main}.rs`
-**Symbol:** `powerd` event loop, a `session_manager` power-action handler (over `StopMachine`/`begin_stop`), `ParsedVerb::Suspend` / `ParsedVerb::PowerOff`
-**Why it matters:** Suspend-on-lid and the power menu are *high-level policy* and per the userspace-first rule must live in ring 3; `session_manager` already supervises the display-critical services and owns the stop lifecycle.
+**Files:** `userspace/powerd/src/main.rs`, `userspace/drivers/acpid/src/main.rs` (`\_S5` registration), `kernel/src/syscall/acpi.rs` (`sys_acpi_register_s5` + `try_acpi_poweroff`), `kernel/src/arch/x86_64/syscall/mod.rs` (`sys_reboot` S5 arm), `userspace/coreutils-rs/src/shutdown.rs`, `userspace/m3ctl/src/{lib,main}.rs`
+**Symbol:** `initiate_poweroff` (powerd), `SYS_ACPI_REGISTER_S5` (0x1134), `try_acpi_poweroff`, `ParsedVerb::PowerOff` / `ParsedVerb::PowerSuspend`
+**Why it matters:** Suspend-on-lid and the power menu are *high-level policy* and per the userspace-first rule must live in ring 3; the button must end in a **real poweroff**, which m3OS never had (the old `REBOOT_CMD_POWER_OFF` was aliased to halt — sync + a QEMU-debug-port write + HLT loop, no ACPI S5).
+
+> **Charter correction:** the routing target is **init, not
+> session_manager** — session_manager's `SessionStop`/`StopMachine` are
+> per-service / text-fallback primitives, while the whole-system
+> reverse-dependency teardown already lives in init's SIGTERM path
+> (`shutdown_services`). The chain as built: powerd **forks a child**
+> that execs `/bin/shutdown` (the child survives init's teardown —
+> powerd itself is a supervised service and gets SIGTERMed mid-chain) →
+> SIGTERM to PID 1 → service teardown → `sys_reboot(POWER_OFF)` →
+> kernel sync → **ACPI S5**. The S5 split follows the 101 architecture:
+> acpid evaluates the `\_S5` package at boot (AML in ring 3) and
+> registers SLP_TYPa/b via the new `/drivers/`-gated
+> `SYS_ACPI_REGISTER_S5` (0x1134, closing the device-host block); the
+> kernel keeps only the final `PM1a_CNT <- SLP_TYP<<10|SLP_EN` write,
+> which must run after the sync when no ring-3 process is left. No
+> `\_S5` → poweroff degrades to the legacy halt. A power-menu UI joins
+> the Phase 105 settings panel later; the session_manager lock/DPMS arm
+> joins Track F's lid handling.
 
 **Acceptance:**
-- [ ] `powerd` blocks on `SYS_POWER_WAIT_EVENT` and routes: **lid close → session_manager** (suspend, or lock + DPMS-off when suspend is unsupported), **power button → session_manager** (power menu / graceful shutdown).
-- [ ] `session_manager` gains a power-action entry point that maps the event to a `begin_stop` / lock action without wedging the display-critical supervision.
-- [ ] `m3ctl power suspend` requests `SYS_POWER_REQUEST_SLEEP` (Track F) and `m3ctl power off` performs a graceful shutdown; both are capability-gated.
+- [x] `powerd` routes the power-button event (fixed `\FIXED.PWRBTN` pseudo-path or a control-method `PWRB` notify, code `0x80`) into the graceful poweroff chain (`POWERD:poweroff reason=power-button`, latched once); Track C.2's thermal-critical sample routes into the same chain (`reason=thermal-critical`).
+- [x] The chain ends in a **real ACPI S5**: `power-smoke` asserts every link (`POWERD:poweroff` → `init: SIGTERM received` → `sys_reboot: System powering off` → `[acpi] S5 poweroff: PM1a_CNT`) and finishes on a **guest-initiated QEMU exit** (bounded `try_wait`, exit 0 — no `child.kill()` on the success path; the first gate in the tree to assert one). The `shutdown` coreutil now issues `REBOOT_CMD_POWER_OFF` (S5) instead of halt.
+- [x] `m3ctl power off` performs the same graceful sequence inline (root-gated — m3ctl runs from a shell, not as a supervised service, so it survives teardown to fire the final syscall); `m3ctl power suspend` parses and reports the Track F pending posture (`SYS_POWER_REQUEST_SLEEP` still pends Track F).
 
 ---
 

@@ -1,6 +1,11 @@
-//! shutdown — halt the system (Phase 46).
+//! shutdown — power the system off (Phase 46; real ACPI S5 since Phase
+//! 103 D.3).
 //!
-//! Signals init (PID 1) to stop all services, then invokes sys_reboot(HALT).
+//! Signals init (PID 1) to stop all services, then invokes
+//! `sys_reboot(POWER_OFF)` — kernel filesystem sync followed by the ACPI
+//! S5 write acpid registered at boot (falls back to halt on platforms
+//! with no `\_S5`). `-r` reboots instead; the `reboot` command is the
+//! same path.
 #![no_std]
 #![no_main]
 
@@ -15,11 +20,11 @@ fn main(args: &[&str]) -> i32 {
         return 1;
     }
 
-    // Check for -h (halt, default), -r (reboot — use the reboot command instead).
-    let halt = !(args.len() > 1 && args[1] == "-r");
+    // Check for -h (poweroff, default), -r (reboot — same as the reboot command).
+    let poweroff = !(args.len() > 1 && args[1] == "-r");
 
-    let message = if halt {
-        "System is going down for halt...\n"
+    let message = if poweroff {
+        "System is going down for poweroff...\n"
     } else {
         "System is going down for reboot...\n"
     };
@@ -32,8 +37,8 @@ fn main(args: &[&str]) -> i32 {
     syscall_lib::nanosleep(3);
 
     // Now invoke the reboot syscall.
-    let cmd = if halt {
-        syscall_lib::REBOOT_CMD_HALT
+    let cmd = if poweroff {
+        syscall_lib::REBOOT_CMD_POWER_OFF
     } else {
         syscall_lib::REBOOT_CMD_RESTART
     };

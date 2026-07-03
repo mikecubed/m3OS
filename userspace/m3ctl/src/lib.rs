@@ -103,6 +103,13 @@ pub enum ParsedVerb {
     /// Phase 103 (A.5) — `m3ctl battery`: the battery-focused view of
     /// the same `POWER_STATUS` query.
     Battery,
+    /// Phase 103 (D.3) — `m3ctl power off`: graceful poweroff (SIGTERM
+    /// to init, service teardown, `sys_reboot(POWER_OFF)` → kernel sync
+    /// + the ACPI S5 write acpid registered at boot). Root-only.
+    PowerOff,
+    /// Phase 103 (D.3) — `m3ctl power suspend`: reserved for Track F
+    /// (S3/S0ix); prints the unsupported posture until sleep lands.
+    PowerSuspend,
 }
 
 /// Service-registry name of the mt792x Wi-Fi driver's userspace control
@@ -387,11 +394,17 @@ pub fn parse_verb(verb: &str, args: &[&str]) -> Result<ParsedVerb, ParseError> {
                 "mitigations: expected `status`",
             )),
         },
-        // Phase 103 (A.5) — `m3ctl power status` / `m3ctl battery`.
+        // Phase 103 (A.5/D.3) — `m3ctl power status|off|suspend` / `m3ctl battery`.
         "power" => match args.first().copied() {
             Some("status") => Ok(ParsedVerb::PowerStatus),
-            Some(_) => Err(ParseError::BadArgument("power: only `status` is supported")),
-            None => Err(ParseError::MissingArgument("power: expected `status`")),
+            Some("off") => Ok(ParsedVerb::PowerOff),
+            Some("suspend") => Ok(ParsedVerb::PowerSuspend),
+            Some(_) => Err(ParseError::BadArgument(
+                "power: expected `status`, `off`, or `suspend`",
+            )),
+            None => Err(ParseError::MissingArgument(
+                "power: expected `status`, `off`, or `suspend`",
+            )),
         },
         "battery" => Ok(ParsedVerb::Battery),
         // Phase 56 — display control verbs.

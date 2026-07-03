@@ -40,6 +40,11 @@
 //!   a handful of lines).
 //! - `POWERD:thermal state=<passive|critical> temp_dc=<t>` — a zone
 //!   crossed a trip point (never fires on zone-less QEMU).
+//! - `POWERD:poweroff reason=<power-button|thermal-critical>` — Track
+//!   D.3 routing fired: a forked child execs `/bin/shutdown` (SIGTERM to
+//!   init → service teardown → `sys_reboot(POWER_OFF)` → kernel sync +
+//!   the ACPI S5 write acpid registered at boot). The child survives
+//!   init's teardown because it is not a supervised service.
 
 #![no_std]
 #![no_main]
@@ -401,6 +406,7 @@ fn program_main(_args: &[&str]) -> i32 {
     };
     let mut last_announced_target: Option<u8> = None;
     let mut last_thermal = ThermalWire::NoZones;
+    let mut poweroff_started = false;
 
     announce(&format!(
         "POWERD:ready battery={} ac={} zones={} mech={}\n",
@@ -436,6 +442,11 @@ fn program_main(_args: &[&str]) -> i32 {
                 ));
             }
             last_thermal = thermal;
+            // D.3 thermal-runaway safety: a zone at/above `_CRT` initiates
+            // the graceful poweroff (never fires on zone-less QEMU).
+            if thermal == ThermalWire::Critical {
+                initiate_poweroff("thermal-critical", &mut poweroff_started);
+            }
             let target = governor.next(load, thermal_cap(thermal));
             set_perf(target);
             if last_announced_target != Some(target) {
@@ -456,8 +467,12 @@ fn program_main(_args: &[&str]) -> i32 {
             let len = bulk.iter().position(|&b| b == 0).unwrap_or(bulk.len());
             let path = core::str::from_utf8(&bulk[..len]).unwrap_or("<non-utf8>");
             announce(&format!("POWERD:event path={path} code={code:#x}\n"));
-            // Policy routing (lid → suspend, button → session) lands with
-            // Track D.3; the log is the slice-1 consumer.
+            // D.3 routing: the power button (fixed-feature pseudo-path or a
+            // control-method PNP0C0C notify) initiates graceful poweroff.
+            // Lid → suspend joins with Track F (no sleep support yet).
+            if code == 0x80 && (path == "\\FIXED.PWRBTN" || path.ends_with("PWRB")) {
+                initiate_poweroff("power-button", &mut poweroff_started);
+            }
             continue;
         }
         let Some(reply_cap) = msg.reply_cap_handle() else {
@@ -486,6 +501,33 @@ fn severity_wire(t: ThermalWire) -> u8 {
         ThermalWire::NoZones | ThermalWire::Normal => 0,
         ThermalWire::Passive => 1,
         ThermalWire::Critical => 2,
+    }
+}
+
+/// Phase 103 D.3 — initiate the graceful poweroff chain, once. Spawns
+/// `/bin/shutdown` (SIGTERM to init → reverse-dependency service stop →
+/// `sys_reboot(POWER_OFF)` → kernel sync + ACPI S5). The work happens in
+/// a forked child because powerd itself is a supervised service: init's
+/// teardown SIGTERMs this daemon mid-shutdown, while the orphaned child
+/// (not a service) survives to fire the final reboot syscall.
+fn initiate_poweroff(reason: &str, started: &mut bool) {
+    if *started {
+        return;
+    }
+    *started = true;
+    announce(&format!("POWERD:poweroff reason={reason}\n"));
+    let pid = syscall_lib::fork();
+    if pid == 0 {
+        // Child: exec the existing shutdown coreutil (owns the
+        // kill(1)+grace+reboot sequence).
+        let path: &[u8] = b"/bin/shutdown\0";
+        let argv: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        syscall_lib::execve(path, &argv, &envp);
+        syscall_lib::exit(1); // exec failed
+    } else if pid < 0 {
+        announce("powerd: WARNING poweroff fork failed\n");
+        *started = false;
     }
 }
 
