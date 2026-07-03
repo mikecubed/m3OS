@@ -114,35 +114,45 @@
 
 ### B.1 — `_BCL` / `_BCM` / `_BQC` control-method wrappers
 
-**File:** `kernel/src/acpi/power.rs`
-**Symbol:** `power::brightness_levels()` (`_BCL`), `power::set_brightness(level)` (`_BCM`), `power::current_brightness()` (`_BQC`)
+**Files:** `kernel-core/src/power/backlight.rs` (new), `kernel-core/src/acpi/namespace.rs` (`backlight_devices()`, `evaluate_with_args`), `userspace/drivers/acpid/src/main.rs` (`ACPI_EVAL_ARG` label 9, `ACPI_LIST_BACKLIGHT` label 10), `kernel-core/tests/acpi_backlight.rs` (new)
+**Symbol:** `backlight::decode_bcl` / `decode_bqc`, `BclLevels::nearest_level` / `level_to_percent`, `Namespace::evaluate_with_args`
 **Why it matters:** Brightness uses the firmware-exposed ACPI path so it rides the Phase 101 interpreter with no GPU-register reverse engineering; this is the "pick the firmware-exposed path" decision from the spec.
 
+> **Charter correction:** lives in the ring-3 ACPI stack per the 101
+> split (no kernel `acpi/power.rs`). `_BCM` is the first *argument-
+> taking* method the query surface evaluates, so acpid grew
+> `ACPI_EVAL_ARG` (bulk = path ++ 8-byte LE Arg0) on the new
+> `Namespace::evaluate_with_args`; backlight devices enumerate as
+> `_BCL` carriers (`ACPI_LIST_BACKLIGHT`, the `ACPI_LIST_TZ` shape).
+> QEMU q35 declares no backlight device, so the populated path is
+> covered by a synthetic `_BCL`/`_BCM`(Store)/`_BQC` DSDT fixture —
+> the ThermalZone-fixture situation.
+
 **Acceptance:**
-- [ ] `_BCL` is evaluated on the GPU child display node and returns the supported brightness-level list (first two entries = AC/battery defaults per the spec); the list is parsed and cached.
-- [ ] `set_brightness(pct)` maps a 0..=100 percent to the nearest supported `_BCL` level and evaluates `_BCM`; `current_brightness()` reads it back via `_BQC`.
-- [ ] The `_BCL` level-list parse is pure logic in `kernel-core::power` and host-tested.
+- [x] `_BCL` is evaluated on the display node and decoded (`decode_bcl`: elements 0/1 = AC/battery defaults, remainder sorted + deduplicated — real firmware repeats the defaults); the list is cached at powerd boot.
+- [x] `set_brightness(pct)` maps 0..=100 onto the nearest `_BCL` level (position-based so sparse/non-percent lists spread evenly) and evaluates `_BCM(level)`; `_BQC` reads back and `level_to_percent` inverts. The fixture test proves the full set → `Store` → read-back round trip through the interpreter.
+- [x] The `_BCL`/`_BQC` decode + both mappings are pure logic in `kernel-core::power::backlight`, host-tested (5 tests) incl. junk rejection and sparse-list round-trip stability.
 
 ### B.2 — Intel GPU PWM fallback (documented)
 
-**File:** `kernel/src/acpi/power.rs` (a `cfg`/runtime fallback stub + a doc comment)
-**Symbol:** `power::pwm_fallback` (documented `BLC_PWM_CTL` path)
+**File:** `kernel-core/src/power/backlight.rs` (module doc)
+**Symbol:** the documented `BLC_PWM_CTL`/`BLC_PWM_DATA` path
 **Why it matters:** Some modern panels expose a stub `_BCM`; the native Intel GPU PWM (`BLC_PWM_CTL` via the GT MMIO BAR) is the real backlight on those — but it is GPU-register work, so it is scoped as a documented fallback, not the primary path.
 
 **Acceptance:**
-- [ ] A doc comment records the `BLC_PWM_CTL` register + GT MMIO BAR path and the condition under which it would be needed (`_BCL` absent or `_BCM` a no-op on the reference panel).
-- [ ] If the reference panel's `_BCM` proves to be a stub during HW validation, the fallback is flagged as a follow-on (it is in *Deferred Until Later*), not silently failed.
+- [x] The module doc records the `BLC_PWM_CTL`/`BLC_PWM_DATA` (+ Tiger Lake offsets, PCH `SBLC_PWM_CTL2`) path and the trigger condition (`_BCM` a no-op — detected by `_BQC` read-back after set).
+- [ ] If the reference panel's `_BCM` proves to be a stub during HW validation, the fallback is flagged as a follow-on (it is in *Deferred Until Later*), not silently failed. *(Hardware-validation arm.)*
 
 ### B.3 — `m3ctl backlight` + powerd brightness apply + restore-on-resume
 
-**Files:** `userspace/m3ctl/src/{lib,main}.rs`, `userspace/powerd/src/main.rs`
-**Symbol:** `ParsedVerb::Backlight`, `powerd` brightness state + the resume hook
+**Files:** `userspace/m3ctl/src/{lib,main}.rs`, `userspace/powerd/src/main.rs`, `kernel-core/src/power/control.rs`
+**Symbol:** `ParsedVerb::Backlight{Show,Set,Step}`, `POWER_SET_BRIGHTNESS` (0x5702), `PowerDevices::set_brightness`
 **Why it matters:** Brightness is the most-used laptop control; it must be a one-liner and survive a suspend/resume cycle.
 
 **Acceptance:**
-- [ ] `m3ctl backlight <pct>` and `m3ctl backlight up|down` drive `SYS_POWER_SET_BRIGHTNESS` through `powerd`; the level is reflected in `/proc/power`.
-- [ ] `powerd` records the last-set brightness and re-applies it on the Track F resume event.
-- [ ] `parse_verb` host test covers the `<pct>` / `up` / `down` argument forms.
+- [x] `m3ctl backlight <pct>` / `up` / `down` drive `POWER_SET_BRIGHTNESS` through `powerd` (charter's `SYS_POWER_SET_BRIGHTNESS` dissolved per A.4 — `_BCM` is AML, no syscall); the current percent rides the status wire's last byte (`backlight_pct`, 0xFF = no device) and renders in `m3ctl power status` / `m3ctl backlight` (the `/proc/power` arm superseded per A.3). On the panel-less VM a set request is rejected cleanly (`backlight: no device`) — a `power-smoke` arm.
+- [ ] `powerd` records the last-set brightness and re-applies it on the Track F resume event. *(The set path stores through `_BCM` today; the resume re-apply hook joins Track F.)*
+- [x] `parse_verb` host test covers `<pct>` / `up` / `down` / bare-show plus out-of-range rejection.
 
 ---
 

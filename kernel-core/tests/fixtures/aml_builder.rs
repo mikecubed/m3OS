@@ -81,6 +81,18 @@ pub fn name(nm: &str, value: &[u8]) -> Vec<u8> {
     out
 }
 
+/// `Package { elements }` — each element pre-encoded (Phase 103 B).
+pub fn package(elements: &[Vec<u8>]) -> Vec<u8> {
+    assert!(elements.len() <= 0xFF, "use VarPackage for more");
+    let mut inner = vec![elements.len() as u8];
+    for e in elements {
+        inner.extend_from_slice(e);
+    }
+    let mut out = vec![0x12];
+    out.extend_from_slice(&pkg(&inner));
+    out
+}
+
 /// String literal.
 pub fn string(s: &str) -> Vec<u8> {
     let mut out = vec![0x0D];

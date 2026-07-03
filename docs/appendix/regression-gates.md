@@ -396,11 +396,13 @@ namespace for `PNP0C0A`/`ACPI0003` (absent on q35) and thermal zones
 (`ACPI_LIST_TZ` — q35 declares none), probes the kernel cpufreq
 mechanism (`SYS_POWER_CPUFREQ_STATUS` — no HWP under QEMU), and
 announces `POWERD:ready battery=none ac=assumed-online zones=0
-mech=none`; the ring-3 conservative governor's first 1 s tick reports
-`POWERD:governor mode=conservative target=` (proving the recv-timeout
-wake, the CPU-times load sample, and the `SYS_POWER_SET_PERF` no-op
-apply); after a serial login, `m3ctl power status` renders the
-battery/thermal/governor posture over the `power` IPC service; then a
+mech=none backlight=none`; the ring-3 conservative governor's first 1 s
+tick reports `POWERD:governor mode=conservative target=` (proving the
+recv-timeout wake, the CPU-times load sample, and the
+`SYS_POWER_SET_PERF` no-op apply); after a serial login, `m3ctl power
+status` renders the battery/thermal/governor/backlight posture over the
+`power` IPC service and `m3ctl backlight 50` is rejected cleanly on the
+panel-less VM (`backlight: no device` — the Track B set path); then a
 QMP `system_powerdown` power button traverses acpid → powerd's event
 subscription (`POWERD:event path=\FIXED.PWRBTN code=0x80`) and — Track
 D.3 — drives the full graceful-poweroff chain: `POWERD:poweroff` →
@@ -408,8 +410,10 @@ D.3 — drives the full graceful-poweroff chain: `POWERD:poweroff` →
 teardown) → `sys_reboot(POWER_OFF)` → kernel sync → the ACPI S5 write
 acpid registered at boot (`[acpi] S5 poweroff: PM1a_CNT`). The gate's
 final assertion is a **guest-initiated QEMU exit** (bounded `try_wait`,
-exit 0; no `child.kill()` on the success path). The
-populated-thermal-zone path is covered host-side by a hand-assembled
-ThermalZone DSDT fixture (`kernel-core/tests/acpi_thermal_zone.rs`);
-the live battery/brightness/HWP-MSR/lid arms have no QEMU model and are
+exit 0; no `child.kill()` on the success path). The populated
+thermal-zone and backlight paths are covered host-side by
+hand-assembled DSDT fixtures (`kernel-core/tests/acpi_thermal_zone.rs`,
+`kernel-core/tests/acpi_backlight.rs` — the latter proving the
+`_BCM(Arg0)`+`Store` set → `_BQC` read-back round trip); the live
+battery/brightness/HWP-MSR/lid arms have no QEMU model and are
 hardware-only (`Validated-on-HW` per the charter's Track G).

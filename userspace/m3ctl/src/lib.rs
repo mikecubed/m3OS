@@ -110,6 +110,16 @@ pub enum ParsedVerb {
     /// Phase 103 (D.3) — `m3ctl power suspend`: reserved for Track F
     /// (S3/S0ix); prints the unsupported posture until sleep lands.
     PowerSuspend,
+    /// Phase 103 (B.3) — `m3ctl backlight`: show the current brightness
+    /// (the `POWER_STATUS` backlight field).
+    BacklightShow,
+    /// Phase 103 (B.3) — `m3ctl backlight <pct>`: set brightness via
+    /// `powerd`'s `POWER_SET_BRIGHTNESS` (percent snapped to the
+    /// nearest `_BCL` level).
+    BacklightSet(u8),
+    /// Phase 103 (B.3) — `m3ctl backlight up|down`: step ±10 % from the
+    /// current level.
+    BacklightStep(i8),
 }
 
 /// Service-registry name of the mt792x Wi-Fi driver's userspace control
@@ -149,7 +159,23 @@ pub fn format_power_status(status: &kernel_core::power::control::PowerStatusWire
     out.push_str("  governor: ");
     out.push_str(&format_governor_field(status));
     out.push('\n');
+    out.push_str("  backlight: ");
+    out.push_str(&format_backlight_field(status));
+    out.push('\n');
     out
+}
+
+/// The Phase 103 B backlight field: `none (no device)` on QEMU/desktop,
+/// or the current percent.
+pub fn format_backlight_field(status: &kernel_core::power::control::PowerStatusWire) -> String {
+    use alloc::string::ToString;
+    use kernel_core::power::backlight::BACKLIGHT_UNKNOWN;
+    if status.backlight_pct == BACKLIGHT_UNKNOWN {
+        return String::from("none (no device)");
+    }
+    let mut line = status.backlight_pct.to_string();
+    line.push('%');
+    line
 }
 
 /// The Phase 103 C thermal field: `none (no zones)` on QEMU/desktop, or
@@ -407,6 +433,18 @@ pub fn parse_verb(verb: &str, args: &[&str]) -> Result<ParsedVerb, ParseError> {
             )),
         },
         "battery" => Ok(ParsedVerb::Battery),
+        // Phase 103 (B.3) — `m3ctl backlight [<pct>|up|down]`.
+        "backlight" => match args.first().copied() {
+            None => Ok(ParsedVerb::BacklightShow),
+            Some("up") => Ok(ParsedVerb::BacklightStep(10)),
+            Some("down") => Ok(ParsedVerb::BacklightStep(-10)),
+            Some(arg) => match arg.parse::<u8>() {
+                Ok(pct) if pct <= 100 => Ok(ParsedVerb::BacklightSet(pct)),
+                _ => Err(ParseError::BadArgument(
+                    "backlight: expected a percent (0-100), `up`, or `down`",
+                )),
+            },
+        },
         // Phase 56 — display control verbs.
         "version" => Ok(ParsedVerb::Display(ControlCommand::Version)),
         "list-surfaces" => Ok(ParsedVerb::Display(ControlCommand::ListSurfaces)),

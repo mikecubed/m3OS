@@ -11160,11 +11160,11 @@ fn cmd_power_smoke(args: &SmokeBootArgs) {
                 .map_err(|e| format!("serial send failed: {e}"))
         };
         wait(
-            "POWERD:ready battery=none ac=assumed-online zones=0 mech=none",
+            "POWERD:ready battery=none ac=assumed-online zones=0 mech=none backlight=none",
             &mut serial_buf,
             &mut serial_history,
         )?;
-        println!("power-smoke: powerd serves the VM no-battery/no-zones/no-HWP posture");
+        println!("power-smoke: powerd serves the VM no-battery/no-zones/no-HWP/no-panel posture");
         // Slice 2: the ring-3 governor tick loop produced its first target —
         // proof the recv-timeout wake, SYS_POWER_CPUFREQ_STATUS load sample,
         // and SYS_POWER_SET_PERF apply all ran (a no-op apply on QEMU).
@@ -11206,7 +11206,18 @@ fn cmd_power_smoke(args: &SmokeBootArgs) {
             &mut serial_buf,
             &mut serial_history,
         )?;
-        println!("power-smoke: m3ctl rendered power/thermal/governor status over IPC");
+        wait(
+            "backlight: none (no device)",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        println!("power-smoke: m3ctl rendered power/thermal/governor/backlight status over IPC");
+        // Track B set-path posture: a brightness request on a panel-less
+        // VM comes back as a clean "no device" error, not a hang/crash.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        send(&mut stdin, "/bin/m3ctl backlight 50\n")?;
+        wait("backlight: no device", &mut serial_buf, &mut serial_history)?;
+        println!("power-smoke: brightness set on the panel-less VM rejected cleanly");
         let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
             .map_err(|e| format!("qmp connect: {e}"))?;
@@ -11280,11 +11291,12 @@ fn cmd_power_smoke(args: &SmokeBootArgs) {
             let elapsed = global_start.elapsed().as_secs();
             println!(
                 "power-smoke: PASSED ({elapsed}s) — powerd served the VM no-battery/\
-                 no-zones/no-HWP posture, the ring-3 governor ticked against the \
-                 kernel cpufreq syscalls, m3ctl rendered power+thermal+governor over \
-                 the power IPC service, and a QMP power-button event traversed \
-                 acpid → powerd and drove the full D.3 poweroff chain (service \
-                 teardown → kernel sync → ACPI S5) to a guest-initiated QEMU exit"
+                 no-zones/no-HWP/no-panel posture, the ring-3 governor ticked against \
+                 the kernel cpufreq syscalls, m3ctl rendered power+thermal+governor+\
+                 backlight over the power IPC service (set rejected cleanly on the \
+                 panel-less VM), and a QMP power-button event traversed acpid → powerd \
+                 and drove the full D.3 poweroff chain (service teardown → kernel \
+                 sync → ACPI S5) to a guest-initiated QEMU exit"
             );
         }
         Err(msg) => {
