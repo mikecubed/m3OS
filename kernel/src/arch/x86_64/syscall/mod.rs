@@ -1708,7 +1708,9 @@ mod syscall_nr {
     // -- Phase 106 Track C installer raw block syscalls --
     // m3OS-native `0x117x` block; canonically declared in
     // `kernel_core::installer`.
-    pub use kernel_core::installer::{SYS_BLK_RAW_READ, SYS_BLK_RAW_WRITE, SYS_BLK_RESOLVE_DEV};
+    pub use kernel_core::installer::{
+        SYS_BLK_RAW_FLUSH, SYS_BLK_RAW_READ, SYS_BLK_RAW_WRITE, SYS_BLK_RESOLVE_DEV,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -2563,6 +2565,7 @@ pub extern "C" fn syscall_handler(
             let arg3 = per_core_syscall_arg3();
             sys_blk_raw_write(arg0, arg1, arg2, arg3)
         }
+        SYS_BLK_RAW_FLUSH => sys_blk_raw_flush(arg0),
         // -- Track D debug probe (feature `kstack-overflow-test`; absent → ENOSYS) --
         #[cfg(feature = "kstack-overflow-test")]
         SYS_KSTACK_OVERFLOW_TEST => sys_kstack_overflow_test(),
@@ -17943,6 +17946,13 @@ pub(super) fn sys_linux_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64)
                     }
                     None => {
                         log::error!("[mount] no ext2 partition found on the root block device");
+                        // Phase 106 C.3 — if an auto-discovery service
+                        // adopted the root slot but its device has no
+                        // ext2 (e.g. a blank internal NVMe present during
+                        // a USB-image install boot), release + skip it so
+                        // init's retry loop re-evaluates to the next
+                        // candidate (AHCI, then the bootable USB).
+                        crate::blk::release_root_and_skip();
                         return NEG_ENODEV;
                     }
                 }
@@ -19936,6 +19946,28 @@ pub(super) fn sys_blk_raw_write(dev_id: u64, start_lba: u64, count: u64, buf_ptr
         return NEG_EIO;
     }
     bytes as u64
+}
+
+/// `sys_blk_raw_flush(dev_id) -> isize`: flush `dev_id`'s write-back
+/// cache (0 on success, negative errno). Installer-gated.
+pub(super) fn sys_blk_raw_flush(dev_id: u64) -> u64 {
+    if !is_installer_process() {
+        return NEG_EPERM;
+    }
+    if dev_id > u64::from(u32::MAX) {
+        return NEG_EINVAL;
+    }
+    if dev_id == 0 {
+        crate::blk::flush();
+        return 0;
+    }
+    if !crate::blk::is_remote_device_registered(dev_id as u32) {
+        return NEG_ENODEV;
+    }
+    match crate::blk::flush_dev(dev_id as u32) {
+        Ok(()) => 0,
+        Err(_) => NEG_EIO,
+    }
 }
 
 // ---------------------------------------------------------------------------

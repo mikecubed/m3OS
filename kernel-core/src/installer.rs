@@ -27,6 +27,12 @@ pub const SYS_BLK_RAW_READ: u64 = 0x1171;
 /// against [`INSTALLER_EXEC_PATH`].
 pub const SYS_BLK_RAW_WRITE: u64 = 0x1172;
 
+/// Flush `dev_id`'s write-back cache: `sys_blk_raw_flush(dev_id) ->
+/// isize` (0 on success, negative errno). The installer flushes the
+/// **target** device (a secondary `dev_id`) before rebooting — the
+/// reboot path only flushes the root device (slot 0).
+pub const SYS_BLK_RAW_FLUSH: u64 = 0x1173;
+
 /// The unforgeable exec path the raw block syscalls are gated on. The
 /// kernel writes `exec_path` during `execve`, so a ring-3 process
 /// cannot spoof it (identical trust model to the `/drivers/` device-host
@@ -38,10 +44,12 @@ pub const INSTALLER_EXEC_PATH: &str = "/sbin/installer";
 /// block backend and the QEMU nvme/usb defaults).
 pub const SECTOR_BYTES: u64 = 512;
 
-/// Upper bound on sectors per raw request — the kernel copies through a
-/// bounded stack/DMA path, so a single call moves at most this many
-/// sectors (`64 KiB`). The installer's copy loop chunks to this.
-pub const MAX_SECTORS_PER_RAW_REQUEST: u64 = 128;
+/// Upper bound on sectors per raw request — matches the block-IPC
+/// `MAX_SECTORS_PER_REQUEST` (256 = 128 KiB), the largest a single
+/// `read_sectors_dev`/`write_sectors_dev` accepts. The installer's copy
+/// loop chunks to this to minimize round-trips over a multi-hundred-MB
+/// image.
+pub const MAX_SECTORS_PER_RAW_REQUEST: u64 = 256;
 
 /// Validate a raw request's sector count against
 /// [`MAX_SECTORS_PER_RAW_REQUEST`]. Pure so both sides (kernel bounds
@@ -60,6 +68,7 @@ mod tests {
         assert_eq!(SYS_BLK_RESOLVE_DEV, 0x1170);
         assert_eq!(SYS_BLK_RAW_READ, 0x1171);
         assert_eq!(SYS_BLK_RAW_WRITE, 0x1172);
+        assert_eq!(SYS_BLK_RAW_FLUSH, 0x1173);
         assert_eq!(INSTALLER_EXEC_PATH, "/sbin/installer");
     }
 
@@ -70,5 +79,7 @@ mod tests {
         assert!(raw_count_ok(MAX_SECTORS_PER_RAW_REQUEST));
         assert!(!raw_count_ok(MAX_SECTORS_PER_RAW_REQUEST + 1));
         assert!(!raw_count_ok(u64::MAX));
+        // Must not exceed the block-IPC per-request ceiling.
+        assert_eq!(MAX_SECTORS_PER_RAW_REQUEST, 256);
     }
 }

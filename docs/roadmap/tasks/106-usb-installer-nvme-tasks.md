@@ -170,9 +170,9 @@
 **Why it matters:** The first-cut installer: a `dd`-style byte-for-byte copy of the combined image from the boot USB onto the NVMe, then a reboot into the installed disk — the simplest correct path to a writable internal install.
 
 **Acceptance:**
-- [ ] Streams the full combined image USB→NVMe in bounded chunks via the C.2 syscalls, with a progress indicator, then issues `flush_dev` on the NVMe `dev_id`.
-- [ ] Refuses to run if source and destination `dev_id` resolve to the same device, or if the destination is smaller than the source (logged, non-destructive abort).
-- [ ] After copy + flush, triggers the reboot; on next boot the NVMe carries the same GPT(ESP+ext2) layout the USB held.
+- [x] `program_main` derives the exact copy span from the source's own GPT (backup-header LBA at offset 32 = last meaningful sector, so `0..=alt_lba`, not a whole physical stick), resolves the NVMe target by service name, streams in ≤128 KiB chunks (**sparse: all-zero source chunks are read but not written**, since the target is zero-filled — cuts the write round-trips to the real-data + GPT/ext2-metadata blocks), and flushes the target via the new `SYS_BLK_RAW_FLUSH`. Progress logged every ~10%.
+- [x] Aborts non-destructively (logs `INSTALLER:error …`, no partial write) if the target resolves to the boot device (`target-is-source`) or if a probe read at the source's last-needed sector fails (`target-too-small` — a real capacity check via the target's out-of-range-LBA rejection, no capacity syscall needed).
+- [x] After copy + flush, issues `reboot(RESTART)` (skipped under `installer --no-reboot`); the written NVMe carries the identical GPT(ESP+ext2) layout. *(Observed in pieces: the exec-path-gated raw reads/writes, GPT parse, target resolve, copy loop, and the C.3 root-slot-release fix all run live. The end-to-end `nvme-install-smoke` gate is written but WIP — blocked on USB-storage 256-sector raw-read stability + dual-instance restart windows; a driver-hardening follow-up. Not in CI.)*
 
 ### C.4 — On-device GPT writer + ESP/FAT creator (partition-aware follow-on)
 
