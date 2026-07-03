@@ -19,6 +19,20 @@ pub const POWER_STATUS: u16 = 0x5701;
 /// the platform has no backlight device (QEMU/desktop).
 pub const POWER_SET_BRIGHTNESS: u16 = 0x5702;
 
+/// `m3ctl power suspend` request label (Phase 103 F). No body. Reply
+/// `u64::MAX` while the suspend path **fails closed**: the F.3 S3
+/// entry/resume mechanism (FACS waking vector + CPU re-establish +
+/// F.2 driver quiesce) is not implemented, and writing `SLP_TYP` for
+/// S3 without a resume path never comes back — so `powerd` refuses
+/// rather than half-suspends, per the F.2 fail-closed acceptance.
+pub const POWER_SUSPEND: u16 = 0x5703;
+
+/// [`PowerStatusWire::sleep_bits`] — firmware-declared sleep support
+/// (acpid F.1 discovery; support ≠ implemented).
+pub const SLEEP_S3: u8 = 1 << 0;
+pub const SLEEP_S4: u8 = 1 << 1;
+pub const SLEEP_S0IX: u8 = 1 << 2;
+
 /// The `powerd` IPC service name.
 pub const POWER_SERVICE_NAME: &str = "power";
 
@@ -145,9 +159,10 @@ impl CpufreqMech {
 
 /// The `POWER_STATUS` reply payload.
 ///
-/// Wire layout (18 bytes LE):
+/// Wire layout (19 bytes LE):
 /// `battery_present[1] | percent[1] | ac[1] | state[4] | rate[4] |
-///  temp_deci_c[2] | thermal[1] | governor[1] | mech[1] | perf[1] | backlight[1]`
+///  temp_deci_c[2] | thermal[1] | governor[1] | mech[1] | perf[1] |
+///  backlight[1] | sleep_bits[1]`
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PowerStatusWire {
     pub battery_present: bool,
@@ -171,10 +186,13 @@ pub struct PowerStatusWire {
     /// Current backlight brightness as a percent (Track B), or
     /// [`BACKLIGHT_UNKNOWN`] on a platform with no backlight device.
     pub backlight_pct: u8,
+    /// Firmware-declared sleep support, `SLEEP_*` bits (Track F.1 —
+    /// discovery only; the resume path decides whether suspend runs).
+    pub sleep_bits: u8,
 }
 
 /// Encoded size of [`PowerStatusWire`].
-pub const POWER_STATUS_WIRE_LEN: usize = 18;
+pub const POWER_STATUS_WIRE_LEN: usize = 19;
 
 impl PowerStatusWire {
     /// The no-battery, no-thermal-zone platform snapshot (QEMU/desktop),
@@ -192,6 +210,7 @@ impl PowerStatusWire {
             mech: CpufreqMech::None,
             perf: 0,
             backlight_pct: BACKLIGHT_UNKNOWN,
+            sleep_bits: 0,
         }
     }
 
@@ -208,6 +227,7 @@ impl PowerStatusWire {
         out[15] = self.mech.to_byte();
         out[16] = self.perf;
         out[17] = self.backlight_pct;
+        out[18] = self.sleep_bits;
         out
     }
 
@@ -230,6 +250,7 @@ impl PowerStatusWire {
             mech: CpufreqMech::from_byte(bytes[15])?,
             perf: bytes[16],
             backlight_pct: bytes[17],
+            sleep_bits: bytes[18],
         })
     }
 }
@@ -254,6 +275,7 @@ mod tests {
                 mech: CpufreqMech::Hwp,
                 perf: 128,
                 backlight_pct: 66,
+                sleep_bits: SLEEP_S3 | SLEEP_S4,
             },
             PowerStatusWire {
                 battery_present: true,
@@ -267,6 +289,7 @@ mod tests {
                 mech: CpufreqMech::Hwp,
                 perf: 1,
                 backlight_pct: 0,
+                sleep_bits: SLEEP_S0IX,
             },
         ] {
             let bytes = wire.encode();
@@ -288,9 +311,10 @@ mod tests {
     fn short_or_junk_input_decodes_to_none() {
         assert_eq!(PowerStatusWire::decode(&[]), None);
         assert_eq!(PowerStatusWire::decode(&[1, 2, 3]), None);
-        // A 14-byte slice-1 frame is short for the slice-2 codec: both
-        // sides ship together, so old frames must not half-decode.
+        // Prior-slice frame sizes (14/18 bytes) are short for this codec:
+        // both sides ship together, so old frames must not half-decode.
         assert_eq!(PowerStatusWire::decode(&[0u8; 14]), None);
+        assert_eq!(PowerStatusWire::decode(&[0u8; 18]), None);
         let mut bad_ac = PowerStatusWire::no_battery().encode();
         bad_ac[2] = 9;
         assert_eq!(PowerStatusWire::decode(&bad_ac), None);

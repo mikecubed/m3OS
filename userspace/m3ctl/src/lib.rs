@@ -162,7 +162,30 @@ pub fn format_power_status(status: &kernel_core::power::control::PowerStatusWire
     out.push_str("  backlight: ");
     out.push_str(&format_backlight_field(status));
     out.push('\n');
+    out.push_str("  sleep: ");
+    out.push_str(&format_sleep_field(status));
+    out.push('\n');
     out
+}
+
+/// The Phase 103 F.1 sleep field: what the firmware declares, with the
+/// honest "discovery only" qualifier while the resume path pends.
+pub fn format_sleep_field(status: &kernel_core::power::control::PowerStatusWire) -> String {
+    use kernel_core::power::control::{SLEEP_S0IX, SLEEP_S3, SLEEP_S4};
+    if status.sleep_bits == 0 {
+        return String::from("none declared");
+    }
+    let mut line = String::new();
+    for (bit, name) in [(SLEEP_S3, "S3"), (SLEEP_S4, "S4"), (SLEEP_S0IX, "S0ix")] {
+        if status.sleep_bits & bit != 0 {
+            if !line.is_empty() {
+                line.push('+');
+            }
+            line.push_str(name);
+        }
+    }
+    line.push_str(" (firmware; resume path pending)");
+    line
 }
 
 /// The Phase 103 B backlight field: `none (no device)` on QEMU/desktop,

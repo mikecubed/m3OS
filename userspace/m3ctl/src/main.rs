@@ -67,7 +67,8 @@ mod os_binary {
         DISPLAY_CONTROL_SERVICE_NAME, LABEL_DISPLAY_CTL_CMD, LABEL_SESSION_CTL_CMD,
         POWER_UNAVAILABLE_MSG, ParseError, ParsedVerb, SESSION_CONTROL_SERVICE_NAME,
         WIFI_CONTROL_SERVICE_NAME, WIFI_NOT_ASSOCIATED_MSG, format_backlight_field, format_battery,
-        format_mitigations, format_power_status, format_wifi_status, parse_verb,
+        format_mitigations, format_power_status, format_sleep_field, format_wifi_status,
+        parse_verb,
     };
     use syscall_lib::STDOUT_FILENO;
     use syscall_lib::heap::BrkAllocator;
@@ -134,10 +135,7 @@ mod os_binary {
             ParsedVerb::PowerStatus => dispatch_power(false),
             ParsedVerb::Battery => dispatch_power(true),
             ParsedVerb::PowerOff => dispatch_power_off(),
-            ParsedVerb::PowerSuspend => {
-                print_str("power: suspend is not supported yet (Phase 103 Track F)\n");
-                1
-            }
+            ParsedVerb::PowerSuspend => dispatch_power_suspend(),
             ParsedVerb::BacklightShow => dispatch_backlight_show(),
             ParsedVerb::BacklightSet(pct) => dispatch_backlight_set(pct),
             ParsedVerb::BacklightStep(delta) => dispatch_backlight_step(delta),
@@ -167,6 +165,40 @@ mod os_binary {
             return 1;
         }
         0
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 103 F — `m3ctl power suspend` (fails closed until F.3 resume)
+    // -----------------------------------------------------------------------
+
+    /// Request a suspend through powerd's `POWER_SUSPEND`. Today this
+    /// always fails closed (the S3 resume path is not implemented —
+    /// refusing beats never waking up); the message reports what the
+    /// firmware declares so the posture is honest.
+    fn dispatch_power_suspend() -> i32 {
+        use kernel_core::power::control::{POWER_SERVICE_NAME, POWER_SUSPEND};
+        let Some(handle) = lookup_with_backoff(POWER_SERVICE_NAME) else {
+            print_str(POWER_UNAVAILABLE_MSG);
+            print_str("\n");
+            return 1;
+        };
+        let reply = syscall_lib::ipc_call(handle, u64::from(POWER_SUSPEND), 0);
+        if reply == 0 {
+            // Reserved for the F.3 landing.
+            print_str("suspend: entering sleep\n");
+            return 0;
+        }
+        match query_power_status() {
+            Some(status) if status.sleep_bits != 0 => {
+                print_str("suspend: failed closed — firmware declares ");
+                print_str(&format_sleep_field(&status));
+                print_str("\n");
+            }
+            _ => {
+                print_str("suspend: failed closed — no sleep states declared\n");
+            }
+        }
+        1
     }
 
     // -----------------------------------------------------------------------
