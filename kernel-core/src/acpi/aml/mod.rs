@@ -24,5 +24,6 @@
 pub mod decode;
 pub mod interp;
 pub mod object;
+pub mod wire;
 
 pub use object::{AmlError, AmlValue, MockRegionSpace, RegionSpace};

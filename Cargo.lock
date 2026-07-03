@@ -1640,6 +1640,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "powerd"
+version = "0.99.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "powerfmt"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

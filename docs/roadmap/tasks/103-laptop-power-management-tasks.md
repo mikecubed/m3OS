@@ -1,6 +1,6 @@
 # Phase 103 — Laptop Power Management (battery, backlight, thermal, suspend): Task List
 
-**Status:** Planned
+**Status:** In progress — **slice 1 (Track A on the as-built ring-3 architecture) landed + green**: `kernel-core::power::{battery,control}` (host-tested decode + IPC codec), the `AmlValue` wire codec + acpid `ACPI_EVAL` verb, the `powerd` daemon (acpid's first production event-push subscriber; serves the `power` IPC service), `m3ctl power status`/`battery`, and the `power-smoke` QEMU gate (VM no-battery posture + m3ctl render + power-button event spine). **Charter correction recorded per-task below:** the Phase 101 split hosts the AML interpreter in ring-3 `acpid`, so the chartered kernel-side `acpi::power`/`SYS_POWER_*`/`/proc/power` surfaces became acpid's `ACPI_EVAL` IPC verb + powerd-owned state (userspace-first); kernel involvement returns where mechanism is real (cpufreq MSRs + sleep-register writes, Tracks E/F).
 **Source Ref:** phase-103
 **Depends on:** Phase 101 (ACPI namespace + SCI) ✅ — AML interpreter + `_HID` namespace walk + SCI/GPE `Notify` dispatch; bare-metal validation strategy (Phase 98 Track A) — `docs/appendix/bare-metal-validation.md`
 **Goal:** Consume the Phase 101 ACPI namespace + SCI/GPE event routing to surface battery/AC, brightness, thermal, lid-switch + power-button, and CPU P-states to userspace through a kernel mechanism surface (`acpi::power` + `cpufreq` + `SYS_POWER_*` + `/proc/power`) and a ring-3 `powerd` policy daemon, with S3/S0ix suspend-resume as a stretch — making the Dell Tiger Lake laptop a usable daily driver. All control-method-result decode + the governor are pure logic host-tested on captured ACPI objects; the live datapaths are bare-metal-only and carry a `Validated-on-HW (run N, date)` status.
@@ -9,7 +9,7 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Battery + AC substrate: `acpi::power` control-method eval, `kernel-core::power::battery` decode, `/proc/power`, `SYS_POWER_*`, `powerd` scaffold, `m3ctl battery`/`power status` | Phase 101 | Planned |
+| A | Battery + AC substrate: acpid `ACPI_EVAL` + `AmlValue` wire codec (charter-corrected from kernel `acpi::power`/`SYS_POWER_*`/`/proc/power`), `kernel-core::power::battery` decode, `powerd` + `power` IPC service, `m3ctl battery`/`power status` | Phase 101 | **Slice 1 landed + green** (`power-smoke`); Dell-live arms pend HW |
 | B | Backlight/brightness (`_BCL`/`_BCM`/`_BQC`; GPU-PWM fallback documented) + `m3ctl backlight` + restore-on-resume | A | Planned |
 | C | Thermal zones (`_TZ`/`_TMP`/`_CRT`/`_PSV`/`_ACx`) + decode + passive/critical policy hook | A, E | Planned |
 | D | Lid-switch + power-button via SCI/GPE `Notify` → kernel power-event notification → `powerd` → `session_manager` | A | Planned |
@@ -21,16 +21,25 @@
 
 ## Track A — Battery + AC (the power substrate)
 
-### A.1 — Kernel ACPI power surface + device discovery
+### A.1 — Power device discovery + evaluation binding
 
-**File:** `kernel/src/acpi/power.rs` (new)
-**Symbol:** `power::init`, `power::evaluate` (thin wrapper over the Phase 101 `acpi::aml::evaluate`), the `PowerDevices` cache keyed by `_HID`
-**Why it matters:** This is the single kernel-side binding between Phase 101's AML interpreter / namespace and this phase's device semantics; without it nothing can evaluate `_BST`/`_PSR`/`_TMP`/`_BCM`. It must add **no** AML or SCI machinery — only the device-class layer on top.
+**File:** `userspace/powerd/src/main.rs` (`PowerDevices`) + `userspace/drivers/acpid/src/main.rs` (`ACPI_EVAL`, label 7) — **not** the chartered `kernel/src/acpi/power.rs`
+**Symbol:** `PowerDevices` (powerd), acpid's `handle_eval` + the `kernel_core::acpi::aml::wire` `AmlValue` codec
+**Why it matters:** This is the single binding between Phase 101's interpreter/namespace and this phase's device semantics.
+
+> **Charter correction:** the charter assumed a kernel-hosted interpreter,
+> but the Phase 101 split (E.5) hosts it in ring-3 `acpid`. Discovery
+> therefore rides acpid's existing `ACPI_FIND_BY_HID`, and evaluation is a
+> new `ACPI_EVAL` IPC verb (bulk = ASL path → bulk = wire-encoded
+> `AmlValue`; the first `AmlValue` wire codec, round-trip host-tested,
+> `kernel-core/src/acpi/aml/wire.rs`). Evaluation stays single-sited in
+> acpid; a method's queued `Notify`s route to subscribers exactly like the
+> GPE drain.
 
 **Acceptance:**
-- [ ] Walks the Phase 101 namespace once at init and caches the object paths of the `PNP0C0A` battery and `ACPI0003` AC-adapter nodes (and logs `[power] battery=<path> ac=<path>` or `none`).
-- [ ] `power::evaluate(path)` returns the typed AML result from the Phase 101 interpreter and is the only call site that touches the interpreter (no duplicated AML logic in this file).
-- [ ] On a no-battery machine (QEMU/desktop) init logs `[power] no battery device` and the rest of the surface degrades to "AC online, no battery" rather than faulting.
+- [x] `powerd` discovers the `PNP0C0A` battery and `ACPI0003` AC-adapter paths through acpid at start and logs `POWERD:ready battery=<path|none> ac=<path|assumed-online>`.
+- [x] Evaluation reaches the interpreter only through acpid's `ACPI_EVAL` (no duplicated AML logic anywhere in powerd).
+- [x] On a no-battery machine (QEMU/desktop) powerd serves the "AC assumed-online, no battery" posture rather than faulting (`power-smoke` asserts it).
 
 ### A.2 — Battery/AC decode + percentage (pure logic, host-tested)
 
@@ -39,10 +48,10 @@
 **Why it matters:** A battery percentage is computed, not read — `_BST` reports remaining capacity in the units `_BIF`/`_BIX` declare, and the rate-vs-capacity / `mWh`-vs-`mAh` units gotcha is exactly the falsifiable logic a host test pins, independent of any hardware.
 
 **Acceptance:**
-- [ ] Decodes a captured `_BST` package (state, present rate, remaining capacity, present voltage) and a captured `_BIF`/`_BIX` package (power-unit flag, design + last-full capacity, design voltage) into typed structs.
-- [ ] `percent()` returns `remaining / last_full_capacity` clamped to 0..=100, correct for both the `mWh` and `mAh` power-unit cases, and returns a sentinel (not a panic) when `last_full_capacity` is 0 or `0xFFFFFFFF` (unknown).
-- [ ] `ac_online()` maps `_PSR` `1→online` / `0→offline`.
-- [ ] Host tests in `kernel-core` (`cargo test -p kernel-core --target x86_64-unknown-linux-gnu`) cover charging/discharging/critical states and the unknown-capacity edge case on **captured ACPI object bytes**.
+- [x] Decodes `_BST` (state, present rate, remaining capacity, present voltage) and `_BIF`/`_BIX` (power-unit flag, design + last-full capacity, design voltage — `_BIX`'s leading revision field shifting the layout is covered) into typed structs.
+- [x] `percent()` returns `remaining / last_full_capacity` clamped to 0..=100 (unit-agnostic — both operands share the `_BIF` unit), and returns `None` (not a panic) when `last_full_capacity` is 0 or `0xFFFFFFFF` (unknown); an over-full reading clamps to 100.
+- [x] `decode_psr()` maps `_PSR` `1→online` / `0→offline` and rejects junk.
+- [x] Host tests cover charging/discharging states, the unknown-capacity sentinels, and malformed packages — on **synthetic Dell-shaped `AmlValue` packages** (the Phase 101 fixture convention; swapping in real captured Dell `_BST`/`_BIF` bytes pends the DSDT-capture session on `next-dell-session.md`).
 
 ### A.3 — Power-state cache + `/proc/power` synthetic surface
 
@@ -53,10 +62,15 @@
 **Symbol:** `PowerSnapshot`, `power::snapshot()`, the `procfs` `"power"` arm (alongside `"blkstats" | "metacache"`)
 **Why it matters:** A read-only `/proc/power` is a zero-policy state surface that works even if `powerd` is down (defense in depth), mirroring the Phase 38 `/proc/blkstats` / `/proc/metacache` convention.
 
+> **Charter correction (deferred):** with the interpreter in ring 3 there
+> is no kernel-side snapshot to expose — powerd owns the state and serves
+> it over the `power` IPC service (A.5), evaluating `_BST`/`_PSR` live per
+> query (no staleness, no cache). A kernel `/proc/power` mirror can return
+> if a defense-in-depth read-only surface is ever needed; nothing in
+> Tracks B–F depends on it.
+
 **Acceptance:**
-- [ ] `acpi::power` caches a `PowerSnapshot` (battery %, charging state, AC online, per-zone temperature, current brightness, governor mode) refreshed on a periodic kernel tick and on every relevant `Notify`.
-- [ ] `cat /proc/power` renders the snapshot in a stable line-oriented format; on QEMU it reads `ac=online battery=none`.
-- [ ] `/proc/power` is added to the procfs path whitelist and `stat`s cleanly (synthetic inode, like the existing entries).
+- [ ] ~~`acpi::power` caches a `PowerSnapshot` … `/proc/power` …~~ *(deferred per the correction above; the `power` IPC service is the slice-1 surface)*
 
 ### A.4 — `SYS_POWER_*` syscall / IPC surface
 
@@ -64,11 +78,18 @@
 **Symbol:** `SYS_POWER_QUERY` (snapshot), `SYS_POWER_SET_BRIGHTNESS`, `SYS_POWER_SET_GOVERNOR`, `SYS_POWER_REQUEST_SLEEP`, `SYS_POWER_WAIT_EVENT` (the new `SYS_POWER_*` family)
 **Why it matters:** `powerd` (and `m3ctl`) need a capability-gated way to read state, drive mechanism, and block on power events; this is the kernel mechanism/userspace policy boundary for the whole phase.
 
+> **Charter correction (superseded/deferred):** `SYS_POWER_QUERY` is
+> supplanted by the `power` IPC service (`kernel_core::power::control`,
+> the shared-layout requirement met by `PowerStatusWire`); the power-event
+> wait is supplanted by acpid's D.5/E.4 event push (powerd subscribes —
+> its first production consumer). `SET_BRIGHTNESS` needs no syscall
+> (`_BCM` is AML → acpid). Kernel syscalls return where mechanism is
+> genuinely privileged: `SET_GOVERNOR` (Track E MSRs) and
+> `REQUEST_SLEEP` (Track F PM1 writes).
+
 **Acceptance:**
-- [ ] `SYS_POWER_QUERY` copies the `PowerSnapshot` to a user buffer (the same bytes `/proc/power` renders).
-- [ ] `SYS_POWER_SET_BRIGHTNESS` / `SYS_POWER_SET_GOVERNOR` invoke the Track B / Track E mechanism and are capability-gated (an unprivileged caller gets `EPERM`).
-- [ ] `SYS_POWER_WAIT_EVENT` blocks the caller on the Track D power-event notification and returns the event kind on wake (decoded `EINTR`/timeout semantics documented).
-- [ ] The ABI struct is shared via a `kernel_core::power` type so userspace decodes the same layout.
+- [x] The status query + shared ABI ship as the `power` IPC service + `kernel_core::power::control::PowerStatusWire` (host-tested codec); events arrive by acpid subscription.
+- [ ] `SYS_POWER_SET_GOVERNOR` / `SYS_POWER_REQUEST_SLEEP` land with Tracks E/F (the genuinely privileged mechanisms).
 
 ### A.5 — `powerd` daemon scaffold + `power_control` service + `m3ctl` query verbs
 
@@ -81,9 +102,9 @@
 **Why it matters:** Per the userspace-first rule, *policy* lives in ring 3; `powerd` is the policy daemon and the Phase 105 settings-panel backend, modelled exactly on the Phase 81 `wifi_control` daemon + `m3ctl wifi status` path. Missing any of the four new-binary wiring points means the daemon is not built/embedded/launched.
 
 **Acceptance:**
-- [ ] `cargo xtask check` builds `powerd`; it is embedded in the ramdisk and launched from `services.d/powerd.conf`; it defines `#[global_allocator] = syscall_lib::heap::BrkAllocator` and enables `syscall-lib`'s `alloc` feature (`needs_alloc = true`).
-- [ ] `powerd` publishes a `power_control` IPC service and answers a status query with the current `PowerSnapshot`.
-- [ ] `m3ctl power status` and `m3ctl battery` look up `power_control` via `lookup_with_backoff` and print the decoded battery %/AC/governor (the `dispatch_wifi_status` shape); a `parse_verb` host test covers the new verbs.
+- [x] `cargo xtask check` builds `powerd`; it is embedded in the ramdisk and launched from `services.d/powerd.conf` (`depends=acpid`); `BrkAllocator` + `needs_alloc = true`.
+- [x] `powerd` publishes the `power` IPC service (`POWER_SERVICE_NAME` — the chartered name `power_control` shortened to match the `wifi.control`-style registry naming) and answers `POWER_STATUS` with a live `PowerStatusWire` (each query re-evaluates `_BST`/`_PSR`; one endpoint registered under two names also receives acpid's event pushes — `POWERD:event` log lines, session routing pends D.3). *(Governor mode joins the wire struct with Track E.)*
+- [x] `m3ctl power status` and `m3ctl battery` look up `power` via `lookup_with_backoff` and print the decoded status (the `dispatch_wifi_status` shape); `parse_verb` + formatter host tests cover the new verbs (37/37 m3ctl tests green).
 
 ---
 
@@ -275,9 +296,9 @@
 **Why it matters:** The plumbing (namespace, `/proc/power`, the syscall surface, the governor) is testable in QEMU even though the device datapaths are not; the gate must be present, assert what it can, and skip-with-reason on the HW-only arms, mirroring `ure-smoke`/`wifi-smoke`.
 
 **Acceptance:**
-- [ ] `power-smoke` boots m3OS and asserts `/proc/power` is present and renders the VM case (`ac=online battery=none`, governor mode reported), and that `m3ctl power status` round-trips through `powerd`.
-- [ ] The live battery/brightness/thermal/lid/suspend arms print a skip-with-reason (no QEMU model), and the gate returns success in CI.
-- [ ] `M3OS_POWER_REGRESSION=1` row added to the `AGENTS.md` gate table with the same skip-vs-pass semantics wording as the `ure-smoke`/`wifi-smoke` rows; `docs/roadmap/README.md` Phase 103 row + mermaid node depending on Phase 101 added.
+- [x] `power-smoke` boots m3OS and asserts the VM case: `POWERD:ready battery=none ac=assumed-online`, `m3ctl power status` round-tripping through `powerd` (`ac: assumed-online` / `battery: none` rendered over the `power` IPC service — the `/proc/power` arm is superseded per A.3's correction; governor mode joins with Track E), **plus the Track D event spine live in CI**: a QMP power button traverses acpid → powerd's subscription (`POWERD:event path=\FIXED.PWRBTN code=0x80`).
+- [x] The live battery/brightness/thermal/lid/suspend arms are hardware-only by construction (no QEMU devices — powerd's no-battery posture IS the skip-with-reason), and the gate passes in CI.
+- [x] `M3OS_POWER_REGRESSION=1` row added to the `AGENTS.md` gate table + `regression-gates.md` stanza + pre-push hook block; `docs/roadmap/README.md` Phase 103 row updated.
 
 ### G.3 — Bare-metal validation pass
 

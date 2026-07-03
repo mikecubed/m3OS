@@ -64,9 +64,10 @@ mod os_binary {
         ControlReply, SessionControlError, decode_reply, encode_verb,
     };
     use m3ctl::{
-        DISPLAY_CONTROL_SERVICE_NAME, LABEL_DISPLAY_CTL_CMD, LABEL_SESSION_CTL_CMD, ParseError,
-        ParsedVerb, SESSION_CONTROL_SERVICE_NAME, WIFI_CONTROL_SERVICE_NAME,
-        WIFI_NOT_ASSOCIATED_MSG, format_mitigations, format_wifi_status, parse_verb,
+        DISPLAY_CONTROL_SERVICE_NAME, LABEL_DISPLAY_CTL_CMD, LABEL_SESSION_CTL_CMD,
+        POWER_UNAVAILABLE_MSG, ParseError, ParsedVerb, SESSION_CONTROL_SERVICE_NAME,
+        WIFI_CONTROL_SERVICE_NAME, WIFI_NOT_ASSOCIATED_MSG, format_battery, format_mitigations,
+        format_power_status, format_wifi_status, parse_verb,
     };
     use syscall_lib::STDOUT_FILENO;
     use syscall_lib::heap::BrkAllocator;
@@ -130,6 +131,54 @@ mod os_binary {
             ParsedVerb::LockScreen => dispatch_lock(),
             ParsedVerb::WifiStatus => dispatch_wifi_status(),
             ParsedVerb::MitigationsStatus => dispatch_mitigations_status(),
+            ParsedVerb::PowerStatus => dispatch_power(false),
+            ParsedVerb::Battery => dispatch_power(true),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 103 A.5 — `m3ctl power status` / `m3ctl battery`
+    // -----------------------------------------------------------------------
+
+    /// Query `powerd`'s `power` service and render either the full
+    /// status or the battery view. Read-only diagnostic: a missing
+    /// daemon prints [`POWER_UNAVAILABLE_MSG`] and exits 0 (the
+    /// `wifi status` posture).
+    fn dispatch_power(battery_view: bool) -> i32 {
+        use kernel_core::power::control::{POWER_SERVICE_NAME, POWER_STATUS, PowerStatusWire};
+
+        let unavailable = || {
+            print_str(POWER_UNAVAILABLE_MSG);
+            print_str("\n");
+            0
+        };
+        let handle = match lookup_with_backoff(POWER_SERVICE_NAME) {
+            Some(h) => h,
+            None => return unavailable(),
+        };
+        // Plain (non-bulk) call: the request has no body, and the kernel's
+        // `send_with_bulk` path rejects a zero-length bulk (`bad_len`) —
+        // found live by power-smoke; the never-served `wifi status` path
+        // this was modelled on carries the same latent shape.
+        let reply_label = syscall_lib::ipc_call(handle, u64::from(POWER_STATUS), 0);
+        if reply_label != 0 {
+            return unavailable();
+        }
+        let mut reply_buf = vec![0u8; MAX_BULK_BYTES];
+        let n = syscall_lib::ipc_take_pending_bulk(&mut reply_buf);
+        if n == u64::MAX || n == 0 {
+            return unavailable();
+        }
+        match PowerStatusWire::decode(&reply_buf[..(n as usize).min(reply_buf.len())]) {
+            Some(status) => {
+                if battery_view {
+                    print_str(&format_battery(&status));
+                } else {
+                    print_str(&format_power_status(&status));
+                }
+                0
+            }
+            None => unavailable(),
         }
     }
 

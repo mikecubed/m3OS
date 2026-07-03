@@ -497,3 +497,50 @@ fn mitigations_status_wx_pku_line() {
     };
     assert!(format_mitigations(&inactive).contains("W^X: v1 (PKU present, inactive)"));
 }
+
+// ---------------------------------------------------------------------------
+// Phase 103 A.5 — `m3ctl power status` / `m3ctl battery`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn power_status_parses_to_power_status_verb() {
+    assert_eq!(
+        parse_verb("power", &["status"]),
+        Ok(ParsedVerb::PowerStatus)
+    );
+    assert_eq!(parse_verb("battery", &[]), Ok(ParsedVerb::Battery));
+}
+
+#[test]
+fn power_without_subcommand_is_missing_argument() {
+    assert!(matches!(
+        parse_verb("power", &[]),
+        Err(ParseError::MissingArgument(_))
+    ));
+    assert!(matches!(
+        parse_verb("power", &["off"]),
+        Err(ParseError::BadArgument(_))
+    ));
+}
+
+#[test]
+fn power_status_format_renders_vm_and_battery_cases() {
+    use kernel_core::power::control::{AcState, PowerStatusWire};
+
+    let vm = PowerStatusWire::no_battery();
+    let rendered = format_power_status(&vm);
+    assert!(rendered.contains("ac: assumed-online"));
+    assert!(rendered.contains("battery: none"));
+
+    let laptop = PowerStatusWire {
+        battery_present: true,
+        percent: 50,
+        ac: AcState::Offline,
+        state: kernel_core::power::battery::BST_STATE_DISCHARGING,
+        rate: 8_760,
+    };
+    let rendered = format_power_status(&laptop);
+    assert!(rendered.contains("ac: offline"));
+    assert!(rendered.contains("50% discharging"));
+    assert!(format_battery(&laptop).contains("battery: 50% discharging"));
+}
