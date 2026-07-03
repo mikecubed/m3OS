@@ -9,6 +9,7 @@
 //! the Phase 101 split, governor policy ticks in `powerd` per the
 //! userspace-first rule), the kernel dispatcher, and `m3ctl`.
 
+pub mod backlight;
 pub mod battery;
 pub mod control;
 pub mod governor;

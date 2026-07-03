@@ -324,6 +324,17 @@ impl Namespace {
             .collect()
     }
 
+    /// Phase 103 B — devices carrying a `_BCL` child (backlight-capable
+    /// display outputs; the surface behind acpid's `ACPI_LIST_BACKLIGHT`
+    /// verb). QEMU q35 declares none — the populated path is covered by
+    /// the synthetic-fixture host test.
+    pub fn backlight_devices(&self) -> Vec<NodeId> {
+        self.devices()
+            .into_iter()
+            .filter(|&dev| self.child(dev, *b"_BCL").is_some())
+            .collect()
+    }
+
     // -- Track B query surface -------------------------------------------
 
     /// Load one definition block (DSDT or SSDT): validates the 36-byte
@@ -357,9 +368,21 @@ impl Namespace {
         regions: &mut R,
         path: &str,
     ) -> Result<AmlValue, AmlError> {
+        self.evaluate_with_args(regions, path, Vec::new())
+    }
+
+    /// Phase 103 B — evaluate a method with explicit arguments (`_BCM`
+    /// takes the target brightness level as Arg0). Non-method nodes
+    /// ignore the args and read as in [`Self::evaluate`].
+    pub fn evaluate_with_args<R: RegionSpace>(
+        &mut self,
+        regions: &mut R,
+        path: &str,
+        args: Vec<AmlValue>,
+    ) -> Result<AmlValue, AmlError> {
         let node = self.resolve_str(path).ok_or(AmlError::UnresolvedName)?;
         let mut interp = Interp::new(self, regions);
-        interp.evaluate_node(node, Vec::new())
+        interp.evaluate_node(node, args)
     }
 
     /// Resolve an ASL-style textual path (`\_SB.PCI0.I2C1`) — test and

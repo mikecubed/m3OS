@@ -33,7 +33,9 @@
 //! sentinels:
 //!
 //! - `POWERD:ready battery=<none|path> ac=<assumed-online|path>
-//!   zones=<n> mech=<none|hwp>`
+//!   zones=<n> mech=<none|hwp> backlight=<none|path>`
+//! - `POWERD:backlight set=<pct>%` — a `POWER_SET_BRIGHTNESS` request
+//!   applied a level through `_BCM` (Track B; never fires on q35).
 //! - `POWERD:event path=<asl-path> code=<c>` — an acpid event arrived.
 //! - `POWERD:governor mode=<m> target=<t> load=<l>%` — first tick, then
 //!   only when the target changes (a QEMU boot settles to the floor in
@@ -59,10 +61,11 @@ use core::alloc::Layout;
 
 use kernel_core::acpi::aml::object::AmlValue;
 use kernel_core::acpi::aml::wire;
+use kernel_core::power::backlight::{self, BACKLIGHT_UNKNOWN, BclLevels};
 use kernel_core::power::battery::{self, BatteryInfo};
 use kernel_core::power::control::{
-    AcState, CpufreqMech, PERCENT_UNKNOWN, POWER_SERVICE_NAME, POWER_STATUS, PowerStatusWire,
-    TEMP_UNKNOWN_DECI_C, ThermalWire,
+    AcState, CpufreqMech, PERCENT_UNKNOWN, POWER_SERVICE_NAME, POWER_SET_BRIGHTNESS, POWER_STATUS,
+    PowerStatusWire, TEMP_UNKNOWN_DECI_C, ThermalWire,
 };
 use kernel_core::power::governor::{Governor, GovernorMode, PERF_MAX, PERF_MIN};
 use kernel_core::power::syscalls::{
@@ -106,6 +109,8 @@ const ACPI_SUBSCRIBE: u64 = 5;
 const ACPI_EVENT: u64 = 6;
 const ACPI_EVAL: u64 = 7;
 const ACPI_LIST_TZ: u64 = 8;
+const ACPI_EVAL_ARG: u64 = 9;
+const ACPI_LIST_BACKLIGHT: u64 = 10;
 
 /// The event-endpoint name acpid resolves for its push handle.
 const EVENTS_SERVICE_NAME: &str = "powerd.events";
@@ -146,10 +151,11 @@ fn eval(handle: u32, path: &str) -> Option<AmlValue> {
     wire::decode(&bulk).ok().map(|(v, _)| v)
 }
 
-/// `ACPI_LIST_TZ` (body-less → plain `ipc_call`, the slice-1
-/// `send_with_bulk:bad_len` lesson): newline-joined zone paths.
-fn list_thermal_zones(handle: u32) -> Vec<String> {
-    if syscall_lib::ipc_call(handle, ACPI_LIST_TZ, 0) != 0 {
+/// A body-less list verb (`ACPI_LIST_TZ`/`ACPI_LIST_BACKLIGHT`; plain
+/// `ipc_call` — the slice-1 `send_with_bulk:bad_len` lesson):
+/// newline-joined full paths.
+fn acpi_list(handle: u32, label: u64) -> Vec<String> {
+    if syscall_lib::ipc_call(handle, label, 0) != 0 {
         return Vec::new();
     }
     let Some(bulk) = take_reply_bulk() else {
@@ -162,6 +168,20 @@ fn list_thermal_zones(handle: u32) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect()
+}
+
+/// `ACPI_EVAL_ARG`: evaluate a one-argument method (`_BCM(level)`).
+/// Bulk = path ++ 8-byte LE arg; `data0` = path length.
+fn eval_arg(handle: u32, path: &str, arg: u64) -> Option<AmlValue> {
+    let mut req = Vec::with_capacity(path.len() + 8);
+    req.extend_from_slice(path.as_bytes());
+    req.extend_from_slice(&arg.to_le_bytes());
+    let reply = syscall_lib::ipc_call_buf(handle, ACPI_EVAL_ARG, path.len() as u64, &req);
+    if reply != 0 {
+        return None;
+    }
+    let bulk = take_reply_bulk()?;
+    wire::decode(&bulk).ok().map(|(v, _)| v)
 }
 
 // ---------------------------------------------------------------------
@@ -206,6 +226,12 @@ struct ThermalZone {
     trips: TripPoints,
 }
 
+/// A backlight output with its boot-decoded (static) `_BCL` level list.
+struct Backlight {
+    path: String,
+    levels: BclLevels,
+}
+
 fn severity(s: ThermalState) -> u8 {
     match s {
         ThermalState::Normal => 0,
@@ -223,6 +249,9 @@ struct PowerDevices {
     /// Thermal zones with trips cached once (`_CRT`/`_PSV` are static;
     /// only `_TMP` is live).
     zones: Vec<ThermalZone>,
+    /// The first backlight-capable display output (`_BCL` carrier),
+    /// with its level list cached once; `None` on QEMU/desktop.
+    backlight: Option<Backlight>,
 }
 
 impl PowerDevices {
@@ -258,15 +287,38 @@ impl PowerDevices {
         }
     }
 
+    /// Current backlight level as a percent (live `_BQC` read mapped
+    /// through the cached `_BCL` list), or `BACKLIGHT_UNKNOWN`.
+    fn backlight_percent(&self) -> u8 {
+        let (Some(acpi), Some(bl)) = (self.acpi, self.backlight.as_ref()) else {
+            return BACKLIGHT_UNKNOWN;
+        };
+        match eval(acpi, &format!("{}._BQC", bl.path)).and_then(|v| backlight::decode_bqc(&v)) {
+            Some(level) => bl.levels.level_to_percent(level),
+            None => BACKLIGHT_UNKNOWN,
+        }
+    }
+
+    /// Apply a brightness percent: snap to the nearest `_BCL` level and
+    /// evaluate `_BCM(level)`. Returns the applied percent, or `None`
+    /// when there is no backlight device or the evaluation failed.
+    fn set_brightness(&self, pct: u8) -> Option<u8> {
+        let (acpi, bl) = (self.acpi?, self.backlight.as_ref()?);
+        let level = bl.levels.nearest_level(pct.min(100));
+        eval_arg(acpi, &format!("{}._BCM", bl.path), level as u64)?;
+        Some(bl.levels.level_to_percent(level))
+    }
+
     /// Evaluate the live snapshot. Every query re-reads `_BST`/`_PSR`/
-    /// `_TMP` — no staleness, and the VM case costs nothing (no devices).
-    /// Governor fields (`governor`/`mech`/`perf`) are the caller's — the
-    /// main loop owns that state and overlays it.
+    /// `_TMP`/`_BQC` — no staleness, and the VM case costs nothing (no
+    /// devices). Governor fields (`governor`/`mech`/`perf`) are the
+    /// caller's — the main loop owns that state and overlays it.
     fn status(&self) -> PowerStatusWire {
         let (temp_deci_c, thermal) = self.thermal_sample();
         let base = PowerStatusWire {
             temp_deci_c,
             thermal,
+            backlight_pct: self.backlight_percent(),
             ..PowerStatusWire::no_battery()
         };
         let Some(acpi) = self.acpi else {
@@ -361,6 +413,7 @@ fn program_main(_args: &[&str]) -> i32 {
         ac_path: None,
         battery_info: None,
         zones: Vec::new(),
+        backlight: None,
     };
     if let Some(handle) = acpi {
         // PNP0C0A = Control Method Battery, ACPI0003 = AC adapter.
@@ -374,9 +427,19 @@ fn program_main(_args: &[&str]) -> i32 {
                     eval(handle, &format!("{bat}._BIF")).and_then(|v| battery::decode_bif(&v))
                 });
         }
+        // Backlight (Track B): the `_BCL` level list is static — decode
+        // once; only `_BQC` is live. First `_BCL` carrier wins (laptops
+        // expose one panel; multi-output brightness is a residual).
+        devices.backlight = acpi_list(handle, ACPI_LIST_BACKLIGHT)
+            .into_iter()
+            .find_map(|path| {
+                let levels = eval(handle, &format!("{path}._BCL"))
+                    .and_then(|v| backlight::decode_bcl(&v))?;
+                Some(Backlight { path, levels })
+            });
         // Thermal zones: trips are static — evaluate once here; only
         // `_TMP` is re-read per sample.
-        for path in list_thermal_zones(handle) {
+        for path in acpi_list(handle, ACPI_LIST_TZ) {
             let trips = TripPoints {
                 critical_dk: eval(handle, &format!("{path}._CRT")).and_then(|v| decode_temp_dk(&v)),
                 passive_dk: eval(handle, &format!("{path}._PSV")).and_then(|v| decode_temp_dk(&v)),
@@ -409,11 +472,15 @@ fn program_main(_args: &[&str]) -> i32 {
     let mut poweroff_started = false;
 
     announce(&format!(
-        "POWERD:ready battery={} ac={} zones={} mech={}\n",
+        "POWERD:ready battery={} ac={} zones={} mech={} backlight={}\n",
         devices.battery_path.as_deref().unwrap_or("none"),
         devices.ac_path.as_deref().unwrap_or("assumed-online"),
         devices.zones.len(),
         mech.as_str(),
+        devices
+            .backlight
+            .as_ref()
+            .map_or("none", |b| b.path.as_str()),
     ));
 
     // ---- Serve ----------------------------------------------------------
@@ -488,6 +555,18 @@ fn program_main(_args: &[&str]) -> i32 {
             let encoded = status.encode();
             syscall_lib::ipc_store_reply_bulk(&encoded);
             syscall_lib::ipc_reply(reply_cap, 0, encoded.len() as u64);
+        } else if rc == u64::from(POWER_SET_BRIGHTNESS) {
+            // Track B: pct in data0 → nearest _BCL level → _BCM. The
+            // last-set level re-applies on resume with Track F.
+            match devices.set_brightness(msg.data[0].min(100) as u8) {
+                Some(applied) => {
+                    announce(&format!("POWERD:backlight set={applied}%\n"));
+                    syscall_lib::ipc_reply(reply_cap, 0, applied as u64);
+                }
+                None => {
+                    syscall_lib::ipc_reply(reply_cap, u64::MAX, 0);
+                }
+            }
         } else {
             syscall_lib::ipc_reply(reply_cap, u64::MAX, 0);
         }

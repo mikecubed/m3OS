@@ -6,11 +6,18 @@
 //! request carries no body; the reply bulk is one encoded
 //! [`PowerStatusWire`].
 
+use super::backlight::BACKLIGHT_UNKNOWN;
 use super::governor::GovernorMode;
 use super::thermal::ThermalState;
 
 /// `m3ctl power status` / `m3ctl battery` request label.
 pub const POWER_STATUS: u16 = 0x5701;
+
+/// `m3ctl backlight <pct>` request label (Phase 103 B): `data0` = the
+/// target percent (0–100). Reply label 0 with `data0` = the applied
+/// percent (after nearest-`_BCL`-level snapping), or `u64::MAX` when
+/// the platform has no backlight device (QEMU/desktop).
+pub const POWER_SET_BRIGHTNESS: u16 = 0x5702;
 
 /// The `powerd` IPC service name.
 pub const POWER_SERVICE_NAME: &str = "power";
@@ -140,7 +147,7 @@ impl CpufreqMech {
 ///
 /// Wire layout (18 bytes LE):
 /// `battery_present[1] | percent[1] | ac[1] | state[4] | rate[4] |
-///  temp_deci_c[2] | thermal[1] | governor[1] | mech[1] | perf[1] | reserved[1]`
+///  temp_deci_c[2] | thermal[1] | governor[1] | mech[1] | perf[1] | backlight[1]`
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PowerStatusWire {
     pub battery_present: bool,
@@ -161,6 +168,9 @@ pub struct PowerStatusWire {
     pub mech: CpufreqMech,
     /// Last governor target on the abstract 1–255 performance scale.
     pub perf: u8,
+    /// Current backlight brightness as a percent (Track B), or
+    /// [`BACKLIGHT_UNKNOWN`] on a platform with no backlight device.
+    pub backlight_pct: u8,
 }
 
 /// Encoded size of [`PowerStatusWire`].
@@ -181,6 +191,7 @@ impl PowerStatusWire {
             governor: GovernorMode::Conservative,
             mech: CpufreqMech::None,
             perf: 0,
+            backlight_pct: BACKLIGHT_UNKNOWN,
         }
     }
 
@@ -196,6 +207,7 @@ impl PowerStatusWire {
         out[14] = self.governor.to_byte();
         out[15] = self.mech.to_byte();
         out[16] = self.perf;
+        out[17] = self.backlight_pct;
         out
     }
 
@@ -217,6 +229,7 @@ impl PowerStatusWire {
             governor: GovernorMode::from_byte(bytes[14])?,
             mech: CpufreqMech::from_byte(bytes[15])?,
             perf: bytes[16],
+            backlight_pct: bytes[17],
         })
     }
 }
@@ -240,6 +253,7 @@ mod tests {
                 governor: GovernorMode::Conservative,
                 mech: CpufreqMech::Hwp,
                 perf: 128,
+                backlight_pct: 66,
             },
             PowerStatusWire {
                 battery_present: true,
@@ -252,6 +266,7 @@ mod tests {
                 governor: GovernorMode::Powersave,
                 mech: CpufreqMech::Hwp,
                 perf: 1,
+                backlight_pct: 0,
             },
         ] {
             let bytes = wire.encode();

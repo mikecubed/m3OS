@@ -66,8 +66,8 @@ mod os_binary {
     use m3ctl::{
         DISPLAY_CONTROL_SERVICE_NAME, LABEL_DISPLAY_CTL_CMD, LABEL_SESSION_CTL_CMD,
         POWER_UNAVAILABLE_MSG, ParseError, ParsedVerb, SESSION_CONTROL_SERVICE_NAME,
-        WIFI_CONTROL_SERVICE_NAME, WIFI_NOT_ASSOCIATED_MSG, format_battery, format_mitigations,
-        format_power_status, format_wifi_status, parse_verb,
+        WIFI_CONTROL_SERVICE_NAME, WIFI_NOT_ASSOCIATED_MSG, format_backlight_field, format_battery,
+        format_mitigations, format_power_status, format_wifi_status, parse_verb,
     };
     use syscall_lib::STDOUT_FILENO;
     use syscall_lib::heap::BrkAllocator;
@@ -138,6 +138,9 @@ mod os_binary {
                 print_str("power: suspend is not supported yet (Phase 103 Track F)\n");
                 1
             }
+            ParsedVerb::BacklightShow => dispatch_backlight_show(),
+            ParsedVerb::BacklightSet(pct) => dispatch_backlight_set(pct),
+            ParsedVerb::BacklightStep(delta) => dispatch_backlight_step(delta),
         }
     }
 
@@ -210,6 +213,80 @@ mod os_binary {
             }
             None => unavailable(),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 103 B.3 — `m3ctl backlight [<pct>|up|down]`
+    // -----------------------------------------------------------------------
+
+    /// Fetch the current power status wire, or `None` when powerd is
+    /// not running / the reply is malformed.
+    fn query_power_status() -> Option<kernel_core::power::control::PowerStatusWire> {
+        use kernel_core::power::control::{POWER_SERVICE_NAME, POWER_STATUS, PowerStatusWire};
+        let handle = lookup_with_backoff(POWER_SERVICE_NAME)?;
+        if syscall_lib::ipc_call(handle, u64::from(POWER_STATUS), 0) != 0 {
+            return None;
+        }
+        let mut reply_buf = vec![0u8; MAX_BULK_BYTES];
+        let n = syscall_lib::ipc_take_pending_bulk(&mut reply_buf);
+        if n == u64::MAX || n == 0 {
+            return None;
+        }
+        PowerStatusWire::decode(&reply_buf[..(n as usize).min(reply_buf.len())])
+    }
+
+    /// `m3ctl backlight` — show the current brightness.
+    fn dispatch_backlight_show() -> i32 {
+        match query_power_status() {
+            Some(status) => {
+                print_str("backlight: ");
+                print_str(&format_backlight_field(&status));
+                print_str("\n");
+                0
+            }
+            None => {
+                print_str(POWER_UNAVAILABLE_MSG);
+                print_str("\n");
+                0
+            }
+        }
+    }
+
+    /// `m3ctl backlight <pct>` — set brightness through powerd
+    /// (`POWER_SET_BRIGHTNESS`; the reply's `data0`-free label-only
+    /// protocol returns `u64::MAX` when there is no backlight device).
+    fn dispatch_backlight_set(pct: u8) -> i32 {
+        use kernel_core::power::control::{POWER_SERVICE_NAME, POWER_SET_BRIGHTNESS};
+        let Some(handle) = lookup_with_backoff(POWER_SERVICE_NAME) else {
+            print_str(POWER_UNAVAILABLE_MSG);
+            print_str("\n");
+            return 1;
+        };
+        let reply = syscall_lib::ipc_call(handle, u64::from(POWER_SET_BRIGHTNESS), pct as u64);
+        if reply != 0 {
+            print_str("backlight: no device\n");
+            return 1;
+        }
+        print_str("backlight: set\n");
+        0
+    }
+
+    /// `m3ctl backlight up|down` — step ±10 % from the current level
+    /// (unknown current treated as 50 % so the verb still works on
+    /// firmware with a broken `_BQC`).
+    fn dispatch_backlight_step(delta: i8) -> i32 {
+        use kernel_core::power::backlight::BACKLIGHT_UNKNOWN;
+        let current = match query_power_status() {
+            Some(status) if status.backlight_pct != BACKLIGHT_UNKNOWN => status.backlight_pct,
+            Some(_) => 50,
+            None => {
+                print_str(POWER_UNAVAILABLE_MSG);
+                print_str("\n");
+                return 1;
+            }
+        };
+        let target = (current as i16 + delta as i16).clamp(0, 100) as u8;
+        dispatch_backlight_set(target)
     }
 
     // -----------------------------------------------------------------------

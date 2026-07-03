@@ -132,6 +132,14 @@ const ACPI_EVAL: u64 = 7;
 /// with `data[0]` = bulk length, bulk = newline-joined zone full paths.
 /// An empty reply on a zone-less platform (QEMU q35) is a *success*.
 const ACPI_LIST_TZ: u64 = 8;
+/// Phase 103 B — evaluate a method with one integer argument (`_BCM`
+/// takes the target brightness level as Arg0). `data[0]` = path length,
+/// bulk = ASL path ++ 8-byte LE u64 argument; reply as [`ACPI_EVAL`].
+const ACPI_EVAL_ARG: u64 = 9;
+/// Phase 103 B — enumerate backlight-capable devices (a `_BCL` child).
+/// Reply as [`ACPI_LIST_TZ`]: `data[0]` = bulk length, bulk =
+/// newline-joined device full paths (empty = success on q35).
+const ACPI_LIST_BACKLIGHT: u64 = 10;
 /// Reply label for any failure (unknown label, bad request, no match).
 const REPLY_ERR: u64 = u64::MAX;
 /// `ACPI_STA` success replies are `REPLY_STA_BASE | sta`.
@@ -552,6 +560,63 @@ fn handle_list_tz(ns: &Namespace, reply_cap: u32) {
     syscall_lib::ipc_reply(reply_cap, 0, joined.len() as u64);
 }
 
+/// `ACPI_EVAL_ARG` handler (Phase 103 B): like `handle_eval` but the 8
+/// bytes after the path carry a little-endian u64 passed as Arg0 —
+/// `_BCM(level)` is the first consumer.
+fn handle_eval_arg(
+    ns: &mut Namespace,
+    regions: &mut SyscallRegionSpace,
+    subscribers: &mut Vec<Subscriber>,
+    msg: &IpcMessage,
+    bulk: &[u8],
+    reply_cap: u32,
+) {
+    let Some(path) = req_str(msg, bulk) else {
+        syscall_lib::ipc_reply(reply_cap, REPLY_ERR, 0);
+        return;
+    };
+    let path_len = msg.data[0] as usize;
+    let Some(raw) = bulk.get(path_len..path_len + 8) else {
+        syscall_lib::ipc_reply(reply_cap, REPLY_ERR, 0);
+        return;
+    };
+    let arg = u64::from_le_bytes(raw.try_into().unwrap());
+    match ns
+        .evaluate_with_args(regions, &path, alloc::vec![AmlValue::Integer(arg)])
+        .ok()
+        .and_then(|v| kernel_core::acpi::aml::wire::encode(&v).ok())
+    {
+        Some(bytes) => {
+            syscall_lib::ipc_store_reply_bulk(&bytes);
+            syscall_lib::ipc_reply(reply_cap, 0, bytes.len() as u64);
+        }
+        None => {
+            syscall_lib::ipc_reply(reply_cap, REPLY_ERR, 0);
+        }
+    }
+    // Route any Notify the evaluation queued (same as handle_eval).
+    for (node, code) in core::mem::take(&mut ns.pending_notify) {
+        let path = ns.full_path(node);
+        announce(&format!("acpid: Notify({path}, {code:#x})\n"));
+        route_notify(subscribers, &path, code);
+    }
+}
+
+/// `ACPI_LIST_BACKLIGHT` handler (Phase 103 B): every device with a
+/// `_BCL` child, newline-joined (the `handle_list_tz` shape; empty on
+/// q35 is a success).
+fn handle_list_backlight(ns: &Namespace, reply_cap: u32) {
+    let mut joined = String::new();
+    for (i, id) in ns.backlight_devices().into_iter().enumerate() {
+        if i > 0 {
+            joined.push('\n');
+        }
+        joined.push_str(&ns.full_path(id));
+    }
+    syscall_lib::ipc_store_reply_bulk(joined.as_bytes());
+    syscall_lib::ipc_reply(reply_cap, 0, joined.len() as u64);
+}
+
 /// `ACPI_SUBSCRIBE` handler (Phase 101 E.4): the bulk carries the
 /// subscriber's REGISTERED event-service name (`data[0]` = length);
 /// acpid resolves it via `ipc_lookup_service` to obtain its own send
@@ -797,6 +862,15 @@ fn program_main(_args: &[&str]) -> i32 {
                 reply_cap,
             ),
             ACPI_LIST_TZ => handle_list_tz(&ns, reply_cap),
+            ACPI_EVAL_ARG => handle_eval_arg(
+                &mut ns,
+                &mut regions,
+                &mut subscribers,
+                &msg,
+                &bulk,
+                reply_cap,
+            ),
+            ACPI_LIST_BACKLIGHT => handle_list_backlight(&ns, reply_cap),
             _ => {
                 syscall_lib::ipc_reply(reply_cap, REPLY_ERR, 0);
             }

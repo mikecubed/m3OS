@@ -524,6 +524,44 @@ fn power_without_subcommand_is_missing_argument() {
 }
 
 #[test]
+fn backlight_parses_pct_up_down_and_show() {
+    // Phase 103 B.3 acceptance: the <pct> / up / down argument forms.
+    assert!(matches!(
+        parse_verb("backlight", &[]),
+        Ok(ParsedVerb::BacklightShow)
+    ));
+    assert!(matches!(
+        parse_verb("backlight", &["50"]),
+        Ok(ParsedVerb::BacklightSet(50))
+    ));
+    assert!(matches!(
+        parse_verb("backlight", &["0"]),
+        Ok(ParsedVerb::BacklightSet(0))
+    ));
+    assert!(matches!(
+        parse_verb("backlight", &["100"]),
+        Ok(ParsedVerb::BacklightSet(100))
+    ));
+    assert!(matches!(
+        parse_verb("backlight", &["up"]),
+        Ok(ParsedVerb::BacklightStep(10))
+    ));
+    assert!(matches!(
+        parse_verb("backlight", &["down"]),
+        Ok(ParsedVerb::BacklightStep(-10))
+    ));
+    for bad in ["101", "-5", "bright", "10%"] {
+        assert!(
+            matches!(
+                parse_verb("backlight", &[bad]),
+                Err(ParseError::BadArgument(_))
+            ),
+            "{bad} must be rejected"
+        );
+    }
+}
+
+#[test]
 fn power_off_and_suspend_parse() {
     // Phase 103 D.3 — the poweroff verb and the Track F suspend stub.
     assert!(matches!(
@@ -545,9 +583,10 @@ fn power_status_format_renders_vm_and_battery_cases() {
     let rendered = format_power_status(&vm);
     assert!(rendered.contains("ac: assumed-online"));
     assert!(rendered.contains("battery: none"));
-    // Slice-2 posture lines on a zone-less, HWP-less VM.
+    // Slice-2/B posture lines on a zone-less, HWP-less, panel-less VM.
     assert!(rendered.contains("thermal: none (no zones)"));
     assert!(rendered.contains("governor: conservative (mech none, target 0)"));
+    assert!(rendered.contains("backlight: none (no device)"));
 
     let laptop = PowerStatusWire {
         battery_present: true,
@@ -560,12 +599,14 @@ fn power_status_format_renders_vm_and_battery_cases() {
         governor: GovernorMode::Conservative,
         mech: CpufreqMech::Hwp,
         perf: 96,
+        backlight_pct: 75,
     };
     let rendered = format_power_status(&laptop);
     assert!(rendered.contains("ac: offline"));
     assert!(rendered.contains("50% discharging"));
     assert!(rendered.contains("thermal: normal, 42.1 C"));
     assert!(rendered.contains("governor: conservative (mech hwp, target 96)"));
+    assert!(rendered.contains("backlight: 75%"));
     assert!(format_battery(&laptop).contains("battery: 50% discharging"));
 
     // A passive-cooling laptop just under boiling renders its state.
