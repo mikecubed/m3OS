@@ -1346,11 +1346,12 @@ impl ServiceManager {
     /// Fallback: register built-in service definitions when no on-disk service
     /// configs are available.
     ///
-    /// This fires on a **bare-metal USB boot with no ext2 data disk**: the
-    /// root mount falls back to the ramdisk root (using the boot USB as a
-    /// writable root is future work — `blk::remote` slot 0 only auto-discovers
-    /// `nvme.block`/`ahci.block`, and the boot stick is a GPT-partitioned device
-    /// the secondary-mount path can't yet target), `/etc/services.d` is absent,
+    /// This fires on a boot where **no writable root could be mounted at
+    /// all**: since Phase 106 A.2–A.4 the bootstrap also brings up the
+    /// boot USB stick (`blk::remote` slot 0 adopts `usb0.block` last-
+    /// resort and the root mount GPT-scans the stick), so this fallback
+    /// is reached only when every backend — virtio, NVMe, AHCI, USB —
+    /// failed. Then `/etc/services.d` is absent,
     /// and without this the box would come up with only `telnetd`/`sshd` — no
     /// keyboard, no USB, no NIC. We parse embedded copies of the essential
     /// configs (mirrors xtask's `populate_ext2_files`) through the same
@@ -2816,11 +2817,53 @@ fn spawn_smoke_runner() -> i32 {
 /// mount succeeded, the negative errno of the last failed mount otherwise.
 #[allow(clippy::manual_c_str_literals)]
 fn bootstrap_ring3_root_disk() -> isize {
-    const AHCI_DRIVER_PATH: &[u8] = b"/drivers/ahci\0";
+    // Stage 1 (Phase 82 D.3): AHCI/SATA. Fork the driver, give it up to
+    // 15 × 100 ms to reset the HBA, bring up the port (COMRESET),
+    // IDENTIFY the disk, and register ahci.block. Bring-up takes well
+    // under a second on QEMU; the headroom covers a slow bare-metal
+    // COMRESET.
+    if fork_driver(b"/drivers/ahci\0") >= 0 && retry_root_mount(15) == 0 {
+        write_str(
+            STDOUT_FILENO,
+            "init: / mounted (ext2 via ring-3 ahci.block)\n",
+        );
+        return 0;
+    }
+    // Stage 2 (Phase 106 A.4): the boot USB stick. Bring up the xHCI
+    // controller + the mass-storage class driver so `usb0.block`
+    // registers (the kernel root slot adopts it last-resort), then
+    // retry against the stick's GPT ext2 partition.
+    write_str(
+        STDOUT_FILENO,
+        "init: retrying ext2 root via USB storage (xhci + usb-storage)\n",
+    );
+    if fork_driver(b"/drivers/xhci\0") < 0 {
+        return -19; // -ENODEV
+    }
+    if fork_driver(b"/drivers/usb-storage\0") < 0 {
+        return -19;
+    }
+    // USB enumeration + SCSI bring-up under TCG can take several
+    // seconds — 100 × 100 ms keeps a healthy margin (only a USB boot
+    // ever reaches this stage, so the ceiling costs normal boots
+    // nothing).
+    let ret = retry_root_mount(100);
+    if ret == 0 {
+        write_str(
+            STDOUT_FILENO,
+            "init: / mounted (ext2 via ring-3 usb0.block)\n",
+        );
+    }
+    ret
+}
+
+/// Fork + exec a `/drivers/` binary (it registers its block/device
+/// service and never returns). Returns the child pid, or fork's
+/// negative errno. An exec failure is logged from the child.
+#[allow(clippy::manual_c_str_literals)]
+fn fork_driver(path: &[u8]) -> isize {
     let pid = fork();
     if pid == 0 {
-        // Child: exec the AHCI driver. It runs the HBA/port bring-up, registers
-        // ahci.block, and enters its block server loop (never returns).
         let envp: [*const u8; 5] = [
             ENV_PATH.as_ptr(),
             ENV_HOME.as_ptr(),
@@ -2828,54 +2871,41 @@ fn bootstrap_ring3_root_disk() -> isize {
             ENV_EDITOR.as_ptr(),
             core::ptr::null(),
         ];
-        let argv: [*const u8; 2] = [AHCI_DRIVER_PATH.as_ptr(), core::ptr::null()];
-        // execve only returns on failure; log the negative errno (matching
-        // spawn_login/spawn_smoke_runner) so a missing or non-executable
-        // /drivers/ahci binary is diagnosable from the boot log.
-        let ret = execve(AHCI_DRIVER_PATH, &argv, &envp);
-        write_str(STDOUT_FILENO, "init: /drivers/ahci execve failed (");
+        let argv: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+        // execve only returns on failure; log the negative errno so a
+        // missing or non-executable driver binary is diagnosable from
+        // the boot log.
+        let ret = execve(path, &argv, &envp);
+        write_str(STDOUT_FILENO, "init: driver execve failed (");
         write_u64(STDOUT_FILENO, (-ret) as u64);
         write_str(STDOUT_FILENO, ")\n");
         exit(1);
     }
     if pid < 0 {
-        write_str(STDOUT_FILENO, "init: failed to fork /drivers/ahci\n");
-        // Propagate fork()'s negative errno rather than flattening it to -1, so
-        // the failure is diagnosable and matches this function's documented
-        // "negative errno ... otherwise" contract.
-        return pid;
+        write_str(STDOUT_FILENO, "init: failed to fork driver\n");
     }
-    // Retry the mount up to 15 × 100 ms = 1.5 s, giving the driver time to reset
-    // the HBA, bring up the port (COMRESET), IDENTIFY the disk, and register
-    // ahci.block. Bring-up takes well under a second on QEMU; the headroom
-    // covers a slow bare-metal COMRESET. (Was 40×100 ms; trimmed because on a
-    // bare-metal USB boot there is no AHCI controller, so this is a pure detour
-    // before the ramdisk-defaults fallback.)
-    //
-    // A '.' is printed per attempt so a bare-metal boot can distinguish a working
-    // timer (dots tick by ~10/s → fall through to defaults) from a wedged
-    // `nanosleep` (stuck on the first dot) — the kernel log is serial-only and
-    // invisible without a serial port.
+    pid
+}
+
+/// Retry the ext2 root mount up to `attempts` × 100 ms, returning 0 on
+/// success or the last mount's negative errno.
+#[allow(clippy::manual_c_str_literals)]
+fn retry_root_mount(attempts: u32) -> isize {
     // Bare-metal bring-up diagnostic (default OFF, mirrors the kernel's
-    // `BRINGUP_DIAG`): a '.' per attempt lets a real-silicon boot tell a working
-    // timer (dots tick ~10/s) from a wedged `nanosleep` (stuck on dot 1). Flip
-    // to `true` + rebuild to re-enable for the next bare-metal bring-up.
+    // `BRINGUP_DIAG`): a '.' per attempt lets a real-silicon boot tell a
+    // working timer (dots tick ~10/s) from a wedged `nanosleep` (stuck
+    // on dot 1). Flip to `true` + rebuild for the next bring-up.
     const BRINGUP_DIAG: bool = false;
     let mut ret: isize = -19; // -ENODEV
-    let mut attempts = 0u32;
-    while attempts < 15 {
+    for _ in 0..attempts {
         if BRINGUP_DIAG {
             write_str(STDOUT_FILENO, ".");
         }
         let _ = nanosleep_for(0, 100_000_000); // 100 ms
         ret = mount(b"/dev/blk0\0".as_ptr(), b"/\0".as_ptr(), b"ext2\0".as_ptr());
         if ret == 0 {
-            if BRINGUP_DIAG {
-                write_str(STDOUT_FILENO, "\n");
-            }
-            return 0;
+            break;
         }
-        attempts += 1;
     }
     if BRINGUP_DIAG {
         write_str(STDOUT_FILENO, "\n");
@@ -3064,14 +3094,10 @@ fn init_main() -> ! {
         // root (the first mount already succeeded, so this branch is skipped).
         write_str(
             STDOUT_FILENO,
-            "init: retrying ext2 root via ring-3 storage driver (ahci)\n",
+            "init: retrying ext2 root via ring-3 storage drivers (ahci, then usb)\n",
         );
-        if bootstrap_ring3_root_disk() == 0 {
-            write_str(
-                STDOUT_FILENO,
-                "init: / mounted (ext2 via ring-3 ahci.block)\n",
-            );
-        } else {
+        // Success is logged inside the bootstrap (it knows which stage won).
+        if bootstrap_ring3_root_disk() != 0 {
             write_str(
                 STDOUT_FILENO,
                 "init: ring-3 root retry failed — continuing with ramdisk defaults\n",

@@ -454,6 +454,8 @@ const SMOKE_EXIT_SYMPHONIA_SMOKE_FAILED: i32 = 99;
 const SMOKE_EXIT_POWER_SMOKE_FAILED: i32 = 100;
 /// Phase 103 F.3 `suspend-smoke` failed (S3 suspend/resume round trip).
 const SMOKE_EXIT_SUSPEND_SMOKE_FAILED: i32 = 101;
+/// Phase 106 A `usb-root-smoke` failed (USB-stick root boot).
+const SMOKE_EXIT_USB_ROOT_SMOKE_FAILED: i32 = 102;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
@@ -907,6 +909,16 @@ fn main() {
                     std::process::exit(1);
                 });
             cmd_acpi_smoke(&smoke_args);
+        }
+        // Phase 106 A — boot to a writable root from the combined USB image.
+        Some("usb-root-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("usb-root-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_usb_root_smoke(&smoke_args);
         }
         // Phase 103 F.3 — full S3 suspend/resume round trip in QEMU.
         Some("suspend-smoke") => {
@@ -1840,7 +1852,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm.\n\
      USB passthrough: --usb-passthrough <vid:pid> (e.g. `--usb-passthrough 0bda:8156`) passes a physical USB device into the guest's emulated xHCI (qemu-xhci,id=xhci_pt). The QEMU process must have access to the USB device node — add a udev rule granting the user/group read-write on the device, or run with sudo. The device is claimed from the host kernel while QEMU runs and is released on exit."
@@ -11354,6 +11366,155 @@ fn cmd_power_smoke(args: &SmokeBootArgs) {
         Err(msg) => {
             eprintln!("power-smoke: FAILED\n{msg}");
             std::process::exit(SMOKE_EXIT_POWER_SMOKE_FAILED);
+        }
+    }
+}
+
+/// Phase 106 Track A/E — `usb-root-smoke`: the M1 milestone. QEMU boots
+/// with the combined GPT image (`cargo xtask image --combined`) attached
+/// **only** as a USB mass-storage stick behind qemu-xhci — no virtio
+/// disk, no AHCI: OVMF boots the stick's ESP, the kernel's virtio root
+/// mount fails, init's bootstrap walks AHCI (absent) then forks
+/// `/drivers/xhci` + `/drivers/usb-storage`, `usb0.block` registers and
+/// the root slot adopts it last-resort (A.2), the mount GPT-scans the
+/// stick and finds the ext2 partition after the ESP (A.3), and the boot
+/// proceeds to a **writable** USB root with the on-disk service configs
+/// (A.4/A.5). The gate then logs in over serial and proves writability
+/// with a file write + read-back.
+#[allow(clippy::zombie_processes)]
+fn cmd_usb_root_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let output_dir = kernel_binary.parent().unwrap().to_path_buf();
+    // Fresh serial-autologin rootfs, then the combined single-disk image.
+    let disk_img = output_dir.join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(&output_dir, false, false, false, false, false, false);
+    if let Err(err) = build_combined_usb_image(&kernel_binary, &output_dir) {
+        eprintln!("usb-root-smoke: failed to build combined image: {err:#}");
+        std::process::exit(SMOKE_EXIT_USB_ROOT_SMOKE_FAILED);
+    }
+    let usb_img = output_dir.join("m3os-usb.img");
+
+    let ovmf = find_ovmf();
+    let mut qemu_args = vec![
+        "-bios".to_string(),
+        ovmf.display().to_string(),
+        // The stick is the ONLY storage device in the machine.
+        "-drive".to_string(),
+        format!("if=none,format=raw,file={},id=usbstick", usb_img.display()),
+        "-device".to_string(),
+        "qemu-xhci,id=xhci0".to_string(),
+        "-device".to_string(),
+        "usb-storage,bus=xhci0.0,drive=usbstick".to_string(),
+        "-serial".to_string(),
+        "stdio".to_string(),
+        "-m".to_string(),
+        "2048".to_string(),
+        "-smp".to_string(),
+        qemu_smp_count().to_string(),
+        "-cpu".to_string(),
+        "qemu64,+xsave,+avx,+xsaveopt,+smep,+smap,+aes".to_string(),
+        "-netdev".to_string(),
+        "user,id=net0".to_string(),
+        "-device".to_string(),
+        "virtio-net-pci,netdev=net0".to_string(),
+        "-no-reboot".to_string(),
+    ];
+    if args.display {
+        qemu_args.extend(["-vga".to_string(), "std".to_string()]);
+    } else {
+        qemu_args.extend(["-display".to_string(), "none".to_string()]);
+    }
+
+    println!(
+        "usb-root-smoke: launching QEMU with the combined image as the only (USB) disk \
+         (timeout {}s)",
+        args.timeout_secs
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let stdout = child.stdout.take().expect("qemu stdout");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_buf = String::new();
+    let mut serial_history = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let step = std::time::Duration::from_secs(args.timeout_secs);
+
+    let mut stdin = child.stdin.take().expect("qemu stdin");
+    let result: Result<(), String> = (|| {
+        let wait = |pat: &str, buf: &mut String, hist: &mut String| {
+            wait_for_serial_pattern(&rx, buf, hist, pat, step, global_start, global_timeout)
+        };
+        let send = |stdin: &mut std::process::ChildStdin, s: &str| -> Result<(), String> {
+            use std::io::Write;
+            stdin
+                .write_all(s.as_bytes())
+                .and_then(|_| stdin.flush())
+                .map_err(|e| format!("serial send failed: {e}"))
+        };
+        wait(
+            "init: retrying ext2 root via ring-3 storage drivers (ahci, then usb)",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        wait(
+            "init: retrying ext2 root via USB storage (xhci + usb-storage)",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        println!("usb-root-smoke: init walked the AHCI stage and forked the USB stack");
+        wait(
+            "init: / mounted (ext2 via ring-3 usb0.block)",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        println!("usb-root-smoke: writable USB root mounted (GPT ext2 partition)");
+        wait("m3OS login:", &mut serial_buf, &mut serial_history)?;
+        send(&mut stdin, "root\n")?;
+        wait("Password:", &mut serial_buf, &mut serial_history)?;
+        send(&mut stdin, "root\n")?;
+        wait(
+            "[security] credential transition complete",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        // Writability proof: a fresh file written to the USB rootfs and
+        // read back (double-space collapse = fresh execution, and the
+        // read goes through the ring-3 usb-storage write/read path).
+        send(&mut stdin, "echo usb-root  ok > /home/usbprobe.txt\n")?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        send(&mut stdin, "cat /home/usbprobe.txt\n")?;
+        wait("usb-root ok", &mut serial_buf, &mut serial_history)?;
+        println!("usb-root-smoke: file write + read-back on the USB root");
+        Ok(())
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    match result {
+        Ok(()) => {
+            let elapsed = global_start.elapsed().as_secs();
+            println!(
+                "usb-root-smoke: PASSED ({elapsed}s) — the combined GPT image booted as a \
+                 USB-only machine: OVMF loaded the ESP, init brought up xhci + usb-storage, \
+                 the root slot adopted usb0.block, the GPT scan found the ext2 partition, \
+                 and a serial login wrote + read back a file on the writable USB root"
+            );
+        }
+        Err(msg) => {
+            eprintln!("usb-root-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_USB_ROOT_SMOKE_FAILED);
         }
     }
 }

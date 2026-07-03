@@ -412,6 +412,26 @@ and the power button still driving the D.3 poweroff chain to a
 **guest-initiated QEMU exit**. `power-smoke` is the complementary
 S3-disabled fail-closed lane.
 
+## usb-root-smoke
+
+**Env var:** `M3OS_USB_ROOT_REGRESSION=1`
+
+The Phase 106 M1 milestone, live in CI: builds the combined single-disk
+USB image (`cargo xtask image --combined` — one GPT disk carrying the
+ESP FAT and the ext2 rootfs; the layout is also pinned host-side by a
+unit test that mirrors the kernel's GPT probe byte-for-byte) and boots
+QEMU with it attached **only** as a USB mass-storage stick behind
+qemu-xhci — no virtio disk, no AHCI controller. OVMF boots the stick's
+ESP; the kernel's virtio root mount fails; init's bootstrap walks the
+AHCI stage (absent) then forks `/drivers/xhci` + `/drivers/usb-storage`;
+`usb0.block` registers and `blk::remote` root slot 0 adopts it
+last-resort (nvme → ahci → usb priority, `/drivers/` owner gate
+enforced); the root mount's `gpt_ext2_scan` finds the ext2 partition
+after the ESP; and the boot proceeds to a **writable** USB root serving
+the on-disk `/etc/services.d`. The gate logs in over serial and proves
+writability with a file write + read-back through the ring-3
+usb-storage path.
+
 ## power-smoke
 
 **Env var:** `M3OS_POWER_REGRESSION=1`

@@ -37,9 +37,9 @@
 **Why it matters:** `is_registered` auto-discovers `"nvme.block"` then `"ahci.block"` for the root slot; the boot USB registers `usb0.block`, which today can only back a *secondary* `/mnt/usb` mount. Promoting it to the root role is the load-bearing kernel change for a writable USB root.
 
 **Acceptance:**
-- [ ] When no `nvme.block`/`ahci.block` is present and a trusted `/drivers/` process has registered `usb0.block`, `is_registered()` adopts it into root slot 0 (owner-gate unchanged — an untrusted registrant is still rejected and logged).
-- [ ] The existing `nvme.block`-then-`ahci.block` priority is preserved when those are present (a host/kernel-test asserts USB is only the last-resort root backend).
-- [ ] `MAX_REMOTE_BLOCK` and the per-`dev_id` paths (`read_sectors_dev`/`write_sectors_dev`/`flush_dev`) are untouched.
+- [x] When no `nvme.block`/`ahci.block` is present and a trusted `/drivers/` process has registered `usb0.block`, `is_registered()` adopts it into root slot 0 (owner-gate unchanged — an untrusted registrant is still rejected and logged).
+- [x] The existing `nvme.block`-then-`ahci.block` priority is preserved when those are present (a host/kernel-test asserts USB is only the last-resort root backend).
+- [x] `MAX_REMOTE_BLOCK` and the per-`dev_id` paths (`read_sectors_dev`/`write_sectors_dev`/`flush_dev`) are untouched.
 
 ### A.3 — GPT-aware root mount
 
@@ -48,9 +48,9 @@
 **Why it matters:** The root mount path uses `crate::blk::mbr::probe_ext2()` + `mount_ext2(base_lba)` (whole-disk / MBR), so it cannot find an ext2 partition that lives **after** an ESP on a GPT stick; the secondary-mount path already solves this with `usb_ext2_base_lba`.
 
 **Acceptance:**
-- [ ] When the root backend is a `usbN.block` GPT device, `VFS_MOUNT_EXT2_ROOT` resolves the ext2 base LBA via `usb_ext2_base_lba(dev_id)` and mounts via `mount_ext2`/`mount_dev` at that LBA.
-- [ ] The legacy virtio-blk / MBR whole-disk root path (`probe_ext2()` → `base_lba`) is unchanged — existing root-mount gates stay green.
-- [ ] A bad/missing ext2 partition fails the mount cleanly (`ENODEV`/`EIO`), never a panic.
+- [x] When the root backend is a `usbN.block` GPT device, `VFS_MOUNT_EXT2_ROOT` resolves the ext2 base LBA via `usb_ext2_base_lba(dev_id)` and mounts via `mount_ext2`/`mount_dev` at that LBA.
+- [x] The legacy virtio-blk / MBR whole-disk root path (`probe_ext2()` → `base_lba`) is unchanged — existing root-mount gates stay green.
+- [x] A bad/missing ext2 partition fails the mount cleanly (`ENODEV`/`EIO`), never a panic.
 
 ### A.4 — `bootstrap_ring3_root_disk` forks the USB storage stack
 
@@ -59,9 +59,9 @@
 **Why it matters:** On a failed root mount, init forks only `/drivers/ahci` today; a USB-only boot needs `/drivers/xhci` + `/drivers/usb-storage` brought up so `usb0.block` registers, then a retry of the root mount against the USB device.
 
 **Acceptance:**
-- [ ] On root-mount failure, `bootstrap_ring3_root_disk` (or a sibling) forks `/drivers/xhci` then `/drivers/usb-storage`, polls for `usb0.block`, and retries the root mount within the bounded retry loop (extends the existing 15×100 ms loop with USB-bring-up headroom).
-- [ ] On success, init logs `init: / mounted (ext2 via ring-3 usb0.block)` and proceeds to a **writable** root (not `add_builtin_defaults`' ramdisk fallback).
-- [ ] On a normal virtio/NVMe/AHCI root (first mount already succeeded) this path is never reached — a no-op detour, asserted by the unchanged existing root gates.
+- [x] On root-mount failure, `bootstrap_ring3_root_disk` (or a sibling) forks `/drivers/xhci` then `/drivers/usb-storage`, polls for `usb0.block`, and retries the root mount within the bounded retry loop (extends the existing 15×100 ms loop with USB-bring-up headroom).
+- [x] On success, init logs `init: / mounted (ext2 via ring-3 usb0.block)` and proceeds to a **writable** root (not `add_builtin_defaults`' ramdisk fallback).
+- [x] On a normal virtio/NVMe/AHCI root (first mount already succeeded) this path is never reached — a no-op detour, asserted by the unchanged existing root gates.
 
 ### A.5 — USB-root service-config baseline
 
@@ -70,8 +70,8 @@
 **Why it matters:** A writable USB root means `/etc/services.d` is now present on the stick, so the boot can use the on-disk configs instead of the minimal ramdisk `BUILTIN_CONFIGS`; the fallback must remain correct for a still-unmountable stick.
 
 **Acceptance:**
-- [ ] When the USB root mounts writable, init reads `/etc/services.d` from it (the ramdisk `BUILTIN_CONFIGS` fallback is taken only when the root is still unmountable).
-- [ ] The comment block at `add_builtin_defaults` documenting the "USB root is future work — slot 0 only auto-discovers nvme/ahci" limitation is updated to reflect A.2/A.3 landing.
+- [x] When the USB root mounts writable, init reads `/etc/services.d` from it (the ramdisk `BUILTIN_CONFIGS` fallback is taken only when the root is still unmountable).
+- [x] The comment block at `add_builtin_defaults` documenting the "USB root is future work — slot 0 only auto-discovers nvme/ahci" limitation is updated to reflect A.2/A.3 landing.
 
 ---
 
