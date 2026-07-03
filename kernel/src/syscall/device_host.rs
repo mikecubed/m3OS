@@ -1416,7 +1416,14 @@ pub fn sys_device_dma_alloc(dev_cap: u32, size: usize, align: usize) -> isize {
             };
             match scheduler::insert_cap(task_id, cap) {
                 Ok(cap_handle) => {
-                    log::info!(
+                    // Debug, not info: a successful DMA allocation is a
+                    // hot-path event — the ring-3 NVMe driver allocates a
+                    // fresh landing buffer per block I/O (freed on reply),
+                    // so at INFO this floods the serial console (~14k lines
+                    // during one `nvme-persist` boot) and starves the
+                    // gate's prompt matching. Failures/rollbacks below stay
+                    // at warn/info where they carry real signal.
+                    log::debug!(
                         "device_host.dma_alloc pid={} bdf={:04x}:{:02x}:{:02x}.{} \
                          size={} iova={:#x} user_va={:#x} cap_handle={}",
                         pid,

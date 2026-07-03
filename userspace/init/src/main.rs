@@ -2817,7 +2817,22 @@ fn spawn_smoke_runner() -> i32 {
 /// mount succeeded, the negative errno of the last failed mount otherwise.
 #[allow(clippy::manual_c_str_literals)]
 fn bootstrap_ring3_root_disk() -> isize {
-    // Stage 1 (Phase 82 D.3): AHCI/SATA. Fork the driver, give it up to
+    // Stage 1 (Phase 106 B.1): NVMe. The kernel root slot prefers
+    // `nvme.block` over `ahci.block`/`usb0.block` (`blk::remote::
+    // is_registered`), so bring the NVMe driver up first: fork it, give
+    // it up to 15 × 100 ms to map its BARs, create the admin + I/O
+    // queues, IDENTIFY namespace 1, and register `nvme.block`. The
+    // driver exits cleanly when no NVMe controller is present, so this
+    // is a harmless no-op on an AHCI/USB/virtio root — the retry mount
+    // then fails and we fall through to the AHCI stage.
+    if fork_driver(b"/drivers/nvme\0") >= 0 && retry_root_mount(15) == 0 {
+        write_str(
+            STDOUT_FILENO,
+            "init: / mounted (ext2 via ring-3 nvme.block)\n",
+        );
+        return 0;
+    }
+    // Stage 2 (Phase 82 D.3): AHCI/SATA. Fork the driver, give it up to
     // 15 × 100 ms to reset the HBA, bring up the port (COMRESET),
     // IDENTIFY the disk, and register ahci.block. Bring-up takes well
     // under a second on QEMU; the headroom covers a slow bare-metal
@@ -2829,7 +2844,7 @@ fn bootstrap_ring3_root_disk() -> isize {
         );
         return 0;
     }
-    // Stage 2 (Phase 106 A.4): the boot USB stick. Bring up the xHCI
+    // Stage 3 (Phase 106 A.4): the boot USB stick. Bring up the xHCI
     // controller + the mass-storage class driver so `usb0.block`
     // registers (the kernel root slot adopts it last-resort), then
     // retry against the stick's GPT ext2 partition.

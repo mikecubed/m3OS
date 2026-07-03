@@ -1054,3 +1054,23 @@ if [ "${M3OS_USB_ROOT_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask usb-root-smoke..."
     cargo xtask usb-root-smoke --timeout 300
 fi
+
+# Phase 106 Track B — NVMe root gates. Gated behind M3OS_NVME_REGRESSION=1
+# because they boot full QEMU runs with the real ext2 rootfs routed
+# behind a QEMU nvme controller. nvme-rw proves a 200 KiB write+read-back
+# over the ring-3 nvme_driver within one boot; nvme-persist is a two-boot
+# reboot-persistence check (BLK_FLUSH) against the same NVMe disk. Set the
+# env var on branches touching the nvme_driver, init's root bootstrap,
+# the DeviceSet nvme_root routing, or blk::remote.
+if [ "${M3OS_NVME_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask nvme-rw-smoke..."
+    if ! cargo xtask nvme-rw-smoke --timeout 300; then
+        echo "pre-push: cargo xtask nvme-rw-smoke failed" >&2
+        exit 1
+    fi
+    echo "pre-push: running cargo xtask nvme-persist-smoke..."
+    if ! cargo xtask nvme-persist-smoke --timeout 300; then
+        echo "pre-push: cargo xtask nvme-persist-smoke failed" >&2
+        exit 1
+    fi
+fi
