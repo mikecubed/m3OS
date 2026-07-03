@@ -2272,9 +2272,19 @@ impl Controller {
         // never completes (or whose IRQ never fires) must NOT hang the server —
         // `notify_wait` has no timeout, so a blocking wait here would deadlock
         // the whole USB stack. Spin-poll first (catches the common fast
-        // completion in µs — see `COMPLETION_SPIN_POLLS`), then a bounded ~400 ms
-        // sleep-poll budget (400 × 1 ms) before giving up.
-        const MAX_POLLS: u32 = 400;
+        // completion in µs — see `COMPLETION_SPIN_POLLS`), then a bounded
+        // sleep-poll budget before giving up.
+        //
+        // Phase 106: 5000 sleep-polls (≥5 s wall), up from 400. Giving up on a
+        // transfer that is merely SLOW is worse than waiting: the abandoned
+        // TD's late completion event lingers on the (shared) event ring and
+        // desyncs every subsequent wait's event attribution — observed as a
+        // mid-copy `BLK_READ shm transport-fail` cascading into CBW/INQUIRY
+        // failures and a false hot-unplug verdict during the installer's
+        // sustained 64 KiB bulk workload under TCG scheduling jitter. A ≥5 s
+        // budget means only a genuinely dead transfer (device gone, ring
+        // wedged) fails the wait — and then failing IS correct.
+        const MAX_POLLS: u32 = 5000;
         let mut wait = CompletionWait::new(MAX_POLLS);
         loop {
             let before = self.consumer.index;

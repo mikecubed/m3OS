@@ -10,10 +10,11 @@
 - **Track C (M3)** 🟡 foundation merged — PR #296 (`13d1cf6e`): C.1
   installer scaffold + C.2 capability-gated raw block syscalls + C.3 raw
   `dd`-copy installer + kernel root-slot-release fix. The former
-  `nvme-install-smoke` blockers (usb-storage multi-sector reads + the
-  concurrent-instance BOT collision) are **fixed** on
-  `feat/phase-106-usb-storage-multisector` (see below); the gate is wired
-  into pre-push behind `M3OS_NVME_INSTALL_REGRESSION=1`. C.4/C.5 pending.
+  `nvme-install-smoke` blockers are **fixed** on
+  `feat/phase-106-usb-storage-multisector` (see below) and the gate is
+  **GREEN end-to-end** (2026-07-03: USB boot → ~40 s 1 GiB sparse copy →
+  reboot → NVMe-alone boot to a live shell over `nvme.block`), wired into
+  pre-push behind `M3OS_NVME_INSTALL_REGRESSION=1`. C.4/C.5 pending.
 - **Tracks D / E** — not started (D first-user; E bare-metal sign-off).
 
 **Charter:** `docs/roadmap/106-usb-installer-nvme.md`
@@ -131,6 +132,19 @@ serial capture showed the real chain:
 3. **Serial log flood:** `device_host.dma_map_shm` logged at INFO per
    transfer (~33 k lines per copy) — demoted to DEBUG, same as the Phase
    106 `dma_alloc` demotion.
+4. **xHCI completion-wait budget** (the residual mid-copy flake): the
+   bulk-event wait (`wait_for_bulk_out_event`) gave up after ~400 ms of
+   sleep-polls; a 64 KiB DMA under TCG scheduling jitter occasionally
+   exceeded that, and the abandoned TD's late completion desynced the
+   shared event ring (cascading CBW/INQUIRY failures at a random LBA).
+   Raised to 5000 sleep-polls (≥5 s) — only a genuinely dead transfer
+   fails, and failing then IS correct. Deliberately no retry-at-SCSI
+   layer: retrying after an abandoned transfer risks stale-event
+   off-by-one attribution, the worse failure.
+5. **Detach false-positive:** the C.4 reconcile treated ONE failed
+   `NextAttach` as a hot-unplug, so a transient glitch made the daemon
+   serving the root unmount and exit. `device_detached_confirmed` now
+   requires two verdicts 300 ms apart.
 
 ---
 

@@ -946,6 +946,21 @@ fn device_detached(usb_ep: u32, cursor: u8) -> bool {
     }
 }
 
+/// Phase 106 hardening: require TWO consecutive detach verdicts ~300 ms
+/// apart before tearing down. When this daemon serves the ROOT filesystem
+/// (USB-root boot), a single failed `NextAttach` round-trip — the xHCI
+/// server mid-recovery after a slow bulk transfer, a transient IPC hiccup —
+/// must not unmount and exit: that turns a one-shot glitch into a dead
+/// system. A real hot-unplug is permanent and passes both probes.
+#[cfg(not(test))]
+fn device_detached_confirmed(usb_ep: u32, cursor: u8) -> bool {
+    if !device_detached(usb_ep, cursor) {
+        return false;
+    }
+    let _ = syscall_lib::nanosleep_for(0, 300_000_000);
+    device_detached(usb_ep, cursor)
+}
+
 // ---------------------------------------------------------------------------
 // Block-server IPC loop (D.4)
 // ---------------------------------------------------------------------------
@@ -1705,7 +1720,7 @@ fn run_multi_block_server_loop(
             last_detach_ns = now;
             let mut j = 0;
             while j < devices.len() {
-                if device_detached(usb_ep, devices[j].cursor) {
+                if device_detached_confirmed(usb_ep, devices[j].cursor) {
                     let index = devices[j].index;
                     let prefix = mount_prefix_cstr(index);
                     let rc_um = syscall_lib::umount(&prefix);
@@ -1778,7 +1793,7 @@ fn run_block_server_loop(
 
         if rc == NEG_ETIMEDOUT {
             // C.4: idle window elapsed — has the device been hot-unplugged?
-            if device_detached(usb_ep, cursor) {
+            if device_detached_confirmed(usb_ep, cursor) {
                 let rc_um = syscall_lib::umount(MOUNT_PREFIX_CSTR);
                 if rc_um == 0 {
                     write_str(STDOUT_FILENO, "USB_STORAGE:detached-unmounted /mnt/usb0\n");

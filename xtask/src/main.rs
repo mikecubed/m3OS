@@ -15723,6 +15723,7 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs) {
                 || l.contains("USB_STORAGE:")
                 || l.contains("nvme_driver")
                 || l.contains("[blk]")
+                || l.contains("[xhci]")
         }) {
             eprintln!("{l}");
         }
