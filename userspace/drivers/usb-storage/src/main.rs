@@ -163,6 +163,64 @@ const MAX_CONSECUTIVE_ERRORS: u32 = 8;
 #[cfg(not(test))]
 const MAX_BOT_SECTORS: u16 = 7;
 
+/// Maximum sectors per BOT READ/WRITE(10) command on the **zero-copy shm
+/// path** (Phase 106): 128 sectors = 64 KiB per SCSI command.
+///
+/// The xHCI server's `SubmitShmTransfer` programs the whole data stage as a
+/// **single Normal TRB** (`submit_bulk_iova`), whose 17-bit transfer-length
+/// field caps one TRB at 128 KiB − 1 — so a full 256-sector block request
+/// cannot be one TRB. 64 KiB stays comfortably inside that limit, is the
+/// classic mass-storage transfer size real OSes issue over BOT, and turns a
+/// 256-sector `BLK_READ` into 2 SCSI commands (6 IPC round-trips) instead of
+/// 37 inline sub-requests (111 round-trips) — the difference between the
+/// Phase 106 installer's image copy finishing in minutes vs hours under TCG.
+#[cfg(not(test))]
+const MAX_SHM_SECTORS: u32 = 128;
+
+/// One persistent shared-memory bounce buffer (`MAX_SHM_SECTORS` × 512 =
+/// 64 KiB) created at server start and reused for every multi-sector BOT
+/// data stage. The xHCI server IOMMU-maps it per transfer and DMAs the
+/// stage directly into/out of it (`SubmitShmTransfer`); this daemon then
+/// memcpys between the region and the block-IPC payload. Setup failure is
+/// non-fatal — `None` falls back to the inline 7-sector chunking.
+#[cfg(not(test))]
+struct ShmBounce {
+    /// Kernel shm region id (passed to the xHCI server by value).
+    id: u32,
+    /// This process's writable mapping of the region.
+    va: *mut u8,
+}
+
+/// Create + map the bounce region. Emits a one-line sentinel either way so
+/// boot logs show which large-transfer path is live.
+#[cfg(not(test))]
+fn setup_shm_bounce() -> Option<ShmBounce> {
+    let bytes = MAX_SHM_SECTORS as usize * 512;
+    let id = syscall_lib::shm_create(bytes);
+    if id == 0 {
+        write_str(
+            STDOUT_FILENO,
+            "usb-storage: shm bounce create failed — inline transfers only\n",
+        );
+        return None;
+    }
+    let va = syscall_lib::shm_map(id);
+    if va == 0 || va == u64::MAX {
+        write_str(
+            STDOUT_FILENO,
+            "usb-storage: shm bounce map failed — inline transfers only\n",
+        );
+        return None;
+    }
+    write_str(STDOUT_FILENO, "USB_STORAGE:shm-bounce-ok sectors=");
+    write_u32_dec(MAX_SHM_SECTORS);
+    write_str(STDOUT_FILENO, "\n");
+    Some(ShmBounce {
+        id,
+        va: va as *mut u8,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // IPC plumbing (mirrors usb-hid's usb_call)
 // ---------------------------------------------------------------------------
@@ -950,6 +1008,11 @@ fn cdb_sync_cache10() -> [u8; 10] {
 
 /// Handle a `BLK_READ` by issuing chunked BOT READ(10) commands.
 ///
+/// Multi-sector spans go through the zero-copy shm path when the bounce
+/// buffer is available (`MAX_SHM_SECTORS`-sized SCSI commands, one TRB per
+/// data stage); a missing bounce buffer or a ≤[`MAX_BOT_SECTORS`] tail uses
+/// the inline `SubmitBulkIn` chunking.
+///
 /// Assembles all sector data into a single buffer, then stages it as a
 /// combined bulk payload (header + data) via `ipc_store_reply_bulk`.
 /// Returns the `BlkReplyHeader` with `bytes = sectors * 512` on success.
@@ -960,12 +1023,63 @@ fn handle_bot_read(
     cmd_id: u64,
     lba: u64,
     sector_count: u32,
+    shm: Option<&ShmBounce>,
 ) -> BlkReplyHeader {
-    let mut all_data: Vec<u8> = Vec::new();
+    let mut all_data: Vec<u8> = Vec::with_capacity(sector_count as usize * 512);
     let mut remaining = sector_count;
     let mut current_lba = lba;
 
     while remaining > 0 {
+        // Zero-copy stage for anything the inline path would have to split.
+        if let Some(bounce) = shm
+            && remaining > MAX_BOT_SECTORS as u32
+        {
+            let chunk = remaining.min(MAX_SHM_SECTORS);
+            let byte_count = chunk * 512;
+            let lba32 = current_lba as u32;
+            match bot_read_shm(
+                usb_ep,
+                notice,
+                &cdb_read10(lba32, chunk as u16),
+                bounce.id,
+                byte_count,
+            ) {
+                Some(0) => {
+                    // SAFETY: the bounce region is MAX_SHM_SECTORS × 512
+                    // bytes mapped at `va`, and byte_count ≤ that. The xHCI
+                    // server's completion reply happens-before this read, so
+                    // the DMA'd stage is visible.
+                    let stage =
+                        unsafe { core::slice::from_raw_parts(bounce.va, byte_count as usize) };
+                    all_data.extend_from_slice(stage);
+                }
+                Some(status) => {
+                    write_str(STDOUT_FILENO, "usb-storage: BLK_READ shm csw-status=");
+                    write_u8_dec(status);
+                    write_str(STDOUT_FILENO, " lba=");
+                    write_u32_dec(lba32);
+                    write_str(STDOUT_FILENO, " sectors=");
+                    write_u32_dec(chunk);
+                    write_str(STDOUT_FILENO, "\n");
+                    return err_reply(cmd_id);
+                }
+                None => {
+                    write_str(
+                        STDOUT_FILENO,
+                        "usb-storage: BLK_READ shm transport-fail lba=",
+                    );
+                    write_u32_dec(lba32);
+                    write_str(STDOUT_FILENO, " sectors=");
+                    write_u32_dec(chunk);
+                    write_str(STDOUT_FILENO, "\n");
+                    return err_reply(cmd_id);
+                }
+            }
+            remaining -= chunk;
+            current_lba += chunk as u64;
+            continue;
+        }
+
         let chunk = remaining.min(MAX_BOT_SECTORS as u32) as u16;
         let byte_count = chunk * 512;
         let lba32 = current_lba as u32; // BOT READ(10) uses 32-bit LBA.
@@ -1047,6 +1161,11 @@ fn handle_bot_read(
 }
 
 /// Handle a `BLK_WRITE` by issuing chunked BOT WRITE(10) commands.
+///
+/// Mirrors [`handle_bot_read`]: multi-sector spans stage their data through
+/// the shm bounce buffer (one `SubmitShmTransfer` data-OUT per SCSI command)
+/// when it is available; the inline `SubmitBulkOut` chunking covers the
+/// no-bounce fallback and ≤[`MAX_BOT_SECTORS`] tails.
 #[cfg(not(test))]
 fn handle_bot_write(
     usb_ep: u32,
@@ -1055,6 +1174,7 @@ fn handle_bot_write(
     lba: u64,
     sector_count: u32,
     payload: &[u8],
+    shm: Option<&ShmBounce>,
 ) -> BlkReplyHeader {
     let expected_bytes = sector_count as usize * 512;
     if payload.len() < expected_bytes {
@@ -1067,6 +1187,55 @@ fn handle_bot_write(
     let mut offset = 0usize;
 
     while remaining > 0 {
+        if let Some(bounce) = shm
+            && remaining > MAX_BOT_SECTORS as u32
+        {
+            let chunk = remaining.min(MAX_SHM_SECTORS);
+            let byte_count = chunk as usize * 512;
+            let lba32 = current_lba as u32;
+            // SAFETY: the bounce region is MAX_SHM_SECTORS × 512 bytes mapped
+            // writable at `va`, byte_count ≤ that, and the payload slice was
+            // length-checked above. The copy completes before the IPC submit,
+            // which is the device's happens-before edge.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    payload[offset..offset + byte_count].as_ptr(),
+                    bounce.va,
+                    byte_count,
+                );
+            }
+            match bot_write_shm(
+                usb_ep,
+                notice,
+                &cdb_write10(lba32, chunk as u16),
+                bounce.id,
+                byte_count as u32,
+            ) {
+                Some(0) => {}
+                Some(status) => {
+                    write_str(STDOUT_FILENO, "usb-storage: BLK_WRITE shm csw-status=");
+                    write_u8_dec(status);
+                    write_str(STDOUT_FILENO, " lba=");
+                    write_u32_dec(lba32);
+                    write_str(STDOUT_FILENO, "\n");
+                    return err_reply(cmd_id);
+                }
+                None => {
+                    write_str(
+                        STDOUT_FILENO,
+                        "usb-storage: BLK_WRITE shm transport-fail lba=",
+                    );
+                    write_u32_dec(lba32);
+                    write_str(STDOUT_FILENO, "\n");
+                    return err_reply(cmd_id);
+                }
+            }
+            remaining -= chunk;
+            current_lba += chunk as u64;
+            offset += byte_count;
+            continue;
+        }
+
         let chunk = remaining.min(MAX_BOT_SECTORS as u32) as u16;
         let byte_count = chunk as usize * 512;
         let lba32 = current_lba as u32;
@@ -1141,17 +1310,46 @@ fn program_main(_args: &[&str]) -> i32 {
         return 0;
     }
 
+    // Phase 106 single-daemon guard: exactly one usb-storage process may
+    // drive BOT traffic. On a USB-root boot, init's bootstrap fork already
+    // serves the boot stick as `usb0.block`, and the service manager's
+    // `usb_storage` daemon still starts afterwards — its probe (GET_MAX_LUN /
+    // TEST UNIT READY / INQUIRY) would interleave raw BOT commands on the
+    // SAME bulk pipes the live instance is mid-transfer on, corrupting both
+    // streams (observed killing the installer's image copy at ~12%). The
+    // kernel registry drops a dead owner's entries (`ipc/cleanup.rs`), so a
+    // live `usb{k}.block` name means a live daemon: skip such devices BEFORE
+    // any device traffic, and exit 0 (`restart=on-failure` must not respawn
+    // us into the same collision) when every discovered device is already
+    // served.
+    let claimed = |k: u32| lookup(&service_name_for(k)).is_some();
+
+    // Phase 106: one shared bounce region serves every device's multi-sector
+    // transfers (both loops are single-threaded, so requests never overlap).
+    let shm_bounce = setup_shm_bounce();
+
     if devices.len() == 1 {
         // Single-device path: the efficient blocking-with-timeout loop
         // (usb0.block; C.4-validated by usb-unmount-smoke). No
         // multi-device idle-poll latency on the common single-stick case.
+        if claimed(0) {
+            write_str(
+                STDOUT_FILENO,
+                "usb-storage: usb0.block already served — exiting cleanly (single-daemon)\n",
+            );
+            return 0;
+        }
         let (notice, cursor) = devices[0];
         let (blk_ep, uas) = match prepare_and_register(usb_ep, &notice, 0) {
             Some(v) => v,
+            // A lost registration race is the concurrent-daemon case again —
+            // exit clean so on-failure restart does not re-probe a pipe
+            // another daemon is actively serving.
+            None if claimed(0) => return 0,
             None => return 1,
         };
         // `cursor` lets the loop re-query NextAttach for a C.4 hot-unplug.
-        run_block_server_loop(usb_ep, blk_ep, &notice, uas, cursor);
+        run_block_server_loop(usb_ep, blk_ep, &notice, uas, cursor, shm_bounce.as_ref());
         return 0;
     }
 
@@ -1161,7 +1359,15 @@ fn program_main(_args: &[&str]) -> i32 {
     write_u8_dec(devices.len() as u8);
     write_str(STDOUT_FILENO, " mass-storage devices — multi-device mode\n");
     let mut active: Vec<StorageDevice> = Vec::new();
+    let mut skipped_claimed = false;
     for (k, (notice, cursor)) in devices.into_iter().enumerate() {
+        if claimed(k as u32) {
+            write_str(STDOUT_FILENO, "usb-storage: usb");
+            write_u8_dec(k as u8);
+            write_str(STDOUT_FILENO, ".block already served — skipping device\n");
+            skipped_claimed = true;
+            continue;
+        }
         match prepare_and_register(usb_ep, &notice, k as u32) {
             Some((blk_ep, uas)) => active.push(StorageDevice {
                 notice,
@@ -1179,9 +1385,12 @@ fn program_main(_args: &[&str]) -> i32 {
         }
     }
     if active.is_empty() {
-        return 1;
+        // Nothing left to serve. If devices were skipped because another
+        // daemon owns them, that is the expected single-daemon posture —
+        // exit clean (no restart). Only genuine prepare failures restart.
+        return if skipped_claimed { 0 } else { 1 };
     }
-    run_multi_block_server_loop(usb_ep, active);
+    run_multi_block_server_loop(usb_ep, active, shm_bounce.as_ref());
 
     0
 }
@@ -1241,6 +1450,7 @@ fn serve_block_request(
     uas: bool,
     msg: &IpcMessage,
     recv_buf: &[u8],
+    shm: Option<&ShmBounce>,
 ) {
     use kernel_core::driver_ipc::block::BLK_REQUEST_HEADER_SIZE;
 
@@ -1272,6 +1482,7 @@ fn serve_block_request(
                         req_hdr.cmd_id,
                         req_hdr.lba,
                         req_hdr.sector_count,
+                        shm,
                     );
                     let already = hdr.bytes == u32::MAX;
                     (hdr, already)
@@ -1284,6 +1495,7 @@ fn serve_block_request(
                         req_hdr.lba,
                         req_hdr.sector_count,
                         write_payload,
+                        shm,
                     );
                     (hdr, false)
                 }
@@ -1449,7 +1661,11 @@ fn prepare_and_register(usb_ep: u32, notice: &AttachNotice, index: u32) -> Optio
 /// `run_block_server_loop` (no poll latency); this path trades a small idle-poll
 /// latency for serving multiple sticks without threads.
 #[cfg(not(test))]
-fn run_multi_block_server_loop(usb_ep: u32, mut devices: Vec<StorageDevice>) {
+fn run_multi_block_server_loop(
+    usb_ep: u32,
+    mut devices: Vec<StorageDevice>,
+    shm: Option<&ShmBounce>,
+) {
     use kernel_core::driver_ipc::block::BLK_REQUEST_HEADER_SIZE;
     use kernel_core::driver_ipc::block::MAX_SECTORS_PER_REQUEST;
 
@@ -1466,7 +1682,14 @@ fn run_multi_block_server_loop(usb_ep: u32, mut devices: Vec<StorageDevice>) {
             let mut msg = IpcMessage::new(0);
             let rc = syscall_lib::ipc_try_recv_msg(ep, &mut msg, &mut recv_buf);
             if rc != u64::MAX {
-                serve_block_request(usb_ep, &devices[i].notice, devices[i].uas, &msg, &recv_buf);
+                serve_block_request(
+                    usb_ep,
+                    &devices[i].notice,
+                    devices[i].uas,
+                    &msg,
+                    &recv_buf,
+                    shm,
+                );
                 served_any = true;
             }
             i += 1;
@@ -1533,7 +1756,14 @@ fn run_multi_block_server_loop(usb_ep: u32, mut devices: Vec<StorageDevice>) {
 /// active filesystem keeps the timeout from firing, so steady-state I/O is
 /// unaffected.
 #[cfg(not(test))]
-fn run_block_server_loop(usb_ep: u32, blk_ep: u32, notice: &AttachNotice, uas: bool, cursor: u8) {
+fn run_block_server_loop(
+    usb_ep: u32,
+    blk_ep: u32,
+    notice: &AttachNotice,
+    uas: bool,
+    cursor: u8,
+    shm: Option<&ShmBounce>,
+) {
     use kernel_core::driver_ipc::block::BLK_REQUEST_HEADER_SIZE;
     use kernel_core::driver_ipc::block::MAX_SECTORS_PER_REQUEST;
 
@@ -1581,7 +1811,7 @@ fn run_block_server_loop(usb_ep: u32, blk_ep: u32, notice: &AttachNotice, uas: b
             continue;
         }
         consecutive_errors = 0;
-        serve_block_request(usb_ep, notice, uas, &msg, &recv_buf);
+        serve_block_request(usb_ep, notice, uas, &msg, &recv_buf, shm);
     }
 }
 

@@ -1,6 +1,6 @@
 # Phase 106 — USB Installer & NVMe Install: Task List
 
-**Status:** In progress — Track A (M1) ✅ merged (PR #294), Track B (M2) ✅ merged (PR #295), Track C foundation (C.1/C.2/C.3) landed on `feat/phase-106-installer` (PR #296); the `nvme-install-smoke` end-to-end gate is WIP (blocked on USB-storage 256-sector raw-read stability — a driver-hardening follow-up, not in CI). Remaining: C.4/C.5 (partition-aware GPT/ESP writer + on-device `mkfs.ext2`), Track D (first-user), Track E (bare-metal sign-off). See `docs/handoffs/2026-07-03-phase-106-usb-installer-nvme.md`.
+**Status:** In progress — Track A (M1) ✅ merged (PR #294), Track B (M2) ✅ merged (PR #295), Track C foundation (C.1/C.2/C.3) ✅ merged (PR #296). The `nvme-install-smoke` blockers are fixed on `feat/phase-106-usb-storage-multisector`: usb-storage multi-sector transfers ride a 64 KiB shm bounce (`SubmitShmTransfer`, 128-sector SCSI commands) and a single-daemon guard stops concurrent-instance BOT probe collisions; the gate is wired into pre-push behind `M3OS_NVME_INSTALL_REGRESSION=1`. Remaining: C.4/C.5 (partition-aware GPT/ESP writer + on-device `mkfs.ext2`), Track D (first-user), Track E (bare-metal sign-off). See `docs/handoffs/2026-07-03-phase-106-usb-installer-nvme.md`.
 **Source Ref:** phase-106
 **Depends on:** Phase 82/87 (AHCI fork-and-retry root bootstrap + writable ext2) ✅, Phase 92a (USB mass-storage with writable `/mnt/usb`) ✅, Phase 55b (ring-3 NVMe driver) ✅, Phase 98 (GUI-workstation re-charter + bare-metal validation strategy) ✅. **Gate:** the NVMe-root milestone is gated on **bare-metal NVMe root boot validated** per the [bare-metal validation strategy](../../appendix/bare-metal-validation.md).
 **Goal:** Climb the M1→M3 ladder from "boots a flashed read-only image" to "installs m3OS onto the Dell's internal NVMe": **M1** a single combined GPT(ESP+ext2) USB image that boots writable from USB; **M2** an NVMe root boot mirroring the AHCI path, with `nvme-rw`/`nvme-persist` gates passing in QEMU; **M3** an on-device installer that writes the NVMe from a USB-resident image and creates the first user. Reuse the Phase 82 `bootstrap_ring3_root_disk` template, the Phase 87 writable-ext2 path, the Phase 92a `usb-storage` write path + `usb_ext2_base_lba` GPT probe, and the Phase 55b ring-3 NVMe driver. HW rungs follow the Phase 98 bare-metal protocol (`docs/appendix/bare-metal-validation.md`) and land as `Validated-on-HW (run N, date)`.
@@ -11,9 +11,9 @@
 |---|---|---|---|
 | A | Combined GPT(ESP+ext2) USB image + USB-ext2 root bootstrap (M1) | — | ✅ Merged (PR #294) — `usb-root-smoke` green |
 | B | NVMe root boot + `nvme-rw`/`nvme-persist` gates (M2) | — | ✅ Merged (PR #295) — both gates green |
-| C | On-device installer: raw USB→NVMe copy, then partition-aware `mkfs` (M3) | A, B | 🟡 C.1/C.2/C.3 landed (PR #296); `nvme-install-smoke` WIP; C.4/C.5 pending |
+| C | On-device installer: raw USB→NVMe copy, then partition-aware `mkfs` (M3) | A, B | 🟡 C.1/C.2/C.3 merged (PR #296); `nvme-install-smoke` blockers fixed (shm bulk path + single-daemon guard); C.4/C.5 pending |
 | D | First-user / account setup on the installed rootfs (M3) | C | Planned |
-| E | Validation: QEMU gates + bare-metal sign-off | A, B, C, D | 🟡 M1/M2 QEMU arms green; M3 gate WIP; HW rungs operator-owned |
+| E | Validation: QEMU gates + bare-metal sign-off | A, B, C, D | 🟡 M1/M2 QEMU arms green; M3 gate in pre-push (`M3OS_NVME_INSTALL_REGRESSION=1`); HW rungs operator-owned |
 
 ---
 

@@ -1074,3 +1074,20 @@ if [ "${M3OS_NVME_REGRESSION:-0}" = "1" ]; then
         exit 1
     fi
 fi
+
+# Phase 106 Track C/E.2 — end-to-end installer gate. Gated behind
+# M3OS_NVME_INSTALL_REGRESSION=1 because it is a two-boot QEMU run whose
+# first boot raw-copies the full combined USB image to a blank NVMe
+# (minutes even with the usb-storage shm bulk path under TCG). Boot 1
+# boots the combined USB image with a blank NVMe attached, logs in, runs
+# /sbin/installer (0x117x raw syscalls, sparse dd-copy, flush, reboot);
+# boot 2 boots the NVMe alone and asserts a live login over nvme.block.
+# Set the env var on branches touching the installer, the raw block
+# syscalls, usb-storage bulk transfers, or blk::remote root discovery.
+if [ "${M3OS_NVME_INSTALL_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask nvme-install-smoke..."
+    if ! cargo xtask nvme-install-smoke --timeout 900; then
+        echo "pre-push: cargo xtask nvme-install-smoke failed" >&2
+        exit 1
+    fi
+fi
