@@ -265,7 +265,7 @@
 > gate. The Wi-Fi stub-service CI arm moves with D.4's backend wiring.
 
 **Acceptance:**
-- [x] Renders four `m3ui` sections (Network, Display, Sound, Power) with working focus — the volume slider holds default keyboard focus; Network/Display/Power render placeholder rows naming their Phase 103/104 dependency until D.4 wires them. *(No scrolling: the panel fits its content; revisit if D.4's section content outgrows the window.)*
+- [x] Renders four `m3ui` sections (Network, Display, Sound, Power) with working focus — the volume slider holds default keyboard focus; Network renders its Phase 104 placeholder; Display/Power are D.4-wired to the Phase 103 power service. *(No scrolling: the panel fits its content; revisit if D.4's section content outgrows the window.)*
 - [x] **Sound:** the volume slider drives `SetMasterVolume` (D.2) via the new `audio_client::set_master_volume` (control-plane verb, host-tested against the mock socket); the server confirms the gain-state update via the change-only `AUDIO_SMOKE:master_gain q15=<N>` sentinel in the io loop. Gate: `settings-smoke` (`M3OS_SETTINGS_REGRESSION=1`, exit 98) — QMP/VNC boot with the AC'97 device attached, keyboard `Left` drives 100%→99%→98% asserting client-ack + server-state sentinels and a ≥12-scanline repaint. **PASS on a default multi-core boot.**
 - [ ] **CI arm:** the Wi-Fi section issues `wifi_core::control::WIFI_SCAN_REQ`/`WIFI_CONNECT_REQ` against a stub `wifi.control` service and renders the returned `ScanResult` rows + a passphrase `text_field`; gated headlessly. *(Deferred to the D.4 slice — lands with the backend clients.)*
 
@@ -276,8 +276,8 @@
 **Why it matters:** Wires the panel to the real headless backends; this is the integration point that makes 103/104 user-visible.
 
 **Acceptance:**
-- [ ] Wi-Fi: selecting a scan row + entering a passphrase sends `WIFI_CONNECT_REQ`; `WIFI_STATUS` (`wifi_core::control::WifiStatus`) drives the associated-SSID + RSSI + IPv4 display.
-- [ ] Display: the brightness slider calls the Phase 103 backlight setter; Power: battery % + AC state read from the Phase 103 surface and rendered.
+- [ ] Wi-Fi: selecting a scan row + entering a passphrase sends `WIFI_CONNECT_REQ`; `WIFI_STATUS` (`wifi_core::control::WifiStatus`) drives the associated-SSID + RSSI + IPv4 display. *(Pends Phase 104.)*
+- [x] Display: the brightness slider calls the Phase 103 backlight setter (`POWER_SET_BRIGHTNESS`; the slider renders only when the status wire reports a backlight device, so the QEMU panel shows the honest "No backlight device" row and the focus order — and `settings-smoke`'s keyboard arms — stay deterministic); Power: battery % + charge state, thermal, and firmware sleep support read from the `power` service (`POWER_STATUS`, refreshed ~2 s) and rendered, plus a **Suspend button** riding `POWER_SUSPEND` (the D.3 power-menu surface — the call blocks across the S3 round trip and the panel refreshes on resume). `settings-smoke` asserts the connect + QEMU-posture sentinel (`SETTINGS:power=ok battery=none backlight=none sleep=S3+S4`).
 
 ### D.5 — Live HW validation (settings over real AX201 + backlight)
 

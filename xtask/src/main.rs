@@ -18614,6 +18614,14 @@ fn cmd_settings_smoke(args: &LessRenderProbeArgs) {
         q.type_text("/bin/settings\n")
             .map_err(|e| format!("type settings launch: {e}"))?;
         wait("SETTINGS:audio=ok", &mut serial_buf, &mut serial_history)?;
+        // Phase 105 D.4: the panel connected to Phase 103's power service
+        // and decoded the QEMU posture (no battery, no backlight, S3+S4
+        // firmware sleep support → the Suspend button renders).
+        wait(
+            "SETTINGS:power=ok battery=none backlight=none sleep=S3+S4",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
         wait("SETTINGS:ready", &mut serial_buf, &mut serial_history)?;
         println!("settings-smoke: panel composed its first frame (audio connected)");
         // Give the compositor a moment to map + focus the new Toplevel.
