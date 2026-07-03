@@ -523,6 +523,12 @@ struct DeviceSet {
     /// (instead of virtio-blk) via an `ide-hd`. Set via `--device ahci`. Phase
     /// 82: drives the ring-3 `ahci_driver` bring-up + `RemoteBlockDevice` mount.
     ahci: bool,
+    /// Phase 106 B.2 — route the **real** ext2 rootfs (`disk.img`) behind a
+    /// QEMU `nvme` controller (instead of virtio-blk), so the ring-3
+    /// `nvme_driver` becomes the `RemoteBlockDevice` backing `/`. Distinct
+    /// from [`Self::nvme`], which attaches a *scratch* second drive. Drives
+    /// the `nvme-rw`/`nvme-persist` gates.
+    nvme_root: bool,
     /// Phase 92d — attach a SECOND `qemu-xhci` controller at PCI slot 0:7.0
     /// (`addr=0x7`) with only a `usb-mouse` on it. Effective only when `xhci`
     /// is also true; that first controller carries only a `usb-kbd`. The mouse
@@ -1134,6 +1140,24 @@ fn main() {
                     std::process::exit(1);
                 });
             cmd_ahci_persist_smoke(&smoke_args);
+        }
+        Some("nvme-rw-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("nvme-rw-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_nvme_rw_smoke(&smoke_args);
+        }
+        Some("nvme-persist-smoke") => {
+            let smoke_args = parse_smoke_boot_args("nvme-persist-smoke", &args[2..])
+                .unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_nvme_persist_smoke(&smoke_args);
         }
         Some("session-smoke") => {
             let smoke_args =
@@ -1852,7 +1876,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm.\n\
      USB passthrough: --usb-passthrough <vid:pid> (e.g. `--usb-passthrough 0bda:8156`) passes a physical USB device into the guest's emulated xHCI (qemu-xhci,id=xhci_pt). The QEMU process must have access to the USB device node — add a udev rule granting the user/group read-write on the device, or run with sudo. The device is claimed from the host kernel while QEMU runs and is released on exit."
@@ -5756,7 +5780,26 @@ fn qemu_args_with_devices_resolved(
     // the `ide-hd` glued to `bus=ahci.0`.
     let data_disk = uefi_image.parent().unwrap().join("disk.img");
     if data_disk.exists() {
-        if devices.ahci {
+        if devices.nvme_root {
+            // Phase 106 B.2 — the real rootfs behind a QEMU NVMe controller.
+            // `if=none` keeps QEMU from auto-wiring the drive; the `nvme`
+            // controller + `drive=` glue makes the ring-3 `nvme_driver` the
+            // `RemoteBlockDevice` for `/`. Mutually exclusive with the
+            // scratch `devices.nvme` drive (the router never sets both).
+            args.extend([
+                "-drive".to_string(),
+                format!(
+                    "file={},if=none,id=nvmeroot0,format=raw",
+                    data_disk.display()
+                ),
+                "-device".to_string(),
+                if devices.iommu {
+                    "nvme,serial=deadbeef,drive=nvmeroot0,addr=0x4".to_string()
+                } else {
+                    "nvme,serial=deadbeef,drive=nvmeroot0".to_string()
+                },
+            ]);
+        } else if devices.ahci {
             args.extend([
                 "-device".to_string(),
                 if devices.iommu {
@@ -15127,6 +15170,370 @@ fn cmd_ahci_persist_smoke(args: &SmokeBootArgs) {
             let _ = child2.wait();
             eprintln!(
                 "ahci-persist-smoke: FAILED (boot 2 — marker did not survive the reboot)\n{msg}"
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 106 Track B — NVMe root: nvme-rw + nvme-persist gates
+// ---------------------------------------------------------------------------
+//
+// Direct analogs of cmd_ahci_rw_smoke / cmd_ahci_persist_smoke, with
+// `DeviceSet { nvme_root: true }` routing the real ext2 rootfs behind the
+// QEMU `nvme` controller (so `/` is served by the ring-3 nvme_driver over
+// `nvme.block`) and the boot-log sentinel switched to the nvme.block mount
+// line that init logs from its new Stage-1 NVMe arm (B.1).
+
+/// AHCI-shaped boot+login steps, but keyed on the NVMe root-mount sentinel.
+fn nvme_boot_and_login_steps() -> Vec<SmokeStep> {
+    const RETRY_AFTER_PASSWD_MISS: &[SmokeStep] = &[
+        SmokeStep::Wait {
+            pattern: "m3OS login:",
+            timeout_secs: 30,
+            label: "nvme: retry login prompt",
+        },
+        SmokeStep::Sleep { millis: 2000 },
+        SmokeStep::Send {
+            input: "root\n",
+            label: "nvme: retry username after passwd miss",
+        },
+        SmokeStep::Wait {
+            pattern: "Password:",
+            timeout_secs: 20,
+            label: "nvme: password prompt after retry",
+        },
+    ];
+    vec![
+        SmokeStep::Wait {
+            pattern: "init: / mounted (ext2 via ring-3 nvme.block)",
+            timeout_secs: 120,
+            label: "nvme: ext2 root mounted over nvme.block",
+        },
+        SmokeStep::Wait {
+            pattern: "m3OS login:",
+            timeout_secs: 90,
+            label: "nvme: login prompt",
+        },
+        SmokeStep::Send {
+            input: "root\n",
+            label: "nvme: username",
+        },
+        SmokeStep::WaitEither {
+            pattern_a: "Password:",
+            pattern_b: "login: cannot read /etc/passwd",
+            timeout_secs: 20,
+            label: "nvme: password prompt or retryable passwd miss",
+            extra_steps_a: &[],
+            extra_steps_b: RETRY_AFTER_PASSWD_MISS,
+        },
+        SmokeStep::Send {
+            input: "root\n",
+            label: "nvme: password",
+        },
+        SmokeStep::Wait {
+            pattern: "[security] credential transition complete",
+            timeout_secs: 60,
+            label: "nvme: credential transition",
+        },
+        SmokeStep::Sleep { millis: 500 },
+        SmokeStep::Send {
+            input: "/bin/echo __LOGIN_READY__\n",
+            label: "nvme: bootstrap shell with deterministic ready marker",
+        },
+        SmokeStep::Wait {
+            pattern: "__LOGIN_READY__",
+            timeout_secs: 30,
+            label: "nvme: login ready marker",
+        },
+    ]
+}
+
+fn nvme_rw_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = nvme_boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/ext2-coherence-smoke\n",
+        label: "run ext2 write+read-back over nvme.block",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "EXT2_COHERENCE:PASS",
+        fail_prefixes: &["EXT2_COHERENCE:FAIL"],
+        timeout_secs: 180,
+        label: "guest/nvme-rw: 200 KiB write + fresh-process read-back over nvme.block",
+        exit_code_on_fail: 1,
+    });
+    steps
+}
+
+/// Phase 106 B.3 — the ring-3 NVMe WRITE path proof: boot with the real ext2
+/// rootfs routed to a QEMU `nvme` controller (so `/` is `nvme.block`), log in,
+/// and run `ext2-coherence-smoke` so a 200 KiB file write + fresh-process
+/// read-back round-trips `blk::remote::write_sectors` → `do_write_ipc` → the
+/// ring-3 `nvme_driver` `handle_write`. Always-on analog of `ahci-rw-smoke`
+/// (default smoke only exercises in-kernel virtio-blk). SKIP-with-reason when
+/// the musl cross-compiler is absent (the C self-test is a 0-byte placeholder).
+fn cmd_nvme_rw_smoke(args: &SmokeBootArgs) {
+    let require_pass = std::env::var("M3OS_NVME_RW_REQUIRE_PASS")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let skip = |reason: &str| {
+        if require_pass {
+            eprintln!(
+                "nvme-rw-smoke: FAIL — M3OS_NVME_RW_REQUIRE_PASS=1 but the gate \
+                 could not run: {reason}"
+            );
+            std::process::exit(1);
+        }
+        println!("nvme-rw-smoke: SKIP — {reason}");
+    };
+    if find_musl_cc().is_none() {
+        skip(
+            "musl cross-compiler not found, so ext2-coherence-smoke is not built \
+             (install musl-tools on Debian/Ubuntu or musl-gcc-cross-bin on Arch)",
+        );
+        return;
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let coh = workspace_root().join("target/generated-initrd/ext2-coherence-smoke");
+    if !std::fs::metadata(&coh)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
+    {
+        skip(&format!(
+            "staged ext2-coherence-smoke is missing or empty at {}",
+            coh.display()
+        ));
+        return;
+    }
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args = qemu_args_with_devices(
+        &uefi_image,
+        &ovmf,
+        display_mode,
+        DeviceSet {
+            nvme_root: true,
+            ..DeviceSet::default()
+        },
+    );
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+
+    let steps = nvme_rw_smoke_steps();
+    println!(
+        "nvme-rw-smoke: launching QEMU with the ext2 rootfs on a QEMU nvme \
+         controller (root over nvme.block; ext2 200 KiB write + read-back, timeout {}s)",
+        args.timeout_secs
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "nvme-rw-smoke: serial script PASSED ({} steps in {elapsed}s) — \
+                 ext2 200 KiB write + fresh-process read-back round-tripped over nvme.block",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("nvme-rw-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn nvme_persist_write_steps() -> Vec<SmokeStep> {
+    let mut steps = nvme_boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "echo NVME_PERSIST_MARKER_OK > /root/persist-marker.txt\n",
+        label: "write marker file to the ext2 root over nvme.block",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "shell prompt after marker write",
+    });
+    steps.push(SmokeStep::Send {
+        input: "cat /root/persist-marker.txt\n",
+        label: "read the marker back in boot 1 (confirms the write landed)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "NVME_PERSIST_MARKER_OK",
+        timeout_secs: 15,
+        label: "boot-1 in-boot read-back of the marker",
+    });
+    steps.push(SmokeStep::Sleep { millis: 8000 });
+    steps
+}
+
+fn nvme_persist_verify_steps() -> Vec<SmokeStep> {
+    let mut steps = nvme_boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "cat /root/persist-marker.txt\n",
+        label: "read the marker after reboot (off the same nvme.block disk)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "NVME_PERSIST_MARKER_OK",
+        timeout_secs: 30,
+        label: "guest/nvme-persist: marker survived the reboot + fresh ext2 remount",
+    });
+    steps
+}
+
+/// Phase 106 B.4 — the reboot-persistence proof over NVMe: a two-boot gate
+/// against the SAME nvme-routed ext2 disk. Boot 1 writes a marker to `/` and
+/// idles past one periodic write-back flush (draining deferred ext2 metadata
+/// and issuing `BLK_FLUSH` over `nvme.block`); boot 2 re-mounts ext2 fresh and
+/// re-reads it. Also asserts boot 1 logged no `[blk] remote block flush failed`.
+/// Always-on analog of `ahci-persist-smoke` (echo/cat only — no musl).
+fn cmd_nvme_persist_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let parent = uefi_image.parent().unwrap().to_path_buf();
+    let disk_img = parent.join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(&parent, false, false, false, false, false, false);
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let make_qemu_args = || {
+        let mut a = qemu_args_with_devices(
+            &uefi_image,
+            &ovmf,
+            display_mode,
+            DeviceSet {
+                nvme_root: true,
+                ..DeviceSet::default()
+            },
+        );
+        for arg in a.iter_mut() {
+            if arg.starts_with("user,id=net0,hostfwd=") {
+                *arg = "user,id=net0".to_string();
+            }
+        }
+        a
+    };
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+
+    let boot1_serial = parent.join("nvme-persist-boot1-serial.log");
+    // SAFETY: single-threaded here (no serial-reader thread yet); removed before boot 2.
+    unsafe {
+        std::env::set_var("M3OS_SMOKE_SERIAL_DUMP", &boot1_serial);
+    }
+    println!(
+        "nvme-persist-smoke: boot 1 — writing marker to the ext2 root over nvme.block \
+         (timeout {}s)",
+        args.timeout_secs
+    );
+    let write_steps = nvme_persist_write_steps();
+    let mut child1 = Command::new("qemu-system-x86_64")
+        .args(make_qemu_args())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU (boot 1)");
+    let r1 = run_smoke_script(&mut child1, &write_steps, global_timeout);
+    let _ = child1.kill();
+    let _ = child1.wait();
+    // SAFETY: same single-threaded teardown window as the set above.
+    unsafe {
+        std::env::remove_var("M3OS_SMOKE_SERIAL_DUMP");
+    }
+    if let Err(msg) = r1 {
+        eprintln!("nvme-persist-smoke: FAILED (boot 1 — marker write)\n{msg}");
+        std::process::exit(1);
+    }
+
+    let boot1_log = std::fs::read_to_string(&boot1_serial).unwrap_or_default();
+    if boot1_log.contains("remote block flush failed") {
+        eprintln!(
+            "nvme-persist-smoke: FAILED — kernel logged '[blk] remote block flush failed' \
+             during boot 1 (BLK_FLUSH did not reach the ring-3 nvme_driver's flush arm)"
+        );
+        std::process::exit(1);
+    }
+
+    println!(
+        "nvme-persist-smoke: boot 2 — verifying the marker survived the reboot \
+         (same disk, fresh ext2 mount)"
+    );
+    let verify_steps = nvme_persist_verify_steps();
+    let mut child2 = Command::new("qemu-system-x86_64")
+        .args(make_qemu_args())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU (boot 2)");
+    let start = std::time::Instant::now();
+    match run_smoke_script(&mut child2, &verify_steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            let _ = child2.kill();
+            let _ = child2.wait();
+            println!(
+                "nvme-persist-smoke: PASSED — marker written over nvme.block in boot 1 \
+                 survived a reboot + fresh ext2 remount in boot 2 ({elapsed}s), and no \
+                 remote block flush failure was logged"
+            );
+        }
+        Err(msg) => {
+            let _ = child2.kill();
+            let _ = child2.wait();
+            eprintln!(
+                "nvme-persist-smoke: FAILED (boot 2 — marker did not survive the reboot)\n{msg}"
             );
             std::process::exit(1);
         }
@@ -33384,6 +33791,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 memory_mib: None,
                 xhci: false,
                 ahci: false,
+                nvme_root: false,
                 dual_xhci: false,
                 usb_passthrough: None,
             },
@@ -33426,6 +33834,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 memory_mib: None,
                 xhci: false,
                 ahci: false,
+                nvme_root: false,
                 dual_xhci: false,
                 usb_passthrough: None,
             },
@@ -33465,6 +33874,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             memory_mib: None,
             xhci: false,
             ahci: false,
+            nvme_root: false,
             dual_xhci: false,
             usb_passthrough: None,
         },
@@ -33501,6 +33911,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 memory_mib: None,
                 xhci: false,
                 ahci: false,
+                nvme_root: false,
                 dual_xhci: false,
                 usb_passthrough: None,
             },
@@ -37075,6 +37486,7 @@ mod tests {
                 memory_mib: Some(4096),
                 xhci: false,
                 ahci: false,
+                nvme_root: false,
                 dual_xhci: false,
                 usb_passthrough: None,
             },
@@ -37137,6 +37549,7 @@ mod tests {
                 memory_mib: None,
                 xhci: false,
                 ahci: false,
+                nvme_root: false,
                 dual_xhci: false,
                 usb_passthrough: None,
             },
@@ -37173,6 +37586,7 @@ mod tests {
                 memory_mib: None,
                 xhci: false,
                 ahci: false,
+                nvme_root: false,
                 dual_xhci: false,
                 usb_passthrough: None,
             },
@@ -37273,6 +37687,88 @@ mod tests {
         fs::remove_dir_all(&temp_root).ok();
     }
 
+    /// Phase 106 B.2 — `nvme_root` routes the REAL rootfs behind a QEMU
+    /// `nvme` controller (`if=none,id=nvmeroot0` + `nvme,drive=nvmeroot0`),
+    /// off virtio-blk, and does NOT emit the AHCI chain.
+    #[test]
+    fn qemu_args_with_nvme_root_routes_rootfs_to_nvme() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = std::env::temp_dir().join(format!("m3os-xtask-nvmeroot-{unique}"));
+        fs::create_dir_all(&temp_root).unwrap();
+        let uefi = temp_root.join("boot-uefi-m3os.img");
+        fs::write(&uefi, b"").unwrap();
+        fs::write(temp_root.join("disk.img"), b"").unwrap();
+
+        let args = qemu_args_with_devices_resolved(
+            &uefi,
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+            DeviceSet {
+                nvme_root: true,
+                ..Default::default()
+            },
+            None,
+        );
+
+        assert!(
+            args.iter()
+                .any(|a| a.contains("if=none,id=nvmeroot0,format=raw")),
+            "expected the NVMe backing drive with if=none,id=nvmeroot0"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-device", "nvme,serial=deadbeef,drive=nvmeroot0"]),
+            "expected -device nvme,serial=deadbeef,drive=nvmeroot0"
+        );
+        // The rootfs moves off virtio-blk and does NOT also get the AHCI chain
+        // or a scratch nvme0 drive.
+        assert!(
+            !args.iter().any(|a| a.contains("if=virtio")),
+            "the rootfs must move off virtio-blk when routed to NVMe"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("ahcidisk0")),
+            "nvme_root must not emit the AHCI chain"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("id=nvme0")),
+            "nvme_root uses the real rootfs, not the scratch nvme0 drive"
+        );
+
+        fs::remove_dir_all(&temp_root).ok();
+    }
+
+    /// The `nvme-rw`/`nvme-persist` gates must key on the NVMe root-mount
+    /// sentinel, not silently degrade. Guards the boot-log assertion.
+    #[test]
+    fn nvme_gates_assert_root_mounted_over_nvme_block() {
+        for (name, patterns) in [
+            ("nvme-rw", nvme_rw_smoke_steps()),
+            ("nvme-persist-write", nvme_persist_write_steps()),
+            ("nvme-persist-verify", nvme_persist_verify_steps()),
+        ] {
+            let waits: Vec<&str> = patterns
+                .iter()
+                .filter_map(|s| match s {
+                    SmokeStep::Wait { pattern, .. } => Some(*pattern),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                waits
+                    .iter()
+                    .any(|p| *p == "init: / mounted (ext2 via ring-3 nvme.block)"),
+                "{name} must assert the ext2 root mounted via ring-3 nvme.block, got: {waits:?}"
+            );
+        }
+    }
+
     /// The `ahci-root-smoke` gate must assert the full root-over-AHCI proof
     /// chain, not a weaker subset. If a future edit drops the load-bearing
     /// mount marker or the boot-completion proof, this test fails — guarding
@@ -37336,6 +37832,7 @@ mod tests {
                 memory_mib: None,
                 xhci: false,
                 ahci: false,
+                nvme_root: false,
                 dual_xhci: false,
                 usb_passthrough: None,
             },
@@ -37384,6 +37881,7 @@ mod tests {
                 memory_mib: None,
                 xhci: false,
                 ahci: false,
+                nvme_root: false,
                 dual_xhci: false,
                 usb_passthrough: None,
             },
@@ -37444,6 +37942,7 @@ mod tests {
                 memory_mib: None,
                 xhci: false,
                 ahci: false,
+                nvme_root: false,
                 dual_xhci: false,
                 usb_passthrough: None,
             },
@@ -37509,6 +38008,7 @@ mod tests {
                 memory_mib: None,
                 xhci: false,
                 ahci: false,
+                nvme_root: false,
                 dual_xhci: false,
                 usb_passthrough: None,
             },
@@ -37547,6 +38047,7 @@ mod tests {
                 memory_mib: None,
                 xhci: false,
                 ahci: false,
+                nvme_root: false,
                 dual_xhci: false,
                 usb_passthrough: None,
             },
@@ -37862,6 +38363,7 @@ mod tests {
             memory_mib: None,
             xhci: false,
             ahci: false,
+            nvme_root: false,
             dual_xhci: false,
             usb_passthrough: None,
         });
@@ -37876,6 +38378,7 @@ mod tests {
             memory_mib: None,
             xhci: false,
             ahci: false,
+            nvme_root: false,
             dual_xhci: false,
             usb_passthrough: None,
         });

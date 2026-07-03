@@ -432,6 +432,37 @@ the on-disk `/etc/services.d`. The gate logs in over serial and proves
 writability with a file write + read-back through the ring-3
 usb-storage path.
 
+## nvme-rw-smoke
+
+**Env var:** `M3OS_NVME_REGRESSION=1`
+
+The NVMe analog of `ahci-rw-smoke`. Boots with the **real** ext2 rootfs
+routed behind a QEMU `nvme` controller (`DeviceSet { nvme_root: true }`
+→ `-drive if=none,id=nvmeroot0` + `-device nvme,drive=nvmeroot0`), so
+`/` is served by the ring-3 `nvme_driver` over `nvme.block` — init's
+Stage-1 NVMe arm logs `init: / mounted (ext2 via ring-3 nvme.block)`.
+After login, `ext2-coherence-smoke` writes a 200 KiB file and a fresh
+process byte-verifies the read-back, exercising `blk::remote::
+write_sectors` → `do_write_ipc` → the ring-3 `nvme_driver` `handle_write`.
+Always-on in CI (default smoke only exercises in-kernel virtio-blk);
+SKIP-with-reason without a musl cross-compiler (the C self-test is then
+a 0-byte placeholder). Note: the driver's bring-up LBA-0 self-test is
+now **non-destructive** (save + restore) so it no longer clobbers the
+MBR of a real rootfs.
+
+## nvme-persist-smoke
+
+**Env var:** `M3OS_NVME_REGRESSION=1`
+
+The NVMe analog of `ahci-persist-smoke`: a two-boot reboot-persistence
+gate against the SAME nvme-routed ext2 disk. Boot 1 writes a marker to
+`/` over `nvme.block` and idles past one periodic write-back flush
+(draining deferred ext2 metadata and issuing `BLK_FLUSH`); QEMU is torn
+down; boot 2 re-mounts ext2 fresh and re-reads the marker. Asserts boot
+1 logged no `[blk] remote block flush failed`. Always-on (echo/cat only
+— no musl). The per-request DMA-alloc kernel log was demoted INFO →
+DEBUG so the NVMe I/O path no longer floods the serial console.
+
 ## power-smoke
 
 **Env var:** `M3OS_POWER_REGRESSION=1`

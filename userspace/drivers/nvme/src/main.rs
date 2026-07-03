@@ -636,9 +636,14 @@ const SELF_TEST_SENTINEL: u8 = 0xA5;
 /// - Uses [`handle_write`] and [`handle_read`] directly (the same
 ///   paths the IPC server loop exercises) to exercise the full DMA /
 ///   PRP / doorbell / completion chain in-band.
-/// - LBA 0 is used deliberately: it is always present and the self-test
-///   pattern is intentionally overwritten immediately afterward (this is
-///   a raw smoke, not a data-preservation test).
+/// - LBA 0 is used deliberately: it is always present. **Non-destructive
+///   (Phase 106 B.1):** the original LBA-0 sector is read and saved
+///   before the sentinel write and restored afterward, so routing the
+///   real ext2 rootfs behind NVMe (`nvme-rw`/`nvme-persist`, an
+///   `nvme_root` boot) no longer clobbers the MBR partition table.
+///   Earlier the driver only ever backed a blank scratch drive, so the
+///   destructive write was harmless; the root path makes preservation
+///   mandatory.
 /// - `NVME_SMOKE:rw:FAIL` is emitted on any sub-step failure so the
 ///   smoke harness never silently misses a broken round-trip.
 #[cfg(not(test))]
@@ -650,6 +655,30 @@ fn nvme_self_test(
     sector_bytes: u32,
 ) {
     use kernel_core::driver_ipc::block::{BLK_READ, BLK_WRITE, BlkRequestHeader, BlockDriverError};
+
+    // Save the original LBA-0 sector so the self-test is non-destructive
+    // (it may be the boot disk's MBR / partition table).
+    let preread_hdr = BlkRequestHeader {
+        kind: BLK_READ,
+        cmd_id: 0xF4B0,
+        lba: 0,
+        sector_count: 1,
+        flags: 0,
+    };
+    let (preread_reply, original) =
+        handle_read(mmio, queue, device, nsid, sector_bytes, &preread_hdr);
+    let original: Option<alloc::vec::Vec<u8>> =
+        if preread_reply.status == BlockDriverError::Ok && original.len() >= 512 {
+            Some(original[..512].to_vec())
+        } else {
+            // Could not read the original — skip the destructive write
+            // rather than risk corrupting a sector we can't restore.
+            syscall_lib::write_str(STDOUT_FILENO, "NVME_SMOKE:rw:SKIP preread-error\n");
+            None
+        };
+    if original.is_none() {
+        return;
+    }
 
     // Build a 512-byte write buffer filled with the sentinel pattern.
     let mut write_data = alloc::vec![SELF_TEST_SENTINEL; 512];
@@ -695,7 +724,27 @@ fn nvme_self_test(
     }
 
     // Verify every returned byte matches the sentinel.
-    if bulk.len() < 512 || bulk[..512].iter().any(|&b| b != SELF_TEST_SENTINEL) {
+    let pattern_ok = bulk.len() >= 512 && bulk[..512].iter().all(|&b| b == SELF_TEST_SENTINEL);
+
+    // Restore the original sector regardless of the verify outcome, so a
+    // real boot disk's MBR survives the self-test.
+    if let Some(orig) = original {
+        let restore_hdr = BlkRequestHeader {
+            kind: BLK_WRITE,
+            cmd_id: 0xF4B3,
+            lba: 0,
+            sector_count: 1,
+            flags: 0,
+        };
+        let restore_reply =
+            handle_write(mmio, queue, device, nsid, sector_bytes, &restore_hdr, &orig);
+        if restore_reply.status != BlockDriverError::Ok {
+            syscall_lib::write_str(STDOUT_FILENO, "NVME_SMOKE:rw:FAIL restore-error\n");
+            return;
+        }
+    }
+
+    if !pattern_ok {
         syscall_lib::write_str(STDOUT_FILENO, "NVME_SMOKE:rw:FAIL pattern-mismatch\n");
         return;
     }

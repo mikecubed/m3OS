@@ -84,9 +84,9 @@
 **Why it matters:** The kernel root slot already prefers `nvme.block` (`is_registered`), and the Phase 55b driver registers it — but init never forks `/drivers/nvme`, so an NVMe-rooted boot can't bring the driver up. This mirrors the Phase 82 AHCI fork-and-retry exactly.
 
 **Acceptance:**
-- [ ] On root-mount failure, init forks `/drivers/nvme` and retries `mount("/dev/blk0", "/", "ext2")` within the bounded loop, alongside the AHCI/USB arms.
-- [ ] On success, init logs `init: / mounted (ext2 via ring-3 nvme.block)`.
-- [ ] `execve` failure of `/drivers/nvme` logs the negative errno (matching the existing AHCI diagnostic) and falls through, not hangs.
+- [x] On root-mount failure, init's `bootstrap_ring3_root_disk` forks `/drivers/nvme` as **Stage 1** (before AHCI/USB — matching the kernel root slot's `nvme > ahci > usb` priority) and retries the root mount within the bounded 15×100 ms loop; the driver exits cleanly with no controller, so it's a no-op on non-NVMe roots.
+- [x] On success, init logs `init: / mounted (ext2 via ring-3 nvme.block)` (the `nvme-rw`/`nvme-persist` boot-log sentinel).
+- [x] `execve` failure of `/drivers/nvme` falls through to the AHCI/USB stages via the shared `fork_driver` diagnostic (no hang).
 
 ### B.2 — Route the real rootfs to the QEMU NVMe controller
 
@@ -95,8 +95,8 @@
 **Why it matters:** `--device nvme` attaches a *scratch* second drive (`target/nvme.img`) today; the `nvme-rw`/`nvme-persist` gates need the **real ext2 rootfs** placed behind the NVMe controller, exactly as `devices.ahci` routes the rootfs to `ich9-ahci`.
 
 **Acceptance:**
-- [ ] A device-flag (e.g. `nvme-root`) routes the real `disk.img` rootfs behind the QEMU `nvme` controller (the `-drive if=none,id=…` + `-device nvme,drive=…` chain), not as a scratch second drive.
-- [ ] The default virtio-blk and the `--device ahci` rootfs routings are unchanged (a unit test asserts the emitted QEMU args for each routing).
+- [x] `DeviceSet.nvme_root` routes the real `disk.img` rootfs behind the QEMU `nvme` controller (`-drive if=none,id=nvmeroot0` + `-device nvme,serial=deadbeef,drive=nvmeroot0`), distinct from the scratch `devices.nvme` drive.
+- [x] The default virtio-blk and `--device ahci` routings are unchanged; `qemu_args_with_nvme_root_routes_rootfs_to_nvme` asserts the emitted args (nvmeroot0 drive + nvme device, no virtio/AHCI/scratch-nvme0).
 
 ### B.3 — `nvme-rw` gate
 
@@ -105,9 +105,9 @@
 **Why it matters:** Proves the ring-3 NVMe **write** path: a payload write that round-trips `blk::remote::write_sectors` → `do_write_ipc` → the ring-3 `nvme_driver` `handle_write`, the NVMe analog of the always-on `ahci-rw-smoke`.
 
 **Acceptance:**
-- [ ] Boots the NVMe-rooted image, logs in, runs an ext2-coherence write of ≥200 KiB to a file on `/`, and a fresh process byte-verifies the read-back (a truncated-write regression fails the gate).
-- [ ] Asserts `init: / mounted (ext2 via ring-3 nvme.block)` in the boot log.
-- [ ] Always-on in CI (mirrors `ahci-rw-smoke`, since default smoke only exercises in-kernel virtio-blk); skip-with-reason without musl if it needs it.
+- [x] `nvme-rw-smoke` boots the NVMe-rooted image, logs in, runs the ext2-coherence 200 KiB write + fresh-process byte-verify over `nvme.block`. **PASSED 22s.** (Uncovered + fixed a real bug: the driver's bring-up self-test wrote LBA 0 destructively, clobbering the rootfs MBR — now save-and-restore.)
+- [x] Asserts `init: / mounted (ext2 via ring-3 nvme.block)` (guarded by the `nvme_gates_assert_root_mounted_over_nvme_block` unit test).
+- [x] Always-on in CI (mirrors `ahci-rw-smoke`); SKIP-with-reason without a musl cross-compiler.
 
 ### B.4 — `nvme-persist` gate
 
@@ -116,9 +116,9 @@
 **Why it matters:** The reboot-persistence proof — a durable on-disk write must survive a re-mount, exercising the `BLK_FLUSH` IPC path on NVMe.
 
 **Acceptance:**
-- [ ] Two-boot gate against the same NVMe disk: boot 1 writes a marker to `/`, idles past one periodic write-back flush, QEMU is torn down; boot 2 re-mounts ext2 fresh and re-reads the marker.
-- [ ] Asserts boot 1 logged **no** `[blk] remote block flush failed`.
-- [ ] Always-on in CI (mirrors `ahci-persist-smoke`).
+- [x] `nvme-persist-smoke` — two-boot gate against the same NVMe disk (marker write + flush drain, teardown, fresh remount + re-read). **PASSED 10s.**
+- [x] Asserts boot 1 logged **no** `[blk] remote block flush failed`.
+- [x] Always-on in CI (mirrors `ahci-persist-smoke`). *(Also demoted the per-request `device_host.dma_alloc` kernel log INFO→DEBUG — the NVMe I/O path allocs a landing buffer per request and flooded the serial ~14k lines/boot, starving prompt matching.)*
 
 ### B.5 — `M3OS_NVME_REGRESSION` gate documentation
 
@@ -130,8 +130,8 @@
 **Why it matters:** Keeps the new gates discoverable and the roadmap accurate per the documentation policy; `nvme-rw`/`nvme-persist` parallel the always-on AHCI gates.
 
 **Acceptance:**
-- [ ] `M3OS_NVME_REGRESSION=1` row added to the `AGENTS.md` gate table covering `nvme-rw`/`nvme-persist` (+`usb-root-smoke`/`nvme-install-smoke`), with the same skip-vs-pass wording as the `M3OS_AHCI_REGRESSION` row.
-- [ ] `docs/roadmap/README.md` has the Phase 106 table row and a mermaid node depending on Phases 82/87/92a/55b.
+- [x] `M3OS_NVME_REGRESSION=1` row added to the `AGENTS.md` gate table covering `nvme-rw`/`nvme-persist` + a `regression-gates.md` section each.
+- [x] `docs/roadmap/README.md` Phase 106 row updated for Track B (the mermaid node + phase dependencies landed with the phase charter).
 
 ---
 
