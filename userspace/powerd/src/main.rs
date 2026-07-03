@@ -76,7 +76,7 @@ use kernel_core::power::control::{
 use kernel_core::power::governor::{Governor, GovernorMode, PERF_MAX, PERF_MIN};
 use kernel_core::power::syscalls::{
     CPUFREQ_MECH_HWP, CPUFREQ_STATUS_WIRE_LEN, CpufreqStatusWire, SYS_POWER_CPUFREQ_STATUS,
-    SYS_POWER_SET_PERF,
+    SYS_POWER_ENTER_SLEEP, SYS_POWER_SET_PERF,
 };
 use kernel_core::power::thermal::{
     ThermalState, TripPoints, classify, deci_celsius_from_decikelvin, decode_temp_dk,
@@ -514,6 +514,7 @@ fn program_main(_args: &[&str]) -> i32 {
     let mut last_announced_target: Option<u8> = None;
     let mut last_thermal = ThermalWire::NoZones;
     let mut poweroff_started = false;
+    let mut last_brightness: Option<u8> = None;
 
     announce(&format!(
         "POWERD:ready battery={} ac={} zones={} mech={} backlight={} sleep={}\n",
@@ -608,21 +609,72 @@ fn program_main(_args: &[&str]) -> i32 {
             syscall_lib::ipc_store_reply_bulk(&encoded);
             syscall_lib::ipc_reply(reply_cap, 0, encoded.len() as u64);
         } else if rc == u64::from(POWER_SUSPEND) {
-            // Track F: **fail closed**. The F.3 S3 entry/resume mechanism
-            // (FACS waking vector + CPU re-establish + F.2 driver quiesce)
-            // is not implemented; writing SLP_TYP without a resume path
-            // never comes back. Refusing beats half-suspending — the F.2
-            // fail-closed acceptance arm.
-            announce(&format!(
-                "POWERD:suspend rejected reason=resume-path-unimplemented firmware={}\n",
-                sleep_str(devices.sleep_bits)
-            ));
-            syscall_lib::ipc_reply(reply_cap, u64::MAX, devices.sleep_bits as u64);
+            // Track F.3: attempt a real S3. The kernel enter-sleep path
+            // returns -ENOSYS when \_S3/FACS were never registered (S3
+            // disabled or hardware-reduced firmware) — the fail-closed
+            // posture survives on exactly the platforms that need it.
+            if let Some(acpi) = devices.acpi {
+                // \_PTS(3): prepare-to-sleep (optional method — a failed
+                // evaluation on firmware without it is not an error).
+                let _ = eval_arg(acpi, "\\_PTS", 3);
+            }
+            announce("POWERD:suspending\n");
+            // SAFETY: argument-less m3OS-native syscall (root-gated).
+            let rc2 = unsafe { syscall_lib::syscall1(SYS_POWER_ENTER_SLEEP, 0) } as i64;
+            if rc2 == 0 {
+                // We are on the other side of a suspend/resume cycle.
+                //
+                // Drain the wake-side event burst BEFORE calling acpid:
+                // the wake itself sets PWRBTN_STS, and acpid is blocked
+                // pushing that event at our endpoint — it cannot serve
+                // a \_WAK call until the push is received (found live:
+                // a clean cross-daemon deadlock, acpid retrying its push
+                // while powerd waited on acpid's reply). Wake-window
+                // button events are artifacts of the wake, NOT poweroff
+                // requests — announce and drop.
+                for _ in 0..8 {
+                    let deadline = monotonic_now_ns().saturating_add(150_000_000);
+                    let rc3 = syscall_lib::ipc_recv_msg_timeout(ep, &mut msg, &mut bulk, deadline);
+                    if rc3 == NEG_ETIMEDOUT || rc3 == u64::MAX {
+                        break;
+                    }
+                    if rc3 == ACPI_EVENT {
+                        let code = msg.data[0];
+                        let len = bulk.iter().position(|&b| b == 0).unwrap_or(bulk.len());
+                        let path = core::str::from_utf8(&bulk[..len]).unwrap_or("<non-utf8>");
+                        announce(&format!(
+                            "POWERD:wake-event path={path} code={code:#x} (wake artifact, dropped)\n"
+                        ));
+                    } else if let Some(rc) = msg.reply_cap_handle() {
+                        // A queued query from before/during the suspend —
+                        // refuse it cleanly rather than servicing out of
+                        // order (the caller retries).
+                        syscall_lib::ipc_reply(rc, u64::MAX, 0);
+                    }
+                }
+                if let Some(acpi) = devices.acpi {
+                    let _ = eval_arg(acpi, "\\_WAK", 3);
+                }
+                // B.3 resume hook: re-apply the last-set brightness (the
+                // panel controller lost it with the platform reset).
+                if let Some(pct) = last_brightness {
+                    let _ = devices.set_brightness(pct);
+                }
+                announce("POWERD:resume\n");
+                syscall_lib::ipc_reply(reply_cap, 0, 0);
+            } else {
+                announce(&format!(
+                    "POWERD:suspend rejected rc={rc2} firmware={}\n",
+                    sleep_str(devices.sleep_bits)
+                ));
+                syscall_lib::ipc_reply(reply_cap, u64::MAX, devices.sleep_bits as u64);
+            }
         } else if rc == u64::from(POWER_SET_BRIGHTNESS) {
             // Track B: pct in data0 → nearest _BCL level → _BCM. The
             // last-set level re-applies on resume with Track F.
             match devices.set_brightness(msg.data[0].min(100) as u8) {
                 Some(applied) => {
+                    last_brightness = Some(applied);
                     announce(&format!("POWERD:backlight set={applied}%\n"));
                     syscall_lib::ipc_reply(reply_cap, 0, applied as u64);
                 }

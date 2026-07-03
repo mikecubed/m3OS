@@ -609,7 +609,7 @@ fn power_status_format_renders_vm_and_battery_cases() {
     assert!(rendered.contains("thermal: normal, 42.1 C"));
     assert!(rendered.contains("governor: conservative (mech hwp, target 96)"));
     assert!(rendered.contains("backlight: 75%"));
-    assert!(rendered.contains("sleep: S3+S4 (firmware; resume path pending)"));
+    assert!(rendered.contains("sleep: S3+S4 (firmware-declared)"));
     assert!(format_battery(&laptop).contains("battery: 50% discharging"));
 
     // A passive-cooling laptop just under boiling renders its state.

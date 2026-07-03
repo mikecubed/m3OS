@@ -21,6 +21,14 @@ pub const SYS_POWER_SET_PERF: u64 = 0x1160;
 /// written, or a negative errno).
 pub const SYS_POWER_CPUFREQ_STATUS: u64 = 0x1161;
 
+/// Enter ACPI S3 (suspend-to-RAM) and return after resume:
+/// `sys_power_enter_sleep() -> isize` (0 = resumed successfully;
+/// `-ENOSYS` when the platform never registered `\_S3` / has no FACS;
+/// other negative errno on a failed entry — always fail-closed to a
+/// live system). Root-only. The caller (`powerd`) evaluates `\_PTS(3)`
+/// before and `\_WAK(3)` after, per the Phase 101 ring-3 AML split.
+pub const SYS_POWER_ENTER_SLEEP: u64 = 0x1162;
+
 /// [`CpufreqStatusWire::mechanism`] values.
 pub const CPUFREQ_MECH_NONE: u8 = 0;
 pub const CPUFREQ_MECH_HWP: u8 = 1;
@@ -102,6 +110,7 @@ mod tests {
         // ABI pins: renumbering breaks every compiled userspace binary.
         assert_eq!(SYS_POWER_SET_PERF, 0x1160);
         assert_eq!(SYS_POWER_CPUFREQ_STATUS, 0x1161);
+        assert_eq!(SYS_POWER_ENTER_SLEEP, 0x1162);
         assert_eq!(CPUFREQ_STATUS_WIRE_LEN, 28);
     }
 

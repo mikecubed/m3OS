@@ -998,3 +998,72 @@ fn probe(handle: pci::PciDeviceHandle) -> DriverProbeResult {
 fn align_up(val: usize, alignment: usize) -> usize {
     (val + alignment - 1) & !(alignment - 1)
 }
+
+/// Phase 103 F.3 — re-initialize the NIC after an S3 resume (the
+/// `virtio_blk::resume_after_s3` shape): status + feature handshake,
+/// **fresh** RX/TX rings (old `DmaBuffer`s drop; nothing was in flight
+/// — the suspend path quiesced first), MSI-X re-arm with the boot
+/// vector + queue-vector re-point, then a full RX repost.
+pub fn resume_after_s3() {
+    with_driver(|opt| {
+        let Some(d) = opt.as_mut() else {
+            return;
+        };
+        let io_base = d.io_base;
+        let cmd = d.pci.read_config_u16(0x04);
+        if cmd & 0x05 != 0x05 {
+            d.pci.write_config_u16(0x04, cmd | 0x05);
+        }
+        // SAFETY: same port I/O sequence as `init_with_handle`, against
+        // the BAR the firmware boot script restored to its boot address.
+        unsafe {
+            Port::<u8>::new(io_base + VIRTIO_DEVICE_STATUS).write(0);
+            Port::<u8>::new(io_base + VIRTIO_DEVICE_STATUS).write(VIRTIO_STATUS_ACKNOWLEDGE);
+            Port::<u8>::new(io_base + VIRTIO_DEVICE_STATUS)
+                .write(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
+            let device_features = Port::<u32>::new(io_base + VIRTIO_DEVICE_FEATURES).read();
+            let our_features = device_features & (VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS);
+            Port::<u32>::new(io_base + VIRTIO_DRIVER_FEATURES).write(our_features);
+            let status = Port::<u8>::new(io_base + VIRTIO_DEVICE_STATUS).read();
+            Port::<u8>::new(io_base + VIRTIO_DEVICE_STATUS)
+                .write(status | VIRTIO_STATUS_FEATURES_OK);
+        }
+        let Some(rx) = Virtqueue::init(&d.pci, io_base, 0) else {
+            log::error!("[virtio-net] S3 resume: RX queue re-init failed");
+            return;
+        };
+        let Some(tx) = Virtqueue::init(&d.pci, io_base, 1) else {
+            log::error!("[virtio-net] S3 resume: TX queue re-init failed");
+            return;
+        };
+        d.rx_queue = rx;
+        d.tx_queue = tx;
+        // MSI-X re-arm + queue-vector re-point (the init quirk: without
+        // this write no MSI ever fires and the net task parks forever).
+        if let Some(irq) = &d.irq
+            && let Some(kind) = irq.msi_kind()
+        {
+            if !pci::reprogram_msi_after_resume(d.pci.device(), irq.vector(), kind) {
+                log::error!("[virtio-net] S3 resume: MSI re-arm failed");
+            }
+            if kind == pci::MsiKind::MsiX {
+                unsafe {
+                    for queue_index in [0u16, 1u16] {
+                        Port::<u16>::new(io_base + VIRTIO_QUEUE_SELECT).write(queue_index);
+                        Port::<u16>::new(io_base + VIRTIO_MSI_QUEUE_VECTOR).write(0);
+                    }
+                }
+            }
+        }
+        unsafe {
+            let status = Port::<u8>::new(io_base + VIRTIO_DEVICE_STATUS).read();
+            Port::<u8>::new(io_base + VIRTIO_DEVICE_STATUS).write(status | VIRTIO_STATUS_DRIVER_OK);
+        }
+        // Repost every RX buffer on the fresh ring.
+        let rx_count = d.rx_queue.queue_size;
+        for i in 0..rx_count {
+            d.rx_queue.post_recv_buffer(i);
+        }
+        log::info!("[virtio-net] re-initialized after S3 resume");
+    });
+}

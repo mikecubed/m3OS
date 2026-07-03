@@ -151,6 +151,12 @@ pub struct FadtInfo {
     pub gpe0_blk: u32,
     /// GPE0 block length in bytes (offset 92); status and enable halves.
     pub gpe0_blk_len: u8,
+    /// 32-bit physical FACS pointer (offset 36) — the firmware ACPI
+    /// control structure holding the S3 firmware waking vector.
+    pub firmware_ctrl: u32,
+    /// 64-bit physical FACS pointer (offset 132, tables ≥ ACPI 2.0);
+    /// preferred over `firmware_ctrl` when non-zero.
+    pub x_firmware_ctrl: u64,
 }
 
 impl FadtInfo {
@@ -160,6 +166,16 @@ impl FadtInfo {
             self.x_dsdt
         } else {
             self.dsdt as u64
+        }
+    }
+
+    /// The physical FACS address, preferring the 64-bit form; 0 = the
+    /// platform has no FACS (hardware-reduced ACPI — no S3 there).
+    pub fn facs_phys(&self) -> u64 {
+        if self.x_firmware_ctrl != 0 {
+            self.x_firmware_ctrl
+        } else {
+            self.firmware_ctrl as u64
         }
     }
 }
@@ -622,6 +638,8 @@ fn parse_fadt() {
         pm1_cnt_len: read_u8(89),
         gpe0_blk: read_u32(76),
         gpe0_blk_len: read_u8(92),
+        firmware_ctrl: read_u32(36),
+        x_firmware_ctrl: read_u64(132),
     };
     log::info!(
         "[acpi] FADT: DSDT {:#x}, SCI_INT {}, PM1a_EVT {:#x}/{}B, PM1a_CNT {:#x}, GPE0 {:#x}/{}B",

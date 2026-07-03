@@ -12,6 +12,7 @@ pub mod preempt_trap_frame;
 pub mod ps2;
 #[cfg(feature = "smep-smap-test")]
 pub mod smap_test;
+pub mod suspend;
 pub mod syscall;
 
 /// Initialize the GDT/TSS, IDT, and syscall gate.

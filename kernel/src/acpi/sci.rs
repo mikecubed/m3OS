@@ -124,3 +124,35 @@ pub fn sci_demux() -> bool {
 
     any
 }
+
+/// Phase 103 F.3 — restore the SCI plumbing after an S3 resume. The
+/// wake-side machine reset cleared the IOAPIC redirection entry
+/// `route_sci` installed at subscribe time (the resume path's
+/// `ioapic_init` re-writes only the standard ISA routes) and zeroed the
+/// PM1 enable register (acpid armed `PWRBTN_EN` at boot). Re-arm both
+/// when a subscriber exists so the power button keeps working after a
+/// suspend/resume cycle. GPE0 enables are NOT restored here — a
+/// documented residual until a hardware platform needs post-resume
+/// `Notify` events (QEMU's fixed power button is PM1-only).
+pub fn reroute_after_resume() {
+    if SCI_NOTIF.load(Ordering::Acquire) == 0xFF {
+        return;
+    }
+    let Some(fadt) = super::fadt_info() else {
+        return;
+    };
+    crate::arch::x86_64::apic::route_sci(
+        fadt.sci_int,
+        crate::arch::x86_64::interrupts::InterruptIndex::Sci as u8,
+    );
+    if fadt.pm1a_evt_blk != 0 {
+        // PWRBTN_EN is bit 8 of the PM1 enable register (ACPI §4.8.4.1).
+        let en_port = (fadt.pm1a_evt_blk + (fadt.pm1_evt_len as u32) / 2) as u16;
+        // SAFETY: FADT-resolved PM1a enable register, 16-bit per spec.
+        unsafe {
+            let cur: u16 = Port::<u16>::new(en_port).read();
+            Port::<u16>::new(en_port).write(cur | (1 << 8));
+        }
+    }
+    log::info!("[acpi] SCI re-routed + PWRBTN re-armed after S3 resume");
+}

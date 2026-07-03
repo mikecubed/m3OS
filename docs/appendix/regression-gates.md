@@ -386,6 +386,32 @@ client (`ACPI_SUB:event path=\FIXED.PWRBTN code=0x80`).
 
 **Env var:** `M3OS_PKG_NET_REGRESSION=1`
 
+## suspend-smoke
+
+**Env var:** `M3OS_SUSPEND_REGRESSION=1`
+
+Boots QEMU (default machine, S3 enabled) and drives the **full ACPI S3
+suspend-to-RAM round trip**: acpid registers `\_S3` SLP_TYP
+(`SYS_ACPI_REGISTER_S3`); `m3ctl power suspend` → powerd `\_PTS(3)` →
+`SYS_POWER_ENTER_SLEEP` → kernel quiesce (filesystem sync, cooperative
+AP park at the scheduler-loop boundary, virtio-blk in-flight drain +
+ring reset, PCI config snapshot) → FACS **X** waking vector at the
+trampoline page's 32-bit shim → `PM1a_CNT <- SLP_TYP|SLP_EN` → QEMU run
+state `suspended`. A QMP `system_wakeup` then re-enters through OVMF's
+S3 path: shim → long mode on the kernel CR3 → minimal register-state
+re-init (GDT with the TSS busy-bit cleared, IDT, GS bases, syscall
+MSRs, TSC monotonic rebase) → long-jump back into the suspended
+syscall → heavyweight re-init in task context (PIC/APIC, PCI config
+restore, SCI reroute + PWRBTN re-arm, virtio-blk/net device
+re-handshake against the retained rings, AP reboot via INIT-SIPI-SIPI)
+→ powerd drains the wake-side event burst (the wake sets `PWRBTN_STS`;
+those events are artifacts, not poweroff requests) → `\_WAK(3)` →
+`POWERD:resume` → `suspend: resumed`. Post-resume liveness: a fresh
+shell echo, a disk write/read through the re-initialized virtio-blk,
+and the power button still driving the D.3 poweroff chain to a
+**guest-initiated QEMU exit**. `power-smoke` is the complementary
+S3-disabled fail-closed lane.
+
 ## power-smoke
 
 **Env var:** `M3OS_POWER_REGRESSION=1`

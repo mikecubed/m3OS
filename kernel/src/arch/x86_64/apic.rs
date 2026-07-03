@@ -371,10 +371,30 @@ static BOOT_TSC: Once<u64> = Once::new();
 /// Invariant TSC ticks per millisecond, calibrated against PIT channel 2.
 static TSC_PER_MS: Once<u64> = Once::new();
 
-/// Return the TSC value at kernel boot (end of LAPIC calibration).
+/// Phase 103 F.3 — post-S3 override for [`boot_tsc`]. The wake-side
+/// machine reset restarts the TSC near zero; the resume path stores
+/// `rdtsc_now - elapsed_before_suspend` here so `now - boot_tsc()`
+/// (CLOCK_MONOTONIC / CLOCK_REALTIME) continues without a jump.
+/// 0 = never suspended (use the boot calibration value).
+static RESUME_BOOT_TSC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Return the TSC value at kernel boot (end of LAPIC calibration), or
+/// the post-S3 rebased value after a resume.
 #[inline]
 pub fn boot_tsc() -> u64 {
+    let rebased = RESUME_BOOT_TSC.load(core::sync::atomic::Ordering::Acquire);
+    if rebased != 0 {
+        return rebased;
+    }
     *BOOT_TSC.get().unwrap_or(&0)
+}
+
+/// Phase 103 F.3 — rebase the monotonic TSC origin after an S3 resume
+/// (wrapping arithmetic keeps `now.wrapping_sub(base)` correct even
+/// when the new base is "negative" modulo 2^64).
+pub fn rebase_boot_tsc(new_base: u64) {
+    // 0 is the "not rebased" sentinel — nudge by one tick if we ever hit it.
+    RESUME_BOOT_TSC.store(new_base.max(1), core::sync::atomic::Ordering::Release);
 }
 
 /// Return invariant TSC ticks per millisecond.

@@ -182,10 +182,11 @@ mod os_binary {
             print_str("\n");
             return 1;
         };
+        // On success this call BLOCKS across the whole suspend/resume
+        // cycle — powerd replies only after \_WAK(3) on the other side.
         let reply = syscall_lib::ipc_call(handle, u64::from(POWER_SUSPEND), 0);
         if reply == 0 {
-            // Reserved for the F.3 landing.
-            print_str("suspend: entering sleep\n");
+            print_str("suspend: resumed\n");
             return 0;
         }
         match query_power_status() {

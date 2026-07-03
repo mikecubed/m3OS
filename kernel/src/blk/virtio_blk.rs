@@ -1356,3 +1356,94 @@ mod tests {
         }
     }
 }
+
+/// Phase 103 F.3 — drain in-flight requests before an S3 entry. Called
+/// on the BSP with interrupts off after the APs are parked: the device
+/// is still live, so poll the used ring until every waiter completes
+/// (their tasks wake through the normal deferred path after resume),
+/// then reset the ring indices to the pristine state the device's
+/// wake-side reset will assume (a machine reset zeroes the device's
+/// internal avail/used counters — the RAM ring must agree or the device
+/// re-executes stale descriptors). Returns `false` if requests stayed
+/// stuck — the caller must abort the suspend (fail closed).
+pub fn quiesce_for_suspend() -> bool {
+    let mut guard = DRIVER.lock();
+    let Some(d) = guard.as_mut() else {
+        return true;
+    };
+    let mut spins = 0u64;
+    loop {
+        let _ = d.request_queue.drain_used();
+        if d.request_queue.waiters.iter().all(|w| w.is_none()) {
+            break;
+        }
+        core::hint::spin_loop();
+        spins += 1;
+        if spins > 2_000_000_000 {
+            log::warn!("[virtio-blk] quiesce: in-flight requests never completed");
+            return false;
+        }
+    }
+    // Pristine ring: indices to zero on both sides of the reset.
+    unsafe {
+        core::ptr::write_volatile(&raw mut (*d.request_queue.avail_base).idx, 0);
+        core::ptr::write_volatile(&raw mut (*d.request_queue.used_base).idx, 0);
+    }
+    d.request_queue.last_used_idx = 0;
+    log::info!("[virtio-blk] quiesced for suspend");
+    true
+}
+
+/// Phase 103 F.3 — re-initialize the device after an S3 resume. The
+/// wake-side machine reset wiped the device's status, negotiated
+/// features, queue PFN register, and MSI-X config; the kernel-side
+/// driver state — including the ring, quiesced + index-reset by
+/// [`quiesce_for_suspend`] — is RAM and survives. The device is
+/// re-pointed at the **same** ring (replacing it would orphan any
+/// waiter bookkeeping and waste the DMA allocation).
+pub fn resume_after_s3() {
+    let mut guard = DRIVER.lock();
+    let Some(d) = guard.as_mut() else {
+        return;
+    };
+    // PCI command: the reset cleared I/O-space + bus-master enables.
+    let cmd = d.pci.read_config_u16(0x04);
+    if cmd & 0x05 != 0x05 {
+        d.pci.write_config_u16(0x04, cmd | 0x05);
+    }
+    let port = d.port;
+    // Status + feature handshake (the probe sequence).
+    port.write_reg::<u8>(VIRTIO_DEVICE_STATUS, 0);
+    port.write_reg::<u8>(VIRTIO_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
+    port.write_reg::<u8>(
+        VIRTIO_DEVICE_STATUS,
+        VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER,
+    );
+    let device_features = port.read_reg::<u32>(VIRTIO_DEVICE_FEATURES);
+    let driver_features = device_features & VIRTIO_BLK_F_FLUSH;
+    port.write_reg::<u32>(VIRTIO_DRIVER_FEATURES, driver_features);
+    FLUSH_NEGOTIATED.store(driver_features & VIRTIO_BLK_F_FLUSH != 0, Ordering::Release);
+    let status = port.read_reg::<u8>(VIRTIO_DEVICE_STATUS);
+    port.write_reg::<u8>(VIRTIO_DEVICE_STATUS, status | VIRTIO_STATUS_FEATURES_OK);
+    // Re-point queue 0 at the retained (pristine) ring.
+    port.write_reg::<u16>(VIRTIO_QUEUE_SELECT, 0);
+    port.write_reg::<u32>(
+        VIRTIO_QUEUE_ADDRESS,
+        (d.request_queue.ring.bus_address() / 4096) as u32,
+    );
+    // MSI-X re-arm with the boot-time vector, then re-point queue 0.
+    if let Some(irq) = &d.irq
+        && let Some(kind) = irq.msi_kind()
+    {
+        if !pci::reprogram_msi_after_resume(d.pci.device(), irq.vector(), kind) {
+            log::error!("[virtio-blk] S3 resume: MSI re-arm failed");
+        }
+        if kind == pci::MsiKind::MsiX {
+            port.write_reg::<u16>(VIRTIO_QUEUE_SELECT, 0);
+            port.write_reg::<u16>(VIRTIO_MSI_QUEUE_VECTOR, 0);
+        }
+    }
+    let status = port.read_reg::<u8>(VIRTIO_DEVICE_STATUS);
+    port.write_reg::<u8>(VIRTIO_DEVICE_STATUS, status | VIRTIO_STATUS_DRIVER_OK);
+    log::info!("[virtio-blk] re-initialized after S3 resume");
+}

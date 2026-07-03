@@ -452,6 +452,8 @@ const SMOKE_EXIT_SYMPHONIA_SMOKE_FAILED: i32 = 99;
 /// render it, or the QMP power-button event never reached powerd's
 /// acpid subscription (`POWERD:event`).
 const SMOKE_EXIT_POWER_SMOKE_FAILED: i32 = 100;
+/// Phase 103 F.3 `suspend-smoke` failed (S3 suspend/resume round trip).
+const SMOKE_EXIT_SUSPEND_SMOKE_FAILED: i32 = 101;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
@@ -905,6 +907,16 @@ fn main() {
                     std::process::exit(1);
                 });
             cmd_acpi_smoke(&smoke_args);
+        }
+        // Phase 103 F.3 — full S3 suspend/resume round trip in QEMU.
+        Some("suspend-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("suspend-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_suspend_smoke(&smoke_args);
         }
         // Phase 103 — powerd VM posture + m3ctl render + power-button event spine.
         Some("power-smoke") => {
@@ -1828,7 +1840,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm.\n\
      USB passthrough: --usb-passthrough <vid:pid> (e.g. `--usb-passthrough 0bda:8156`) passes a physical USB device into the guest's emulated xHCI (qemu-xhci,id=xhci_pt). The QEMU process must have access to the USB device node — add a udev rule granting the user/group read-write on the device, or run with sudo. The device is claimed from the host kernel while QEMU runs and is released on exit."
@@ -11125,6 +11137,14 @@ fn cmd_power_smoke(args: &SmokeBootArgs) {
     }
     qemu_args.push("-qmp".to_string());
     qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+    // Phase 103 F.3: this gate is the FAIL-CLOSED lane — S3 is disabled at
+    // the machine level (no \_S3 in the DSDT → acpid registers nothing →
+    // the kernel enter-sleep path returns -ENOSYS). The full round trip
+    // lives in `suspend-smoke`.
+    qemu_args.push("-global".to_string());
+    // The default machine is i440FX/PIIX4 (PM base 0xb000) — the S3
+    // knob lives on PIIX4_PM there, not ICH9-LPC.
+    qemu_args.push("PIIX4_PM.disable_s3=1".to_string());
 
     println!(
         "power-smoke: launching QEMU (timeout {}s, qmp {})",
@@ -11160,13 +11180,13 @@ fn cmd_power_smoke(args: &SmokeBootArgs) {
                 .map_err(|e| format!("serial send failed: {e}"))
         };
         wait(
-            "POWERD:ready battery=none ac=assumed-online zones=0 mech=none backlight=none sleep=s3+s4",
+            "POWERD:ready battery=none ac=assumed-online zones=0 mech=none backlight=none sleep=s4",
             &mut serial_buf,
             &mut serial_history,
         )?;
         println!(
             "power-smoke: powerd serves the VM no-battery/no-zones/no-HWP/no-panel posture \
-             (firmware sleep discovery: s3+s4)"
+             (firmware sleep discovery: s4 — S3 disabled on this lane)"
         );
         // Slice 2: the ring-3 governor tick loop produced its first target —
         // proof the recv-timeout wake, SYS_POWER_CPUFREQ_STATUS load sample,
@@ -11215,7 +11235,7 @@ fn cmd_power_smoke(args: &SmokeBootArgs) {
             &mut serial_history,
         )?;
         wait(
-            "sleep: S3+S4 (firmware; resume path pending)",
+            "sleep: S4 (firmware-declared)",
             &mut serial_buf,
             &mut serial_history,
         )?;
@@ -11233,7 +11253,7 @@ fn cmd_power_smoke(args: &SmokeBootArgs) {
         std::thread::sleep(std::time::Duration::from_millis(300));
         send(&mut stdin, "/bin/m3ctl power suspend\n")?;
         wait(
-            "POWERD:suspend rejected reason=resume-path-unimplemented firmware=s3+s4",
+            "POWERD:suspend rejected rc=-38 firmware=s4",
             &mut serial_buf,
             &mut serial_history,
         )?;
@@ -11334,6 +11354,241 @@ fn cmd_power_smoke(args: &SmokeBootArgs) {
         Err(msg) => {
             eprintln!("power-smoke: FAILED\n{msg}");
             std::process::exit(SMOKE_EXIT_POWER_SMOKE_FAILED);
+        }
+    }
+}
+
+/// Phase 103 F.3 — `suspend-smoke`: the full ACPI S3 suspend/resume
+/// round trip on QEMU q35 + OVMF (S3 enabled — the default machine
+/// config; `power-smoke` is the S3-disabled fail-closed lane):
+///
+/// 1. acpid registers `\_S3` SLP_TYP; powerd announces `sleep=s3+s4`.
+/// 2. `m3ctl power suspend` → powerd `\_PTS(3)` → `SYS_POWER_ENTER_SLEEP`
+///    → kernel quiesce (sync, AP park, virtio) → FACS waking vector →
+///    `PM1a_CNT <- SLP_TYP|SLP_EN` → QEMU run state `suspended`.
+/// 3. QMP `system_wakeup` → OVMF S3 resume → FACS X-vector 32-bit shim →
+///    long mode → kernel re-init → `[suspend] resumed from S3` →
+///    powerd `\_WAK(3)` → `POWERD:resume` → m3ctl `suspend: resumed`.
+/// 4. Liveness: shell echo + a disk write/read through the re-inited
+///    virtio-blk path.
+/// 5. The power button still works post-resume (SCI reroute + PWRBTN
+///    re-arm) — the QMP button drives the D.3 poweroff chain to a
+///    guest-initiated QEMU exit, same as `power-smoke`.
+#[allow(clippy::zombie_processes)]
+fn cmd_suspend_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = fs::remove_file(&qmp_socket);
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+
+    println!(
+        "suspend-smoke: launching QEMU (timeout {}s, qmp {})",
+        args.timeout_secs,
+        qmp_socket.display()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let stdout = child.stdout.take().expect("qemu stdout");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_buf = String::new();
+    let mut serial_history = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let step = std::time::Duration::from_secs(args.timeout_secs);
+
+    let mut stdin = child.stdin.take().expect("qemu stdin");
+    let result: Result<(), String> = (|| {
+        let wait = |pat: &str, buf: &mut String, hist: &mut String| {
+            wait_for_serial_pattern(&rx, buf, hist, pat, step, global_start, global_timeout)
+        };
+        let send = |stdin: &mut std::process::ChildStdin, s: &str| -> Result<(), String> {
+            use std::io::Write;
+            stdin
+                .write_all(s.as_bytes())
+                .and_then(|_| stdin.flush())
+                .map_err(|e| format!("serial send failed: {e}"))
+        };
+        wait(
+            "acpid: S3 registered slp_typ=1,1",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        wait(
+            "POWERD:ready battery=none ac=assumed-online zones=0 mech=none backlight=none sleep=s3+s4",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        println!("suspend-smoke: \\_S3 registered; powerd reports s3+s4");
+        wait(
+            "init: started 'net_udp' pid=",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        std::thread::sleep(std::time::Duration::from_secs(25));
+        wait("m3OS login:", &mut serial_buf, &mut serial_history)?;
+        send(&mut stdin, "root\n")?;
+        wait("Password:", &mut serial_buf, &mut serial_history)?;
+        send(&mut stdin, "root\n")?;
+        wait(
+            "[security] credential transition complete",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // ---- Suspend ----------------------------------------------------
+        send(&mut stdin, "/bin/m3ctl power suspend\n")?;
+        wait("POWERD:suspending", &mut serial_buf, &mut serial_history)?;
+        wait(
+            "[suspend] entering S3",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        // The guest should now reach QEMU's `suspended` run state.
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+        let sus_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let status = q
+                .execute("query-status", serde_json::json!({}))
+                .map_err(|e| format!("qmp query-status: {e}"))?;
+            let state = status
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<none>")
+                .to_string();
+            if state == "suspended" {
+                break;
+            }
+            if std::time::Instant::now() > sus_deadline {
+                return Err(format!(
+                    "guest never reached run state 'suspended' (last: {state})"
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        println!("suspend-smoke: guest is suspended (QEMU run state) — waking via QMP");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // ---- Wake -------------------------------------------------------
+        q.execute("system_wakeup", serde_json::json!({}))
+            .map_err(|e| format!("qmp system_wakeup: {e}"))?;
+        wait(
+            "[suspend] resumed from S3",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        wait("POWERD:resume", &mut serial_buf, &mut serial_history)?;
+        wait("suspend: resumed", &mut serial_buf, &mut serial_history)?;
+        println!("suspend-smoke: kernel + powerd + m3ctl all resumed");
+
+        // ---- Post-resume liveness ----------------------------------------
+        // Shell round trip (double-space collapse = fresh execution proof).
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        send(&mut stdin, "echo resume-liveness  ok\n")?;
+        wait("resume-liveness ok", &mut serial_buf, &mut serial_history)?;
+        // Disk write + read back through the re-initialized virtio-blk.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        send(&mut stdin, "echo s3-disk  ok > /home/s3probe.txt\n")?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        send(&mut stdin, "cat /home/s3probe.txt\n")?;
+        wait("s3-disk ok", &mut serial_buf, &mut serial_history)?;
+        println!("suspend-smoke: post-resume shell + virtio-blk round trips pass");
+
+        // ---- The power button still works after resume -------------------
+        q.execute("system_powerdown", serde_json::json!({}))
+            .map_err(|e| format!("qmp system_powerdown: {e}"))?;
+        wait(
+            "POWERD:event path=\\FIXED.PWRBTN code=0x80",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        wait(
+            "[acpi] S5 poweroff: PM1a_CNT",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        println!("suspend-smoke: post-resume power button drove the poweroff chain");
+        Ok(())
+    })();
+
+    // Success ends in a guest-initiated poweroff — QEMU must exit itself.
+    let result = result.and_then(|()| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    println!("suspend-smoke: QEMU exited by itself after S5 ({status})");
+                    return Ok(());
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Ok(None) => {
+                    return Err("QEMU still running 30s after the S5 write".to_string());
+                }
+                Err(e) => return Err(format!("waiting for QEMU exit: {e}")),
+            }
+        }
+    });
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_file(&qmp_socket);
+
+    match result {
+        Ok(()) => {
+            let elapsed = global_start.elapsed().as_secs();
+            println!(
+                "suspend-smoke: PASSED ({elapsed}s) — full S3 round trip: \\_S3 \
+                 registration, \\_PTS, kernel quiesce (sync + AP park), FACS wake \
+                 vector, SLP_EN write to QEMU 'suspended', QMP wakeup through the \
+                 OVMF S3 path + real-mode trampoline, kernel re-init, \\_WAK, live \
+                 shell + virtio-blk after resume, and a working power button \
+                 driving the poweroff chain to a guest-initiated QEMU exit"
+            );
+        }
+        Err(msg) => {
+            eprintln!("suspend-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_SUSPEND_SMOKE_FAILED);
         }
     }
 }

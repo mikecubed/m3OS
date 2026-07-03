@@ -328,6 +328,11 @@ pub const SYS_ACPI_MEM_WRITE: u64 = 0x1133;
 /// been SIGTERMed by init's service teardown.
 pub const SYS_ACPI_REGISTER_S5: u64 = 0x1134;
 
+/// Register the platform's `\_S3` sleep-type values so the Track F
+/// suspend path can perform a real S3 entry (the S5 shape):
+/// `sys_acpi_register_s3(slp_typa, slp_typb) -> isize`.
+pub const SYS_ACPI_REGISTER_S3: u64 = 0x1135;
+
 /// `reg_sel` values for [`SYS_ACPI_PM_READ`]/[`SYS_ACPI_PM_WRITE`]. The
 /// kernel resolves each selector to its FADT-declared port and access
 /// width — ring 3 never names a raw port number.
@@ -354,7 +359,7 @@ pub const DEVICE_HOST_BASE: u64 = SYS_DEVICE_CLAIM;
 ///
 /// Adjust upward when adding new device-host syscalls; the Track B acceptance
 /// items pin this constant as the authoritative upper bound.
-pub const DEVICE_HOST_LAST: u64 = SYS_ACPI_REGISTER_S5;
+pub const DEVICE_HOST_LAST: u64 = SYS_ACPI_REGISTER_S3;
 
 #[cfg(test)]
 mod tests {
@@ -391,9 +396,10 @@ mod tests {
         assert_eq!(SYS_ACPI_IO_WRITE, 0x1131);
         assert_eq!(SYS_ACPI_MEM_READ, 0x1132);
         assert_eq!(SYS_ACPI_MEM_WRITE, 0x1133);
-        // Phase 103 D.3 — S5 sleep-type registration for real poweroff.
+        // Phase 103 D.3/F — S5/S3 sleep-type registration.
         assert_eq!(SYS_ACPI_REGISTER_S5, 0x1134);
-        assert_eq!(DEVICE_HOST_LAST, SYS_ACPI_REGISTER_S5);
+        assert_eq!(SYS_ACPI_REGISTER_S3, 0x1135);
+        assert_eq!(DEVICE_HOST_LAST, SYS_ACPI_REGISTER_S3);
     }
 
     #[test]
@@ -420,6 +426,7 @@ mod tests {
             SYS_ACPI_MEM_READ,
             SYS_ACPI_MEM_WRITE,
             SYS_ACPI_REGISTER_S5,
+            SYS_ACPI_REGISTER_S3,
         ];
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate() {
@@ -454,6 +461,7 @@ mod tests {
             SYS_ACPI_MEM_READ,
             SYS_ACPI_MEM_WRITE,
             SYS_ACPI_REGISTER_S5,
+            SYS_ACPI_REGISTER_S3,
         ];
         for n in all {
             assert!(
@@ -489,9 +497,10 @@ mod tests {
         assert_eq!(SYS_ACPI_IO_WRITE, SYS_ACPI_IO_READ + 1);
         assert_eq!(SYS_ACPI_MEM_READ, SYS_ACPI_IO_WRITE + 1);
         assert_eq!(SYS_ACPI_MEM_WRITE, SYS_ACPI_MEM_READ + 1);
-        // Phase 103 D.3 pin: S5 registration closes the block.
+        // Phase 103 D.3/F pins: the sleep-type registrations close the block.
         assert_eq!(SYS_ACPI_REGISTER_S5, SYS_ACPI_MEM_WRITE + 1);
-        assert_eq!(DEVICE_HOST_LAST, SYS_ACPI_REGISTER_S5);
+        assert_eq!(SYS_ACPI_REGISTER_S3, SYS_ACPI_REGISTER_S5 + 1);
+        assert_eq!(DEVICE_HOST_LAST, SYS_ACPI_REGISTER_S3);
     }
 
     #[test]
