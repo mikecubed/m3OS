@@ -333,6 +333,22 @@ pub fn enter_sleep_s3() -> i64 {
     }
     crate::arch::x86_64::apic::init();
 
+    // PS/2: the i8042 was reset with the machine — re-run the bounded
+    // keyboard + mouse bring-up so input works after resume. (Earlier
+    // iterations blamed this code for a post-resume hang; the real
+    // culprit was the setjmp stack clobber downstream — every PS/2 wait
+    // is POLL_BUDGET-bounded and the re-init completes fine.)
+    // SAFETY: same port-I/O init the boot path runs.
+    unsafe {
+        if let Err(e) = crate::arch::x86_64::ps2::init_keyboard() {
+            log::warn!("[suspend] PS/2 keyboard re-init failed: {e:?}");
+        }
+        if let Err(e) = crate::arch::x86_64::ps2::init_mouse() {
+            log::warn!("[suspend] PS/2 mouse re-init failed: {e:?}");
+        }
+    }
+    log::info!("[suspend] PS/2 re-initialized");
+
     // Bring PCI config space back before any driver touches its BARs.
     crate::pci::restore_config_after_resume();
 

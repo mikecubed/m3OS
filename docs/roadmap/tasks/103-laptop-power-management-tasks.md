@@ -366,7 +366,7 @@
 **Acceptance:**
 - [x] `enter_sleep_s3` (after powerd's `_PTS(3)`) installs the FACS X waking vector and writes `SLP_TYP|SLP_EN` into `PM1a_CNT` after the F.2 quiesce; QEMU reaches run state `suspended`. *(PM1b joins on hardware that declares one.)*
 - [x] On resume the kernel re-establishes CPU state (GDT/IDT/TSS/GS/syscall MSRs/XCR0/PAT, PIC/APIC, TSC rebase), powerd evaluates `_WAK(3)` and re-applies brightness (the B.3 resume hook); the `POWERD:resume` sentinel replaces the chartered `POWER_EVENT` resume kind (powerd IS the daemon that would consume it — it is the suspend caller). `suspend-smoke` proves shell + virtio-blk + power-button liveness after the round trip.
-- [ ] **Validated-on-HW**: an S3 (or S0ix) suspend/resume round-trips to a live session, **or** the attempt fails closed; the outcome is recorded in the Track G run entry (a partial/closed-fail is an acceptable stretch outcome). *(QEMU round trip green; Dell arm pends. Residuals: PS/2 keyboard/mouse re-init hangs post-resume (replug required), GPE re-arm, framebuffer re-mode-set on hardware GPUs, S0ix.)*
+- [ ] **Validated-on-HW**: an S3 (or S0ix) suspend/resume round-trips to a live session, **or** the attempt fails closed; the outcome is recorded in the Track G run entry (a partial/closed-fail is an acceptable stretch outcome). *(QEMU round trip green incl. PS/2 keyboard/mouse re-init — the earlier "i8042 hangs post-resume" was the setjmp stack clobber misattributed; every PS/2 wait is bounded and the gate now asserts the re-init sentinel. Dell arm pends. Residuals: GPE re-arm, framebuffer re-mode-set on hardware GPUs, S0ix.)*
 
 ---
 
