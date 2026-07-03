@@ -1041,3 +1041,16 @@ if [ "${M3OS_SUSPEND_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask suspend-smoke..."
     cargo xtask suspend-smoke --timeout 240
 fi
+
+# Phase 106 Track A — USB-root boot gate. Gated behind
+# M3OS_USB_ROOT_REGRESSION=1 because it builds the combined GPT image
+# and boots QEMU with it as the ONLY (USB) disk: OVMF boots the ESP,
+# init brings up xhci + usb-storage, the root slot adopts usb0.block
+# last-resort, the mount GPT-scans to the ext2 partition, and a serial
+# login proves the root is writable. Set the env var on branches
+# touching the combined-image builder, blk::remote root discovery, the
+# GPT root-mount scan, or init's root bootstrap.
+if [ "${M3OS_USB_ROOT_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask usb-root-smoke..."
+    cargo xtask usb-root-smoke --timeout 300
+fi

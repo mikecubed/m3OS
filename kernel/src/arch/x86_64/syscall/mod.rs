@@ -17726,29 +17726,43 @@ pub(super) fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
 /// (LE) at superblock offset 56. Returns 0 when no ext2 is found (the caller's
 /// mount then fails cleanly).
 fn usb_ext2_base_lba(dev_id: u32) -> u64 {
-    let has_ext2_at = |lba: u64| -> bool {
+    let mut read =
+        |lba: u64, buf: &mut [u8; 512]| crate::blk::read_sectors_dev(dev_id, lba, 1, buf).is_ok();
+    gpt_ext2_scan(&mut read).unwrap_or(0)
+}
+
+/// Phase 106 A.3 — the same scan against the ROOT block path (virtio or
+/// the remote slot 0, whatever `crate::blk::read_sectors` routes to).
+/// `Some(0)` = whole-disk ext2; `None` = nothing found.
+fn root_gpt_ext2_base_lba() -> Option<u64> {
+    let mut read = |lba: u64, buf: &mut [u8; 512]| crate::blk::read_sectors(lba, 1, buf).is_ok();
+    gpt_ext2_scan(&mut read)
+}
+
+/// Locate an ext2 filesystem on a possibly-partitioned disk, reading
+/// through `read_lba`: whole-disk superblock first, then a GPT walk
+/// (protective MBR `0xEE` → `EFI PART` → 128-byte entries → ext2 magic
+/// at each `first_lba`), then classic MBR type entries. Extracted from
+/// the Phase 92a `usb_ext2_base_lba` so the Phase 106 root mount can
+/// run the identical probe over the routed block layer.
+fn gpt_ext2_scan(read_lba: &mut dyn FnMut(u64, &mut [u8; 512]) -> bool) -> Option<u64> {
+    let has_ext2_at = |read: &mut dyn FnMut(u64, &mut [u8; 512]) -> bool, lba: u64| -> bool {
         let mut sb = [0u8; 512];
-        crate::blk::read_sectors_dev(dev_id, lba + 2, 1, &mut sb).is_ok()
-            && sb[56] == 0x53
-            && sb[57] == 0xEF
+        read(lba + 2, &mut sb) && sb[56] == 0x53 && sb[57] == 0xEF
     };
     // 1. Whole-disk ext2 (base_lba = 0) — preserves the existing behaviour.
-    if has_ext2_at(0) {
-        return 0;
+    if has_ext2_at(read_lba, 0) {
+        return Some(0);
     }
     // 2. Partition table at LBA 0 (MBR signature required).
     let mut lba0 = [0u8; 512];
-    if crate::blk::read_sectors_dev(dev_id, 0, 1, &mut lba0).is_err()
-        || lba0[510] != 0x55
-        || lba0[511] != 0xAA
-    {
-        return 0;
+    if !read_lba(0, &mut lba0) || lba0[510] != 0x55 || lba0[511] != 0xAA {
+        return None;
     }
     // GPT: a protective MBR's first partition entry (offset 446) has type 0xEE.
     if lba0[450] == 0xEE {
         let mut hdr = [0u8; 512];
-        if crate::blk::read_sectors_dev(dev_id, 1, 1, &mut hdr).is_ok() && &hdr[0..8] == b"EFI PART"
-        {
+        if read_lba(1, &mut hdr) && &hdr[0..8] == b"EFI PART" {
             let part_lba = u64::from_le_bytes(hdr[72..80].try_into().unwrap_or([0; 8]));
             let esize = u32::from_le_bytes(hdr[84..88].try_into().unwrap_or([0; 4])) as usize;
             if part_lba != 0 && esize == 128 {
@@ -17762,7 +17776,7 @@ fn usb_ext2_base_lba(dev_id: u32) -> u64 {
                 let scan_sectors = ((num_entries * esize as u64).div_ceil(512)).min(256);
                 for sec in 0..scan_sectors {
                     let mut ent = [0u8; 512];
-                    if crate::blk::read_sectors_dev(dev_id, part_lba + sec, 1, &mut ent).is_err() {
+                    if !read_lba(part_lba + sec, &mut ent) {
                         break;
                     }
                     for k in 0..4usize {
@@ -17770,14 +17784,14 @@ fn usb_ext2_base_lba(dev_id: u32) -> u64 {
                         let first = u64::from_le_bytes(
                             ent[off + 32..off + 40].try_into().unwrap_or([0; 8]),
                         );
-                        if first != 0 && has_ext2_at(first) {
-                            return first;
+                        if first != 0 && has_ext2_at(read_lba, first) {
+                            return Some(first);
                         }
                     }
                 }
             }
         }
-        return 0;
+        return None;
     }
     // 3. Classic MBR: 4 × 16-byte entries at offset 446 (type at +4, LBA at +8).
     for e in 0..4usize {
@@ -17786,11 +17800,11 @@ fn usb_ext2_base_lba(dev_id: u32) -> u64 {
             continue;
         }
         let start = u32::from_le_bytes(lba0[off + 8..off + 12].try_into().unwrap_or([0; 4])) as u64;
-        if start != 0 && has_ext2_at(start) {
-            return start;
+        if start != 0 && has_ext2_at(read_lba, start) {
+            return Some(start);
         }
     }
-    0
+    None
 }
 
 pub(super) fn sys_linux_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64) -> u64 {
@@ -17900,11 +17914,23 @@ pub(super) fn sys_linux_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64)
     let _mount_guard = MOUNT_OP_LOCK.lock();
 
     if action == kernel_core::fs::vfs_protocol::VFS_MOUNT_EXT2_ROOT {
-        let (base_lba, _) = match crate::blk::mbr::probe_ext2() {
-            Some(p) => p,
+        let base_lba = match crate::blk::mbr::probe_ext2() {
+            Some((lba, _)) => lba,
             None => {
-                log::error!("[mount] no ext2 partition found on virtio-blk");
-                return NEG_ENODEV;
+                // Phase 106 A.3 — a GPT boot stick (ESP first, rootfs
+                // after) is invisible to the MBR probe; run the same
+                // GPT-aware scan the secondary USB mount uses, over the
+                // routed block layer (virtio or the remote root slot).
+                match root_gpt_ext2_base_lba() {
+                    Some(lba) => {
+                        log::info!("[mount] GPT ext2 root partition at LBA {lba}");
+                        lba
+                    }
+                    None => {
+                        log::error!("[mount] no ext2 partition found on the root block device");
+                        return NEG_ENODEV;
+                    }
+                }
             }
         };
         match crate::fs::ext2::mount_ext2(base_lba) {
