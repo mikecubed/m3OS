@@ -133,7 +133,37 @@ mod os_binary {
             ParsedVerb::MitigationsStatus => dispatch_mitigations_status(),
             ParsedVerb::PowerStatus => dispatch_power(false),
             ParsedVerb::Battery => dispatch_power(true),
+            ParsedVerb::PowerOff => dispatch_power_off(),
+            ParsedVerb::PowerSuspend => {
+                print_str("power: suspend is not supported yet (Phase 103 Track F)\n");
+                1
+            }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 103 D.3 — `m3ctl power off`
+    // -----------------------------------------------------------------------
+
+    /// Graceful poweroff: the `shutdown` coreutil sequence inline (m3ctl
+    /// runs from a shell, not as a supervised service, so it survives
+    /// init's teardown to fire the final syscall). SIGTERM to init →
+    /// grace for reverse-dependency service stop → `sys_reboot(POWER_OFF)`
+    /// (kernel sync + the ACPI S5 write acpid registered at boot).
+    fn dispatch_power_off() -> i32 {
+        if syscall_lib::getuid() != 0 {
+            print_str("power off: must be root\n");
+            return 1;
+        }
+        print_str("System is going down for poweroff...\n");
+        syscall_lib::kill(1, syscall_lib::SIGTERM);
+        syscall_lib::nanosleep(3);
+        let ret = syscall_lib::reboot(syscall_lib::REBOOT_CMD_POWER_OFF);
+        if ret < 0 {
+            print_str("power off: reboot syscall failed\n");
+            return 1;
+        }
+        0
     }
 
     // -----------------------------------------------------------------------

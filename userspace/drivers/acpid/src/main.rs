@@ -68,13 +68,13 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 
-use kernel_core::acpi::aml::object::{AmlError, RegionSpace};
+use kernel_core::acpi::aml::object::{AmlError, AmlValue, RegionSpace};
 use kernel_core::acpi::namespace::Namespace;
 use kernel_core::device_host::syscalls::{
     ACPI_PM_REG_GPE0_STS, ACPI_PM_REG_PM1A_CNT, ACPI_PM_REG_PM1A_EN, ACPI_PM_REG_PM1A_STS,
     ACPI_PM_REG_SMI_CMD, ACPI_SCI_BIT_GPE, ACPI_SCI_BIT_PM1, NOTIFICATION_SENTINEL_NEW,
     SYS_ACPI_IO_READ, SYS_ACPI_IO_WRITE, SYS_ACPI_MEM_READ, SYS_ACPI_MEM_WRITE, SYS_ACPI_PM_READ,
-    SYS_ACPI_PM_WRITE, SYS_ACPI_SCI_SUBSCRIBE, SYS_ACPI_TABLE_GET,
+    SYS_ACPI_PM_WRITE, SYS_ACPI_REGISTER_S5, SYS_ACPI_SCI_SUBSCRIBE, SYS_ACPI_TABLE_GET,
 };
 use kernel_core::ipc::wake_kind::RECV_KIND_NOTIFICATION;
 use syscall_lib::heap::BrkAllocator;
@@ -695,6 +695,33 @@ fn program_main(_args: &[&str]) -> i32 {
             Ok(v) => announce(&format!("ACPI_SMOKE:regionspace-mem MISMATCH val={v:#x}\n")),
             Err(_) => announce("ACPI_SMOKE:regionspace-mem FAILED\n"),
         }
+    }
+
+    // ---- Phase 103 D.3: register \_S5 for real S5 poweroff --------------
+    // Evaluate the DSDT's `\_S5` package (elements 0/1 = SLP_TYPa/b) and
+    // hand the two integers to the kernel: the final PM1a_CNT write runs
+    // in `sys_reboot` *after* the shutdown sync, when this daemon has
+    // already been SIGTERMed by init's service teardown. No `\_S5` (rare,
+    // pre-ACPI-2 firmware) just means poweroff degrades to halt.
+    match ns.evaluate(&mut regions, "\\_S5") {
+        Ok(AmlValue::Package(elems)) => {
+            let typ = |i: usize| match elems.get(i) {
+                Some(AmlValue::Integer(v)) => Some(*v & 0x7),
+                _ => None,
+            };
+            match (typ(0), typ(1)) {
+                (Some(a), Some(b)) => {
+                    let rc = unsafe { syscall_lib::syscall2(SYS_ACPI_REGISTER_S5, a, b) as isize };
+                    if rc == 0 {
+                        announce(&format!("acpid: S5 registered slp_typ={a},{b}\n"));
+                    } else {
+                        announce(&format!("acpid: S5 register failed ({rc})\n"));
+                    }
+                }
+                _ => announce("acpid: \\_S5 package malformed — poweroff degrades to halt\n"),
+            }
+        }
+        _ => announce("acpid: no \\_S5 — poweroff degrades to halt\n"),
     }
 
     // ---- Register the query service ------------------------------------

@@ -518,8 +518,21 @@ fn power_without_subcommand_is_missing_argument() {
         Err(ParseError::MissingArgument(_))
     ));
     assert!(matches!(
-        parse_verb("power", &["off"]),
+        parse_verb("power", &["frobnicate"]),
         Err(ParseError::BadArgument(_))
+    ));
+}
+
+#[test]
+fn power_off_and_suspend_parse() {
+    // Phase 103 D.3 — the poweroff verb and the Track F suspend stub.
+    assert!(matches!(
+        parse_verb("power", &["off"]),
+        Ok(ParsedVerb::PowerOff)
+    ));
+    assert!(matches!(
+        parse_verb("power", &["suspend"]),
+        Ok(ParsedVerb::PowerSuspend)
     ));
 }
 

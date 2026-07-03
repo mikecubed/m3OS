@@ -11066,20 +11066,27 @@ fn cmd_acpi_smoke(args: &SmokeBootArgs) {
     }
 }
 
-/// Phase 103 — `power-smoke`: proves the slice-1 power pipeline on the
-/// platform QEMU can model (the desktop/VM "no battery" case, per the
-/// charter's Track G split):
+/// Phase 103 — `power-smoke`: proves the power pipeline on the platform
+/// QEMU can model (the desktop/VM posture, per the charter's Track G
+/// split):
 ///
-/// 1. `POWERD:ready battery=none ac=assumed-online` — powerd found
-///    acpid, walked the namespace for `PNP0C0A`/`ACPI0003` (absent on
-///    q35), and serves the no-battery posture.
-/// 2. `m3ctl power status` renders it over the `power` IPC service
-///    (`ac: assumed-online`, `battery: none`).
-/// 3. A QMP power button reaches powerd through its acpid event
-///    subscription (`POWERD:event path=\FIXED.PWRBTN code=0x80`) — the
-///    Track D event spine, live in CI.
+/// 1. `POWERD:ready battery=none ac=assumed-online zones=0 mech=none` —
+///    powerd found acpid, walked the namespace for `PNP0C0A`/`ACPI0003`
+///    and thermal zones (all absent on q35), probed cpufreq (no HWP).
+/// 2. `POWERD:governor mode=conservative target=` — the ring-3 governor
+///    tick loop ran against the `0x116x` cpufreq syscalls.
+/// 3. `m3ctl power status` renders battery/thermal/governor over the
+///    `power` IPC service.
+/// 4. A QMP power button reaches powerd through its acpid event
+///    subscription (`POWERD:event path=\FIXED.PWRBTN code=0x80`) and —
+///    Track D.3 — routes into the graceful poweroff chain:
+///    `POWERD:poweroff` → `/bin/shutdown` → SIGTERM to init (service
+///    teardown) → `sys_reboot(POWER_OFF)` → kernel sync → the ACPI S5
+///    write acpid registered at boot → **QEMU exits by itself**. The
+///    gate's final assertion is that guest-initiated exit (bounded
+///    `try_wait`, no `child.kill()` on the success path).
 ///
-/// The live battery/brightness/thermal arms are hardware-only
+/// The live battery/brightness/HWP-MSR/lid arms are hardware-only
 /// (skip-with-reason posture; `Validated-on-HW` per the charter).
 #[allow(clippy::zombie_processes)]
 fn cmd_power_smoke(args: &SmokeBootArgs) {
@@ -11211,8 +11218,58 @@ fn cmd_power_smoke(args: &SmokeBootArgs) {
             &mut serial_history,
         )?;
         println!("power-smoke: power-button event reached powerd's subscription");
+        // Track D.3 — the event routes into the graceful poweroff chain.
+        // Assert each link that prints *before* the machine dies; skip
+        // init's final "shutdown complete" line, which can race the
+        // shutdown child's 3 s grace timer.
+        wait(
+            "POWERD:poweroff reason=power-button",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        wait(
+            "init: SIGTERM received, initiating shutdown",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        wait(
+            "sys_reboot: System powering off...",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        wait(
+            "[acpi] S5 poweroff: PM1a_CNT",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        println!("power-smoke: poweroff chain reached the ACPI S5 write");
         Ok(())
     })();
+
+    // On success the guest powers itself off via the S5 write — QEMU must
+    // exit on its own (the strongest possible assertion; no other gate
+    // exercises a guest-initiated exit). On failure, kill as usual.
+    let result = result.and_then(|()| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    println!("power-smoke: QEMU exited by itself after S5 ({status})");
+                    return Ok(());
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Ok(None) => {
+                    return Err(
+                        "QEMU still running 30s after the S5 write — poweroff did not land"
+                            .to_string(),
+                    );
+                }
+                Err(e) => return Err(format!("waiting for QEMU exit: {e}")),
+            }
+        }
+    });
 
     let _ = child.kill();
     let _ = child.wait();
@@ -11226,7 +11283,8 @@ fn cmd_power_smoke(args: &SmokeBootArgs) {
                  no-zones/no-HWP posture, the ring-3 governor ticked against the \
                  kernel cpufreq syscalls, m3ctl rendered power+thermal+governor over \
                  the power IPC service, and a QMP power-button event traversed \
-                 acpid → powerd's subscription"
+                 acpid → powerd and drove the full D.3 poweroff chain (service \
+                 teardown → kernel sync → ACPI S5) to a guest-initiated QEMU exit"
             );
         }
         Err(msg) => {

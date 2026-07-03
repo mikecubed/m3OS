@@ -1686,11 +1686,11 @@ mod syscall_nr {
     #[allow(unused_imports)]
     pub use kernel_core::device_host::syscalls::{
         DEVICE_HOST_BASE, DEVICE_HOST_LAST, SYS_ACPI_IO_READ, SYS_ACPI_IO_WRITE, SYS_ACPI_MEM_READ,
-        SYS_ACPI_MEM_WRITE, SYS_ACPI_PM_READ, SYS_ACPI_PM_WRITE, SYS_ACPI_SCI_SUBSCRIBE,
-        SYS_ACPI_TABLE_GET, SYS_DEVICE_CLAIM, SYS_DEVICE_CONFIG_READ, SYS_DEVICE_CONFIG_WRITE,
-        SYS_DEVICE_DMA_ALLOC, SYS_DEVICE_DMA_HANDLE_INFO, SYS_DEVICE_DMA_MAP_SHM,
-        SYS_DEVICE_DMA_UNMAP_SHM, SYS_DEVICE_IRQ_SUBSCRIBE, SYS_DEVICE_MMIO_MAP,
-        SYS_DEVICE_PCI_ENUMERATE, SYS_DEVICE_PIO_READ, SYS_DEVICE_PIO_WRITE,
+        SYS_ACPI_MEM_WRITE, SYS_ACPI_PM_READ, SYS_ACPI_PM_WRITE, SYS_ACPI_REGISTER_S5,
+        SYS_ACPI_SCI_SUBSCRIBE, SYS_ACPI_TABLE_GET, SYS_DEVICE_CLAIM, SYS_DEVICE_CONFIG_READ,
+        SYS_DEVICE_CONFIG_WRITE, SYS_DEVICE_DMA_ALLOC, SYS_DEVICE_DMA_HANDLE_INFO,
+        SYS_DEVICE_DMA_MAP_SHM, SYS_DEVICE_DMA_UNMAP_SHM, SYS_DEVICE_IRQ_SUBSCRIBE,
+        SYS_DEVICE_MMIO_MAP, SYS_DEVICE_PCI_ENUMERATE, SYS_DEVICE_PIO_READ, SYS_DEVICE_PIO_WRITE,
     };
 
     // -- Phase 84 Spectre mitigations (Track D.3 reporter / C.4 STIBP opt-in) --
@@ -2527,6 +2527,11 @@ pub extern "C" fn syscall_handler(
         SYS_ACPI_MEM_WRITE => {
             // Signature: sys_acpi_mem_write(phys_addr, width_bytes, value) -> isize.
             crate::syscall::acpi::sys_acpi_mem_write(arg0, arg1, arg2) as u64
+        }
+        // -- Phase 103 D.3: acpid registers \_S5 SLP_TYP for real poweroff --
+        SYS_ACPI_REGISTER_S5 => {
+            // Signature: sys_acpi_register_s5(slp_typa, slp_typb) -> isize.
+            crate::syscall::acpi::sys_acpi_register_s5(arg0, arg1) as u64
         }
         // -- Phase 84 Spectre mitigations --
         SYS_MITIGATIONS_STATUS => sys_mitigations_status(arg0, arg1),
@@ -4427,7 +4432,24 @@ pub(super) fn sys_reboot(cmd: u64) -> u64 {
     }
 
     match cmd {
-        REBOOT_CMD_HALT | REBOOT_CMD_POWER_OFF => {
+        REBOOT_CMD_POWER_OFF => {
+            log::info!("sys_reboot: System powering off...");
+            kernel_shutdown();
+            // Phase 103 D.3 — real ACPI S5 when acpid registered `\_S5` at
+            // boot (PM1a_CNT <- SLP_TYPa<<10 | SLP_EN; QEMU exits, hardware
+            // cuts power). Falls through to the legacy halt path when the
+            // platform never registered (no acpid, no FADT PM1a block).
+            crate::syscall::acpi::try_acpi_poweroff();
+            // QEMU isa-debug-exit device (port 0xf4) — terminates the emulator.
+            unsafe {
+                x86_64::instructions::port::Port::new(0xf4).write(0x10_u32);
+            }
+            // If that didn't work, HLT loop.
+            loop {
+                x86_64::instructions::hlt();
+            }
+        }
+        REBOOT_CMD_HALT => {
             log::info!("sys_reboot: System halting...");
             kernel_shutdown();
             // QEMU isa-debug-exit device (port 0xf4) — terminates the emulator.
