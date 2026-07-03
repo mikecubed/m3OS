@@ -11516,6 +11516,14 @@ fn cmd_suspend_smoke(args: &SmokeBootArgs) {
             &mut serial_buf,
             &mut serial_history,
         )?;
+        // The i8042 came back too (keyboard + mouse re-init completed —
+        // the bounded bring-up, distinct sentinel so the boot-time init
+        // can't false-match the non-consuming matcher).
+        wait(
+            "[suspend] PS/2 re-initialized",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
         wait("POWERD:resume", &mut serial_buf, &mut serial_history)?;
         wait("suspend: resumed", &mut serial_buf, &mut serial_history)?;
         println!("suspend-smoke: kernel + powerd + m3ctl all resumed");
@@ -11581,7 +11589,7 @@ fn cmd_suspend_smoke(args: &SmokeBootArgs) {
                 "suspend-smoke: PASSED ({elapsed}s) — full S3 round trip: \\_S3 \
                  registration, \\_PTS, kernel quiesce (sync + AP park), FACS wake \
                  vector, SLP_EN write to QEMU 'suspended', QMP wakeup through the \
-                 OVMF S3 path + real-mode trampoline, kernel re-init, \\_WAK, live \
+                 OVMF S3 path + the X-vector 32-bit shim, kernel re-init (incl. PS/2), \\_WAK, live \
                  shell + virtio-blk after resume, and a working power button \
                  driving the poweroff chain to a guest-initiated QEMU exit"
             );

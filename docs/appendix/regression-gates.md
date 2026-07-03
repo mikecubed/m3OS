@@ -403,7 +403,7 @@ re-init (GDT with the TSS busy-bit cleared, IDT, GS bases, syscall
 MSRs, TSC monotonic rebase) → long-jump back into the suspended
 syscall → heavyweight re-init in task context (PIC/APIC, PCI config
 restore, SCI reroute + PWRBTN re-arm, virtio-blk/net device
-re-handshake against the retained rings, AP reboot via INIT-SIPI-SIPI)
+re-handshake against the retained rings, PS/2 keyboard+mouse re-init, AP reboot via INIT-SIPI-SIPI)
 → powerd drains the wake-side event burst (the wake sets `PWRBTN_STS`;
 those events are artifacts, not poweroff requests) → `\_WAK(3)` →
 `POWERD:resume` → `suspend: resumed`. Post-resume liveness: a fresh
