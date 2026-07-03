@@ -11153,11 +11153,20 @@ fn cmd_power_smoke(args: &SmokeBootArgs) {
                 .map_err(|e| format!("serial send failed: {e}"))
         };
         wait(
-            "POWERD:ready battery=none ac=assumed-online",
+            "POWERD:ready battery=none ac=assumed-online zones=0 mech=none",
             &mut serial_buf,
             &mut serial_history,
         )?;
-        println!("power-smoke: powerd serves the VM no-battery posture");
+        println!("power-smoke: powerd serves the VM no-battery/no-zones/no-HWP posture");
+        // Slice 2: the ring-3 governor tick loop produced its first target —
+        // proof the recv-timeout wake, SYS_POWER_CPUFREQ_STATUS load sample,
+        // and SYS_POWER_SET_PERF apply all ran (a no-op apply on QEMU).
+        wait(
+            "POWERD:governor mode=conservative target=",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        println!("power-smoke: governor tick loop reported its first target");
         // Inline serial login (the acpi-smoke pattern — this driver owns
         // its own reader, so run_smoke_script's steps don't apply).
         wait(
@@ -11177,10 +11186,20 @@ fn cmd_power_smoke(args: &SmokeBootArgs) {
         )?;
         std::thread::sleep(std::time::Duration::from_millis(500));
         send(&mut stdin, "/bin/m3ctl power status\n")?;
-        // Output-only patterns (the typed command contains neither).
+        // Output-only patterns (the typed command contains none of them).
         wait("ac: assumed-online", &mut serial_buf, &mut serial_history)?;
         wait("battery: none", &mut serial_buf, &mut serial_history)?;
-        println!("power-smoke: m3ctl rendered the power status over IPC");
+        wait(
+            "thermal: none (no zones)",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        wait(
+            "governor: conservative (mech none, target ",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        println!("power-smoke: m3ctl rendered power/thermal/governor status over IPC");
         let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
             .map_err(|e| format!("qmp connect: {e}"))?;
@@ -11203,9 +11222,11 @@ fn cmd_power_smoke(args: &SmokeBootArgs) {
         Ok(()) => {
             let elapsed = global_start.elapsed().as_secs();
             println!(
-                "power-smoke: PASSED ({elapsed}s) — powerd served the VM no-battery \
-                 posture, m3ctl rendered it over the power IPC service, and a QMP \
-                 power-button event traversed acpid → powerd's subscription"
+                "power-smoke: PASSED ({elapsed}s) — powerd served the VM no-battery/\
+                 no-zones/no-HWP posture, the ring-3 governor ticked against the \
+                 kernel cpufreq syscalls, m3ctl rendered power+thermal+governor over \
+                 the power IPC service, and a QMP power-button event traversed \
+                 acpid → powerd's subscription"
             );
         }
         Err(msg) => {

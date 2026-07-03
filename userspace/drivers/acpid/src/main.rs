@@ -128,6 +128,10 @@ const ACPI_EVENT: u64 = 6;
 /// or [`REPLY_ERR`] (unresolved path, evaluation error, oversize result).
 /// Any `Notify()` the evaluation queues is routed to subscribers.
 const ACPI_EVAL: u64 = 7;
+/// Phase 103 C — enumerate thermal zones. No request body; reply label 0
+/// with `data[0]` = bulk length, bulk = newline-joined zone full paths.
+/// An empty reply on a zone-less platform (QEMU q35) is a *success*.
+const ACPI_LIST_TZ: u64 = 8;
 /// Reply label for any failure (unknown label, bad request, no match).
 const REPLY_ERR: u64 = u64::MAX;
 /// `ACPI_STA` success replies are `REPLY_STA_BASE | sta`.
@@ -532,6 +536,22 @@ fn handle_eval(
     }
 }
 
+/// `ACPI_LIST_TZ` handler (Phase 103 C): reply with every `ThermalZone`
+/// node's full path, newline-joined (`data[0]` = bulk length, matching
+/// `ACPI_EVAL`'s convention). Zero zones is a successful empty reply —
+/// the QEMU q35 posture `powerd` must handle gracefully.
+fn handle_list_tz(ns: &Namespace, reply_cap: u32) {
+    let mut joined = String::new();
+    for (i, id) in ns.thermal_zones().into_iter().enumerate() {
+        if i > 0 {
+            joined.push('\n');
+        }
+        joined.push_str(&ns.full_path(id));
+    }
+    syscall_lib::ipc_store_reply_bulk(joined.as_bytes());
+    syscall_lib::ipc_reply(reply_cap, 0, joined.len() as u64);
+}
+
 /// `ACPI_SUBSCRIBE` handler (Phase 101 E.4): the bulk carries the
 /// subscriber's REGISTERED event-service name (`data[0]` = length);
 /// acpid resolves it via `ipc_lookup_service` to obtain its own send
@@ -749,6 +769,7 @@ fn program_main(_args: &[&str]) -> i32 {
                 &bulk,
                 reply_cap,
             ),
+            ACPI_LIST_TZ => handle_list_tz(&ns, reply_cap),
             _ => {
                 syscall_lib::ipc_reply(reply_cap, REPLY_ERR, 0);
             }

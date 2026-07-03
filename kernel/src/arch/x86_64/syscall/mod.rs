@@ -1696,6 +1696,11 @@ mod syscall_nr {
     // -- Phase 84 Spectre mitigations (Track D.3 reporter / C.4 STIBP opt-in) --
     // m3OS-native `0x114x` block; canonically declared in `kernel_core::spectre`.
     pub use kernel_core::spectre::{SYS_MITIGATIONS_STATUS, SYS_SET_SPEC_CTRL};
+
+    // -- Phase 103 Track E cpufreq mechanism --
+    // m3OS-native `0x116x` block; canonically declared in
+    // `kernel_core::power::syscalls` (0x1150 is the kstack debug probe).
+    pub use kernel_core::power::syscalls::{SYS_POWER_CPUFREQ_STATUS, SYS_POWER_SET_PERF};
 }
 
 // ---------------------------------------------------------------------------
@@ -2526,6 +2531,9 @@ pub extern "C" fn syscall_handler(
         // -- Phase 84 Spectre mitigations --
         SYS_MITIGATIONS_STATUS => sys_mitigations_status(arg0, arg1),
         SYS_SET_SPEC_CTRL => sys_set_spec_ctrl(arg0),
+        // -- Phase 103 Track E cpufreq mechanism --
+        SYS_POWER_SET_PERF => sys_power_set_perf(arg0),
+        SYS_POWER_CPUFREQ_STATUS => sys_power_cpufreq_status(arg0, arg1),
         // -- Track D debug probe (feature `kstack-overflow-test`; absent → ENOSYS) --
         #[cfg(feature = "kstack-overflow-test")]
         SYS_KSTACK_OVERFLOW_TEST => sys_kstack_overflow_test(),
@@ -19675,6 +19683,46 @@ pub(super) fn sys_set_spec_ctrl(enable: u64) -> u64 {
     let pid = crate::process::current_pid();
     crate::mitigations::set_stibp_opt_in(pid, enable != 0);
     0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 103 Track E — cpufreq syscalls (0x1160/0x1161)
+// ---------------------------------------------------------------------------
+
+/// `sys_power_set_perf(target) -> isize`: apply a governor target on the
+/// abstract 1–255 scale. Root-only — an HWP request caps the whole
+/// package's clock, so an unprivileged caller could throttle the system.
+/// A successful no-op when no mechanism was probed (every QEMU lane), so
+/// `powerd`'s policy loop is platform-independent.
+pub(super) fn sys_power_set_perf(target: u64) -> u64 {
+    let (_, _, euid, _) = current_process_ids();
+    if euid != 0 {
+        return NEG_EPERM;
+    }
+    if target == 0 || target > 255 {
+        return NEG_EINVAL;
+    }
+    crate::arch::x86_64::cpufreq::apply_target(target as u8);
+    0
+}
+
+/// `sys_power_cpufreq_status(buf_ptr, buf_len) -> isize`: copy the
+/// [`kernel_core::power::syscalls::CpufreqStatusWire`] snapshot (probed
+/// mechanism + last target + cumulative scheduler CPU times) into a user
+/// buffer. Read-only, ungated — same posture as `SYS_MITIGATIONS_STATUS`.
+pub(super) fn sys_power_cpufreq_status(buf_ptr: u64, buf_len: u64) -> u64 {
+    use kernel_core::power::syscalls::CPUFREQ_STATUS_WIRE_LEN;
+    let bytes = crate::arch::x86_64::cpufreq::status().encode();
+    if (buf_len as usize) < CPUFREQ_STATUS_WIRE_LEN {
+        return NEG_EINVAL;
+    }
+    if UserSliceWo::new(buf_ptr, CPUFREQ_STATUS_WIRE_LEN)
+        .and_then(|s| s.copy_from_kernel(&bytes[..]))
+        .is_err()
+    {
+        return NEG_EFAULT;
+    }
+    CPUFREQ_STATUS_WIRE_LEN as u64
 }
 
 // ---------------------------------------------------------------------------

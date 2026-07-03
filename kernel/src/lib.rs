@@ -523,6 +523,11 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
         crate::mitigations::init_bsp();
     });
 
+    // Phase 103 Track E: probe HWP and opt in on the BSP (IA32_PM_ENABLE is
+    // package-scope, so the one write covers APs). QEMU CPU models expose no
+    // HWP — this logs the posture and the cpufreq mechanism stays a no-op.
+    arch::x86_64::cpufreq::init_bsp();
+
     // Phase 16: Initialize NIC drivers.  Phase 55b E.5: the in-kernel e1000
     // driver has been deleted; device-specific 82540EM code now lives in
     // `userspace/drivers/e1000`. The kernel registers only virtio-net here;

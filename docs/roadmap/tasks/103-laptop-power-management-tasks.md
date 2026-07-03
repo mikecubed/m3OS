@@ -84,12 +84,14 @@
 > wait is supplanted by acpid's D.5/E.4 event push (powerd subscribes —
 > its first production consumer). `SET_BRIGHTNESS` needs no syscall
 > (`_BCM` is AML → acpid). Kernel syscalls return where mechanism is
-> genuinely privileged: `SET_GOVERNOR` (Track E MSRs) and
-> `REQUEST_SLEEP` (Track F PM1 writes).
+> genuinely privileged: the Track E MSR apply (landed as
+> `SYS_POWER_SET_PERF`/`SYS_POWER_CPUFREQ_STATUS`, `0x116x` — see E.3
+> for why `SET_GOVERNOR` dissolved) and `REQUEST_SLEEP` (Track F PM1
+> writes).
 
 **Acceptance:**
 - [x] The status query + shared ABI ship as the `power` IPC service + `kernel_core::power::control::PowerStatusWire` (host-tested codec); events arrive by acpid subscription.
-- [ ] `SYS_POWER_SET_GOVERNOR` / `SYS_POWER_REQUEST_SLEEP` land with Tracks E/F (the genuinely privileged mechanisms).
+- [x] The Track E syscalls landed as the `0x116x` family (`kernel_core::power::syscalls`, spectre.rs-style single source; `0x1150` was taken by the kstack debug probe): `SYS_POWER_SET_PERF` 0x1160 (root-gated MSR apply) + `SYS_POWER_CPUFREQ_STATUS` 0x1161 (read-only mechanism + CPU-times snapshot). *(Charter correction: no `SET_GOVERNOR` syscall — the governor **mode** is policy and lives in `powerd`, so only the perf-target apply is privileged; `REQUEST_SLEEP` still pends Track F.)*
 
 ### A.5 — `powerd` daemon scaffold + `power_control` service + `m3ctl` query verbs
 
@@ -103,7 +105,7 @@
 
 **Acceptance:**
 - [x] `cargo xtask check` builds `powerd`; it is embedded in the ramdisk and launched from `services.d/powerd.conf` (`depends=acpid`); `BrkAllocator` + `needs_alloc = true`.
-- [x] `powerd` publishes the `power` IPC service (`POWER_SERVICE_NAME` — the chartered name `power_control` shortened to match the `wifi.control`-style registry naming) and answers `POWER_STATUS` with a live `PowerStatusWire` (each query re-evaluates `_BST`/`_PSR`; one endpoint registered under two names also receives acpid's event pushes — `POWERD:event` log lines, session routing pends D.3). *(Governor mode joins the wire struct with Track E.)*
+- [x] `powerd` publishes the `power` IPC service (`POWER_SERVICE_NAME` — the chartered name `power_control` shortened to match the `wifi.control`-style registry naming) and answers `POWER_STATUS` with a live `PowerStatusWire` (each query re-evaluates `_BST`/`_PSR`/`_TMP`; one endpoint registered under two names also receives acpid's event pushes — `POWERD:event` log lines, session routing pends D.3). *(Slice 2: the wire grew to 18 bytes — hottest-zone temp + thermal state (Track C) and governor mode/mechanism/target (Track E) — both sides ship together so the codec rejects short slice-1 frames.)*
 - [x] `m3ctl power status` and `m3ctl battery` look up `power` via `lookup_with_backoff` and print the decoded status (the `dispatch_wifi_status` shape); `parse_verb` + formatter host tests cover the new verbs (37/37 m3ctl tests green).
 
 ---
@@ -148,25 +150,39 @@
 
 ### C.1 — Thermal-zone enumerate + read + decode
 
-**Files:** `kernel/src/acpi/power.rs`, `kernel-core/src/power/thermal.rs` (new)
-**Symbol:** `power::thermal_zones()`, `thermal::celsius_from_decikelvin(raw)`, `thermal::classify(temp, &trips)`
+**Files:** `kernel-core/src/power/thermal.rs` (new), `kernel-core/src/acpi/namespace.rs` (`thermal_zones()`), `userspace/drivers/acpid/src/main.rs` (`ACPI_LIST_TZ`), `kernel-core/tests/acpi_thermal_zone.rs` (new)
+**Symbol:** `Namespace::thermal_zones()`, acpid `ACPI_LIST_TZ` (label 8), `thermal::deci_celsius_from_decikelvin(raw)`, `thermal::classify(temp, &trips)`
 **Why it matters:** Thermal awareness keeps the machine from cooking under load; the decikelvin→Celsius conversion and trip classification are pure logic falsifiable in CI.
 
+> **Charter correction:** enumeration lives in the ring-3 ACPI stack, not
+> a kernel `acpi/power.rs` — `Namespace::thermal_zones()` filters the
+> `NodeObject::ThermalZone` arena nodes (the interpreter already decoded
+> the `5B 85` op alongside `Device`) and acpid exposes it as the
+> body-less `ACPI_LIST_TZ` verb (newline-joined full paths; **an empty
+> reply is a success** — QEMU q35 declares zero zones, so the populated
+> path is covered by a hand-assembled ThermalZone DSDT fixture,
+> `aml_builder::thermal_zone`, the Dell-touchpad-fixture situation).
+
 **Acceptance:**
-- [ ] Enumerates `_TZ` zones and reads `_TMP` (current), `_CRT` (critical), `_PSV` (passive), `_ACx` (active), `_TSP` (sample period) for each.
-- [ ] `celsius_from_decikelvin` converts ACPI decikelvin to Celsius; host-tested against captured `_TMP`/`_CRT`/`_PSV` values (e.g. `0x0BB8` → 25 °C).
-- [ ] `classify` returns `Normal` / `Passive` / `Active(n)` / `Critical` against the parsed trip points; host-tested across the boundaries.
+- [x] Enumerates `ThermalZone` nodes (`thermal_zones()` → `ACPI_LIST_TZ`) and reads `_TMP` (live, per sample) + `_CRT`/`_PSV` (static, cached at powerd boot) per zone. *(`_ACx`/`_TSP` active-cooling objects are a residual with fan control.)*
+- [x] `deci_celsius_from_decikelvin` (full sensor precision, signed) + `celsius_from_decikelvin` convert ACPI decikelvin; host-tested at 25.0 °C/0 °C/95 °C/−10 °C; `decode_temp_dk` rejects 0 dK and > 5000 dK firmware junk.
+- [x] `classify` returns `Normal` / `Passive` / `Critical` against the trip points, `_CRT` checked first (inverted-firmware-trip safe); host-tested across the at-trip boundaries; the interpreter round-trip (`_TMP`→decode→classify) is covered by `acpi_thermal_zone.rs`. *(No `Active(n)` — active cooling pends with `_ACx`.)*
 
 ### C.2 — Passive + critical policy hook
 
-**Files:** `kernel/src/acpi/power.rs`, `kernel/src/arch/x86_64/cpufreq.rs`
-**Symbol:** `power::thermal_tick`, the governor thermal clamp, the critical-shutdown path
+**Files:** `userspace/powerd/src/main.rs`, `kernel-core/src/power/control.rs`
+**Symbol:** `PowerDevices::thermal_sample`, `thermal_cap()` (the governor clamp), `ThermalWire`
 **Why it matters:** Reading temperatures is useless without acting on them; this wires thermal into the governor (passive cooling) and the shutdown path (thermal-runaway safety).
 
+> **Charter correction:** the policy hook lives in `powerd`'s governor
+> tick (ring 3, userspace-first), not a kernel `thermal_tick`; the trip
+> state is reported via `m3ctl power status` (the `/proc/power` arm was
+> superseded by the `power` IPC service in A.3).
+
 **Acceptance:**
-- [ ] Above `_PSV` the governor's max target is clamped (passive cooling) and `/proc/power` reflects the active trip state; the clamp lifts when temperature drops below `_PSV` with hysteresis.
-- [ ] At `_CRT` the kernel initiates a critical shutdown (logged `[power] CRITICAL temp <C> >= _CRT, shutting down`).
-- [ ] A `Notify(TZ, 0x80)` re-reads `_TMP` and re-runs the policy.
+- [x] Above `_PSV` the governor's cap is clamped to half scale (`thermal_cap` → `Governor::next`) and the status wire carries `thermal=passive` + the hottest zone temp; the clamp lifts when the sample drops below `_PSV` (the conservative ramp provides the recovery hysteresis).
+- [ ] At `_CRT` the governor pins the floor and powerd logs `POWERD:thermal state=critical`; the actual critical-shutdown action (session_manager graceful stop) pends Track D.3's session routing.
+- [ ] A `Notify(TZ, 0x80)` re-reads `_TMP` immediately. *(Interim: the 1 s governor tick re-samples every zone, so a trip is acted on within a tick; event-driven re-read joins D.3.)*
 
 ---
 
@@ -210,35 +226,48 @@
 
 ### E.1 — HWP P-state mechanism
 
-**File:** `kernel/src/arch/x86_64/cpufreq.rs` (new)
-**Symbol:** `cpufreq::enable_hwp`, `cpufreq::set_hwp_request(min, max, desired, epp)`
-**Why it matters:** On Tiger Lake the P-state mechanism is HWP; this is the privileged per-core MSR write that the governor's decision actuates, reusing the `Msr::new(IA32_*)` pattern from `cpuid.rs`/`microcode.rs`.
+**Files:** `kernel/src/arch/x86_64/cpufreq.rs` (new), `kernel/src/arch/x86_64/cpuid.rs` (`probe_hwp`)
+**Symbol:** `cpufreq::init_bsp`, `cpufreq::apply_target(target)`, `cpuid::probe_hwp()`
+**Why it matters:** On Tiger Lake the P-state mechanism is HWP; this is the privileged MSR write that the governor's decision actuates, reusing the `Msr::new(IA32_*)` pattern from `cpuid.rs`/`microcode.rs`.
 
 **Acceptance:**
-- [ ] Detects HWP support (CPUID `06H:EAX[7]`), sets `IA32_PM_ENABLE` bit 0, reads `IA32_HWP_CAPABILITIES` (highest/guaranteed/efficient/lowest perf), and programs `IA32_HWP_REQUEST` per core.
-- [ ] Logs the discovered HWP perf range at init (`[cpufreq] HWP perf hi=<n> lo=<n>`).
-- [ ] The write is done on each online core (per-CPU, not BSP-only).
+- [x] Detects HWP support (CPUID `06H:EAX[7]` + pkg-request `EAX[11]`, max-basic-leaf-guarded like `probe_smep_smap`), sets `IA32_PM_ENABLE` bit 0 at BSP boot, reads `IA32_HWP_CAPABILITIES` (highest/lowest), and programs `IA32_HWP_REQUEST` (min=hw floor, max=governor target linearly mapped from the abstract 1–255 scale, EPP balanced).
+- [x] Logs the discovered range at init (`cpufreq: HWP enabled, perf range <lo>..<hi>`); on QEMU logs the no-HWP posture and `apply_target` is a successful no-op (CI proves probe + degradation; the MSR write path is bare-metal/VFIO-validated like the mt792x radio).
+- [ ] The write covers each online core. *(Interim: `IA32_HWP_REQUEST_PKG` — one package-wide write — is used when CPUID advertises it (all modern parts incl. Tiger Lake); the per-core `IA32_HWP_REQUEST` fallback lands on the syscall's core only. Per-core IPI broadcast is a residual.)*
 
 ### E.2 — Legacy `IA32_PERF_CTL` / `_PSS` fallback
 
-**Files:** `kernel/src/arch/x86_64/cpufreq.rs`, `kernel/src/acpi/power.rs`
-**Symbol:** `cpufreq::set_perf_ctl`, `power::pss_states()` (`_PSS`/`_PCT`)
+**Files:** `kernel/src/arch/x86_64/cpufreq.rs`, acpid `ACPI_EVAL` (the `_PSS`/`_PCT` reads)
+**Symbol:** `cpufreq::set_perf_ctl`, `_PSS` package decode in `kernel-core::power`
 **Why it matters:** Pre-HWP parts and VMs expose only the legacy ACPI P-state objects; the fallback keeps cpufreq functional (and host-testable) without HWP.
 
 **Acceptance:**
-- [ ] When HWP is absent, `_PSS`/`_PCT` are evaluated into a P-state table and `IA32_PERF_CTL` is written for a selected state.
+- [ ] When HWP is absent, `_PSS`/`_PCT` are evaluated into a P-state table and `IA32_PERF_CTL` is written for a selected state. *(Documented residual — QEMU exposes neither HWP nor `_PSS`, and the Dell target is HWP; revisit if a pre-HWP validation machine appears.)*
 - [ ] The `_PSS` package decode is pure logic in `kernel-core::power` and host-tested.
 
 ### E.3 — Conservative governor (pure logic) + mode select
 
-**Files:** `kernel-core/src/power/governor.rs` (new), `kernel/src/arch/x86_64/cpufreq.rs`
-**Symbol:** `governor::Governor::next(load, thermal_cap) -> TargetPerf`, governor-mode select via `SYS_POWER_SET_GOVERNOR`
+**Files:** `kernel-core/src/power/governor.rs` (new), `kernel-core/src/power/syscalls.rs` (new), `userspace/powerd/src/main.rs` (the tick loop)
+**Symbol:** `governor::Governor::next(load_pct, thermal_cap) -> u8`, `GovernorMode`, `CpufreqStatusWire::load_pct_since`
 **Why it matters:** The governor (load → target perf) is portable pure logic decoupled from the privileged MSR write; the mode is policy and must be settable from userspace without a kernel change.
 
+> **Charter correction (the slice's big one):** the governor ticks in
+> **ring-3 `powerd`**, not the kernel — per the userspace-first rule the
+> load-following policy is not privileged. `powerd`'s serve loop uses a
+> 1 s `ipc_recv_msg_timeout` idle wake (the vfs_server flush-interval
+> pattern): sample `SYS_POWER_CPUFREQ_STATUS` (cumulative scheduler CPU
+> times from `global_cpu_times()`), fold the busy/idle delta through
+> `load_pct_since`, clamp by the Track C thermal cap, and apply via
+> `SYS_POWER_SET_PERF`. This also dissolves the chartered
+> `SYS_POWER_SET_GOVERNOR`: the **mode** is a powerd-internal policy
+> knob (reported in the status wire; settable over the `power` IPC
+> service when the settings panel needs it), and only the target apply
+> is a syscall.
+
 **Acceptance:**
-- [ ] `Governor::next` implements a conservative ramp (step up on sustained high load, down on idle) clamped by the Track C thermal cap; host-tested across a load sweep and with a clamp applied.
-- [ ] Governor mode (`performance` / `powersave` / `conservative`) is settable through `SYS_POWER_SET_GOVERNOR` and reported in `/proc/power`.
-- [ ] The kernel ticks the governor against per-core load and applies the result via E.1/E.2 mechanism.
+- [x] `Governor::next` implements a conservative ramp (±32/tick on the 1–255 scale with a 30–75 % hysteresis band) clamped by the thermal cap; host-tested across load sweeps, cap clamp/release, and mode pinning (6 tests).
+- [x] Governor mode (`performance` / `powersave` / `conservative`) exists with a stable wire encoding and is reported in `m3ctl power status` (`governor: conservative (mech none, target N)`); runtime mode *selection* over the `power` service pends the Phase 105 settings-panel Power slice (D.3/D.4).
+- [x] The governor ticks against measured load and applies through the E.1 mechanism — in `powerd` per the correction above; `power-smoke` asserts the first `POWERD:governor mode=conservative target=` tick and the m3ctl render on a mechanism-less VM.
 
 ---
 
@@ -296,7 +325,7 @@
 **Why it matters:** The plumbing (namespace, `/proc/power`, the syscall surface, the governor) is testable in QEMU even though the device datapaths are not; the gate must be present, assert what it can, and skip-with-reason on the HW-only arms, mirroring `ure-smoke`/`wifi-smoke`.
 
 **Acceptance:**
-- [x] `power-smoke` boots m3OS and asserts the VM case: `POWERD:ready battery=none ac=assumed-online`, `m3ctl power status` round-tripping through `powerd` (`ac: assumed-online` / `battery: none` rendered over the `power` IPC service — the `/proc/power` arm is superseded per A.3's correction; governor mode joins with Track E), **plus the Track D event spine live in CI**: a QMP power button traverses acpid → powerd's subscription (`POWERD:event path=\FIXED.PWRBTN code=0x80`).
+- [x] `power-smoke` boots m3OS and asserts the VM case: `POWERD:ready battery=none ac=assumed-online zones=0 mech=none`, `m3ctl power status` round-tripping through `powerd` (`ac: assumed-online` / `battery: none` / `thermal: none (no zones)` / `governor: conservative (mech none, target N)` rendered over the `power` IPC service — the `/proc/power` arm is superseded per A.3's correction), **the Track E governor loop live in CI** (the first `POWERD:governor mode=conservative target=` tick proves the recv-timeout wake + both `0x116x` syscalls), **plus the Track D event spine live in CI**: a QMP power button traverses acpid → powerd's subscription (`POWERD:event path=\FIXED.PWRBTN code=0x80`).
 - [x] The live battery/brightness/thermal/lid/suspend arms are hardware-only by construction (no QEMU devices — powerd's no-battery posture IS the skip-with-reason), and the gate passes in CI.
 - [x] `M3OS_POWER_REGRESSION=1` row added to the `AGENTS.md` gate table + `regression-gates.md` stanza + pre-push hook block; `docs/roadmap/README.md` Phase 103 row updated.
 

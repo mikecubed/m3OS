@@ -525,12 +525,16 @@ fn power_without_subcommand_is_missing_argument() {
 
 #[test]
 fn power_status_format_renders_vm_and_battery_cases() {
-    use kernel_core::power::control::{AcState, PowerStatusWire};
+    use kernel_core::power::control::{AcState, CpufreqMech, PowerStatusWire, ThermalWire};
+    use kernel_core::power::governor::GovernorMode;
 
     let vm = PowerStatusWire::no_battery();
     let rendered = format_power_status(&vm);
     assert!(rendered.contains("ac: assumed-online"));
     assert!(rendered.contains("battery: none"));
+    // Slice-2 posture lines on a zone-less, HWP-less VM.
+    assert!(rendered.contains("thermal: none (no zones)"));
+    assert!(rendered.contains("governor: conservative (mech none, target 0)"));
 
     let laptop = PowerStatusWire {
         battery_present: true,
@@ -538,9 +542,24 @@ fn power_status_format_renders_vm_and_battery_cases() {
         ac: AcState::Offline,
         state: kernel_core::power::battery::BST_STATE_DISCHARGING,
         rate: 8_760,
+        temp_deci_c: 421,
+        thermal: ThermalWire::Normal,
+        governor: GovernorMode::Conservative,
+        mech: CpufreqMech::Hwp,
+        perf: 96,
     };
     let rendered = format_power_status(&laptop);
     assert!(rendered.contains("ac: offline"));
     assert!(rendered.contains("50% discharging"));
+    assert!(rendered.contains("thermal: normal, 42.1 C"));
+    assert!(rendered.contains("governor: conservative (mech hwp, target 96)"));
     assert!(format_battery(&laptop).contains("battery: 50% discharging"));
+
+    // A passive-cooling laptop just under boiling renders its state.
+    let hot = PowerStatusWire {
+        temp_deci_c: 953,
+        thermal: ThermalWire::Passive,
+        ..laptop
+    };
+    assert!(format_power_status(&hot).contains("thermal: passive, 95.3 C"));
 }
