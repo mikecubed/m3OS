@@ -587,6 +587,7 @@ fn power_status_format_renders_vm_and_battery_cases() {
     assert!(rendered.contains("thermal: none (no zones)"));
     assert!(rendered.contains("governor: conservative (mech none, target 0)"));
     assert!(rendered.contains("backlight: none (no device)"));
+    assert!(rendered.contains("sleep: none declared"));
 
     let laptop = PowerStatusWire {
         battery_present: true,
@@ -600,6 +601,7 @@ fn power_status_format_renders_vm_and_battery_cases() {
         mech: CpufreqMech::Hwp,
         perf: 96,
         backlight_pct: 75,
+        sleep_bits: kernel_core::power::control::SLEEP_S3 | kernel_core::power::control::SLEEP_S4,
     };
     let rendered = format_power_status(&laptop);
     assert!(rendered.contains("ac: offline"));
@@ -607,6 +609,7 @@ fn power_status_format_renders_vm_and_battery_cases() {
     assert!(rendered.contains("thermal: normal, 42.1 C"));
     assert!(rendered.contains("governor: conservative (mech hwp, target 96)"));
     assert!(rendered.contains("backlight: 75%"));
+    assert!(rendered.contains("sleep: S3+S4 (firmware; resume path pending)"));
     assert!(format_battery(&laptop).contains("battery: 50% discharging"));
 
     // A passive-cooling laptop just under boiling renders its state.

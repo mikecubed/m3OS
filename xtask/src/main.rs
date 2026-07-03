@@ -11160,11 +11160,14 @@ fn cmd_power_smoke(args: &SmokeBootArgs) {
                 .map_err(|e| format!("serial send failed: {e}"))
         };
         wait(
-            "POWERD:ready battery=none ac=assumed-online zones=0 mech=none backlight=none",
+            "POWERD:ready battery=none ac=assumed-online zones=0 mech=none backlight=none sleep=s3+s4",
             &mut serial_buf,
             &mut serial_history,
         )?;
-        println!("power-smoke: powerd serves the VM no-battery/no-zones/no-HWP/no-panel posture");
+        println!(
+            "power-smoke: powerd serves the VM no-battery/no-zones/no-HWP/no-panel posture \
+             (firmware sleep discovery: s3+s4)"
+        );
         // Slice 2: the ring-3 governor tick loop produced its first target —
         // proof the recv-timeout wake, SYS_POWER_CPUFREQ_STATUS load sample,
         // and SYS_POWER_SET_PERF apply all ran (a no-op apply on QEMU).
@@ -11211,13 +11214,42 @@ fn cmd_power_smoke(args: &SmokeBootArgs) {
             &mut serial_buf,
             &mut serial_history,
         )?;
-        println!("power-smoke: m3ctl rendered power/thermal/governor/backlight status over IPC");
+        wait(
+            "sleep: S3+S4 (firmware; resume path pending)",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        println!(
+            "power-smoke: m3ctl rendered power/thermal/governor/backlight/sleep status over IPC"
+        );
         // Track B set-path posture: a brightness request on a panel-less
         // VM comes back as a clean "no device" error, not a hang/crash.
         std::thread::sleep(std::time::Duration::from_millis(300));
         send(&mut stdin, "/bin/m3ctl backlight 50\n")?;
         wait("backlight: no device", &mut serial_buf, &mut serial_history)?;
         println!("power-smoke: brightness set on the panel-less VM rejected cleanly");
+        // Track F: a suspend request FAILS CLOSED to a live session (no S3
+        // resume path yet) — the F.2 fail-closed acceptance arm, live.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        send(&mut stdin, "/bin/m3ctl power suspend\n")?;
+        wait(
+            "POWERD:suspend rejected reason=resume-path-unimplemented firmware=s3+s4",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        wait(
+            "suspend: failed closed",
+            &mut serial_buf,
+            &mut serial_history,
+        )?;
+        // The session must still be alive after the refusal — an echo
+        // with the double-space collapse proves fresh execution (the
+        // typed line has two spaces, the output one; earlier history
+        // cannot false-match since the matcher is non-consuming).
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        send(&mut stdin, "echo suspend-liveness  ok\n")?;
+        wait("suspend-liveness ok", &mut serial_buf, &mut serial_history)?;
+        println!("power-smoke: suspend failed closed to a live session");
         let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
             .map_err(|e| format!("qmp connect: {e}"))?;

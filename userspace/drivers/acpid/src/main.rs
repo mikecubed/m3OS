@@ -140,10 +140,21 @@ const ACPI_EVAL_ARG: u64 = 9;
 /// Reply as [`ACPI_LIST_TZ`]: `data[0]` = bulk length, bulk =
 /// newline-joined device full paths (empty = success on q35).
 const ACPI_LIST_BACKLIGHT: u64 = 10;
+/// Phase 103 F.1 — query the firmware's sleep-state support. No request
+/// body; the reply label is `REPLY_SLEEP_BASE | bits` with bit 0 = `\_S3`
+/// present, bit 1 = `\_S4`, bit 2 = S0ix (a `PNP0D80` Low-Power-S0-Idle
+/// device) — the `ACPI_STA` label-carries-the-value shape.
+const ACPI_SLEEP_STATES: u64 = 11;
 /// Reply label for any failure (unknown label, bad request, no match).
 const REPLY_ERR: u64 = u64::MAX;
 /// `ACPI_STA` success replies are `REPLY_STA_BASE | sta`.
 const REPLY_STA_BASE: u64 = 0x100;
+/// `ACPI_SLEEP_STATES` success replies are `REPLY_SLEEP_BASE | bits`.
+const REPLY_SLEEP_BASE: u64 = 0x200;
+/// Sleep-support bits (mirrored in `kernel_core::power::control`).
+const SLEEP_S3: u64 = 1 << 0;
+const SLEEP_S4: u64 = 1 << 1;
+const SLEEP_S0IX: u64 = 1 << 2;
 
 /// Bounded subscriber table (Phase 102/103 clients + smoke harnesses).
 const MAX_SUBSCRIBERS: usize = 8;
@@ -789,6 +800,29 @@ fn program_main(_args: &[&str]) -> i32 {
         _ => announce("acpid: no \\_S5 — poweroff degrades to halt\n"),
     }
 
+    // ---- Phase 103 F.1: sleep-state discovery ---------------------------
+    // Which sleep states the firmware declares decides the entire suspend
+    // strategy up front (classic S3 vs modern S0ix). `\_Sx` presence is
+    // static; S0ix shows as a `PNP0D80` Low-Power-S0-Idle device. QEMU
+    // q35 declares `\_S3` + `\_S4` and no S0ix.
+    let mut sleep_bits: u64 = 0;
+    if ns.evaluate(&mut regions, "\\_S3").is_ok() {
+        sleep_bits |= SLEEP_S3;
+    }
+    if ns.evaluate(&mut regions, "\\_S4").is_ok() {
+        sleep_bits |= SLEEP_S4;
+    }
+    if !ns.find_by_hid(&mut regions, "PNP0D80").is_empty() {
+        sleep_bits |= SLEEP_S0IX;
+    }
+    let yn = |bit: u64| if sleep_bits & bit != 0 { "yes" } else { "no" };
+    announce(&format!(
+        "acpid: sleep states s3={} s4={} s0ix={}\n",
+        yn(SLEEP_S3),
+        yn(SLEEP_S4),
+        yn(SLEEP_S0IX)
+    ));
+
     // ---- Register the query service ------------------------------------
     let ep = syscall_lib::create_endpoint();
     if ep == u64::MAX {
@@ -871,6 +905,9 @@ fn program_main(_args: &[&str]) -> i32 {
                 reply_cap,
             ),
             ACPI_LIST_BACKLIGHT => handle_list_backlight(&ns, reply_cap),
+            ACPI_SLEEP_STATES => {
+                syscall_lib::ipc_reply(reply_cap, REPLY_SLEEP_BASE | sleep_bits, 0);
+            }
             _ => {
                 syscall_lib::ipc_reply(reply_cap, REPLY_ERR, 0);
             }

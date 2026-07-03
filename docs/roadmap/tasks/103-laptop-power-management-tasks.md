@@ -303,13 +303,20 @@
 
 ### F.1 — Sleep-state discovery (S3 vs S0ix)
 
-**Files:** `kernel/src/acpi/power.rs`, `kernel/src/acpi/mod.rs`
-**Symbol:** `power::sleep_states()` (`_S3`/`_S4`/`_S5` packages + the FADT PM1_CNT block), S0ix capability detection
+**Files:** `userspace/drivers/acpid/src/main.rs` (`ACPI_SLEEP_STATES` label 11), `kernel-core/src/power/control.rs` (`SLEEP_*` bits, `sleep_bits` in the wire), `userspace/powerd/src/main.rs`
+**Symbol:** acpid's boot probe + `ACPI_SLEEP_STATES` verb (reply label = `REPLY_SLEEP_BASE | bits`, the `_STA` shape), `format_sleep_field`
 **Why it matters:** Whether the machine supports classic S3 or only S0ix decides the entire suspend strategy; detecting it up front avoids attempting an unsupported sleep.
 
+> **Charter correction:** discovery lives in acpid per the 101 split
+> (no kernel `acpi/power.rs`). `\_Sx` presence is probed by evaluating
+> the packages through the interpreter; S0ix detection is a `PNP0D80`
+> Low-Power-S0-Idle device match via the existing `find_by_hid`. QEMU
+> q35 declares `\_S3` + `\_S4` and no S0ix, so the discovery arm runs
+> **live in CI** against real firmware AML (unlike battery/backlight).
+
 **Acceptance:**
-- [ ] Reads the `_Sx` packages from the Phase 101 namespace to learn the `SLP_TYP` values and which sleep states are supported; logs `[power] sleep states: S3=<y/n> S0ix=<y/n>`.
-- [ ] Detects S0ix support (the `LPS0`/`_LPI` presence) and records it as the modern follow-on path when `_S3` is absent.
+- [x] Probes `\_S3`/`\_S4` from the Phase 101 namespace and logs `acpid: sleep states s3=<yes|no> s4=<yes|no> s0ix=<yes|no>`; the bits ride the status wire (19 bytes now) into `m3ctl power status` (`sleep: S3+S4 (firmware; resume path pending)`) and the `POWERD:ready` line (`sleep=s3+s4`), both asserted by `power-smoke` against the live q35 DSDT. *(The S3 SLP_TYP values themselves register with the kernel when F.3's entry mechanism lands — the `\_S5` registration shape.)*
+- [x] Detects S0ix (`PNP0D80`) and reports it as its own bit — the modern follow-on path when `\_S3` is absent.
 
 ### F.2 — Device quiesce/restore choreography
 
@@ -319,7 +326,7 @@
 
 **Acceptance:**
 - [ ] `powerd` + `session_manager` quiesce the display/input/storage/NIC drivers (stop rings, save state) before requesting the sleep, and restore them after resume.
-- [ ] A quiesce failure aborts the suspend and fails closed to a live session (no half-suspended state).
+- [x] A quiesce failure aborts the suspend and fails closed to a live session (no half-suspended state). *(The fail-closed arm is live ahead of the choreography: `POWER_SUSPEND` (0x5703) is refused outright — `POWERD:suspend rejected reason=resume-path-unimplemented` — because entering S3 without the F.3 resume path never wakes; `power-smoke` asserts the refusal and that the session stays live. Lid-close routes to the lockscreen fallback (`POWERD:lid action=lock`) instead of suspending — the D.3 lid arm, HW-validated later since q35 models no lid.)*
 
 ### F.3 — S3 entry + resume (S0ix noted)
 

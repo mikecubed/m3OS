@@ -396,13 +396,18 @@ namespace for `PNP0C0A`/`ACPI0003` (absent on q35) and thermal zones
 (`ACPI_LIST_TZ` — q35 declares none), probes the kernel cpufreq
 mechanism (`SYS_POWER_CPUFREQ_STATUS` — no HWP under QEMU), and
 announces `POWERD:ready battery=none ac=assumed-online zones=0
-mech=none backlight=none`; the ring-3 conservative governor's first 1 s
+mech=none backlight=none sleep=s3+s4` (the F.1 sleep discovery runs
+against the live q35 DSDT — `\_S3`/`\_S4` declared, no S0ix); the ring-3 conservative governor's first 1 s
 tick reports `POWERD:governor mode=conservative target=` (proving the
 recv-timeout wake, the CPU-times load sample, and the
 `SYS_POWER_SET_PERF` no-op apply); after a serial login, `m3ctl power
 status` renders the battery/thermal/governor/backlight posture over the
 `power` IPC service and `m3ctl backlight 50` is rejected cleanly on the
-panel-less VM (`backlight: no device` — the Track B set path); then a
+panel-less VM (`backlight: no device` — the Track B set path);
+`m3ctl power suspend` **fails closed** (`POWERD:suspend rejected
+reason=resume-path-unimplemented` — no S3 resume path exists, and
+entering S3 without one never wakes) with the session verified alive
+afterward (an echo round-trip); then a
 QMP `system_powerdown` power button traverses acpid → powerd's event
 subscription (`POWERD:event path=\FIXED.PWRBTN code=0x80`) and — Track
 D.3 — drives the full graceful-poweroff chain: `POWERD:poweroff` →

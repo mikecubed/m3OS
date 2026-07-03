@@ -33,7 +33,12 @@
 //! sentinels:
 //!
 //! - `POWERD:ready battery=<none|path> ac=<assumed-online|path>
-//!   zones=<n> mech=<none|hwp> backlight=<none|path>`
+//!   zones=<n> mech=<none|hwp> backlight=<none|path> sleep=<none|s3+s4…>`
+//! - `POWERD:suspend rejected reason=resume-path-unimplemented
+//!   firmware=<bits>` — a `POWER_SUSPEND` request failed closed (Track
+//!   F: no S3 resume path yet; refusing beats never waking up).
+//! - `POWERD:lid action=lock (suspend fails closed)` — lid-close routed
+//!   to the lockscreen fallback (no QEMU lid model; HW-validated).
 //! - `POWERD:backlight set=<pct>%` — a `POWER_SET_BRIGHTNESS` request
 //!   applied a level through `_BCM` (Track B; never fires on q35).
 //! - `POWERD:event path=<asl-path> code=<c>` — an acpid event arrived.
@@ -65,7 +70,8 @@ use kernel_core::power::backlight::{self, BACKLIGHT_UNKNOWN, BclLevels};
 use kernel_core::power::battery::{self, BatteryInfo};
 use kernel_core::power::control::{
     AcState, CpufreqMech, PERCENT_UNKNOWN, POWER_SERVICE_NAME, POWER_SET_BRIGHTNESS, POWER_STATUS,
-    PowerStatusWire, TEMP_UNKNOWN_DECI_C, ThermalWire,
+    POWER_SUSPEND, PowerStatusWire, SLEEP_S0IX, SLEEP_S3, SLEEP_S4, TEMP_UNKNOWN_DECI_C,
+    ThermalWire,
 };
 use kernel_core::power::governor::{Governor, GovernorMode, PERF_MAX, PERF_MIN};
 use kernel_core::power::syscalls::{
@@ -111,6 +117,10 @@ const ACPI_EVAL: u64 = 7;
 const ACPI_LIST_TZ: u64 = 8;
 const ACPI_EVAL_ARG: u64 = 9;
 const ACPI_LIST_BACKLIGHT: u64 = 10;
+const ACPI_SLEEP_STATES: u64 = 11;
+/// `ACPI_SLEEP_STATES` replies carry the bits in the label:
+/// `REPLY_SLEEP_BASE | bits` (the acpid `_STA` shape).
+const REPLY_SLEEP_BASE: u64 = 0x200;
 
 /// The event-endpoint name acpid resolves for its push handle.
 const EVENTS_SERVICE_NAME: &str = "powerd.events";
@@ -168,6 +178,33 @@ fn acpi_list(handle: u32, label: u64) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect()
+}
+
+/// `ACPI_SLEEP_STATES` (F.1): the firmware's declared sleep support as
+/// `SLEEP_*` bits, carried in the reply label.
+fn sleep_states(handle: u32) -> u8 {
+    let reply = syscall_lib::ipc_call(handle, ACPI_SLEEP_STATES, 0);
+    if reply & !0xFF != REPLY_SLEEP_BASE {
+        return 0;
+    }
+    (reply & 0xFF) as u8
+}
+
+/// Render sleep bits for the ready line / logs (`none` or `s3+s4`…).
+fn sleep_str(bits: u8) -> String {
+    if bits == 0 {
+        return String::from("none");
+    }
+    let mut s = String::new();
+    for (bit, name) in [(SLEEP_S3, "s3"), (SLEEP_S4, "s4"), (SLEEP_S0IX, "s0ix")] {
+        if bits & bit != 0 {
+            if !s.is_empty() {
+                s.push('+');
+            }
+            s.push_str(name);
+        }
+    }
+    s
 }
 
 /// `ACPI_EVAL_ARG`: evaluate a one-argument method (`_BCM(level)`).
@@ -252,6 +289,8 @@ struct PowerDevices {
     /// The first backlight-capable display output (`_BCL` carrier),
     /// with its level list cached once; `None` on QEMU/desktop.
     backlight: Option<Backlight>,
+    /// Firmware-declared sleep support (F.1 discovery), `SLEEP_*` bits.
+    sleep_bits: u8,
 }
 
 impl PowerDevices {
@@ -319,6 +358,7 @@ impl PowerDevices {
             temp_deci_c,
             thermal,
             backlight_pct: self.backlight_percent(),
+            sleep_bits: self.sleep_bits,
             ..PowerStatusWire::no_battery()
         };
         let Some(acpi) = self.acpi else {
@@ -414,6 +454,7 @@ fn program_main(_args: &[&str]) -> i32 {
         battery_info: None,
         zones: Vec::new(),
         backlight: None,
+        sleep_bits: 0,
     };
     if let Some(handle) = acpi {
         // PNP0C0A = Control Method Battery, ACPI0003 = AC adapter.
@@ -427,6 +468,9 @@ fn program_main(_args: &[&str]) -> i32 {
                     eval(handle, &format!("{bat}._BIF")).and_then(|v| battery::decode_bif(&v))
                 });
         }
+        // Sleep discovery (Track F.1): which states the firmware declares
+        // is static; whether suspend *runs* is the F.3 resume path's call.
+        devices.sleep_bits = sleep_states(handle);
         // Backlight (Track B): the `_BCL` level list is static — decode
         // once; only `_BQC` is live. First `_BCL` carrier wins (laptops
         // expose one panel; multi-output brightness is a residual).
@@ -472,7 +516,7 @@ fn program_main(_args: &[&str]) -> i32 {
     let mut poweroff_started = false;
 
     announce(&format!(
-        "POWERD:ready battery={} ac={} zones={} mech={} backlight={}\n",
+        "POWERD:ready battery={} ac={} zones={} mech={} backlight={} sleep={}\n",
         devices.battery_path.as_deref().unwrap_or("none"),
         devices.ac_path.as_deref().unwrap_or("assumed-online"),
         devices.zones.len(),
@@ -481,6 +525,7 @@ fn program_main(_args: &[&str]) -> i32 {
             .backlight
             .as_ref()
             .map_or("none", |b| b.path.as_str()),
+        sleep_str(devices.sleep_bits),
     ));
 
     // ---- Serve ----------------------------------------------------------
@@ -536,9 +581,16 @@ fn program_main(_args: &[&str]) -> i32 {
             announce(&format!("POWERD:event path={path} code={code:#x}\n"));
             // D.3 routing: the power button (fixed-feature pseudo-path or a
             // control-method PNP0C0C notify) initiates graceful poweroff.
-            // Lid → suspend joins with Track F (no sleep support yet).
             if code == 0x80 && (path == "\\FIXED.PWRBTN" || path.ends_with("PWRB")) {
                 initiate_poweroff("power-button", &mut poweroff_started);
+            }
+            // Track F lid routing (charter D.3): suspend fails closed
+            // until the F.3 resume path exists, so lid-close falls back
+            // to locking the session (`PNP0C0D` lid devices are named
+            // LID0/LID_ across firmwares; no QEMU model — HW-validated).
+            if code == 0x80 && path.contains("LID") {
+                announce("POWERD:lid action=lock (suspend fails closed)\n");
+                lock_session();
             }
             continue;
         }
@@ -555,6 +607,17 @@ fn program_main(_args: &[&str]) -> i32 {
             let encoded = status.encode();
             syscall_lib::ipc_store_reply_bulk(&encoded);
             syscall_lib::ipc_reply(reply_cap, 0, encoded.len() as u64);
+        } else if rc == u64::from(POWER_SUSPEND) {
+            // Track F: **fail closed**. The F.3 S3 entry/resume mechanism
+            // (FACS waking vector + CPU re-establish + F.2 driver quiesce)
+            // is not implemented; writing SLP_TYP without a resume path
+            // never comes back. Refusing beats half-suspending — the F.2
+            // fail-closed acceptance arm.
+            announce(&format!(
+                "POWERD:suspend rejected reason=resume-path-unimplemented firmware={}\n",
+                sleep_str(devices.sleep_bits)
+            ));
+            syscall_lib::ipc_reply(reply_cap, u64::MAX, devices.sleep_bits as u64);
         } else if rc == u64::from(POWER_SET_BRIGHTNESS) {
             // Track B: pct in data0 → nearest _BCL level → _BCM. The
             // last-set level re-applies on resume with Track F.
@@ -580,6 +643,19 @@ fn severity_wire(t: ThermalWire) -> u8 {
         ThermalWire::NoZones | ThermalWire::Normal => 0,
         ThermalWire::Passive => 1,
         ThermalWire::Critical => 2,
+    }
+}
+
+/// Track F lid fallback: lock the session (the `m3ctl lock` shape — a
+/// forked child execs `/bin/lockscreen`).
+fn lock_session() {
+    let pid = syscall_lib::fork();
+    if pid == 0 {
+        let path: &[u8] = b"/bin/lockscreen\0";
+        let argv: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        syscall_lib::execve(path, &argv, &envp);
+        syscall_lib::exit(1);
     }
 }
 
