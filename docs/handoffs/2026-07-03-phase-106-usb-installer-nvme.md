@@ -1,8 +1,8 @@
 # Handoff — Phase 106: USB Installer & NVMe Install
 
 **Date:** 2026-07-04 (living doc — update on every session working this phase)
-**Branch:** `feat/phase-106-c5-mkfs-ext2` (off `main`; PR #299 open + green) — the
-active feature branch. Earlier tracks merged (below).
+**Branch:** `feat/phase-106-c4-partition-installer` (off `main`; PR #302) — the
+active feature branch. Earlier tracks merged (below; PR #299 merged 2026-07-04).
 **State:** IN PROGRESS.
 - **Track A (M1)** ✅ merged — PR #294 (`40a9e685`). Combined GPT(ESP+ext2)
   USB image + USB-ext2 root bootstrap. `usb-root-smoke` green.
@@ -15,11 +15,17 @@ active feature branch. Earlier tracks merged (below).
   - **`nvme-install-smoke`** ✅ **GREEN end-to-end** — PR #297 (merged): USB
     boot → ~40 s 1 GiB sparse copy → reboot → NVMe-alone boot to a live shell
     over `nvme.block`; in pre-push behind `M3OS_NVME_INSTALL_REGRESSION=1`.
-  - **C.5 on-device `mkfs.ext2`** ✅ **pure-logic core landed** — PR #299
-    (open + fully green, all review resolved). `kernel-core/src/fs/ext2_format.rs`
-    (`format_ext2` + `Ext2Fs` writer + `BlockIo` seam). See below.
-  - **C.4** (partition-aware GPT/ESP writer) + the C.5 installer-populate arm —
-    pending.
+  - **C.5 on-device `mkfs.ext2`** ✅ **merged** — PR #299 (`09921df3`).
+    `kernel-core/src/fs/ext2_format.rs` (`format_ext2` + `Ext2Fs` writer +
+    `BlockIo` seam). See below.
+  - **C.4 + C.5 installer-populate arm** ✅ **landed on PR #302**
+    (`feat/phase-106-c4-partition-installer`): pure-logic GPT builder/parser
+    (`kernel-core/src/fs/gpt.rs`, sgdisk-validated), populate walker +
+    write-back block cache (`kernel-core/src/fs/ext2_populate.rs`,
+    e2fsck-validated), `installer --part` (fresh target-sized GPT + ESP copy +
+    on-device `format_ext2` + file-level populate), and the
+    `nvme-install-part-smoke` gate (same `M3OS_NVME_INSTALL_REGRESSION=1`
+    env var; host-side gpt-crate + e2fsck cross-checks between the boots).
 - **Tracks D / E** — not started (D first-user; E bare-metal sign-off).
 - **CI reliability** ✅ — a four-cause chain that made every PR's checks red/flaky
   was root-caused and fixed this session (PRs #298/#300/#301, all merged). The
@@ -222,9 +228,8 @@ consider an ASCII sentinel emitted more than once.
 
 ## Remaining Phase 106 work
 
-- **C.5 — on-device `mkfs.ext2`** ✅ **pure-logic core landed — PR #299**
-  (`feat/phase-106-c5-mkfs-ext2`, open + fully green, all Copilot review
-  resolved). New `kernel-core/src/fs/ext2_format.rs`:
+- **C.5 — on-device `mkfs.ext2`** ✅ **merged — PR #299** (`09921df3`).
+  New `kernel-core/src/fs/ext2_format.rs`:
   - `format_ext2(io, params)` lays down a complete rev-1 filesystem — primary +
     per-group backup superblocks (with the primary-at-offset-1024 vs
     backup-at-offset-0 asymmetry for >1 KiB blocks), BGD table, block/inode
@@ -251,13 +256,45 @@ consider an ASCII sentinel emitted more than once.
     **plus a real `e2fsck -fn` external-validator test** (skips-with-reason if
     absent; ran+passed on the dev host). Two independent opus reviews (one
     brute-forced the byte-scan equivalence over all inputs).
-  - **Remaining C.5 (installer populate):** deferred to C.4 — see below.
-- **C.4 — on-device GPT writer + ESP/FAT creator** (partition-aware follow-on to
-  the raw copy). Lets the installer lay a fresh GPT + ESP sized to the target
-  disk instead of a byte-for-byte image clone. **C.5's installer-populate arm
-  lands here:** format the C.4-created Linux partition with `format_ext2`, then
-  copy the source rootfs into it via `Ext2Fs::create_*` (needs a source-fs
-  reader over the raw syscalls). The pure-logic pieces are done and validated.
+  - **Remaining C.5 (installer populate):** ✅ landed with C.4 — below.
+- **C.4 — partition-aware installer** ✅ **landed — PR #302**
+  (`feat/phase-106-c4-partition-installer`, 2026-07-04). `installer --part`
+  lays a fresh GPT + ESP sized to the target disk instead of a byte-for-byte
+  image clone:
+  - `kernel-core/src/fs/gpt.rs` — pure-logic GPT builder (`build_gpt` +
+    `GptPlan::for_target`: source ESP span kept, Linux partition grown to the
+    target's last usable LBA; CRC32 IEEE; `sector_writes()` yields the exact
+    write list) + `parse_gpt`, a **CRC-verified** parser (stricter than the
+    kernel probe — the installer fails closed on a corrupt source). 9 host
+    tests incl. a kernel `gpt_ext2_scan` replica and an `sgdisk --verify`
+    external validator (ran+passed on the dev host).
+  - `kernel-core/src/fs/ext2_populate.rs` — `populate_from_reader` walks the
+    source rootfs via the existing `BlockReader` read path and re-creates
+    every dir/file/symlink through the C.5 `Ext2Fs` writer (cross-block-size;
+    mode/uid/gid/timestamps preserved; `lost+found` skipped; visited-set
+    terminates a corrupt source's dir cycle). `WriteBackBlockIo` — LRU
+    write-back cache for metadata read-modify-writes + contiguous-run
+    coalescer emitting single ≤256-sector `write_block_run` raw requests
+    (new `BlockIo` default method) — >2× fewer device write requests,
+    byte-identical image (both test-asserted). 5 host tests incl. `e2fsck
+    -fn` on a cache-populated target.
+  - `userspace/installer` `--part` mode: CRC-verified source-GPT parse →
+    source ext2 mount (read-only, before any target write) → target resolve
+    + `target-is-source` guard → capacity probe (LBA bisection over raw
+    reads — no capacity syscall needed) → fresh GPT → sparse same-span ESP
+    copy (the FAT's geometry is partition-relative; `hidden sectors` = the
+    unchanged start LBA, so a raw copy stays valid — no on-device FAT
+    formatter needed) → `format_ext2` (source's block size — the geometry
+    the kernel root mount is proven on) → populate → `Ext2Fs::flush` +
+    cache flush + `BLK_FLUSH` → reboot. New sentinels:
+    `INSTALLER:mode/layout/target/gpt-written/esp-copied/format/populate`,
+    `INSTALLER:error part-*`.
+  - **Gate `nvme-install-part-smoke`** (same `M3OS_NVME_INSTALL_REGRESSION=1`;
+    second pre-push invocation): boot 1 runs `--part`; between the boots the
+    gate host-verifies the written disk — grown-root-span math vs the source
+    image's own GPT, an **independent `gpt`-crate parse** of the installed
+    GPT, `skipped=0` in the populate sentinel, and `e2fsck -fn` of the
+    extracted rootfs partition; boot 2 (NVMe alone → live login) unchanged.
 - **Track D — first-user / account setup.** Wire `adduser`/`passwd`
   (PBKDF2/`crypto-lib`) into the installer or a one-shot first-boot: create
   root + first-user `/etc/passwd`+`/etc/shadow`, seed the home dir, **disable the
@@ -272,6 +309,24 @@ consider an ASCII sentinel emitted more than once.
 ---
 
 ## Gotchas learned this phase (don't re-discover)
+
+- **A device-status error reply used to wedge the whole `dev_id` (fixed with
+  C.4).** `blk::remote`'s outer read/write wrappers treated ANY inner error —
+  including a decoded `status != Ok` reply from a perfectly live driver — as
+  an IPC/driver failure: `on_ipc_error*` latched `is_restarting()`, the
+  restart wait timed out (a healthy driver never re-registers), and **every
+  later request on that `dev_id` blocked out the full 1 s restart budget and
+  failed**. Never seen before C.4 because no green path ever produced a
+  legitimate error reply; the `--part` installer's capacity probe (deliberate
+  out-of-range reads) hit it instantly — one failing probe bricked all
+  subsequent reads *and* writes (`part-gpt-write-failed lba=0`), and the
+  bisection collapsed to `known_good+1` (every probe "failed"). Fix:
+  `restart_suspected(err_byte)` (kernel-core `driver_ipc::block`,
+  host-tested) — only transport-shaped failures (`DriverRestarting`, the
+  `0xFF` no-endpoint/decode convention) may trigger the restart dance; a
+  decoded status error passes through untouched. If a gate ever shows "first
+  error on a device, then everything fails with ~1 s stalls", check for a
+  path that bypasses this classification.
 
 - **NVMe self-test was destructive.** The ring-3 `nvme_driver` wrote a bring-up
   sentinel to LBA 0, clobbering a real rootfs MBR when routed as the root disk.
@@ -333,6 +388,12 @@ consider an ASCII sentinel emitted more than once.
    — shm bounce path + single-daemon guard on
    `feat/phase-106-usb-storage-multisector`; gate wired behind
    `M3OS_NVME_INSTALL_REGRESSION=1`.
-3. **C.5 on-device `mkfs.ext2`** (host-tested pure logic) → **C.4** GPT/ESP writer.
+3. ~~**C.5 on-device `mkfs.ext2`**~~ ✅ merged (PR #299) → ~~**C.4** GPT/ESP
+   writer + populate~~ ✅ landed (PR #302, `installer --part` +
+   `nvme-install-part-smoke`).
 4. **Track D** first-user setup (reuse `adduser`/`passwd`; disable autologin).
+   The natural next step: run it as an installer step (or first-boot one-shot)
+   against the `--part` populate — `Ext2Fs`'s writer can lay `/etc/passwd` +
+   `/etc/shadow` + the home dir directly, or the C.3 raw path post-edits the
+   installed rootfs via the kernel writable-ext2 engine.
 5. **Track E** bare-metal M1/M3 on the Dell (operator-owned).

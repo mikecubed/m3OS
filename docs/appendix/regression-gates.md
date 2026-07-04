@@ -486,6 +486,23 @@ sub-requests), which is what makes a ~1 GiB image copy finish inside
 the gate window under TCG. Opt-in (two full QEMU boots + an image copy:
 minutes per run).
 
+The same env var also runs **`nvme-install-part-smoke`** — the Phase
+106 C.4 partition-aware arm. Boot 1 runs `/sbin/installer --part`
+instead: CRC-verified source-GPT parse (`kernel-core::fs::gpt`), target
+capacity probe (LBA bisection over the raw read syscall), a **fresh
+GPT sized to the target** (same ESP span, Linux partition grown to the
+last usable LBA), a sparse same-span ESP copy, an on-device
+`format_ext2` of the grown partition, and a file-level populate
+(`ext2_populate::populate_from_reader` over a write-back cache + run
+coalescer). Between the boots the gate verifies **host-side** what the
+installer wrote: the `INSTALLER:gpt-written root_sectors=` sentinel
+must equal the target's usable tail (cross-checked against the source
+image's own GPT via the independent `gpt` crate), the installed disk's
+GPT must parse with that crate and carry the grown span + an ESP, the
+populate sentinel must report `skipped=0`, and — when the host has
+`e2fsck` — the extracted rootfs partition must check clean before boot
+2 ever mounts it. Boot 2 is identical to the raw arm.
+
 ## power-smoke
 
 **Env var:** `M3OS_POWER_REGRESSION=1`

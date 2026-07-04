@@ -1090,4 +1090,14 @@ if [ "${M3OS_NVME_INSTALL_REGRESSION:-0}" = "1" ]; then
         echo "pre-push: cargo xtask nvme-install-smoke failed" >&2
         exit 1
     fi
+    # Phase 106 C.4 — the partition-aware arm: fresh target-sized GPT +
+    # ESP copy + on-device format_ext2 + file-level populate, then the
+    # same NVMe-alone second boot. Host-side it also cross-checks the
+    # grown root span against the source GPT and e2fsck's the installed
+    # partition.
+    echo "pre-push: running cargo xtask nvme-install-part-smoke..."
+    if ! cargo xtask nvme-install-part-smoke --timeout 900; then
+        echo "pre-push: cargo xtask nvme-install-part-smoke failed" >&2
+        exit 1
+    fi
 fi
