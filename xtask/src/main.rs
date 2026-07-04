@@ -7479,10 +7479,32 @@ const BACKGROUND_INIT_PREFIXES: &[&str] = &[
     "init: session ended, respawning login...",
 ];
 
+/// High-frequency background heartbeats that are NOT `[LEVEL]`-prefixed kernel
+/// logs but still flood the serial console continuously, independent of any
+/// test: the compositor's per-frame render fingerprint (Phase 100 `RENDER_FP`),
+/// the USB-Ethernet driver's link heartbeat (`ure: HB `), and the USB-HID idle
+/// tick (`USB_HID:idle`).
+///
+/// **Root cause of the intermittent `timeout waiting for '# '/'$ '` regression
+/// flake.** None of these are ever awaited by a smoke/regression `Wait` step
+/// (the render probes match `RENDER_FP` through `wait_for_serial_pattern` on the
+/// raw history, a different path), but left in the matched buffer they land
+/// *after* the shell prompt — displacing it from the buffer end (defeating the
+/// strict `prompt_suffix_end` matcher) AND never letting the console go idle for
+/// the 750 ms `idle_prompt_fallback_matches` needs. The prompt is then present
+/// but never recognized, so the wait times out no matter how long it is —
+/// flakily, since whether a lucky idle gap appears depends on compositor and
+/// runner-scheduling timing. Stripping them makes the cleaned-buffer prompt
+/// matcher fire deterministically, independent of runner load. Prefixes are
+/// specific (`ure: HB `, `USB_HID:idle`) so they cannot swallow awaited markers
+/// like `USB_HID:led` or a live `ure:` bring-up line.
+const BACKGROUND_HEARTBEAT_PREFIXES: &[&str] = &["RENDER_FP ", "ure: HB ", "USB_HID:idle"];
+
 fn starts_with_background_noise(input: &str) -> bool {
     BACKGROUND_LOG_PREFIXES
         .iter()
         .chain(BACKGROUND_INIT_PREFIXES.iter())
+        .chain(BACKGROUND_HEARTBEAT_PREFIXES.iter())
         .any(|pfx| input.starts_with(pfx))
 }
 
@@ -39066,6 +39088,37 @@ mod tests {
         assert_eq!(
             wait_pattern_for_label(&steps, "guest/log: marker found in /var/log/messages"),
             Some("REGTEST_LOG_MARKER")
+        );
+    }
+
+    #[test]
+    fn prompt_recognized_through_compositor_render_fp_flood() {
+        // Root cause of the intermittent "timeout waiting for '# '/'$ '"
+        // regression flake on loaded CI runners: the compositor emits a
+        // `RENDER_FP` fingerprint line every compose frame (plus `ure:`/USB-HID
+        // heartbeats), landing AFTER the shell prompt on the shared serial
+        // console. The strict matcher needs the buffer to END with the prompt;
+        // the idle fallback needs 750 ms of quiet — the continuous flood
+        // defeats both, so the prompt (present in the buffer) is never
+        // recognized. Stripping the flood as background noise lets the
+        // cleaned-buffer strict matcher fire, independent of runner speed.
+        let mut buf = String::from("root@m3os:/# /bin/su user\nuser@m3os:/$ \n");
+        for f in 0..300 {
+            buf.push_str(&format!(
+                "RENDER_FP frame={f} rows_nonblank=1072 rows_changed=0 hash=0x0e32a011\n"
+            ));
+            buf.push_str("ure: HB no-nic seen=0\n");
+            buf.push_str("ure: HB topo disc=0 up=0\n");
+            buf.push_str("USB_HID:idle ticks=2800 backoff_ns=100000000\n");
+            buf.push_str("[INFO] [dhcpv6] retransmit Information-Request\n");
+        }
+        let stripped = strip_ansi(&buf);
+        let cleaned = strip_background_noise(&stripped);
+        assert!(
+            find_serial_match(&stripped, &cleaned, "$ ").is_some(),
+            "the shell prompt must be recognized even when the compositor floods \
+             RENDER_FP (and ure/USB-HID heartbeats) after it — the cleaned buffer \
+             should end with the prompt so the strict matcher fires"
         );
     }
 
