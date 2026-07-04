@@ -148,6 +148,30 @@ serial capture showed the real chain:
 
 ---
 
+## Validation status (2026-07-04) + two repo-level discoveries
+
+The full battery ran manually against `feat/phase-106-usb-storage-multisector`
+(PR #297; matrix posted as a PR comment): 12 suite passes, 5 suite failures
+that all pass in isolation (the hook's documented flake pattern), and **one
+persistent failure that reproduces identically on `main`**:
+
+- **`usb-storage-dual-smoke` is broken on `main`** (pre-existing): times out
+  waiting for `mass-storage devices — multi-device mode`. Suspects: the wait
+  pattern has an **em-dash in a single-shot startup line** (see the serial
+  gotchas below — multi-byte sentinels split under lossy decode, and the
+  Phase 100 `RENDER_FP` per-frame compositor spam interleaves with early
+  boot), or the second stick misses the ~600 ms discovery stability window.
+  Needs its own investigation; consider an ASCII sentinel emitted more than
+  once.
+- **This clone's pushes were not running the QEMU battery.** `core.hooksPath`
+  pointed at a stale March-era `.git/hooks/pre-push` that only ran
+  `cargo xtask check` — every push since then skipped smoke-test / kernel
+  tests / regression / all env-gated arms. Fixed by re-running `./setup.sh`
+  (now `.githooks`). Assume any "hook-verified" claim between March and
+  2026-07-04 from this machine only covered `check`.
+
+---
+
 ## Remaining Phase 106 work
 
 - **C.4 — on-device GPT writer + ESP/FAT creator** (partition-aware follow-on to
