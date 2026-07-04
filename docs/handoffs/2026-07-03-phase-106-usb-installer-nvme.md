@@ -225,6 +225,33 @@ push from this machine skipped smoke/test/regression for months. Fixed by
 re-running `./setup.sh`. Assume any "hook-verified" claim from this machine
 between March and 2026-07-04 only covered `check`.
 
+**Known pre-existing (NOT fixed): usb-storage BOT/xHCI has NO error
+recovery — one abandoned transfer poisons the pipe for good.** Signature
+(hit twice on 2026-07-04, both during install-gate image copies; 0
+occurrences across all green runs — it is all-or-nothing):
+`usb-storage: BLK_READ shm transport-fail lba=<n>` on some innocent
+transfer, then `[xhci] bulk-OUT non-success cc=6` (STALL) and **every**
+subsequent ≥8-sector (shm-path) transfer on the device fails, including
+the kernel's own rootfs reads. Chain: a transfer exceeds the 5 s
+bulk-event wait (TCG under load) → the daemon abandons it mid-BOT
+exchange → the QEMU device is left phase-desynced → it STALLs the next
+CBW → the STALL **halts the xHCI endpoint** and nothing ever clears it
+(no Bulk-Only Mass Storage Reset, no CLEAR_FEATURE(HALT), no xHCI Reset
+Endpoint + Set TR Dequeue). Installer-level retries (added with Track D)
+cannot help a halted pipe — all 3 attempts fail in ~200 ms. The real fix
+is BOT recovery in `usb-storage` (class reset + clear-halt control
+transfers — the GET_MAX_LUN control plumbing already exists) plus
+halted-endpoint recovery in the xHCI server (Reset Endpoint command +
+Set TR Dequeue Pointer); until then any long USB copy — including the
+Dell bare-metal install — can die to one 5 s hiccup. **This should be
+the next Phase 106 work item before Track E bare-metal.** Ruled out
+while diagnosing: the restart-looping service-manager `xhci` instance
+(config-space scans only, never claims — 5-7 restarts per boot, benign),
+the second `usb_storage` instance (its `shm_create`/`shm_map` are
+process-local; the single-daemon guard exits it before any BOT
+traffic), and the Track D changes themselves (the failing raw-arm data
+path is byte-identical to C.3's).
+
 **Known pre-existing (NOT fixed):** `usb-storage-dual-smoke` fails identically on
 `main` — times out waiting for `mass-storage devices — multi-device mode`.
 Suspects: an **em-dash in a single-shot startup sentinel** (multi-byte split
