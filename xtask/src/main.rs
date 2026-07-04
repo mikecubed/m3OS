@@ -35700,7 +35700,17 @@ fn cmd_regression(args: &RegressionArgs) {
     let mut current_disk_has_inject_key = false;
 
     for test in &tests_to_run {
-        let timeout = args.timeout_secs.unwrap_or(test.timeout_secs);
+        // Scale the per-test GLOBAL timeout by M3OS_CI_TIMING_MULT, not just the
+        // per-step waits (`scaled_secs` in the step engine). Every step deadline
+        // is `step_deadline.min(global_deadline)`, so on a slow CI runner an
+        // unscaled global silently caps the per-step scaling for late-step
+        // tests — e.g. security-floor's step-19 "user shell prompt after su
+        // user" (120 s step budget) hit the 180 s global and timed out on a
+        // jittery shared runner even with the 3x per-step multiplier already in
+        // effect. Scaling the global too (180 s → 540 s at 3x) gives late steps
+        // the same headroom the multiplier grants early ones. `scaled_secs` is a
+        // no-op when the multiplier is unset (local runs keep the exact value).
+        let timeout = scaled_secs(args.timeout_secs.unwrap_or(test.timeout_secs)).as_secs();
 
         // Phase 56 F.2 + F.3 + close-out (G.1, G.2) — rebuild the data
         // disk when the test's marker requirements differ from the
