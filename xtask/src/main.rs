@@ -6308,6 +6308,16 @@ fn normalize_run_qemu_exit(code: Option<i32>) -> i32 {
 
 fn cmd_check() {
     let root = workspace_root();
+    // Phase 100 made the kernel `include_bytes!` the (gitignored) Nerd Font
+    // asset (`kernel/src/fs/ramdisk.rs`), so the kernel no longer compiles
+    // without `xtask/assets/fonts/term.ttf` present. The asset is fetched, not
+    // committed (Phase 69c), so a fresh checkout — CI, a fresh clone, or the
+    // pre-push hook — has only the SHA pin. Guarantee it here BEFORE clippy
+    // compiles the kernel below; `ensure_font_asset` is a quiet no-op when the
+    // asset already matches the committed SHA (the normal local case) and only
+    // downloads on a fresh checkout. Without this, `cargo xtask check` fails at
+    // kernel compile time with `couldn't read .../term.ttf: No such file`.
+    ensure_font_asset();
     build_userspace_bins();
     // Phase 76 — the dynamic linker is a PIE crate that lives outside
     // the static `bins` table; build it explicitly so `xtask check`
@@ -32838,6 +32848,36 @@ fn collect_ports_entries(
 /// Subsequent runs verify the checksum and skip the download when
 /// the file already matches — this keeps the gate cheap for
 /// developers who already have the asset on disk.
+/// Guarantee the kernel's compile-time Nerd Font dependency is present.
+///
+/// The kernel `include_bytes!`s `xtask/assets/fonts/term.ttf` (gitignored,
+/// fetched-not-committed), so any path that compiles the kernel must ensure
+/// the asset exists first. This is a **quiet no-op** when the on-disk font
+/// already matches the committed SHA-256 pin — the common local case does no
+/// network I/O and prints nothing — and delegates to the verbose,
+/// exit-on-failure [`cmd_fetch_fonts`] only when the asset is missing or stale
+/// (a fresh checkout). Call it before any kernel `cargo`/`clippy` invocation.
+fn ensure_font_asset() {
+    let root = workspace_root();
+    let dest = root.join("xtask/assets/fonts/term.ttf");
+    let checksum_path = root.join("xtask/assets/fonts/term.ttf.sha256");
+    if let Ok(s) = fs::read_to_string(&checksum_path) {
+        let expected = s
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if expected.len() == 64
+            && expected.chars().all(|c| c.is_ascii_hexdigit())
+            && dest.is_file()
+            && verify_sha256_strict(&dest, &expected)
+        {
+            return; // already present + verified — no network, no output
+        }
+    }
+    cmd_fetch_fonts();
+}
+
 fn cmd_fetch_fonts() {
     const FONT_URL: &str = "https://github.com/ryanoasis/nerd-fonts/raw/v3.2.1/patched-fonts/JetBrainsMono/NoLigatures/Regular/JetBrainsMonoNLNerdFontMono-Regular.ttf";
     let root = workspace_root();

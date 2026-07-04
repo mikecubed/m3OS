@@ -515,8 +515,11 @@ static PKG_ELF: &[u8] = generated_initrd_asset!("pkg");
 // embedded in the ramdisk so `term`'s glyph atlas loads on a diskless boot
 // (which has no ext2 data disk to stage `/usr/share/fonts/m3os/term.ttf`).
 // Without it term falls back to the static 8×16 bitmap, which renders blocky
-// and gappy in the Phase 73 24×48 cell. ~2.1 MiB; sourced from the committed,
-// sha256-pinned asset (see xtask `term.ttf.sha256`).
+// and gappy in the Phase 73 24×48 cell. ~2.1 MiB; sourced from the
+// sha256-pinned asset FETCHED (not committed) by `cargo xtask fetch-fonts`
+// (see xtask `term.ttf.sha256`). `cargo xtask check` calls `ensure_font_asset`
+// so this compile-time `include_bytes!` dependency is present on a fresh
+// checkout before the kernel is built.
 static TERM_TTF: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../xtask/assets/fonts/term.ttf"
