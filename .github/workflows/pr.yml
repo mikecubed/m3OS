@@ -64,6 +64,15 @@ jobs:
   qemu-gates:
     name: QEMU smoke + device + regression gates
     runs-on: ubuntu-latest
+    # Per-step QEMU-gate waits scale 3x to absorb GitHub shared-runner
+    # scheduling jitter: even a KVM-accelerated guest gets descheduled under
+    # noisy neighbours, which trips tight step timeouts (a 10 s "prompt after
+    # net_udp stop" wait in the serverization-fallback regression timed out on
+    # an otherwise-KVM run). Mirrors nightly-stress.yml. Passing gate steps
+    # match their sentinel well under the extended ceiling; this only lengthens
+    # the deadline before a genuinely stalled step is declared failed.
+    env:
+      M3OS_CI_TIMING_MULT: "3"
     steps:
       - uses: actions/checkout@v5
 
