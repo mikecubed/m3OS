@@ -15730,10 +15730,13 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs, part: bool) {
     let r1: Result<(), String> = (|| {
         // Fail fast on an `INSTALLER:error` line instead of idling out the
         // full window waiting for a sentinel that can no longer arrive (the
-        // installer fails closed and exits on any error).
+        // installer fails closed and exits on any error). The retry loop is
+        // anchored to boot 1's GLOBAL window (`start1 + timeout`, the same
+        // budget `wait_for_serial_pattern` enforces) — a per-wait deadline
+        // would silently extend the boot past its intended budget.
         let wait = |pat: &str, b: &mut String, h: &mut String| -> Result<(), String> {
             let step = std::time::Duration::from_millis(500);
-            let deadline = std::time::Instant::now() + timeout;
+            let deadline = start1 + timeout;
             loop {
                 match wait_for_serial_pattern(&rx1, b, h, pat, step, start1, timeout) {
                     Ok(()) => return Ok(()),

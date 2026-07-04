@@ -1091,12 +1091,17 @@ if [ "${M3OS_NVME_INSTALL_REGRESSION:-0}" = "1" ]; then
         exit 1
     fi
     # Phase 106 C.4 — the partition-aware arm: fresh target-sized GPT +
-    # ESP copy + on-device format_ext2 + file-level populate, then the
-    # same NVMe-alone second boot. Host-side it also cross-checks the
-    # grown root span against the source GPT and e2fsck's the installed
-    # partition.
+    # ESP copy + on-device format_ext2 + file-level populate + the Track D
+    # first-user prompts, then the same NVMe-alone second boot. Host-side
+    # it also cross-checks the grown root span against the source GPT and
+    # e2fsck's the installed partition. Timeout is above the raw arm's:
+    # this arm does strictly more work (format + file-level populate +
+    # between-boot host verification), and at the tail of the pre-push
+    # battery TCG runs measurably slower than standalone (a 900 s window
+    # that fits a standalone run in ~60 s timed out mid-populate under
+    # battery load, 2026-07-04).
     echo "pre-push: running cargo xtask nvme-install-part-smoke..."
-    if ! cargo xtask nvme-install-part-smoke --timeout 900; then
+    if ! cargo xtask nvme-install-part-smoke --timeout 1500; then
         echo "pre-push: cargo xtask nvme-install-part-smoke failed" >&2
         exit 1
     fi
