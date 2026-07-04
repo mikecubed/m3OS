@@ -148,6 +148,23 @@ impl BlockDriverError {
     }
 }
 
+/// Whether a failed block-IPC call's error byte suggests the **driver
+/// process itself** is gone — an explicit [`BlockDriverError::DriverRestarting`]
+/// (dead endpoint at call time) or the `0xFF` no-endpoint / undecodable-reply
+/// convention used by `kernel/src/blk/remote.rs` — rather than a decoded
+/// device-status error from a **live** driver (IoError / InvalidLba / ...).
+///
+/// Only transport-shaped failures may trigger the restart-wait dance in the
+/// remote block facade. Treating a decoded status error as a restart signal
+/// latches a healthy device `is_restarting()` forever (the driver never
+/// re-registers because it never died), so every later request blocks out
+/// the full restart budget and fails — the Phase 106 C.4 whole-device wedge:
+/// one legitimately-failing out-of-range read (the installer's capacity
+/// probe) bricked every subsequent read *and* write on that `dev_id`.
+pub const fn restart_suspected(err_byte: u8) -> bool {
+    err_byte == BlockDriverError::DriverRestarting.to_byte() || err_byte == 0xFF
+}
+
 // ------------------------------------------------------------------------
 // BlkRequestHeader / BlkReplyHeader
 // ------------------------------------------------------------------------
@@ -421,6 +438,31 @@ mod tests {
             -11,
             "DriverRestarting (byte 5) must map to NEG_EAGAIN (-11)"
         );
+    }
+
+    /// Only transport-shaped error bytes (DriverRestarting, the 0xFF
+    /// no-endpoint/decode convention) may trigger the restart-wait dance;
+    /// every decoded device-status error comes from a live driver and must
+    /// pass through (marking it restarting wedges the device — Phase 106
+    /// C.4).
+    #[test]
+    fn restart_suspected_classifies_transport_vs_status_errors() {
+        assert!(restart_suspected(
+            BlockDriverError::DriverRestarting.to_byte()
+        ));
+        assert!(restart_suspected(0xFF));
+        for status in [
+            BlockDriverError::IoError,
+            BlockDriverError::InvalidLba,
+            BlockDriverError::DeviceAbsent,
+            BlockDriverError::Busy,
+            BlockDriverError::InvalidRequest,
+        ] {
+            assert!(
+                !restart_suspected(status.to_byte()),
+                "{status:?} is a live-driver status, not a restart signal"
+            );
+        }
     }
 
     /// `Busy` (byte 4) must also map to `NEG_EAGAIN` (-11) — caller can retry.
