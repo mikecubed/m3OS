@@ -734,6 +734,40 @@ impl Ext2Fs {
         Ext2Inode::parse(&buf[off..])
     }
 
+    /// Look up `name` in directory `parent_ino`, returning its inode number
+    /// or `None` when absent. Walks the direct blocks only — the same bound
+    /// this writer's own `add_dir_entry` produces — through the write seam,
+    /// so it sees entries a wrapping cache still holds dirty. Lets a caller
+    /// (the installer's first-user step) find `/etc` / `/home` on a volume
+    /// it just populated without needing a separate read-path mount.
+    pub fn lookup<IO: BlockIo + ?Sized>(
+        &mut self,
+        io: &mut IO,
+        parent_ino: u32,
+        name: &str,
+    ) -> Result<Option<u32>, Ext2Error> {
+        let parent = self.read_inode(io, parent_ino)?;
+        if !parent.is_dir() {
+            return Err(Ext2Error::NotDirectory);
+        }
+        let bs = self.geo.block_size as usize;
+        let dir_blocks = (parent.size as usize).div_ceil(bs);
+        for lb in 0..dir_blocks.min(EXT2_NDIR_BLOCKS) {
+            let phys = parent.block[lb];
+            if phys == 0 {
+                continue;
+            }
+            let mut buf = vec![0u8; bs];
+            io.read_block(phys, &mut buf)?;
+            for entry in super::ext2::Ext2DirEntry::parse_block(&buf)? {
+                if entry.inode != 0 && entry.name == name {
+                    return Ok(Some(entry.inode));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Store `data` as the block list of a fresh inode: direct, then
     /// single-indirect, then double-indirect. Returns `(block_ptrs, total_
     /// allocated_blocks)` — the pointer array for the inode plus the count of

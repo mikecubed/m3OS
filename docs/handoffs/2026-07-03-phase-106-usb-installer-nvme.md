@@ -26,7 +26,17 @@ active feature branch. Earlier tracks merged (below; PR #299 merged 2026-07-04).
     on-device `format_ext2` + file-level populate), and the
     `nvme-install-part-smoke` gate (same `M3OS_NVME_INSTALL_REGRESSION=1`
     env var; host-side gpt-crate + e2fsck cross-checks between the boots).
-- **Tracks D / E** — not started (D first-user; E bare-metal sign-off).
+- **Track D** ✅ landed (`feat/phase-106-track-d-first-user`): `installer
+  --part` first-user setup — console prompts (root password / username /
+  user password, echo off) before any target write; the populate filters the
+  image's `/etc/passwd`/`/etc/shadow`/`/etc/group` + `/home/user` off the
+  target (`populate_from_reader_filtered`) and fresh ones are written via the
+  existing `passwd`-lib `$sha256i$` chain (`getrandom` salt; no new crypto).
+  `/home/<user>` seeded (0700, uid/gid 1000, `.profile` carried over).
+  `--no-user` opts out; raw mode is a byte-clone by definition.
+  `nvme-install-part-smoke` drives the prompts and boot 2 logs in **as the
+  created user** + asserts the `/etc/passwd` entry (the E.2 deferred arm).
+- **Track E** — bare-metal sign-off not started (operator-owned).
 - **CI reliability** ✅ — a four-cause chain that made every PR's checks red/flaky
   was root-caused and fixed this session (PRs #298/#300/#301, all merged). The
   regression suite is now **deterministically** reliable, not just timeout-padded.
@@ -391,9 +401,11 @@ consider an ASCII sentinel emitted more than once.
 3. ~~**C.5 on-device `mkfs.ext2`**~~ ✅ merged (PR #299) → ~~**C.4** GPT/ESP
    writer + populate~~ ✅ landed (PR #302, `installer --part` +
    `nvme-install-part-smoke`).
-4. **Track D** first-user setup (reuse `adduser`/`passwd`; disable autologin).
-   The natural next step: run it as an installer step (or first-boot one-shot)
-   against the `--part` populate — `Ext2Fs`'s writer can lay `/etc/passwd` +
-   `/etc/shadow` + the home dir directly, or the C.3 raw path post-edits the
-   installed rootfs via the kernel writable-ext2 engine.
-5. **Track E** bare-metal M1/M3 on the Dell (operator-owned).
+4. ~~**Track D** first-user setup~~ ✅ landed — `installer --part` prompts +
+   filtered populate + fresh credentials via the passwd-lib chain;
+   `nvme-install-part-smoke` logs in as the created user. (Note: there is no
+   literal serial-autologin marker to strip — the serial image boots to an
+   interactive `login`; D.2's substance was replacing the well-known seeded
+   `root:root`/`user:user` credentials, which first-user mode never copies.)
+5. **Track E** bare-metal M1/M3 on the Dell (operator-owned) — the only
+   remaining Phase 106 work.

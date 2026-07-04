@@ -1118,6 +1118,7 @@ name = "installer"
 version = "0.99.0"
 dependencies = [
  "kernel-core",
+ "passwd",
  "syscall-lib",
 ]
 

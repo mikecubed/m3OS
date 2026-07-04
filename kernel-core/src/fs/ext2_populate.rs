@@ -35,6 +35,7 @@ use super::ext2::{
 };
 use super::ext2_format::{BlockIo, Ext2Fs};
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -51,6 +52,11 @@ pub struct PopulateStats {
     /// directory entries that would revisit an already-copied directory
     /// (a corrupt source's cycle — fail-safe, not fail-stop).
     pub skipped: u32,
+    /// Entries dropped by the caller's path filter
+    /// ([`populate_from_reader_filtered`]) — deliberate exclusions, counted
+    /// separately from `skipped` so a gate can assert `skipped == 0` while
+    /// still using a filter.
+    pub filtered: u32,
 }
 
 /// Copy `uid`/`gid`/timestamps from a source inode onto a freshly created
@@ -82,6 +88,25 @@ pub fn populate_from_reader<R: BlockReader + ?Sized, IO: BlockIo + ?Sized>(
     fs: &mut Ext2Fs,
     io: &mut IO,
 ) -> Result<PopulateStats, Ext2Error> {
+    populate_from_reader_filtered(src, fs, io, &mut |_| false)
+}
+
+/// [`populate_from_reader`] with a path filter: `skip` is called with each
+/// entry's absolute source path (`"/etc/passwd"`, `"/home/user"`, …) and a
+/// `true` return drops it — a skipped directory drops its whole subtree.
+/// Skipped entries are counted in [`PopulateStats::filtered`].
+///
+/// This is how the installer's first-user step (Phase 106 Track D) keeps the
+/// image's seeded `/etc/passwd`/`/etc/shadow`/`/etc/group` and `/home/user`
+/// off the installed rootfs so it can write fresh ones: [`Ext2Fs`] is a
+/// write-once surface with no entry removal, so exclusion at populate time is
+/// the correct (and only) replacement mechanism.
+pub fn populate_from_reader_filtered<R: BlockReader + ?Sized, IO: BlockIo + ?Sized>(
+    src: &R,
+    fs: &mut Ext2Fs,
+    io: &mut IO,
+    skip: &mut dyn FnMut(&str) -> bool,
+) -> Result<PopulateStats, Ext2Error> {
     let mut stats = PopulateStats::default();
 
     // Root fidelity: mode bits + owner + times.
@@ -97,9 +122,9 @@ pub fn populate_from_reader<R: BlockReader + ?Sized, IO: BlockIo + ?Sized>(
 
     let mut visited: BTreeSet<u32> = BTreeSet::new();
     visited.insert(EXT2_ROOT_INO);
-    let mut stack: Vec<(u32, u32)> = vec![(EXT2_ROOT_INO, EXT2_ROOT_INO)];
+    let mut stack: Vec<(u32, u32, String)> = vec![(EXT2_ROOT_INO, EXT2_ROOT_INO, String::new())];
 
-    while let Some((src_dir, dst_dir)) = stack.pop() {
+    while let Some((src_dir, dst_dir, dir_path)) = stack.pop() {
         let dir_inode = read_inode(src, src_dir)?;
         for (name, ino, _ft) in read_directory_entries(src, &dir_inode)? {
             if name == "." || name == ".." {
@@ -107,6 +132,11 @@ pub fn populate_from_reader<R: BlockReader + ?Sized, IO: BlockIo + ?Sized>(
             }
             if src_dir == EXT2_ROOT_INO && name == "lost+found" {
                 continue; // the formatted target already has its own
+            }
+            let path = alloc::format!("{dir_path}/{name}");
+            if skip(&path) {
+                stats.filtered += 1;
+                continue;
             }
             let inode = read_inode(src, ino)?;
             if inode.is_dir() {
@@ -119,7 +149,7 @@ pub fn populate_from_reader<R: BlockReader + ?Sized, IO: BlockIo + ?Sized>(
                 let new = fs.create_dir(io, dst_dir, &name, inode.permission_mode())?;
                 copy_owner(fs, io, new, &inode)?;
                 stats.dirs += 1;
-                stack.push((ino, new));
+                stack.push((ino, new, path));
             } else if inode.is_regular() {
                 let mut data = vec![0u8; inode.size as usize];
                 let n = read_file_data(src, &inode, 0, &mut data)?;
@@ -727,6 +757,61 @@ mod tests {
         assert_eq!(vol.data[11 * 1024], 0xB2);
         assert_eq!(vol.data[40 * 1024], 0xAA);
         assert_eq!(vol.data[5 * 1024], 0x55);
+    }
+
+    #[test]
+    fn filtered_populate_excludes_paths_and_fresh_files_replace_them() {
+        // The installer's first-user pattern: skip the image's credential
+        // files + /home/user during populate, then write replacements via
+        // the Ext2Fs writer, located with Ext2Fs::lookup.
+        let src_vol = build_source(0, 4096);
+        let src = MountView::mount(&src_vol);
+
+        let mut dst_vol = MemVolume::new(2048, 4096);
+        format_ext2(&mut dst_vol, &params(2048, 2)).expect("format dst");
+        let mut fs = Ext2Fs::open(&mut dst_vol, 2).expect("open dst");
+        let stats = populate_from_reader_filtered(&src, &mut fs, &mut dst_vol, &mut |path| {
+            path == "/etc/shadow" || path == "/home/user" || path == "/wide"
+        })
+        .expect("populate");
+        // /etc/shadow + /home/user (whole subtree via the dir) + /wide.
+        assert_eq!(stats.filtered, 3);
+        assert_eq!(stats.skipped, 0);
+        // Files copied: hostname + sh0 + leaf = 3... plus nothing else —
+        // shadow is filtered, /wide's 60 files and /home/user/.profile are
+        // never even walked (their parent dirs were dropped). From the
+        // unfiltered total of 65: 65 - 1 (shadow) - 60 (wide) - 1 (.profile)
+        // = 3.
+        assert_eq!(stats.files, 3);
+
+        // Replacement content via the writer, located with lookup().
+        let etc = fs
+            .lookup(&mut dst_vol, EXT2_ROOT_INO, "etc")
+            .expect("lookup etc")
+            .expect("etc exists");
+        assert_eq!(
+            fs.lookup(&mut dst_vol, etc, "shadow").expect("lookup"),
+            None,
+            "skipped file must be absent before replacement"
+        );
+        fs.create_file(&mut dst_vol, etc, "shadow", b"root:$new$::::::\n", 0o600)
+            .expect("fresh shadow");
+        fs.flush(&mut dst_vol).expect("flush");
+
+        let dst = MountView::mount(&dst_vol);
+        // Skipped paths absent (shadow replaced with fresh content).
+        assert!(resolve_path(&dst, "/home/user").is_err());
+        assert!(resolve_path(&dst, "/wide").is_err());
+        let shadow = resolve_path(&dst, "/etc/shadow").expect("fresh shadow resolves");
+        let si = read_inode(&dst, shadow).expect("inode");
+        assert_eq!(si.mode & 0o7777, 0o600);
+        let mut body = vec![0u8; si.size as usize];
+        read_file_data(&dst, &si, 0, &mut body).expect("read");
+        assert_eq!(body, b"root:$new$::::::\n");
+        // Unfiltered content intact.
+        assert!(resolve_path(&dst, "/etc/hostname").is_ok());
+        assert!(resolve_path(&dst, "/a/b/c/d/leaf").is_ok());
+        assert!(resolve_path(&dst, "/bin/sh0").is_ok());
     }
 
     #[test]

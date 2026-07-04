@@ -12,7 +12,7 @@
 | A | Combined GPT(ESP+ext2) USB image + USB-ext2 root bootstrap (M1) | — | ✅ Merged (PR #294) — `usb-root-smoke` green |
 | B | NVMe root boot + `nvme-rw`/`nvme-persist` gates (M2) | — | ✅ Merged (PR #295) — both gates green |
 | C | On-device installer: raw USB→NVMe copy, then partition-aware `mkfs` (M3) | A, B | 🟢 C.1/C.2/C.3 merged (PR #296); `nvme-install-smoke` GREEN; C.5 mkfs.ext2 merged (PR #299, e2fsck-validated); **C.4 + C.5-populate landed** (`installer --part` + `nvme-install-part-smoke`) |
-| D | First-user / account setup on the installed rootfs (M3) | C | Planned |
+| D | First-user / account setup on the installed rootfs (M3) | C | 🟢 Landed — `installer --part` first-user prompts (default; `--no-user` opts out); `nvme-install-part-smoke` logs in as the created user |
 | E | Validation: QEMU gates + bare-metal sign-off | A, B, C, D | 🟡 M1/M2 QEMU arms green; M3 gate GREEN in pre-push (`M3OS_NVME_INSTALL_REGRESSION=1`); HW rungs operator-owned |
 
 ---
@@ -210,26 +210,26 @@
 ### D.1 — Create root + first-user credentials
 
 **Files:**
-- `userspace/installer/src/main.rs`
-- the installed rootfs `/etc/passwd` + `/etc/shadow`
+- `userspace/installer/src/main.rs` (`first_user_prompts` / `shadow_line` / `apply_first_user`)
+- `kernel-core/src/fs/ext2_populate.rs` (`populate_from_reader_filtered`), `ext2_format.rs` (`Ext2Fs::lookup`)
 
-**Symbol:** reuse `adduser` / `passwd` (PBKDF2 via `crypto-lib`)
-**Why it matters:** The installed NVMe system must come up with a real account, not the image's autologin; reuse the existing multi-user tooling rather than new auth crypto.
-
-**Acceptance:**
-- [ ] The installer (or a one-shot first-boot step) creates a root credential and a first-user account in the installed `/etc/passwd` + `/etc/shadow`, hashed via the existing `passwd`/`crypto-lib` path.
-- [ ] The first user's home directory is seeded on the installed rootfs.
-- [ ] No new password-hashing code is introduced — `adduser`/`passwd` are reused.
-
-### D.2 — Disable image autologin on the installed rootfs
-
-**File:** `userspace/installer/src/main.rs` (rootfs post-processing)
-**Symbol:** the installed `services.d` / login config
-**Why it matters:** The build image autologs in for smoke runs; the installed workstation must present a login prompt to the created user.
+**Symbol:** reuse the `passwd` lib's `$sha256i$` chain (`build_hash_field` + `syscall_lib::sha256::hash_password_iterated` + `getrandom` salt — the exact `adduser`/`passwd`/`login` recipe)
+**Why it matters:** The installed NVMe system must come up with a real account, not the image's well-known seeded credentials; reuse the existing multi-user tooling rather than new auth crypto.
 
 **Acceptance:**
-- [ ] The installed rootfs login config presents a login prompt (the build-image autologin marker is removed/flipped) so the first user must authenticate.
-- [ ] `nvme-install-smoke` (Track E) asserts the installed system reaches a login with the created user present.
+- [x] `installer --part` prompts on the console (root password / username / user password, echo off via the `adduser` termios pattern) **before any target write**, then writes fresh `/etc/passwd` + `/etc/shadow` (+ `/etc/group`) hashed via the existing `passwd`-lib path. The populate **filters** the image's credential files + `/home/user` off the target (the `Ext2Fs` writer is write-once, so exclusion-then-rewrite is the replacement mechanism; host-tested). `--no-user` opts out.
+- [x] The first user's home directory (`/home/<name>`, 0700, uid/gid 1000) is seeded on the installed rootfs, `.profile` carried over from the image's seeded account when present.
+- [x] No new password-hashing code is introduced — the `passwd` lib + `syscall_lib::sha256` are reused.
+
+### D.2 — Installed rootfs presents a real login (image credentials replaced)
+
+**File:** `userspace/installer/src/main.rs` (`FIRST_USER_SKIP_PATHS` + `apply_first_user`)
+**Symbol:** the filtered populate + fresh credential files
+**Why it matters:** The serial image boots to an interactive `login` already (there is no literal serial autologin marker — the smoke images use `smoke-runner` mode, and the graphical gate is the separate `/etc/m3os-graphical-only`); the real exposure is the image's **well-known seeded credentials** (`root:root`, `user:user`). The installed workstation must require the operator-chosen accounts instead.
+
+**Acceptance:**
+- [x] The installed rootfs presents a login prompt whose valid credentials are the installer-created ones — the image's seeded `/etc/passwd`/`/etc/shadow`/`/etc/group` are never copied in first-user mode, so `root:root`/`user:user` do not authenticate on the installed system.
+- [x] `nvme-install-part-smoke` (Track E) asserts the installed system reaches a login **as the created user** (`mike`/created password) and that the account is present in the installed `/etc/passwd` (uid/home/shell asserted).
 
 ---
 
@@ -254,7 +254,7 @@
 
 **Acceptance:**
 - [x] Boots from a USB-attached combined image, runs `userspace/installer` against a blank NVMe scratch disk (raw copy and/or partition-aware), and flushes. *(Green 2026-07-03 — ~40 s sparse copy over the usb-storage shm bulk path; in pre-push behind `M3OS_NVME_INSTALL_REGRESSION=1`.)*
-- [x] Tears down QEMU, relaunches with **only** the NVMe attached, and asserts the installed system boots to a login. *(Green 2026-07-03 — `init: / mounted (ext2 via ring-3 nvme.block)` + live shell. The "created first user present in `/etc/passwd`" arm pends Track D and moves to its acceptance.)*
+- [x] Tears down QEMU, relaunches with **only** the NVMe attached, and asserts the installed system boots to a login. *(Green 2026-07-03 — `init: / mounted (ext2 via ring-3 nvme.block)` + live shell. The "created first user present in `/etc/passwd`" arm landed with Track D in `nvme-install-part-smoke`: boot 2 logs in as the installer-created user and asserts the `/etc/passwd` entry.)*
 - [ ] Fails fast on any kernel-fatal marker (reuses the global fatal-line scan). *(Not yet — on failure the gate dumps filtered `INSTALLER:`/driver/`[xhci]` serial lines instead.)*
 
 ### E.3 — Bare-metal sign-off (M1 + M3 HW rungs)

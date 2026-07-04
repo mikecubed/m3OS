@@ -488,20 +488,28 @@ minutes per run).
 
 The same env var also runs **`nvme-install-part-smoke`** — the Phase
 106 C.4 partition-aware arm. Boot 1 runs `/sbin/installer --part`
-instead: CRC-verified source-GPT parse (`kernel-core::fs::gpt`), target
-capacity probe (LBA bisection over the raw read syscall), a **fresh
-GPT sized to the target** (same ESP span, Linux partition grown to the
-last usable LBA), a sparse same-span ESP copy, an on-device
-`format_ext2` of the grown partition, and a file-level populate
-(`ext2_populate::populate_from_reader` over a write-back cache + run
-coalescer). Between the boots the gate verifies **host-side** what the
-installer wrote: the `INSTALLER:gpt-written root_sectors=` sentinel
-must equal the target's usable tail (cross-checked against the source
-image's own GPT via the independent `gpt` crate), the installed disk's
-GPT must parse with that crate and carry the grown span + an ESP, the
-populate sentinel must report `skipped=0`, and — when the host has
-`e2fsck` — the extracted rootfs partition must check clean before boot
-2 ever mounts it. Boot 2 is identical to the raw arm.
+instead: CRC-verified source-GPT parse (`kernel-core::fs::gpt`), the
+Track D **first-user prompts** (root password / username / user
+password on the console, echo off, answered by the gate — the created
+account replaces the image's well-known seeded credentials, which the
+filtered populate never copies), target capacity probe (LBA bisection
+over the raw read syscall), a **fresh GPT sized to the target** (same
+ESP span, Linux partition grown to the last usable LBA), a sparse
+same-span ESP copy, an on-device `format_ext2` of the grown partition,
+a file-level populate (`ext2_populate::populate_from_reader_filtered`
+over a write-back cache + run coalescer), and fresh
+`/etc/passwd`/`/etc/shadow`/`/etc/group` + `/home/<user>` written via
+the existing passwd-lib `$sha256i$` chain. Between the boots the gate
+verifies **host-side** what the installer wrote: the
+`INSTALLER:gpt-written root_sectors=` sentinel must equal the target's
+usable tail (cross-checked against the source image's own GPT via the
+independent `gpt` crate), the installed disk's GPT must parse with that
+crate and carry the grown span + an ESP, the populate sentinel must
+report `skipped=0`, and — when the host has `e2fsck` — the extracted
+rootfs partition must check clean before boot 2 ever mounts it. Boot 2
+then logs in **as the installer-created user** and asserts the account
+row in the installed `/etc/passwd` (uid 1000, `/home/<user>`,
+`/bin/ion`).
 
 ## power-smoke
 
