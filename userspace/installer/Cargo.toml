@@ -11,3 +11,7 @@ path = "src/main.rs"
 [dependencies]
 syscall-lib = { path = "../syscall-lib", features = ["alloc"] }
 kernel-core = { path = "../../kernel-core", default-features = false }
+# Track D.1 — the first-user step reuses the passwd lib's hash-field builder
+# (same $sha256i$ format + iteration count as the in-OS passwd/adduser/login
+# chain; no new password-hashing code).
+passwd = { path = "../passwd" }

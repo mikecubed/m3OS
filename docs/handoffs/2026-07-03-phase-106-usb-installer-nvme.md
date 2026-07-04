@@ -26,7 +26,17 @@ active feature branch. Earlier tracks merged (below; PR #299 merged 2026-07-04).
     on-device `format_ext2` + file-level populate), and the
     `nvme-install-part-smoke` gate (same `M3OS_NVME_INSTALL_REGRESSION=1`
     env var; host-side gpt-crate + e2fsck cross-checks between the boots).
-- **Tracks D / E** — not started (D first-user; E bare-metal sign-off).
+- **Track D** ✅ landed (`feat/phase-106-track-d-first-user`): `installer
+  --part` first-user setup — console prompts (root password / username /
+  user password, echo off) before any target write; the populate filters the
+  image's `/etc/passwd`/`/etc/shadow`/`/etc/group` + `/home/user` off the
+  target (`populate_from_reader_filtered`) and fresh ones are written via the
+  existing `passwd`-lib `$sha256i$` chain (`getrandom` salt; no new crypto).
+  `/home/<user>` seeded (0700, uid/gid 1000, `.profile` carried over).
+  `--no-user` opts out; raw mode is a byte-clone by definition.
+  `nvme-install-part-smoke` drives the prompts and boot 2 logs in **as the
+  created user** + asserts the `/etc/passwd` entry (the E.2 deferred arm).
+- **Track E** — bare-metal sign-off not started (operator-owned).
 - **CI reliability** ✅ — a four-cause chain that made every PR's checks red/flaky
   was root-caused and fixed this session (PRs #298/#300/#301, all merged). The
   regression suite is now **deterministically** reliable, not just timeout-padded.
@@ -215,6 +225,33 @@ push from this machine skipped smoke/test/regression for months. Fixed by
 re-running `./setup.sh`. Assume any "hook-verified" claim from this machine
 between March and 2026-07-04 only covered `check`.
 
+**Known pre-existing (NOT fixed): usb-storage BOT/xHCI has NO error
+recovery — one abandoned transfer poisons the pipe for good.** Signature
+(hit twice on 2026-07-04, both during install-gate image copies; 0
+occurrences across all green runs — it is all-or-nothing):
+`usb-storage: BLK_READ shm transport-fail lba=<n>` on some innocent
+transfer, then `[xhci] bulk-OUT non-success cc=6` (STALL) and **every**
+subsequent ≥8-sector (shm-path) transfer on the device fails, including
+the kernel's own rootfs reads. Chain: a transfer exceeds the 5 s
+bulk-event wait (TCG under load) → the daemon abandons it mid-BOT
+exchange → the QEMU device is left phase-desynced → it STALLs the next
+CBW → the STALL **halts the xHCI endpoint** and nothing ever clears it
+(no Bulk-Only Mass Storage Reset, no CLEAR_FEATURE(HALT), no xHCI Reset
+Endpoint + Set TR Dequeue). Installer-level retries (added with Track D)
+cannot help a halted pipe — all 3 attempts fail in ~200 ms. The real fix
+is BOT recovery in `usb-storage` (class reset + clear-halt control
+transfers — the GET_MAX_LUN control plumbing already exists) plus
+halted-endpoint recovery in the xHCI server (Reset Endpoint command +
+Set TR Dequeue Pointer); until then any long USB copy — including the
+Dell bare-metal install — can die to one 5 s hiccup. **This should be
+the next Phase 106 work item before Track E bare-metal.** Ruled out
+while diagnosing: the restart-looping service-manager `xhci` instance
+(config-space scans only, never claims — 5-7 restarts per boot, benign),
+the second `usb_storage` instance (its `shm_create`/`shm_map` are
+process-local; the single-daemon guard exits it before any BOT
+traffic), and the Track D changes themselves (the failing raw-arm data
+path is byte-identical to C.3's).
+
 **Known pre-existing (NOT fixed):** `usb-storage-dual-smoke` fails identically on
 `main` — times out waiting for `mass-storage devices — multi-device mode`.
 Suspects: an **em-dash in a single-shot startup sentinel** (multi-byte split
@@ -391,9 +428,11 @@ consider an ASCII sentinel emitted more than once.
 3. ~~**C.5 on-device `mkfs.ext2`**~~ ✅ merged (PR #299) → ~~**C.4** GPT/ESP
    writer + populate~~ ✅ landed (PR #302, `installer --part` +
    `nvme-install-part-smoke`).
-4. **Track D** first-user setup (reuse `adduser`/`passwd`; disable autologin).
-   The natural next step: run it as an installer step (or first-boot one-shot)
-   against the `--part` populate — `Ext2Fs`'s writer can lay `/etc/passwd` +
-   `/etc/shadow` + the home dir directly, or the C.3 raw path post-edits the
-   installed rootfs via the kernel writable-ext2 engine.
-5. **Track E** bare-metal M1/M3 on the Dell (operator-owned).
+4. ~~**Track D** first-user setup~~ ✅ landed — `installer --part` prompts +
+   filtered populate + fresh credentials via the passwd-lib chain;
+   `nvme-install-part-smoke` logs in as the created user. (Note: there is no
+   literal serial-autologin marker to strip — the serial image boots to an
+   interactive `login`; D.2's substance was replacing the well-known seeded
+   `root:root`/`user:user` credentials, which first-user mode never copies.)
+5. **Track E** bare-metal M1/M3 on the Dell (operator-owned) — the only
+   remaining Phase 106 work.

@@ -15730,10 +15730,13 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs, part: bool) {
     let r1: Result<(), String> = (|| {
         // Fail fast on an `INSTALLER:error` line instead of idling out the
         // full window waiting for a sentinel that can no longer arrive (the
-        // installer fails closed and exits on any error).
+        // installer fails closed and exits on any error). The retry loop is
+        // anchored to boot 1's GLOBAL window (`start1 + timeout`, the same
+        // budget `wait_for_serial_pattern` enforces) — a per-wait deadline
+        // would silently extend the boot past its intended budget.
         let wait = |pat: &str, b: &mut String, h: &mut String| -> Result<(), String> {
             let step = std::time::Duration::from_millis(500);
-            let deadline = std::time::Instant::now() + timeout;
+            let deadline = start1 + timeout;
             loop {
                 match wait_for_serial_pattern(&rx1, b, h, pat, step, start1, timeout) {
                     Ok(()) => return Ok(()),
@@ -15783,10 +15786,27 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs, part: bool) {
             send(&mut stdin1, "/sbin/installer --part\n")?;
             wait("INSTALLER:mode part", &mut buf1, &mut hist1)?;
             wait("INSTALLER:source", &mut buf1, &mut hist1)?;
+            // Track D.1 — answer the first-user prompts (the created
+            // account is boot 2's login). The prompt strings are
+            // deliberately non-overlapping ("root password:" vs
+            // "user password:") so contains()-matching cannot fire on an
+            // earlier prompt still in the buffer.
+            wait("INSTALLER:firstuser setup", &mut buf1, &mut hist1)?;
+            wait("root password: ", &mut buf1, &mut hist1)?;
+            send(&mut stdin1, "installr00t\n")?;
+            wait("username: ", &mut buf1, &mut hist1)?;
+            send(&mut stdin1, "mike\n")?;
+            wait("user password: ", &mut buf1, &mut hist1)?;
+            send(&mut stdin1, "hunter2\n")?;
             wait("INSTALLER:gpt-written root_sectors=", &mut buf1, &mut hist1)?;
             println!("{name}: fresh GPT laid onto the NVMe, copying ESP + populating rootfs...");
             wait("INSTALLER:esp-copied", &mut buf1, &mut hist1)?;
             wait("INSTALLER:format blocks=", &mut buf1, &mut hist1)?;
+            wait(
+                "INSTALLER:firstuser user=mike uid=1000",
+                &mut buf1,
+                &mut hist1,
+            )?;
             wait("INSTALLER:populate dirs=", &mut buf1, &mut hist1)?;
             wait("INSTALLER:done mode=part", &mut buf1, &mut hist1)?;
         } else {
@@ -15894,9 +15914,19 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs, part: bool) {
         )?;
         println!("{name}: installed NVMe mounted ext2 root over nvme.block");
         wait("m3OS login:", &mut buf2, &mut hist2)?;
-        send(&mut stdin2, "root\n")?;
-        wait("Password:", &mut buf2, &mut hist2)?;
-        send(&mut stdin2, "root\n")?;
+        if part {
+            // Track D — the account CREATED BY THE INSTALLER is the login;
+            // the image's seeded root/root credentials were never copied,
+            // so this both proves the first user works and that the
+            // well-known dev credentials are gone (D.1 + D.2).
+            send(&mut stdin2, "mike\n")?;
+            wait("Password:", &mut buf2, &mut hist2)?;
+            send(&mut stdin2, "hunter2\n")?;
+        } else {
+            send(&mut stdin2, "root\n")?;
+            wait("Password:", &mut buf2, &mut hist2)?;
+            send(&mut stdin2, "root\n")?;
+        }
         wait(
             "[security] credential transition complete",
             &mut buf2,
@@ -15906,6 +15936,17 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs, part: bool) {
         std::thread::sleep(std::time::Duration::from_millis(500));
         send(&mut stdin2, "echo installed-boot  ok\n")?;
         wait("installed-boot ok", &mut buf2, &mut hist2)?;
+        if part {
+            // E.2's deferred arm: the created first user is present in the
+            // installed /etc/passwd with the planned uid/home/shell.
+            send(&mut stdin2, "cat /etc/passwd\n")?;
+            wait(
+                "mike:x:1000:1000:mike:/home/mike:/bin/ion",
+                &mut buf2,
+                &mut hist2,
+            )?;
+            println!("{name}: created first user present in installed /etc/passwd");
+        }
         println!("{name}: installed system reached a live shell");
         Ok(())
     })();
