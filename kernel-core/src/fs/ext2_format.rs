@@ -586,10 +586,15 @@ impl Ext2Fs {
             uuid: [0; 16],
         })?;
         // The volume must agree with the derived layout — this handle's
-        // allocators assume it.
+        // allocators and inode-table offset math assume it. `inode_size` is
+        // load-bearing: `read_inode`/`write_inode_raw` compute byte offsets with
+        // `FORMAT_INODE_SIZE`, so a volume with a different on-disk inode record
+        // size (but otherwise similar geometry) would read/write the wrong
+        // offsets — reject rather than silently corrupt.
         if geo.blocks_per_group != sb.blocks_per_group
             || geo.inodes_per_group != sb.inodes_per_group
             || geo.group_count != sb.block_group_count()
+            || sb.inode_size as u32 != FORMAT_INODE_SIZE
         {
             return Err(Ext2Error::CorruptedEntry);
         }
@@ -603,6 +608,21 @@ impl Ext2Fs {
             table[off..off + bs as usize].copy_from_slice(&blk);
         }
         let bgds = Ext2BlockGroupDescriptor::parse_table(&table, geo.group_count)?;
+
+        // The write-side block math uses the DERIVED geometry offsets
+        // (`geo.*_block(g)`), NOT these on-disk BGD pointers. A volume whose
+        // BGDs point elsewhere (a foreign mke2fs layout, corruption) would be
+        // written to the wrong blocks, so reject any mismatch: this handle only
+        // supports volumes laid out exactly as `format_ext2` produces.
+        for (g, bgd) in bgds.iter().enumerate() {
+            let g = g as u32;
+            if bgd.block_bitmap != geo.block_bitmap_block(g)
+                || bgd.inode_bitmap != geo.inode_bitmap_block(g)
+                || bgd.inode_table != geo.inode_table_block(g)
+            {
+                return Err(Ext2Error::CorruptedEntry);
+            }
+        }
 
         Ok(Ext2Fs {
             total_blocks: sb.blocks_count,
@@ -826,6 +846,21 @@ impl Ext2Fs {
                 } else {
                     dirent_len(name_len)
                 };
+                // Guard a corrupt on-disk entry whose name doesn't fit its
+                // rec_len (mirrors the reader's `name_end <= off + rec_len`
+                // check): a live entry must hold its own header+name, or
+                // `rec_len - used` underflows and `off + used` runs past the
+                // block, panicking / writing garbage. A self-formatted volume
+                // never trips this; a foreign/corrupt one fails closed here.
+                // Guard a corrupt on-disk entry whose name doesn't fit its
+                // rec_len (mirrors the reader's `name_end <= off + rec_len`
+                // check): a live entry must hold its own header+name, or
+                // `rec_len - used` underflows and `off + used` runs past the
+                // block, panicking / writing garbage. A self-formatted volume
+                // never trips this; a foreign/corrupt one fails closed here.
+                if used > rec_len {
+                    return Err(Ext2Error::CorruptedEntry);
+                }
                 if rec_len - used >= need {
                     // Split: shrink the live entry to its natural size, put
                     // the new entry in the slack.
@@ -1090,6 +1125,49 @@ mod tests {
         let map = [0xFF, 0xFF, 0b1010_1011, 0x00];
         let naive = (0..32u32).find(|&b| map[(b / 8) as usize] & (1 << (b % 8)) == 0);
         assert_eq!(bitmap_find_clear(&map, 32), naive);
+    }
+
+    #[test]
+    fn open_rejects_wrong_inode_size() {
+        let mut vol = MemVolume::new(4096, 1024);
+        format_ext2(&mut vol, &params(4096, 0)).expect("format");
+        // Tamper s_inode_size (superblock offset 88; superblock at disk 1024).
+        vol.data[1024 + 88..1024 + 90].copy_from_slice(&256u16.to_le_bytes());
+        assert!(matches!(
+            Ext2Fs::open(&mut vol, 0),
+            Err(Ext2Error::CorruptedEntry)
+        ));
+    }
+
+    #[test]
+    fn open_rejects_mismatched_bgd_pointer() {
+        let mut vol = MemVolume::new(4096, 1024);
+        let geo = format_ext2(&mut vol, &params(4096, 0)).expect("format");
+        // BGD table starts at block group_start(0)+1; corrupt group 0's
+        // inode_table pointer (BGD field offset 8) to a wrong block.
+        let bgd0 = (geo.group_start(0) + 1) as usize * 1024;
+        let bad = geo.inode_table_block(0) + 1;
+        vol.data[bgd0 + 8..bgd0 + 12].copy_from_slice(&bad.to_le_bytes());
+        assert!(matches!(
+            Ext2Fs::open(&mut vol, 0),
+            Err(Ext2Error::CorruptedEntry)
+        ));
+    }
+
+    #[test]
+    fn create_file_rejects_corrupt_dir_entry_without_panic() {
+        let mut vol = MemVolume::new(4096, 1024);
+        let geo = format_ext2(&mut vol, &params(4096, 0)).expect("format");
+        // Corrupt the root directory block's first entry's name_len so
+        // dirent_len(name_len) exceeds its rec_len — the add_dir_entry slack
+        // loop must fail closed (CorruptedEntry), not underflow/panic.
+        let root_dir = geo.first_group_data_block(0) as usize * 1024;
+        vol.data[root_dir + 6] = 255; // name_len of the "." entry (rec_len 12)
+        let mut fs = Ext2Fs::open(&mut vol, 0).expect("open");
+        assert!(matches!(
+            fs.create_file(&mut vol, EXT2_ROOT_INO, "x", b"data", 0o644),
+            Err(Ext2Error::CorruptedEntry)
+        ));
     }
 
     fn params(total_blocks: u32, block_size_log: u32) -> FormatParams {
