@@ -160,6 +160,16 @@ impl FormatGeometry {
             }
         }
 
+        // `inodes_per_group * group_count` stays well under u32::MAX for every
+        // volume the current inode ratio produces (a 16 TiB 4 KiB-block volume
+        // lands near ~1.07e9), but the product is unchecked arithmetic on
+        // caller-controlled `total_blocks` — a future ratio change or a
+        // pathological param must not silently wrap into a bogus on-disk
+        // `s_inodes_count`. Reject rather than overflow.
+        let inodes_count = inodes_per_group
+            .checked_mul(group_count)
+            .ok_or(Ext2Error::OutOfSpace)?;
+
         Ok(FormatGeometry {
             block_size,
             first_data_block,
@@ -169,7 +179,7 @@ impl FormatGeometry {
             bgd_blocks,
             inode_table_blocks,
             overhead_blocks,
-            inodes_count: inodes_per_group * group_count,
+            inodes_count,
         })
     }
 
@@ -258,8 +268,30 @@ fn bitmap_get(bitmap: &[u8], bit: u32) -> bool {
 }
 
 /// Index of the first clear bit below `limit`, or `None`.
+///
+/// Scans **byte-wise**: a fully-allocated byte (`0xFF`) is skipped in one step
+/// rather than eight bit tests, then the first clear bit inside the first
+/// non-full byte is located. `alloc_block`/`alloc_inode` call this once per
+/// allocation and (with the low-end fill pattern the writer produces) the
+/// clear region always sits just past the already-allocated prefix, so byte
+/// skipping keeps a large populate close to linear instead of the O(n²) a
+/// bit-by-bit rescan-from-zero would cost.
 fn bitmap_find_clear(bitmap: &[u8], limit: u32) -> Option<u32> {
-    (0..limit).find(|&bit| !bitmap_get(bitmap, bit))
+    let full_bytes = (limit / 8) as usize;
+    // First whole byte that is not fully allocated → its first 0 bit
+    // (LSB-first, so `trailing_ones` is the clear bit's index within the byte).
+    let in_full = bitmap
+        .iter()
+        .take(full_bytes)
+        .enumerate()
+        .find_map(|(byte_idx, &byte)| {
+            (byte != 0xFF).then(|| byte_idx as u32 * 8 + byte.trailing_ones())
+        });
+    // Tail: the final partial byte holds bits [full_bytes*8, limit).
+    in_full.or_else(|| {
+        let tail_start = full_bytes as u32 * 8;
+        (tail_start..limit).find(|&bit| !bitmap_get(bitmap, bit))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -382,10 +414,11 @@ pub fn format_ext2<IO: BlockIo + ?Sized>(
         let start = geo.group_start(g);
         let in_group = geo.blocks_in_group(g, params.total_blocks);
 
-        // Superblock copy (primary in group 0). For 1 KiB blocks the copy is
-        // the group's first block; for larger blocks group 0's copy sits at
-        // byte 1024 of block 0 and backups occupy their group's first block
-        // at the same interior offset for uniformity.
+        // Superblock copy (primary in group 0). For 1 KiB blocks every copy is
+        // its group's own first block. For larger blocks the layout is
+        // asymmetric (see `superblock_block`): group 0's PRIMARY sits at byte
+        // 1024 of block 0 (after the boot record), while each BACKUP sits at
+        // offset 0 of its group's first block.
         io.write_block(start, &superblock_block(&sb, &params.uuid, &geo, g as u16))?;
 
         // BGD table.
@@ -503,6 +536,25 @@ fn write_inode_raw<IO: BlockIo + ?Sized>(
 /// **primary** copies by [`Ext2Fs::flush`]; per-group backups keep their
 /// format-time counts (they exist for fsck recovery, not steady-state reads —
 /// the same policy in-kernel writeback follows).
+///
+/// # Failure model — no rollback (abort-and-reformat)
+///
+/// The `create_*` methods mutate on-disk bitmaps, inode tables, and directory
+/// blocks **incrementally with no journal or undo**. If any step fails
+/// partway — an [`BlockIo`] I/O error, or [`Ext2Error::OutOfSpace`] when a
+/// data-block allocation or a directory-block extension can't be satisfied —
+/// the volume is left **partially modified** (e.g. an inode allocated in the
+/// bitmap but with no directory entry, or a directory grown by one block whose
+/// inode `i_size` update never landed). There is no transactional recovery.
+///
+/// Callers (the installer's populate path) MUST treat any error from a
+/// `create_*`/`alloc_*`/`flush` call as **fatal for the whole volume**: abort
+/// the install and re-run [`format_ext2`] before retrying, rather than
+/// continuing to write into a half-updated filesystem. The in-memory free
+/// counts track the on-disk bitmaps (each is decremented only after its bitmap
+/// write succeeds), so the hazard is not a lost count but a **logical
+/// inconsistency** — an orphaned inode or data block, or a stale link count /
+/// `i_size` — that a later [`Ext2Fs::flush`] would then durably record.
 pub struct Ext2Fs {
     pub sb: Ext2Superblock,
     pub geo: FormatGeometry,
@@ -1015,6 +1067,29 @@ mod tests {
             }
             Ok(self.vol.data[start..start + bs].to_vec())
         }
+    }
+
+    #[test]
+    fn bitmap_find_clear_byte_scan_matches_bit_scan() {
+        // All clear → bit 0.
+        assert_eq!(bitmap_find_clear(&[0x00, 0x00], 16), Some(0));
+        // First byte partially full (bits 0..3 set) → first clear is bit 3.
+        assert_eq!(bitmap_find_clear(&[0b0000_0111, 0x00], 16), Some(3));
+        // First byte fully allocated → skipped; next byte's bit 0 = global 8.
+        assert_eq!(bitmap_find_clear(&[0xFF, 0x00], 16), Some(8));
+        // All full bytes allocated, clear bit only in the partial tail byte:
+        // limit 12 → full_bytes = 1 (byte 0), tail bits [8,12). Byte 1 =
+        // 0b0000_0010 sets bit 9; bit 8 is clear → global 8.
+        assert_eq!(bitmap_find_clear(&[0xFF, 0b0000_0010], 12), Some(8));
+        // Every bit below limit set → None (tail byte's high bits are ≥ limit
+        // and must not be returned).
+        assert_eq!(bitmap_find_clear(&[0xFF, 0b0000_1111], 12), None);
+        // Full byte + fully-set tail region → None.
+        assert_eq!(bitmap_find_clear(&[0xFF, 0xFF], 16), None);
+        // Cross-check the byte-scan against a naive bit-scan over a varied map.
+        let map = [0xFF, 0xFF, 0b1010_1011, 0x00];
+        let naive = (0..32u32).find(|&b| map[(b / 8) as usize] & (1 << (b % 8)) == 0);
+        assert_eq!(bitmap_find_clear(&map, 32), naive);
     }
 
     fn params(total_blocks: u32, block_size_log: u32) -> FormatParams {
