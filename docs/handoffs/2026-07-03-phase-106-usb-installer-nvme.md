@@ -174,17 +174,31 @@ persistent failure that reproduces identically on `main`**:
 
 ## Remaining Phase 106 work
 
+- **C.5 — on-device `mkfs.ext2`** ✅ **pure-logic core landed** (2026-07-04,
+  branch `feat/phase-106-c5-mkfs-ext2`). New `kernel-core/src/fs/ext2_format.rs`:
+  - `format_ext2(io, params)` lays down a complete rev-1 filesystem — primary +
+    per-group backup superblocks (with the primary-at-offset-1024 vs
+    backup-at-offset-0 asymmetry for >1 KiB blocks), BGD table, block/inode
+    bitmaps (metadata + tail bits marked), inode tables, root + `lost+found`.
+    FILETYPE-only feature set, 128-byte inodes, no `sparse_super`/journal.
+  - `Ext2Fs` — a mounted-for-write handle: bitmap block/inode allocation +
+    `create_file` (direct/indirect/double-indirect), `create_dir`,
+    `create_symlink` (inline + block), `flush`.
+  - `BlockIo` write seam (dual of the read path's `BlockReader`); the installer's
+    `0x117x` raw syscalls back it directly.
+  - `Ext2Superblock::write_full_into` added to `ext2.rs` (the existing
+    `write_into` is a partial writeback helper; format needs the full struct).
+  - **11 host tests** round-trip written content back through the **existing
+    `ext2.rs` reader** (small/indirect/double-indirect files, dir tree +
+    symlink, 4 KiB blocks, dir-block spill), **plus a real `e2fsck -fn`
+    external-validator test** (skips-with-reason if absent; ran+passed here).
+  - **Remaining C.5 (installer populate):** deferred to C.4 — see below.
 - **C.4 — on-device GPT writer + ESP/FAT creator** (partition-aware follow-on to
   the raw copy). Lets the installer lay a fresh GPT + ESP sized to the target
-  disk instead of a byte-for-byte image clone.
-- **C.5 — on-device `mkfs.ext2`** — the only genuinely new pure-logic capability
-  in this phase. `kernel-core::fs::ext2` has the structure **serializers**
-  (`Ext2Superblock::write_into`, `Ext2BlockGroupDescriptor::write_into`,
-  `Ext2Inode::write_into`) + the read path + kernel-side allocators, but nothing
-  **orchestrates a from-scratch format** (group geometry, superblock + backups,
-  BGD table, block/inode bitmaps, root inode, `lost+found`). Add it as
-  host-tested pure logic with a round-trip test (format → re-mount → write+read a
-  file), keeping the kernel boundary thin.
+  disk instead of a byte-for-byte image clone. **C.5's installer-populate arm
+  lands here:** format the C.4-created Linux partition with `format_ext2`, then
+  copy the source rootfs into it via `Ext2Fs::create_*` (needs a source-fs
+  reader over the raw syscalls). The pure-logic pieces are done and validated.
 - **Track D — first-user / account setup.** Wire `adduser`/`passwd`
   (PBKDF2/`crypto-lib`) into the installer or a one-shot first-boot: create
   root + first-user `/etc/passwd`+`/etc/shadow`, seed the home dir, **disable the

@@ -208,6 +208,44 @@ impl Ext2Superblock {
         buf[56..58].copy_from_slice(&self.magic.to_le_bytes());
         buf[58..60].copy_from_slice(&self.state.to_le_bytes());
     }
+
+    /// Serialize **every** parsed field at its on-disk offset (Phase 106 C.5).
+    ///
+    /// [`Self::write_into`] is a writeback helper that only touches the
+    /// mutable fields of an already-valid on-disk superblock; a from-scratch
+    /// format (`fs::ext2_format`) needs the full structure laid down. Fields
+    /// outside the parsed set (feature flags, UUID, volume name, …) are the
+    /// formatter's responsibility — this writes exactly what `parse` reads.
+    pub fn write_full_into(&self, buf: &mut [u8]) {
+        debug_assert!(buf.len() >= 1024);
+        buf[0..4].copy_from_slice(&self.inodes_count.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.blocks_count.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.r_blocks_count.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.free_blocks_count.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.free_inodes_count.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.first_data_block.to_le_bytes());
+        buf[24..28].copy_from_slice(&self.log_block_size.to_le_bytes());
+        buf[28..32].copy_from_slice(&self.log_frag_size.to_le_bytes());
+        buf[32..36].copy_from_slice(&self.blocks_per_group.to_le_bytes());
+        buf[36..40].copy_from_slice(&self.frags_per_group.to_le_bytes());
+        buf[40..44].copy_from_slice(&self.inodes_per_group.to_le_bytes());
+        buf[44..48].copy_from_slice(&self.mtime.to_le_bytes());
+        buf[48..52].copy_from_slice(&self.wtime.to_le_bytes());
+        buf[52..54].copy_from_slice(&self.mnt_count.to_le_bytes());
+        buf[54..56].copy_from_slice(&self.max_mnt_count.to_le_bytes());
+        buf[56..58].copy_from_slice(&self.magic.to_le_bytes());
+        buf[58..60].copy_from_slice(&self.state.to_le_bytes());
+        buf[60..62].copy_from_slice(&self.errors.to_le_bytes());
+        buf[62..64].copy_from_slice(&self.minor_rev_level.to_le_bytes());
+        buf[64..68].copy_from_slice(&self.lastcheck.to_le_bytes());
+        buf[68..72].copy_from_slice(&self.checkinterval.to_le_bytes());
+        buf[72..76].copy_from_slice(&self.creator_os.to_le_bytes());
+        buf[76..80].copy_from_slice(&self.rev_level.to_le_bytes());
+        buf[80..82].copy_from_slice(&self.def_resuid.to_le_bytes());
+        buf[82..84].copy_from_slice(&self.def_resgid.to_le_bytes());
+        buf[84..88].copy_from_slice(&self.first_ino.to_le_bytes());
+        buf[88..90].copy_from_slice(&self.inode_size.to_le_bytes());
+    }
 }
 
 // ---------------------------------------------------------------------------

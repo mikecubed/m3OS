@@ -11,7 +11,7 @@
 |---|---|---|---|
 | A | Combined GPT(ESP+ext2) USB image + USB-ext2 root bootstrap (M1) | — | ✅ Merged (PR #294) — `usb-root-smoke` green |
 | B | NVMe root boot + `nvme-rw`/`nvme-persist` gates (M2) | — | ✅ Merged (PR #295) — both gates green |
-| C | On-device installer: raw USB→NVMe copy, then partition-aware `mkfs` (M3) | A, B | 🟡 C.1/C.2/C.3 merged (PR #296); `nvme-install-smoke` GREEN (shm bulk path + single-daemon guard + wait-budget fix); C.4/C.5 pending |
+| C | On-device installer: raw USB→NVMe copy, then partition-aware `mkfs` (M3) | A, B | 🟡 C.1/C.2/C.3 merged (PR #296); `nvme-install-smoke` GREEN; **C.5 mkfs.ext2 pure-logic landed** (e2fsck-validated); C.4 GPT/ESP writer + C.5 installer-populate pending |
 | D | First-user / account setup on the installed rootfs (M3) | C | Planned |
 | E | Validation: QEMU gates + bare-metal sign-off | A, B, C, D | 🟡 M1/M2 QEMU arms green; M3 gate GREEN in pre-push (`M3OS_NVME_INSTALL_REGRESSION=1`); HW rungs operator-owned |
 
@@ -184,19 +184,19 @@
 - [ ] Writes a valid GPT (protective MBR + primary/backup headers + partition entries) onto the NVMe with an ESP + a Linux partition; the produced GPT parses with `usb_ext2_base_lba`-style logic.
 - [ ] Creates a FAT ESP and copies the bootloader + kernel into it; the firmware can boot the resulting disk (validated in `nvme-install-smoke`, Track E).
 
-### C.5 — On-device `mkfs.ext2`
+### C.5 — On-device `mkfs.ext2` 🟢 pure-logic core landed (2026-07-04)
 
 **Files:**
-- `kernel-core/src/fs/ext2.rs`
-- `userspace/installer/src/main.rs`
+- `kernel-core/src/fs/ext2_format.rs` *(new module; `ext2.rs` gained `Ext2Superblock::write_full_into`)*
+- `userspace/installer/src/main.rs` *(populate integration — deferred to C.4, see below)*
 
-**Symbol:** new `format_ext2` orchestration (composing the existing `Ext2Superblock::write_into` / `Ext2BlockGroupDescriptor::write_into` / `Ext2Inode::write_into` serializers)
+**Symbol:** new `format_ext2` orchestration + `Ext2Fs` write handle, composing the existing `ext2.rs` serializers (`Ext2Inode::write_into`, `Ext2BlockGroupDescriptor::write_into`, the new full-superblock serializer) and driving them through a `BlockIo` device seam.
 **Why it matters:** `kernel-core::fs::ext2` reads and writes an **existing** filesystem but cannot **create** one — there is no orchestration that lays out a superblock, BGD table, block/inode bitmaps, inode table, root inode, and `lost+found` from scratch. This is the genuinely new pure-logic capability.
 
 **Acceptance:**
-- [ ] `format_ext2` produces a blank rev-1 ext2 image (correct group geometry, primary + backup superblocks, BGD table, zeroed-then-marked bitmaps, root inode + `lost+found`) sized to a given block count.
-- [ ] A host test formats an in-memory image, then **re-mounts it through the existing reader and round-trips a written file** (write a file → fresh mount → read it back identical) — the falsifiable proof the format is valid.
-- [ ] The installer can `format_ext2` the NVMe Linux partition, then copy the rootfs files into it (an alternative to the C.3 raw copy).
+- [x] `format_ext2` produces a blank rev-1 ext2 image (correct group geometry, primary + per-group backup superblocks with the primary-vs-backup 1024-byte offset asymmetry, BGD table, zeroed-then-marked bitmaps, root inode + `lost+found`) sized to a given block count. Feature set is FILETYPE-only; 128-byte inodes; no `sparse_super`/journal/resize-inode. Geometry validated for degenerate-volume rejection. *(11 host tests in `ext2_format::tests`.)*
+- [x] A host test formats an in-memory image, then **re-mounts it through the existing `ext2.rs` reader and round-trips written content** — small file, indirect + double-indirect file, a directory tree with a symlink, 4 KiB blocks, and 60-file dir-block spill all read back byte-identical via `resolve_path`/`read_file_data`/`read_symlink_target`. **Plus** an external-validator test that runs real `e2fsck -fn` on the formatted+populated image and asserts a clean exit (skips-with-reason when `e2fsck` is absent; **ran and passed** on this host).
+- [ ] The installer can `format_ext2` the NVMe Linux partition, then copy the rootfs files into it (an alternative to the C.3 raw copy). **Deferred to C.4:** formatting is only meaningful against a partition C.4's GPT/ESP writer lays down, and populating needs a source-fs reader; the `Ext2Fs` writer (`create_file`/`create_dir`/`create_symlink`) is the ready building block. The `0x117x` raw syscalls give the installer the `BlockIo` backing.
 
 ---
 
