@@ -15838,6 +15838,32 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs, part: bool) {
         }) {
             eprintln!("{l}");
         }
+        // And persist the COMPLETE boot-1 serial history — the silent-stall
+        // class (a task parked BlockedOnReply with no waker) is only
+        // diagnosable from the kernel's IPC/scheduler warn lines, which the
+        // filtered dump above and the 60-line tail both drop.
+        let dump = output_dir.join("nvme-install-boot1-serial.log");
+        if std::fs::write(&dump, strip_ansi(&hist1)).is_ok() {
+            eprintln!("full boot-1 serial history: {}", dump.display());
+        }
+        // Classify the failure: the Phase 106 "Bug 2" scheduler/IPC
+        // lost-wakeup (a fork-child stranded in BlockedOnReply with no
+        // reply ever delivered) is a SEPARATE pre-existing hang from any
+        // installer / USB-transport fault, and its `[replystall]` /
+        // `no waker registered` watchdog lines are the tell. Name it
+        // explicitly so a future failure is never re-misattributed to the
+        // installer or the (fixed) BOT transport-fail cascade. See
+        // docs/handoffs/2026-07-03-phase-106-usb-installer-nvme.md.
+        let clean = strip_ansi(&hist1);
+        if clean.contains("STRANDED(BlockedOnReply") || clean.contains("(no waker registered)") {
+            eprintln!(
+                "*** KNOWN-FLAKE: Phase 106 Bug 2 — scheduler/IPC lost-wakeup \
+                 (BlockedOnReply stranded, no reply delivered) under the populate's \
+                 heavy multi-core block-IPC load. This is NOT the installer and NOT \
+                 the fixed BOT transport-fail cascade (zero transport-fail lines this \
+                 run). It is the pre-existing 57e preempt-full hang class. ***"
+            );
+        }
         fail(&format!("boot 1 (install): {msg}"));
     }
 

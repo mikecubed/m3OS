@@ -105,6 +105,17 @@ pub const TRB_TYPE_ADDRESS_DEVICE: u8 = 11;
 pub const TRB_TYPE_CONFIGURE_ENDPOINT: u8 = 12;
 /// Evaluate Context Command.
 pub const TRB_TYPE_EVALUATE_CONTEXT: u8 = 13;
+/// Reset Endpoint Command (xHCI §4.6.8) — clears a Halted endpoint back to
+/// Stopped so its ring can be restarted (the transfer-error / STALL recovery
+/// path).
+pub const TRB_TYPE_RESET_ENDPOINT: u8 = 14;
+/// Stop Endpoint Command (xHCI §4.6.9) — stops a Running endpoint so its
+/// ring can be safely repointed (flushing an abandoned/orphaned TD).
+pub const TRB_TYPE_STOP_ENDPOINT: u8 = 15;
+/// Set TR Dequeue Pointer Command (xHCI §4.6.10) — repoints a Stopped
+/// endpoint's transfer-ring dequeue pointer (with its Dequeue Cycle State),
+/// discarding everything the controller had not yet consumed.
+pub const TRB_TYPE_SET_TR_DEQUEUE: u8 = 16;
 /// No Op Command.
 pub const TRB_TYPE_NO_OP_COMMAND: u8 = 23;
 /// Transfer Event.
@@ -147,6 +158,12 @@ pub enum TrbType {
     ConfigureEndpoint = TRB_TYPE_CONFIGURE_ENDPOINT,
     /// Evaluate Context command.
     EvaluateContext = TRB_TYPE_EVALUATE_CONTEXT,
+    /// Reset Endpoint command.
+    ResetEndpoint = TRB_TYPE_RESET_ENDPOINT,
+    /// Stop Endpoint command.
+    StopEndpoint = TRB_TYPE_STOP_ENDPOINT,
+    /// Set TR Dequeue Pointer command.
+    SetTrDequeue = TRB_TYPE_SET_TR_DEQUEUE,
     /// No Op command.
     NoOpCommand = TRB_TYPE_NO_OP_COMMAND,
     /// Transfer Event.
@@ -176,6 +193,9 @@ impl TrbType {
             TRB_TYPE_ADDRESS_DEVICE => Some(TrbType::AddressDevice),
             TRB_TYPE_CONFIGURE_ENDPOINT => Some(TrbType::ConfigureEndpoint),
             TRB_TYPE_EVALUATE_CONTEXT => Some(TrbType::EvaluateContext),
+            TRB_TYPE_RESET_ENDPOINT => Some(TrbType::ResetEndpoint),
+            TRB_TYPE_STOP_ENDPOINT => Some(TrbType::StopEndpoint),
+            TRB_TYPE_SET_TR_DEQUEUE => Some(TrbType::SetTrDequeue),
             TRB_TYPE_NO_OP_COMMAND => Some(TrbType::NoOpCommand),
             TRB_TYPE_TRANSFER_EVENT => Some(TrbType::TransferEvent),
             TRB_TYPE_COMMAND_COMPLETION => Some(TrbType::CommandCompletion),
@@ -207,6 +227,13 @@ pub const COMPLETION_SHORT_PACKET: u8 = 13;
 /// has no retry, so the affected interval's data is simply dropped; the driver
 /// resynchronises on the next interval rather than treating it as fatal.
 pub const COMPLETION_MISSED_SERVICE_ERROR: u8 = 26;
+
+/// Context State Error completion code (xHCI §6.4.5) — the command targeted
+/// an endpoint whose state didn't require it (e.g. Stop Endpoint on an
+/// already-Stopped/Halted endpoint, Reset Endpoint on a non-Halted one). The
+/// endpoint-recovery sequence tolerates this: it means that step was simply
+/// unnecessary, not that recovery failed.
+pub const COMPLETION_CONTEXT_STATE_ERROR: u8 = 19;
 
 // ---------------------------------------------------------------------------
 // Generic field accessors
@@ -439,6 +466,10 @@ const DATA_TRB_TRANSFER_LENGTH_MASK: u32 = 0x0001_FFFF;
 
 /// Shift of the Slot ID in a command TRB control dword (bits 31:24).
 const CMD_SLOT_ID_SHIFT: u32 = 24;
+/// Shift of the Endpoint ID (DCI) in an endpoint-targeting command TRB
+/// control dword (bits 20:16 — Stop Endpoint / Reset Endpoint / Set TR
+/// Dequeue Pointer, xHCI §6.4.3).
+const CMD_ENDPOINT_ID_SHIFT: u32 = 16;
 /// BSR (Block Set Address Request) bit in an Address Device Command TRB
 /// control dword (bit 9, xHCI §6.4.3.4). When set the controller skips
 /// assigning a USB address; used during the EP0 MPS two-step.
@@ -597,6 +628,57 @@ impl Trb {
             parameter: input_ctx_iova,
             status: 0,
             control: control_type_cycle(TRB_TYPE_EVALUATE_CONTEXT, cycle)
+                | ((slot_id as u32) << CMD_SLOT_ID_SHIFT),
+        }
+    }
+
+    /// Build a **Stop Endpoint Command TRB** (xHCI §6.4.3.3) for (`slot_id`,
+    /// `dci`). Stops a Running endpoint so its ring can be repointed; part of
+    /// the transfer-abandonment recovery path (SP bit left 0 — a full stop,
+    /// not suspend).
+    pub const fn stop_endpoint(slot_id: u8, dci: u8, cycle: bool) -> Trb {
+        Trb {
+            parameter: 0,
+            status: 0,
+            control: control_type_cycle(TRB_TYPE_STOP_ENDPOINT, cycle)
+                | ((dci as u32) << CMD_ENDPOINT_ID_SHIFT)
+                | ((slot_id as u32) << CMD_SLOT_ID_SHIFT),
+        }
+    }
+
+    /// Build a **Reset Endpoint Command TRB** (xHCI §6.4.3.4) for (`slot_id`,
+    /// `dci`). Clears a Halted endpoint (a device STALL halts it) back to
+    /// Stopped. TSP is left 0 so the endpoint's transfer state (data
+    /// toggle / sequence number) is reset — the pairing behaviour for a
+    /// device-side `CLEAR_FEATURE(ENDPOINT_HALT)`, which resets the device's
+    /// toggle too.
+    pub const fn reset_endpoint(slot_id: u8, dci: u8, cycle: bool) -> Trb {
+        Trb {
+            parameter: 0,
+            status: 0,
+            control: control_type_cycle(TRB_TYPE_RESET_ENDPOINT, cycle)
+                | ((dci as u32) << CMD_ENDPOINT_ID_SHIFT)
+                | ((slot_id as u32) << CMD_SLOT_ID_SHIFT),
+        }
+    }
+
+    /// Build a **Set TR Dequeue Pointer Command TRB** (xHCI §6.4.3.9) for
+    /// (`slot_id`, `dci`): repoint the Stopped endpoint's dequeue to
+    /// `new_dequeue_iova` with Dequeue Cycle State `dcs`, discarding every
+    /// TD the controller had not yet consumed (the orphan-flush half of the
+    /// recovery path).
+    pub const fn set_tr_dequeue(
+        new_dequeue_iova: u64,
+        dcs: bool,
+        slot_id: u8,
+        dci: u8,
+        cycle: bool,
+    ) -> Trb {
+        Trb {
+            parameter: (new_dequeue_iova & TRB_POINTER_MASK) | dcs as u64,
+            status: 0,
+            control: control_type_cycle(TRB_TYPE_SET_TR_DEQUEUE, cycle)
+                | ((dci as u32) << CMD_ENDPOINT_ID_SHIFT)
                 | ((slot_id as u32) << CMD_SLOT_ID_SHIFT),
         }
     }
@@ -1403,6 +1485,46 @@ mod tests {
         assert!(trb_cycle(&trb));
         assert_eq!(trb.parameter, ctx);
         assert_eq!((trb.control >> CMD_SLOT_ID_SHIFT) as u8, 7);
+    }
+
+    #[test]
+    fn stop_endpoint_trb() {
+        let trb = Trb::stop_endpoint(4, 3, true);
+        assert_eq!(trb_type_raw(&trb), TRB_TYPE_STOP_ENDPOINT);
+        assert!(trb_cycle(&trb));
+        assert_eq!(trb.parameter, 0);
+        assert_eq!((trb.control >> CMD_SLOT_ID_SHIFT) as u8, 4);
+        assert_eq!(((trb.control >> CMD_ENDPOINT_ID_SHIFT) & 0x1F) as u8, 3);
+        // SP (suspend) bit 23 must be clear — a full stop.
+        assert_eq!(trb.control & (1 << 23), 0);
+    }
+
+    #[test]
+    fn reset_endpoint_trb() {
+        let trb = Trb::reset_endpoint(6, 4, false);
+        assert_eq!(trb_type_raw(&trb), TRB_TYPE_RESET_ENDPOINT);
+        assert!(!trb_cycle(&trb));
+        assert_eq!((trb.control >> CMD_SLOT_ID_SHIFT) as u8, 6);
+        assert_eq!(((trb.control >> CMD_ENDPOINT_ID_SHIFT) & 0x1F) as u8, 4);
+        // TSP bit 9 must be clear — transfer state (data toggle) resets.
+        assert_eq!(trb.control & (1 << 9), 0);
+    }
+
+    #[test]
+    fn set_tr_dequeue_trb_carries_pointer_and_dcs() {
+        let deq = 0x0070_0040u64;
+        let trb = Trb::set_tr_dequeue(deq, true, 2, 5, true);
+        assert_eq!(trb_type_raw(&trb), TRB_TYPE_SET_TR_DEQUEUE);
+        assert!(trb_cycle(&trb));
+        // Pointer in the upper bits, DCS in bit 0.
+        assert_eq!(trb.parameter & !0xF, deq);
+        assert_eq!(trb.parameter & 1, 1);
+        assert_eq!((trb.control >> CMD_SLOT_ID_SHIFT) as u8, 2);
+        assert_eq!(((trb.control >> CMD_ENDPOINT_ID_SHIFT) & 0x1F) as u8, 5);
+        // DCS=false leaves bit 0 clear; a misaligned pointer is masked.
+        let trb2 = Trb::set_tr_dequeue(deq | 0x6, false, 2, 5, true);
+        assert_eq!(trb2.parameter & 1, 0);
+        assert_eq!(trb2.parameter & !0xF, deq);
     }
 
     #[test]

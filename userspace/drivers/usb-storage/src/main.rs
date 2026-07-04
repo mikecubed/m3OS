@@ -1021,6 +1021,84 @@ fn cdb_sync_cache10() -> [u8; 10] {
     [0x35, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
 }
 
+/// USB Mass Storage **BOT Reset Recovery** (BOT spec §5.3.4) plus the xHCI
+/// controller-side endpoint recovery — the answer to the install-copy
+/// `transport-fail` cascade (Phase 106).
+///
+/// The failure it unwinds: one bulk transfer exceeds the xHCI server's
+/// completion-wait budget (host stalls of >5 s were observed under
+/// battery-load TCG while QEMU's disk backends fought the host page cache)
+/// and is abandoned mid-BOT-exchange. The device is now phase-desynced (it
+/// still owes data / a CSW), so it STALLs the next CBW — and the STALL halts
+/// the xHCI endpoint. Without recovery every later ≥8-sector transfer on the
+/// device fails, including the kernel's own rootfs reads.
+///
+/// Sequence:
+/// 1. `RecoverEndpoint` on both bulk pipes — the xHCI half (Stop/Reset
+///    Endpoint + Set TR Dequeue + stale-event sweep).
+/// 2. **Bulk-Only Mass Storage Reset** (class request `0xFF` to the
+///    interface) — returns the device's BOT state machine to CBW-wait.
+/// 3. `CLEAR_FEATURE(ENDPOINT_HALT)` on bulk-IN then bulk-OUT — clears the
+///    device-side stall state + data toggles (pairing with Reset Endpoint's
+///    TSP=0 on the controller side).
+///
+/// Returns `true` when every step succeeded; the caller then retries the
+/// failed BOT command exactly once. Only TRANSPORT failures recover — a CSW
+/// with a bad status is the device *answering* (BOT framing intact), so it
+/// passes through as a normal command failure.
+#[cfg(not(test))]
+fn bot_recover(usb_ep: u32, notice: &AttachNotice) -> bool {
+    write_str(STDOUT_FILENO, "usb-storage: BOT reset recovery start\n");
+    let slot = notice.slot_id;
+    let recover_ep = |dci: u8| -> bool {
+        matches!(
+            usb_call(usb_ep, &UsbRequest::RecoverEndpoint { slot_id: slot, dci }),
+            Some(UsbReply::TransferComplete {
+                completion_code: 1,
+                ..
+            })
+        )
+    };
+    let control = |setup: [u8; 8]| -> bool {
+        matches!(
+            usb_call(
+                usb_ep,
+                &UsbRequest::ControlRequest {
+                    slot_id: slot,
+                    setup,
+                    length: 0,
+                },
+            ),
+            Some(UsbReply::ControlData {
+                completion_code: 1,
+                ..
+            })
+        )
+    };
+
+    let ep_recovered = recover_ep(notice.bulk_in_dci) & recover_ep(notice.bulk_out_dci);
+    // Bulk-Only Mass Storage Reset: bmRequestType 0x21 (H2D, class,
+    // interface), bRequest 0xFF, wIndex = interface, no data stage.
+    let bot_reset = control([0x21, 0xFF, 0, 0, notice.interface_num, 0, 0, 0]);
+    // CLEAR_FEATURE(ENDPOINT_HALT): bmRequestType 0x02 (H2D, standard,
+    // endpoint), bRequest 1, wValue 0 (ENDPOINT_HALT), wIndex = endpoint
+    // address. DCI = ep*2 + dir, so the endpoint number is dci >> 1 and the
+    // IN address carries bit 7.
+    let clear_in = control([0x02, 0x01, 0, 0, 0x80 | (notice.bulk_in_dci >> 1), 0, 0, 0]);
+    let clear_out = control([0x02, 0x01, 0, 0, notice.bulk_out_dci >> 1, 0, 0, 0]);
+
+    let ok = ep_recovered && bot_reset && clear_in && clear_out;
+    write_str(
+        STDOUT_FILENO,
+        if ok {
+            "usb-storage: BOT reset recovery ok — retrying command\n"
+        } else {
+            "usb-storage: BOT reset recovery FAILED\n"
+        },
+    );
+    ok
+}
+
 /// Handle a `BLK_READ` by issuing chunked BOT READ(10) commands.
 ///
 /// Multi-sector spans go through the zero-copy shm path when the bounce
@@ -1052,42 +1130,53 @@ fn handle_bot_read(
             let chunk = remaining.min(MAX_SHM_SECTORS);
             let byte_count = chunk * 512;
             let lba32 = current_lba as u32;
-            match bot_read_shm(
-                usb_ep,
-                notice,
-                &cdb_read10(lba32, chunk as u16),
-                bounce.id,
-                byte_count,
-            ) {
-                Some(0) => {
-                    // SAFETY: the bounce region is MAX_SHM_SECTORS × 512
-                    // bytes mapped at `va`, and byte_count ≤ that. The xHCI
-                    // server's completion reply happens-before this read, so
-                    // the DMA'd stage is visible.
-                    let stage =
-                        unsafe { core::slice::from_raw_parts(bounce.va, byte_count as usize) };
-                    all_data.extend_from_slice(stage);
-                }
-                Some(status) => {
-                    write_str(STDOUT_FILENO, "usb-storage: BLK_READ shm csw-status=");
-                    write_u8_dec(status);
-                    write_str(STDOUT_FILENO, " lba=");
-                    write_u32_dec(lba32);
-                    write_str(STDOUT_FILENO, " sectors=");
-                    write_u32_dec(chunk);
-                    write_str(STDOUT_FILENO, "\n");
-                    return err_reply(cmd_id);
-                }
-                None => {
-                    write_str(
-                        STDOUT_FILENO,
-                        "usb-storage: BLK_READ shm transport-fail lba=",
-                    );
-                    write_u32_dec(lba32);
-                    write_str(STDOUT_FILENO, " sectors=");
-                    write_u32_dec(chunk);
-                    write_str(STDOUT_FILENO, "\n");
-                    return err_reply(cmd_id);
+            let mut retried = false;
+            loop {
+                match bot_read_shm(
+                    usb_ep,
+                    notice,
+                    &cdb_read10(lba32, chunk as u16),
+                    bounce.id,
+                    byte_count,
+                ) {
+                    Some(0) => {
+                        // SAFETY: the bounce region is MAX_SHM_SECTORS × 512
+                        // bytes mapped at `va`, and byte_count ≤ that. The xHCI
+                        // server's completion reply happens-before this read, so
+                        // the DMA'd stage is visible.
+                        let stage =
+                            unsafe { core::slice::from_raw_parts(bounce.va, byte_count as usize) };
+                        all_data.extend_from_slice(stage);
+                        break;
+                    }
+                    Some(status) => {
+                        write_str(STDOUT_FILENO, "usb-storage: BLK_READ shm csw-status=");
+                        write_u8_dec(status);
+                        write_str(STDOUT_FILENO, " lba=");
+                        write_u32_dec(lba32);
+                        write_str(STDOUT_FILENO, " sectors=");
+                        write_u32_dec(chunk);
+                        write_str(STDOUT_FILENO, "\n");
+                        return err_reply(cmd_id);
+                    }
+                    None => {
+                        write_str(
+                            STDOUT_FILENO,
+                            "usb-storage: BLK_READ shm transport-fail lba=",
+                        );
+                        write_u32_dec(lba32);
+                        write_str(STDOUT_FILENO, " sectors=");
+                        write_u32_dec(chunk);
+                        write_str(STDOUT_FILENO, "\n");
+                        // Phase 106: one transport failure used to poison the
+                        // pipe for good — reset-recover and retry this SCSI
+                        // command exactly once.
+                        if !retried && bot_recover(usb_ep, notice) {
+                            retried = true;
+                            continue;
+                        }
+                        return err_reply(cmd_id);
+                    }
                 }
             }
             remaining -= chunk;
@@ -1098,45 +1187,54 @@ fn handle_bot_read(
         let chunk = remaining.min(MAX_BOT_SECTORS as u32) as u16;
         let byte_count = chunk * 512;
         let lba32 = current_lba as u32; // BOT READ(10) uses 32-bit LBA.
-        match bot_command(usb_ep, notice, &cdb_read10(lba32, chunk), true, byte_count) {
-            Some((data, 0)) if data.len() == byte_count as usize => {
-                all_data.extend_from_slice(&data);
-            }
-            // Bare-metal diagnostic: name the failure shape + LBA so the boot log
-            // says WHY READ(10) failed instead of a bare "BOT error".
-            //   short-read  → CSW passed but the bulk-IN data phase came up short
-            //   csw-status  → device reported command-failed(1)/phase-error(2)
-            //   transport   → CBW/CSW/bulk-IN transfer itself failed (None)
-            Some((data, 0)) => {
-                write_str(STDOUT_FILENO, "usb-storage: BLK_READ BOT short-read lba=");
-                write_u32_dec(lba32);
-                write_str(STDOUT_FILENO, " got=");
-                write_u32_dec(data.len() as u32);
-                write_str(STDOUT_FILENO, " want=");
-                write_u32_dec(byte_count as u32);
-                write_str(STDOUT_FILENO, "\n");
-                return err_reply(cmd_id);
-            }
-            Some((_, status)) => {
-                write_str(STDOUT_FILENO, "usb-storage: BLK_READ BOT csw-status=");
-                write_u8_dec(status);
-                write_str(STDOUT_FILENO, " lba=");
-                write_u32_dec(lba32);
-                write_str(STDOUT_FILENO, " sectors=");
-                write_u8_dec(chunk as u8);
-                write_str(STDOUT_FILENO, "\n");
-                return err_reply(cmd_id);
-            }
-            None => {
-                write_str(
-                    STDOUT_FILENO,
-                    "usb-storage: BLK_READ BOT transport-fail lba=",
-                );
-                write_u32_dec(lba32);
-                write_str(STDOUT_FILENO, " sectors=");
-                write_u8_dec(chunk as u8);
-                write_str(STDOUT_FILENO, "\n");
-                return err_reply(cmd_id);
+        let mut retried = false;
+        loop {
+            match bot_command(usb_ep, notice, &cdb_read10(lba32, chunk), true, byte_count) {
+                Some((data, 0)) if data.len() == byte_count as usize => {
+                    all_data.extend_from_slice(&data);
+                    break;
+                }
+                // Bare-metal diagnostic: name the failure shape + LBA so the boot log
+                // says WHY READ(10) failed instead of a bare "BOT error".
+                //   short-read  → CSW passed but the bulk-IN data phase came up short
+                //   csw-status  → device reported command-failed(1)/phase-error(2)
+                //   transport   → CBW/CSW/bulk-IN transfer itself failed (None)
+                Some((data, 0)) => {
+                    write_str(STDOUT_FILENO, "usb-storage: BLK_READ BOT short-read lba=");
+                    write_u32_dec(lba32);
+                    write_str(STDOUT_FILENO, " got=");
+                    write_u32_dec(data.len() as u32);
+                    write_str(STDOUT_FILENO, " want=");
+                    write_u32_dec(byte_count as u32);
+                    write_str(STDOUT_FILENO, "\n");
+                    return err_reply(cmd_id);
+                }
+                Some((_, status)) => {
+                    write_str(STDOUT_FILENO, "usb-storage: BLK_READ BOT csw-status=");
+                    write_u8_dec(status);
+                    write_str(STDOUT_FILENO, " lba=");
+                    write_u32_dec(lba32);
+                    write_str(STDOUT_FILENO, " sectors=");
+                    write_u8_dec(chunk as u8);
+                    write_str(STDOUT_FILENO, "\n");
+                    return err_reply(cmd_id);
+                }
+                None => {
+                    write_str(
+                        STDOUT_FILENO,
+                        "usb-storage: BLK_READ BOT transport-fail lba=",
+                    );
+                    write_u32_dec(lba32);
+                    write_str(STDOUT_FILENO, " sectors=");
+                    write_u8_dec(chunk as u8);
+                    write_str(STDOUT_FILENO, "\n");
+                    // Phase 106: reset-recover + retry once (transport only).
+                    if !retried && bot_recover(usb_ep, notice) {
+                        retried = true;
+                        continue;
+                    }
+                    return err_reply(cmd_id);
+                }
             }
         }
         remaining -= chunk as u32;
@@ -1219,30 +1317,40 @@ fn handle_bot_write(
                     byte_count,
                 );
             }
-            match bot_write_shm(
-                usb_ep,
-                notice,
-                &cdb_write10(lba32, chunk as u16),
-                bounce.id,
-                byte_count as u32,
-            ) {
-                Some(0) => {}
-                Some(status) => {
-                    write_str(STDOUT_FILENO, "usb-storage: BLK_WRITE shm csw-status=");
-                    write_u8_dec(status);
-                    write_str(STDOUT_FILENO, " lba=");
-                    write_u32_dec(lba32);
-                    write_str(STDOUT_FILENO, "\n");
-                    return err_reply(cmd_id);
-                }
-                None => {
-                    write_str(
-                        STDOUT_FILENO,
-                        "usb-storage: BLK_WRITE shm transport-fail lba=",
-                    );
-                    write_u32_dec(lba32);
-                    write_str(STDOUT_FILENO, "\n");
-                    return err_reply(cmd_id);
+            let mut retried = false;
+            loop {
+                match bot_write_shm(
+                    usb_ep,
+                    notice,
+                    &cdb_write10(lba32, chunk as u16),
+                    bounce.id,
+                    byte_count as u32,
+                ) {
+                    Some(0) => break,
+                    Some(status) => {
+                        write_str(STDOUT_FILENO, "usb-storage: BLK_WRITE shm csw-status=");
+                        write_u8_dec(status);
+                        write_str(STDOUT_FILENO, " lba=");
+                        write_u32_dec(lba32);
+                        write_str(STDOUT_FILENO, "\n");
+                        return err_reply(cmd_id);
+                    }
+                    None => {
+                        write_str(
+                            STDOUT_FILENO,
+                            "usb-storage: BLK_WRITE shm transport-fail lba=",
+                        );
+                        write_u32_dec(lba32);
+                        write_str(STDOUT_FILENO, "\n");
+                        // Phase 106: reset-recover + retry once. The bounce
+                        // buffer still holds this chunk's payload, so the
+                        // retried WRITE(10) is byte-identical (idempotent).
+                        if !retried && bot_recover(usb_ep, notice) {
+                            retried = true;
+                            continue;
+                        }
+                        return err_reply(cmd_id);
+                    }
                 }
             }
             remaining -= chunk;
@@ -1255,11 +1363,34 @@ fn handle_bot_write(
         let byte_count = chunk as usize * 512;
         let lba32 = current_lba as u32;
         let chunk_payload = &payload[offset..offset + byte_count];
-        match bot_command_write(usb_ep, notice, &cdb_write10(lba32, chunk), chunk_payload) {
-            Some(0) => {}
-            _ => {
-                write_str(STDOUT_FILENO, "usb-storage: BLK_WRITE BOT error\n");
-                return err_reply(cmd_id);
+        let mut retried = false;
+        loop {
+            match bot_command_write(usb_ep, notice, &cdb_write10(lba32, chunk), chunk_payload) {
+                Some(0) => break,
+                Some(status) => {
+                    write_str(STDOUT_FILENO, "usb-storage: BLK_WRITE BOT csw-status=");
+                    write_u8_dec(status);
+                    write_str(STDOUT_FILENO, " lba=");
+                    write_u32_dec(lba32);
+                    write_str(STDOUT_FILENO, "\n");
+                    return err_reply(cmd_id);
+                }
+                None => {
+                    write_str(
+                        STDOUT_FILENO,
+                        "usb-storage: BLK_WRITE BOT transport-fail lba=",
+                    );
+                    write_u32_dec(lba32);
+                    write_str(STDOUT_FILENO, "\n");
+                    // Phase 106: reset-recover + retry once (transport only;
+                    // the payload slice is unchanged, so the retry is
+                    // idempotent).
+                    if !retried && bot_recover(usb_ep, notice) {
+                        retried = true;
+                        continue;
+                    }
+                    return err_reply(cmd_id);
+                }
             }
         }
         remaining -= chunk as u32;
