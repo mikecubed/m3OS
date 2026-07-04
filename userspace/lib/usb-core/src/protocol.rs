@@ -385,6 +385,25 @@ pub enum UsbRequest {
         /// The PCM bytes for this service interval.
         data: Vec<u8>,
     },
+
+    /// Recover a wedged bulk endpoint (Phase 106 — the BOT reset-recovery
+    /// substrate). The server runs the xHCI §4.6.8–4.6.10 sequence on
+    /// (`slot_id`, `dci`): Stop Endpoint (flushes a Running endpoint that
+    /// still owns an abandoned TD), Reset Endpoint (clears the Halted state a
+    /// device STALL leaves behind), Set TR Dequeue Pointer to the ring's
+    /// producer enqueue (discarding every orphaned TD), then drains + discards
+    /// any stale Transfer Events the abandoned TDs already posted. Class
+    /// drivers call this before the device-side recovery control requests
+    /// (Bulk-Only Mass Storage Reset + `CLEAR_FEATURE(ENDPOINT_HALT)`).
+    ///
+    /// Returns [`UsbReply::TransferComplete`] — `completion_code` 1 on
+    /// success, 0 on failure; `len` is 0.
+    RecoverEndpoint {
+        /// Target slot ID.
+        slot_id: u8,
+        /// Device Context Index of the bulk endpoint to recover.
+        dci: u8,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -616,6 +635,7 @@ const REQ_SUBMIT_BULK_IN: u8 = 11;
 const REQ_ENUMERATE_CHILD: u8 = 12;
 const REQ_SUBMIT_SHM_TRANSFER: u8 = 13;
 const REQ_SUBMIT_ISOCH_OUT: u8 = 14;
+const REQ_RECOVER_ENDPOINT: u8 = 15;
 
 // --- reply tags ---
 const REP_DESCRIPTORS: u8 = 1;
@@ -857,6 +877,11 @@ impl UsbRequest {
                 v.push(*dci);
                 put_bytes(&mut v, data);
             }
+            UsbRequest::RecoverEndpoint { slot_id, dci } => {
+                v.push(REQ_RECOVER_ENDPOINT);
+                v.push(*slot_id);
+                v.push(*dci);
+            }
         }
         v
     }
@@ -944,6 +969,10 @@ impl UsbRequest {
                 slot_id: r.u8()?,
                 dci: r.u8()?,
                 data: r.bytes()?,
+            },
+            REQ_RECOVER_ENDPOINT => UsbRequest::RecoverEndpoint {
+                slot_id: r.u8()?,
+                dci: r.u8()?,
             },
             _ => return None,
         })
@@ -1270,6 +1299,7 @@ mod tests {
                 dci: 2,
                 data: alloc::vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
             },
+            UsbRequest::RecoverEndpoint { slot_id: 5, dci: 3 },
         ];
         for r in reqs {
             let bytes = r.encode();

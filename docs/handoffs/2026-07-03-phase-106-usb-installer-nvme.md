@@ -225,32 +225,80 @@ push from this machine skipped smoke/test/regression for months. Fixed by
 re-running `./setup.sh`. Assume any "hook-verified" claim from this machine
 between March and 2026-07-04 only covered `check`.
 
-**Known pre-existing (NOT fixed): usb-storage BOT/xHCI has NO error
-recovery — one abandoned transfer poisons the pipe for good.** Signature
+**FIXED (2026-07-04): usb-storage BOT/xHCI error recovery — one abandoned
+transfer no longer poisons the pipe for good.** The failure it addressed
 (hit twice on 2026-07-04, both during install-gate image copies; 0
-occurrences across all green runs — it is all-or-nothing):
-`usb-storage: BLK_READ shm transport-fail lba=<n>` on some innocent
-transfer, then `[xhci] bulk-OUT non-success cc=6` (STALL) and **every**
-subsequent ≥8-sector (shm-path) transfer on the device fails, including
-the kernel's own rootfs reads. Chain: a transfer exceeds the 5 s
-bulk-event wait (TCG under load) → the daemon abandons it mid-BOT
-exchange → the QEMU device is left phase-desynced → it STALLs the next
-CBW → the STALL **halts the xHCI endpoint** and nothing ever clears it
-(no Bulk-Only Mass Storage Reset, no CLEAR_FEATURE(HALT), no xHCI Reset
-Endpoint + Set TR Dequeue). Installer-level retries (added with Track D)
-cannot help a halted pipe — all 3 attempts fail in ~200 ms. The real fix
-is BOT recovery in `usb-storage` (class reset + clear-halt control
-transfers — the GET_MAX_LUN control plumbing already exists) plus
-halted-endpoint recovery in the xHCI server (Reset Endpoint command +
-Set TR Dequeue Pointer); until then any long USB copy — including the
-Dell bare-metal install — can die to one 5 s hiccup. **This should be
-the next Phase 106 work item before Track E bare-metal.** Ruled out
-while diagnosing: the restart-looping service-manager `xhci` instance
-(config-space scans only, never claims — 5-7 restarts per boot, benign),
-the second `usb_storage` instance (its `shm_create`/`shm_map` are
-process-local; the single-daemon guard exits it before any BOT
-traffic), and the Track D changes themselves (the failing raw-arm data
-path is byte-identical to C.3's).
+occurrences across green runs — all-or-nothing): `usb-storage: BLK_READ
+shm transport-fail lba=<n>` on some innocent transfer, then `[xhci]
+bulk-OUT non-success cc=6` (STALL) and **every** subsequent ≥8-sector
+(shm-path) transfer on the device failing, including the kernel's own
+rootfs reads. Chain: a transfer exceeds the 5 s bulk-event wait (host
+page-cache stalls under battery-load TCG — QEMU reads the USB image
+synchronously while the ~1 GiB NVMe target floods write-back) → the
+daemon abandons it mid-BOT exchange → the device is left phase-desynced
+→ it STALLs the next CBW → the STALL **halts the xHCI endpoint**, and
+nothing cleared it; the abandoned TD's late completion event additionally
+got mis-attributed to the NEXT transfer (the wait matched events by
+(slot, dci) only). Three-layer fix:
+
+1. **Event attribution** (`xhci/src/controller.rs`): the bulk completion
+   waits now match by **TRB pointer** — a stale event from an abandoned
+   TD is consumed + discarded with a `[xhci] stale transfer event
+   discarded` line instead of being credited to the current transfer.
+   (Also: bulk-IN transport failures now print their cc — they used to
+   be silent, which is why the first failure in the logs had no xhci
+   line.)
+2. **xHCI endpoint recovery** (`Controller::recover_endpoint`, exposed
+   as `UsbRequest::RecoverEndpoint`): Stop Endpoint → Reset Endpoint →
+   Set TR Dequeue Pointer to the producer enqueue (xHCI §4.6.8–4.6.10;
+   Context State Error tolerated per step) + a stale-event sweep. New
+   host-tested command-TRB builders in `kernel-core usb/xhci/trb.rs`.
+3. **BOT reset recovery + retry-once** (`usb-storage bot_recover`): on a
+   TRANSPORT failure (never a CSW status failure — that's the device
+   answering) the daemon runs `RecoverEndpoint` on both pipes, then the
+   class-standard Bulk-Only Mass Storage Reset + `CLEAR_FEATURE
+   (ENDPOINT_HALT)` on both endpoints (BOT §5.3.4 — via the existing
+   `ControlRequest` plumbing), and retries the failed SCSI command
+   exactly once. Protects even retry-less callers (the kernel's own
+   rootfs reads); the installer's 3-attempt raw retries remain the outer
+   belt.
+
+The trigger (a >5 s host stall) is environmental and can recur; the
+sentinel chain to look for on the next occurrence is `transport-fail` →
+`usb-storage: BOT reset recovery ok — retrying command` → the copy
+proceeding. Ruled out while diagnosing: the restart-looping
+service-manager `xhci` instance (config-space scans only, never claims —
+5-7 restarts per boot, benign), the second `usb_storage` instance (its
+`shm_create`/`shm_map` are process-local; the single-daemon guard exits
+it before any BOT traffic), and the Track D changes themselves (the
+failing raw-arm data path is byte-identical to C.3's).
+
+**KNOWN, NOT YET FIXED — "Bug 2": a scheduler/IPC lost-wakeup strands
+`BlockedOnReply` tasks under the populate's block-IPC load.** DISTINCT
+from the (now-fixed) BOT transport-fail cascade — a `nvme-install-part-smoke`
+run failed with **zero** `transport-fail` lines and **zero** of the BOT
+recovery paths firing, so it is neither the installer nor the USB
+transport. Full boot-1 serial capture (the gate now writes
+`nvme-install-boot1-serial.log` and prints a `KNOWN-FLAKE: Phase 106
+Bug 2` banner on this signature): multiple `fork-child` tasks wedged with
+`[replystall] … state=BlockedOnReply … pending_msg=false reply_waker=true
+waker_flag=false … STRANDED(BlockedOnReply, no reply delivered)`, plus
+`[stallcensus] … BlockedOnService`, and the watchdog's `task pid=5 …
+BlockedOnReply stuck-since=…ms (no waker registered)` climbing past 100 s.
+`pending_msg=false` at strand means the SERVER never called
+`endpoint::reply()` for that caller (or the reply/wake was lost) — the
+classic **57e preempt-full lost-wakeup** class
+(`docs/handoffs/57e-preempt-full-userspace-hangs.md`), surfaced by the
+sustained multi-core block-IPC storm the partition populate generates
+(thousands of raw read/write syscalls fanned across cores). It is
+intermittent (~1 in a few heavy runs); a light standalone run usually
+passes. **Mitigation in place, not a fix:** the pre-push hook retries
+each install gate once (`run_install_gate`) — a real regression fails
+both attempts, this flake almost never repeats back-to-back. **The actual
+fix is core scheduler/IPC work** (the reply-waker / `wake_task_v2` path
+under contention) and is the recommended next Phase 106 item alongside
+Track E. Starting evidence is captured in `nvme-install-boot1-serial.log`
+on any failing run.
 
 **Known pre-existing (NOT fixed):** `usb-storage-dual-smoke` fails identically on
 `main` — times out waiting for `mass-storage devices — multi-device mode`.

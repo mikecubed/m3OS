@@ -879,6 +879,23 @@ fn handle_request(
                 }
             }
         }
+        // Phase 106 — the controller half of BOT reset-recovery: Stop/Reset
+        // Endpoint + Set TR Dequeue + stale-event sweep (see
+        // `Controller::recover_endpoint`). The class driver follows up with
+        // the device-side Bulk-Only Reset + CLEAR_FEATURE control requests.
+        UsbRequest::RecoverEndpoint {
+            slot_id,
+            dci: target_dci,
+        } => match owner!(slot_id) {
+            Some((c, irq, slot)) => {
+                let ok = c.recover_endpoint(irq, slot, target_dci);
+                UsbReply::TransferComplete {
+                    transferred: 0,
+                    completion_code: if ok { 1 } else { 0 },
+                }
+            }
+            None => UsbReply::Error { code: EINVAL },
+        },
         // GetDescriptors / ConfigureEndpoints / SubmitTransfer (page-grant) are
         // not needed by the live paths — descriptors are pre-resolved into
         // AttachNotice during enumeration; endpoints are configured at bring-up.

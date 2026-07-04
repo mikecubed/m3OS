@@ -1915,7 +1915,7 @@ impl Controller {
             let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
             ep.data_bufs[0] = new_buf;
         }
-        {
+        let trb_iova = {
             let sc = self.slot_mut(slot_id)?;
             let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
             // Copy the frame into the DMA buffer.
@@ -1923,6 +1923,7 @@ impl Controller {
                 // SAFETY: data_bufs[0] was (re)allocated to >= data.len() bytes; i < data.len().
                 unsafe { core::ptr::write_volatile(ep.data_bufs[0].user_ptr().add(i), b) };
             }
+            let trb_iova = ep.ring_iova + (ep.producer.enqueue as u64) * trb::TRB_SIZE as u64;
             let cycle = ep.producer.cycle;
             write_trb(
                 &ep.ring,
@@ -1938,9 +1939,10 @@ impl Controller {
                     trb::Trb::link(iova, true, cycle_before),
                 );
             }
-        }
+            trb_iova
+        };
         self.ring_doorbell(slot_id, dci);
-        match self.wait_for_bulk_out_event(irq, slot_id, dci) {
+        match self.wait_for_bulk_out_event(irq, slot_id, dci, trb_iova) {
             // Accept SHORT_PACKET as well as SUCCESS, mirroring `submit_bulk_in`.
             // The xHC reports a multi-packet bulk-OUT TD whose last packet is
             // short — or whose data buffer was consumed exactly — with a Short
@@ -2016,10 +2018,11 @@ impl Controller {
             let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
             ep.data_bufs[0] = new_buf;
         }
-        {
+        let trb_iova = {
             let sc = self.slot_mut(slot_id)?;
             let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
             zero_dma(&ep.data_bufs[0]);
+            let trb_iova = ep.ring_iova + (ep.producer.enqueue as u64) * trb::TRB_SIZE as u64;
             let cycle = ep.producer.cycle;
             write_trb(
                 &ep.ring,
@@ -2035,9 +2038,10 @@ impl Controller {
                     trb::Trb::link(iova, true, cycle_before),
                 );
             }
-        }
+            trb_iova
+        };
         self.ring_doorbell(slot_id, dci);
-        match self.wait_for_bulk_out_event(irq, slot_id, dci) {
+        match self.wait_for_bulk_out_event(irq, slot_id, dci, trb_iova) {
             Some(ev)
                 if ev.completion_code == trb::COMPLETION_SUCCESS
                     || ev.completion_code == COMPLETION_SHORT_PACKET =>
@@ -2055,7 +2059,16 @@ impl Controller {
                 }
                 Some(out)
             }
-            _ => None,
+            Some(ev) => {
+                // Phase 106: a bulk-IN transport failure used to be a SILENT
+                // `None` — name the completion code so a BOT data/CSW failure
+                // is diagnosable from the boot log.
+                write_str(STDOUT_FILENO, "[xhci] bulk-IN non-success cc=");
+                crate::write_u8_dec(ev.completion_code);
+                write_str(STDOUT_FILENO, "\n");
+                None
+            }
+            None => None,
         }
     }
 
@@ -2089,9 +2102,10 @@ impl Controller {
         if len == 0 {
             return Some(0);
         }
-        {
+        let trb_iova = {
             let sc = self.slot_mut(slot_id)?;
             let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
+            let trb_iova = ep.ring_iova + (ep.producer.enqueue as u64) * trb::TRB_SIZE as u64;
             let cycle = ep.producer.cycle;
             write_trb(
                 &ep.ring,
@@ -2107,9 +2121,10 @@ impl Controller {
                     trb::Trb::link(ring_iova, true, cycle_before),
                 );
             }
-        }
+            trb_iova
+        };
         self.ring_doorbell(slot_id, dci);
-        match self.wait_for_bulk_out_event(irq, slot_id, dci) {
+        match self.wait_for_bulk_out_event(irq, slot_id, dci, trb_iova) {
             Some(ev)
                 if ev.completion_code == trb::COMPLETION_SUCCESS
                     || ev.completion_code == COMPLETION_SHORT_PACKET =>
@@ -2125,6 +2140,132 @@ impl Controller {
             }
             None => None,
         }
+    }
+
+    /// Phase 106 — recover a wedged bulk endpoint (the controller half of the
+    /// BOT reset-recovery path; the device half is the class driver's
+    /// Bulk-Only Reset + `CLEAR_FEATURE(ENDPOINT_HALT)` control requests).
+    ///
+    /// The failure this unwinds: a bulk transfer exceeds the completion-wait
+    /// budget and is abandoned. The orphaned TD still sits on the transfer
+    /// ring; its late completion event lingers on the event ring; and if the
+    /// desynced device then STALLs a following transfer, the endpoint context
+    /// is left **Halted** — with no recovery, every later transfer on the pipe
+    /// fails (the install-copy `transport-fail` cascade). Sequence per xHCI
+    /// §4.6.9 / §4.6.8 / §4.6.10:
+    ///
+    /// 1. **Stop Endpoint** — quiesces a Running endpoint that still owns an
+    ///    abandoned TD (Context State Error = it was already Stopped/Halted —
+    ///    tolerated, the step was just unnecessary).
+    /// 2. **Reset Endpoint** — clears the Halted state a STALL leaves (same
+    ///    tolerance when it was not halted). TSP=0 resets the data toggle,
+    ///    pairing with the device-side `CLEAR_FEATURE`.
+    /// 3. **Set TR Dequeue Pointer** → the ring's current producer enqueue
+    ///    position (current cycle as DCS): every orphaned TD is discarded and
+    ///    ring + controller agree the ring is empty.
+    /// 4. Drain + discard any stale Transfer Events the abandoned TDs already
+    ///    posted (they are ordered before the command completions consumed in
+    ///    1–3, so one more pass suffices; the pointer-matched waits make any
+    ///    straggler harmless anyway).
+    ///
+    /// Returns `true` when all three commands completed with
+    /// Success/Context-State-Error.
+    pub fn recover_endpoint(&mut self, irq: &IrqNotification, slot_id: u8, dci: u8) -> bool {
+        let tolerated =
+            |cc: u8| cc == trb::COMPLETION_SUCCESS || cc == trb::COMPLETION_CONTEXT_STATE_ERROR;
+
+        let cycle = self.producer.cycle;
+        let stop = self.issue_command_and_wait(irq, trb::Trb::stop_endpoint(slot_id, dci, cycle));
+        let cycle = self.producer.cycle;
+        let reset = self.issue_command_and_wait(irq, trb::Trb::reset_endpoint(slot_id, dci, cycle));
+
+        // Repoint the dequeue to wherever the producer will enqueue next —
+        // i.e. declare the ring empty. DCS must be the producer's CURRENT
+        // cycle so the controller's ownership test matches the next TRB we
+        // write there.
+        let Some((deq_iova, dcs)) = self.slot(slot_id).and_then(|sc| {
+            sc.interrupt_eps.iter().find(|e| e.dci == dci).map(|ep| {
+                (
+                    ep.ring_iova + (ep.producer.enqueue as u64) * trb::TRB_SIZE as u64,
+                    ep.producer.cycle,
+                )
+            })
+        }) else {
+            return false;
+        };
+        let cycle = self.producer.cycle;
+        let deq = self.issue_command_and_wait(
+            irq,
+            trb::Trb::set_tr_dequeue(deq_iova, dcs, slot_id, dci, cycle),
+        );
+
+        // Sweep any stale transfer events for this endpoint off the event
+        // ring (command completions above are ordered after them). Unrelated
+        // IN completions are captured + re-armed per the H.2 discipline.
+        let mut discarded = 0u32;
+        let before = self.consumer.index;
+        let mut completed: alloc::vec::Vec<(u8, u8)> = alloc::vec::Vec::new();
+        loop {
+            let seg = self.event_ring.as_ref().expect("event ring allocated");
+            let candidate = read_trb(seg, self.consumer.index);
+            if !self.consumer.owns(&candidate) {
+                break;
+            }
+            match trb::event_trb_type(&candidate) {
+                Some(trb::TrbType::TransferEvent) => {
+                    let ev = trb::parse_transfer_event(&candidate);
+                    if ev.slot_id == slot_id && ev.endpoint_id == dci {
+                        discarded += 1;
+                    } else if ev.endpoint_id & 1 == 1 && self.capture_interrupt_report(ev) {
+                        completed.push((ev.slot_id, ev.endpoint_id));
+                    }
+                }
+                Some(trb::TrbType::CommandCompletion) => {
+                    let ev = trb::parse_command_completion(&candidate);
+                    self.on_command_completion(ev);
+                }
+                Some(trb::TrbType::PortStatusChange) => {
+                    let ev = trb::parse_port_status_change(&candidate);
+                    self.on_port_status_change(ev);
+                }
+                _ => {}
+            }
+            self.consumer.dequeue_step();
+        }
+        if self.consumer.index != before {
+            let erdp = self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
+            self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
+            self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
+        }
+        for (s, d) in completed {
+            let len = self
+                .slot(s)
+                .and_then(|sc| sc.interrupt_eps.iter().find(|e| e.dci == d))
+                .map(|e| e.armed_len)
+                .unwrap_or(0);
+            if len > 0 {
+                self.arm_ring_in(s, d, len);
+            }
+        }
+
+        let ok = tolerated(stop.completion_code)
+            && tolerated(reset.completion_code)
+            && tolerated(deq.completion_code);
+        write_str(STDOUT_FILENO, "[xhci] endpoint recovery slot=");
+        crate::write_u8_dec(slot_id);
+        write_str(STDOUT_FILENO, " dci=");
+        crate::write_u8_dec(dci);
+        write_str(STDOUT_FILENO, if ok { " ok" } else { " FAILED" });
+        write_str(STDOUT_FILENO, " (stop/reset/deq cc=");
+        crate::write_u8_dec(stop.completion_code);
+        write_str(STDOUT_FILENO, "/");
+        crate::write_u8_dec(reset.completion_code);
+        write_str(STDOUT_FILENO, "/");
+        crate::write_u8_dec(deq.completion_code);
+        write_str(STDOUT_FILENO, ", stale events=");
+        crate::write_u8_dec(discarded.min(255) as u8);
+        write_str(STDOUT_FILENO, ")\n");
+        ok
     }
 
     /// Phase 92c (E.1/E.3) — submit an **isochronous OUT** transfer of `data` on
@@ -2267,6 +2408,7 @@ impl Controller {
         _irq: &IrqNotification,
         slot_id: u8,
         dci: u8,
+        expected_trb: u64,
     ) -> Option<trb::TransferEvent> {
         // Poll the event ring rather than block on `irq.wait()`: a bulk-OUT that
         // never completes (or whose IRQ never fires) must NOT hang the server —
@@ -2300,7 +2442,23 @@ impl Controller {
                     Some(trb::TrbType::TransferEvent) => {
                         let ev = trb::parse_transfer_event(&candidate);
                         if ev.slot_id == slot_id && ev.endpoint_id == dci {
-                            found = Some(ev);
+                            // Phase 106: match by TRB pointer, not just
+                            // (slot, dci) — a previously abandoned TD's LATE
+                            // completion event otherwise gets attributed to
+                            // THIS transfer (the off-by-one poison behind the
+                            // install-copy transport-fail cascade). A stale
+                            // event is consumed + discarded; ours is still
+                            // ahead on the ring.
+                            if ev.trb_pointer == expected_trb {
+                                found = Some(ev);
+                            } else {
+                                write_str(
+                                    STDOUT_FILENO,
+                                    "[xhci] stale transfer event discarded cc=",
+                                );
+                                crate::write_u8_dec(ev.completion_code);
+                                write_str(STDOUT_FILENO, "\n");
+                            }
                         } else if ev.endpoint_id & 1 == 1 {
                             // An IN completion on some other endpoint — capture
                             // it rather than drop it (odd DCI = IN per trb::dci).
