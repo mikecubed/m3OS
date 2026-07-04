@@ -1,21 +1,31 @@
 # Handoff — Phase 106: USB Installer & NVMe Install
 
-**Date:** 2026-07-03 (living doc — update on every session working this phase)
-**Branch:** `feat/phase-106-usb-storage-multisector` (off `main`)
+**Date:** 2026-07-04 (living doc — update on every session working this phase)
+**Branch:** `feat/phase-106-c5-mkfs-ext2` (off `main`; PR #299 open + green) — the
+active feature branch. Earlier tracks merged (below).
 **State:** IN PROGRESS.
 - **Track A (M1)** ✅ merged — PR #294 (`40a9e685`). Combined GPT(ESP+ext2)
   USB image + USB-ext2 root bootstrap. `usb-root-smoke` green.
 - **Track B (M2)** ✅ merged — PR #295 (`9510a0a1`). NVMe root boot +
   `nvme-rw` / `nvme-persist` gates green.
-- **Track C (M3)** 🟡 foundation merged — PR #296 (`13d1cf6e`): C.1
-  installer scaffold + C.2 capability-gated raw block syscalls + C.3 raw
-  `dd`-copy installer + kernel root-slot-release fix. The former
-  `nvme-install-smoke` blockers are **fixed** on
-  `feat/phase-106-usb-storage-multisector` (see below) and the gate is
-  **GREEN end-to-end** (2026-07-03: USB boot → ~40 s 1 GiB sparse copy →
-  reboot → NVMe-alone boot to a live shell over `nvme.block`), wired into
-  pre-push behind `M3OS_NVME_INSTALL_REGRESSION=1`. C.4/C.5 pending.
+- **Track C (M3)** 🟡 in progress:
+  - **C.1–C.3** ✅ merged — PR #296 (`13d1cf6e`): installer scaffold +
+    capability-gated raw block syscalls + raw `dd`-copy installer + kernel
+    root-slot-release fix.
+  - **`nvme-install-smoke`** ✅ **GREEN end-to-end** — PR #297 (merged): USB
+    boot → ~40 s 1 GiB sparse copy → reboot → NVMe-alone boot to a live shell
+    over `nvme.block`; in pre-push behind `M3OS_NVME_INSTALL_REGRESSION=1`.
+  - **C.5 on-device `mkfs.ext2`** ✅ **pure-logic core landed** — PR #299
+    (open + fully green, all review resolved). `kernel-core/src/fs/ext2_format.rs`
+    (`format_ext2` + `Ext2Fs` writer + `BlockIo` seam). See below.
+  - **C.4** (partition-aware GPT/ESP writer) + the C.5 installer-populate arm —
+    pending.
 - **Tracks D / E** — not started (D first-user; E bare-metal sign-off).
+- **CI reliability** ✅ — a four-cause chain that made every PR's checks red/flaky
+  was root-caused and fixed this session (PRs #298/#300/#301, all merged). The
+  regression suite is now **deterministically** reliable, not just timeout-padded.
+  Details under "CI reliability" below — read it before touching the regression
+  harness or the compositor's `RENDER_FP` emission.
 
 **Charter:** `docs/roadmap/106-usb-installer-nvme.md`
 **Tasks:** `docs/roadmap/tasks/106-usb-installer-nvme-tasks.md`
@@ -148,50 +158,99 @@ serial capture showed the real chain:
 
 ---
 
-## Validation status (2026-07-04) + two repo-level discoveries
+## CI reliability — four root causes fixed (2026-07-04)
 
-The full battery ran manually against `feat/phase-106-usb-storage-multisector`
-(PR #297; matrix posted as a PR comment): 12 suite passes, 5 suite failures
-that all pass in isolation (the hook's documented flake pattern), and **one
-persistent failure that reproduces identically on `main`**:
+The `Build` (on `main`) and `PR Check` GitHub Actions had been red/flaky "for a
+while." This was **four distinct bugs**, all now fixed and merged. The last one
+is the important durable lesson — read it before touching the regression harness
+or the compositor.
 
-- **`usb-storage-dual-smoke` is broken on `main`** (pre-existing): times out
-  waiting for `mass-storage devices — multi-device mode`. Suspects: the wait
-  pattern has an **em-dash in a single-shot startup line** (see the serial
-  gotchas below — multi-byte sentinels split under lossy decode, and the
-  Phase 100 `RENDER_FP` per-frame compositor spam interleaves with early
-  boot), or the second stick misses the ~600 ms discovery stability window.
-  Needs its own investigation; consider an ASCII sentinel emitted more than
-  once.
-- **This clone's pushes were not running the QEMU battery.** `core.hooksPath`
-  pointed at a stale March-era `.git/hooks/pre-push` that only ran
-  `cargo xtask check` — every push since then skipped smoke-test / kernel
-  tests / regression / all env-gated arms. Fixed by re-running `./setup.sh`
-  (now `.githooks`). Assume any "hook-verified" claim between March and
-  2026-07-04 from this machine only covered `check`.
+1. **Font before compile** (PR #298). The kernel `include_bytes!`s the
+   **gitignored** Nerd Font `xtask/assets/fonts/term.ttf` (Phase 100), but
+   `build.yml`/`pr.yml`/`release.yml` ran `cargo xtask check` (compiles the
+   kernel) **before** their `fetch-fonts` step → fresh checkout can't compile.
+   Fix: `cmd_check` calls `ensure_font_asset()` first (idempotent, silent when
+   the font's already present).
+2. **Per-step timeouts too tight** (PR #298). Added
+   `M3OS_CI_TIMING_MULT: "3"` to the `pr.yml`/`build.yml` QEMU jobs (the
+   `scaled_secs` knob nightly-stress already used) to absorb shared-runner
+   jitter.
+3. **Unscaled global timeout** (PR #300). The multiplier scaled per-**step**
+   waits but not the per-**test** global (`cmd_regression`: `timeout =
+   args.timeout_secs.unwrap_or(test.timeout_secs)`), and every step deadline is
+   `step_deadline.min(global_deadline)` — so the global silently capped the
+   per-step scaling for **late-step** tests (`security-floor` step 19,
+   `su user`). Fix: scale the global through the same `scaled_secs` (180 s →
+   540 s at 3×).
+4. **`RENDER_FP` serial flood defeats the prompt matcher** (PR #301) — *the
+   actual reliability killer, not runner speed.* The compositor emits a
+   `RENDER_FP frame=… rows_changed=0 hash=…` fingerprint line **every compose
+   frame, continuously**, even on a static screen. With the `ure: HB` and
+   `USB_HID:idle` heartbeats it floods the shared serial console **after** the
+   shell prompt. The smoke-step `# `/`$ ` detector then fails **both** ways: the
+   strict matcher (`prompt_suffix_end`) needs the buffer to *end with* the
+   prompt (flood lands after it), and the idle fallback
+   (`idle_prompt_fallback_matches`) needs 750 ms of quiet (flood never idles).
+   So the prompt is *present but never recognized* and the wait times out no
+   matter how long — **flakily**, because whether a lucky idle gap appears
+   depends on runner load (which is why the timeout work in #298/#300 only
+   half-helped). The tell: the serial tail at every failure is 100 %
+   `RENDER_FP`/`ure`/`dhcpv6` with no visible prompt. Fix: `strip_background_noise`
+   now strips `BACKGROUND_HEARTBEAT_PREFIXES` (`RENDER_FP `, `ure: HB `,
+   `USB_HID:idle`) so the cleaned buffer ends with the prompt and the strict
+   matcher fires **deterministically, independent of runner load**. Test-proven:
+   `prompt_recognized_through_compositor_render_fp_flood` reproduces a prompt
+   under 300 frames of flood — fails before, passes after. #298/#300 are kept as
+   orthogonal margin for genuinely-slow ops.
+
+**Also discovered this session:** this clone's `core.hooksPath` had drifted to a
+stale March-era `.git/hooks/pre-push` that only ran `cargo xtask check` — every
+push from this machine skipped smoke/test/regression for months. Fixed by
+re-running `./setup.sh`. Assume any "hook-verified" claim from this machine
+between March and 2026-07-04 only covered `check`.
+
+**Known pre-existing (NOT fixed):** `usb-storage-dual-smoke` fails identically on
+`main` — times out waiting for `mass-storage devices — multi-device mode`.
+Suspects: an **em-dash in a single-shot startup sentinel** (multi-byte split
+under lossy decode), or the second stick missing the ~600 ms discovery
+stability window. Note the `RENDER_FP`-flood mechanism above may also contribute
+(that sentinel is a `Wait` on a line that the flood can displace); worth
+re-checking now that #301 strips the flood. Needs its own investigation —
+consider an ASCII sentinel emitted more than once.
 
 ---
 
 ## Remaining Phase 106 work
 
-- **C.5 — on-device `mkfs.ext2`** ✅ **pure-logic core landed** (2026-07-04,
-  branch `feat/phase-106-c5-mkfs-ext2`). New `kernel-core/src/fs/ext2_format.rs`:
+- **C.5 — on-device `mkfs.ext2`** ✅ **pure-logic core landed — PR #299**
+  (`feat/phase-106-c5-mkfs-ext2`, open + fully green, all Copilot review
+  resolved). New `kernel-core/src/fs/ext2_format.rs`:
   - `format_ext2(io, params)` lays down a complete rev-1 filesystem — primary +
     per-group backup superblocks (with the primary-at-offset-1024 vs
     backup-at-offset-0 asymmetry for >1 KiB blocks), BGD table, block/inode
     bitmaps (metadata + tail bits marked), inode tables, root + `lost+found`.
     FILETYPE-only feature set, 128-byte inodes, no `sparse_super`/journal.
-  - `Ext2Fs` — a mounted-for-write handle: bitmap block/inode allocation +
-    `create_file` (direct/indirect/double-indirect), `create_dir`,
-    `create_symlink` (inline + block), `flush`.
+    `derive` uses `checked_mul` for `inodes_count` (no u32 overflow).
+  - `Ext2Fs` — a mounted-for-write handle: bitmap block/inode allocation
+    (byte-wise `bitmap_find_clear`, not O(n²)) + `create_file`
+    (direct/indirect/double-indirect), `create_dir`, `create_symlink`
+    (inline + block), `flush`. **No rollback** — a partial `create_*` failure
+    leaves a logical inconsistency; callers (installer populate) must abort +
+    reformat (documented on the type). `open()` **fails closed** on an
+    incompatible/corrupt volume (validates `inode_size == 128`, geometry, and
+    that on-disk BGD pointers match the derived `geo.*_block(g)` offsets; the
+    dir-entry scan guards `used > rec_len` against underflow).
   - `BlockIo` write seam (dual of the read path's `BlockReader`); the installer's
     `0x117x` raw syscalls back it directly.
   - `Ext2Superblock::write_full_into` added to `ext2.rs` (the existing
     `write_into` is a partial writeback helper; format needs the full struct).
-  - **11 host tests** round-trip written content back through the **existing
+  - **15 host tests** round-trip written content back through the **existing
     `ext2.rs` reader** (small/indirect/double-indirect files, dir tree +
-    symlink, 4 KiB blocks, dir-block spill), **plus a real `e2fsck -fn`
-    external-validator test** (skips-with-reason if absent; ran+passed here).
+    symlink, 4 KiB blocks, dir-block spill), a byte-scan cross-check, three
+    fail-closed negative tests (bad inode_size / bad BGD / corrupt dir entry),
+    **plus a real `e2fsck -fn` external-validator test** (skips-with-reason if
+    absent; ran+passed on the dev host). Two independent opus reviews (one
+    brute-forced the byte-scan equivalence over all inputs).
   - **Remaining C.5 (installer populate):** deferred to C.4 — see below.
 - **C.4 — on-device GPT writer + ESP/FAT creator** (partition-aware follow-on to
   the raw copy). Lets the installer lay a fresh GPT + ESP sized to the target
