@@ -39,7 +39,7 @@ use kernel_core::driver_ipc::blk_dispatch::{
 use kernel_core::driver_ipc::block::{
     BLK_FLUSH, BLK_READ, BLK_REPLY_HEADER_SIZE, BLK_REQUEST_HEADER_SIZE, BLK_WRITE,
     BlkRequestHeader, BlockDriverError, MAX_SECTORS_PER_REQUEST, decode_blk_reply,
-    encode_blk_request,
+    encode_blk_request, restart_suspected,
 };
 
 use crate::ipc::EndpointId;
@@ -488,6 +488,11 @@ pub fn read_sectors_dev(
     }
     match do_read_ipc_dev(dev_id, start_sector, count, buf) {
         Ok(()) => Ok(()),
+        // Live-driver status error — pass through, no restart dance (see
+        // `read_sectors` / `restart_suspected`). The installer's capacity
+        // probe legitimately reads past the end of the device; before this
+        // guard, that single error reply wedged the whole `dev_id`.
+        Err(e) if !restart_suspected(e) => Err(e),
         Err(_) => {
             on_ipc_error_dev(dev_id);
             if wait_for_driver_restart_dev(dev_id) {
@@ -523,6 +528,9 @@ pub fn write_sectors_dev(
     // Pass payload_grant=0 (inline-bulk path) for dev writes.
     match do_write_ipc_dev(dev_id, start_sector, count, buf, 0, true) {
         Ok(()) => Ok(()),
+        // Live-driver status error — pass through, no restart dance (see
+        // `read_sectors` / `restart_suspected`).
+        Err(e) if !restart_suspected(e) => Err(e),
         Err(_) => {
             on_ipc_error_dev(dev_id);
             if wait_for_driver_restart_dev(dev_id) {
@@ -587,9 +595,15 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
     if REMOTE_BLOCK.lock().entries[0].state.is_restarting() && !wait_for_driver_restart() {
         return Err(BlockDriverError::DriverRestarting.to_byte());
     }
-    // Attempt the IPC call; on failure wait + retry once.
+    // Attempt the IPC call; on TRANSPORT failure wait + retry once. A
+    // decoded device-status error (IoError / InvalidLba / ...) comes from a
+    // LIVE driver and passes through — treating it as a restart signal
+    // latches `is_restarting()` on a healthy driver forever (it never
+    // re-registers), wedging every later request behind the full restart
+    // budget (the Phase 106 C.4 capacity-probe whole-device wedge).
     match do_read_ipc(start_sector, count, buf) {
         Ok(()) => Ok(()),
+        Err(e) if !restart_suspected(e) => Err(e),
         Err(_) => {
             on_ipc_error();
             if wait_for_driver_restart() {
@@ -686,6 +700,9 @@ pub fn write_sectors(
     // this is the same logical write retrying, not a fresh use.
     match do_write_ipc(start_sector, count, buf, payload_grant, true) {
         Ok(()) => Ok(()),
+        // Live-driver status error — pass through, no restart dance (see
+        // `read_sectors` / `restart_suspected`).
+        Err(e) if !restart_suspected(e) => Err(e),
         Err(_) => {
             on_ipc_error();
             if wait_for_driver_restart() {

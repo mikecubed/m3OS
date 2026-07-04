@@ -71,6 +71,23 @@ pub trait BlockIo {
     fn read_block(&mut self, block: u32, buf: &mut [u8]) -> Result<(), Ext2Error>;
     /// Write one whole block from `data`.
     fn write_block(&mut self, block: u32, data: &[u8]) -> Result<(), Ext2Error>;
+    /// Write `count` physically-contiguous whole blocks starting at
+    /// `start_block` from `data` (`data.len() == count * block_size`). The
+    /// default writes them one at a time; implementors override for a single
+    /// multi-block device write (the dual of `BlockReader::read_block_run` —
+    /// what makes the populate path's coalesced runs one raw request each).
+    fn write_block_run(
+        &mut self,
+        start_block: u32,
+        count: u32,
+        data: &[u8],
+    ) -> Result<(), Ext2Error> {
+        let bs = data.len() / count as usize;
+        for i in 0..count as usize {
+            self.write_block(start_block + i as u32, &data[i * bs..(i + 1) * bs])?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -846,12 +863,6 @@ impl Ext2Fs {
                 } else {
                     dirent_len(name_len)
                 };
-                // Guard a corrupt on-disk entry whose name doesn't fit its
-                // rec_len (mirrors the reader's `name_end <= off + rec_len`
-                // check): a live entry must hold its own header+name, or
-                // `rec_len - used` underflows and `off + used` runs past the
-                // block, panicking / writing garbage. A self-formatted volume
-                // never trips this; a foreign/corrupt one fails closed here.
                 // Guard a corrupt on-disk entry whose name doesn't fit its
                 // rec_len (mirrors the reader's `name_end <= off + rec_len`
                 // check): a live entry must hold its own header+name, or

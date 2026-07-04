@@ -11,7 +11,7 @@
 |---|---|---|---|
 | A | Combined GPT(ESP+ext2) USB image + USB-ext2 root bootstrap (M1) | — | ✅ Merged (PR #294) — `usb-root-smoke` green |
 | B | NVMe root boot + `nvme-rw`/`nvme-persist` gates (M2) | — | ✅ Merged (PR #295) — both gates green |
-| C | On-device installer: raw USB→NVMe copy, then partition-aware `mkfs` (M3) | A, B | 🟡 C.1/C.2/C.3 merged (PR #296); `nvme-install-smoke` GREEN; **C.5 mkfs.ext2 pure-logic landed** (e2fsck-validated); C.4 GPT/ESP writer + C.5 installer-populate pending |
+| C | On-device installer: raw USB→NVMe copy, then partition-aware `mkfs` (M3) | A, B | 🟢 C.1/C.2/C.3 merged (PR #296); `nvme-install-smoke` GREEN; C.5 mkfs.ext2 merged (PR #299, e2fsck-validated); **C.4 + C.5-populate landed** (`installer --part` + `nvme-install-part-smoke`) |
 | D | First-user / account setup on the installed rootfs (M3) | C | Planned |
 | E | Validation: QEMU gates + bare-metal sign-off | A, B, C, D | 🟡 M1/M2 QEMU arms green; M3 gate GREEN in pre-push (`M3OS_NVME_INSTALL_REGRESSION=1`); HW rungs operator-owned |
 
@@ -174,15 +174,20 @@
 - [x] Aborts non-destructively (logs `INSTALLER:error …`, no partial write) if the target resolves to the boot device (`target-is-source`) or if a probe read at the source's last-needed sector fails (`target-too-small` — a real capacity check via the target's out-of-range-LBA rejection, no capacity syscall needed).
 - [x] After copy + flush, issues `reboot(RESTART)` (skipped under `installer --no-reboot`); the written NVMe carries the identical GPT(ESP+ext2) layout. *(Proven end-to-end 2026-07-03: `nvme-install-smoke` GREEN — the former blockers were the usb-storage inline-path throughput, a concurrent-instance BOT probe collision, and the xHCI bulk completion-wait budget; all fixed. In pre-push behind `M3OS_NVME_INSTALL_REGRESSION=1`.)*
 
-### C.4 — On-device GPT writer + ESP/FAT creator (partition-aware follow-on)
+### C.4 — On-device GPT writer + ESP copy (partition-aware follow-on)
 
-**File:** `userspace/installer/src/main.rs` (+ a host-tested partition module)
-**Symbol:** `write_gpt` / `create_esp`
-**Why it matters:** A partition-aware install sizes the rootfs to the target disk (a raw copy wastes everything past the image size); it must write a GPT + a protective MBR and lay down an ESP FAT with the bootloader/kernel.
+**Files:**
+- `kernel-core/src/fs/gpt.rs` *(new — pure-logic GPT builder + CRC-verified parser)*
+- `kernel-core/src/fs/ext2_populate.rs` *(new — populate walker + write-back block cache; the C.5 populate arm)*
+- `userspace/installer/src/main.rs` (`installer --part`)
+
+**Symbol:** `build_gpt` / `GptPlan::for_target` / `parse_gpt` (kernel-core); `install_part` (installer)
+**Why it matters:** A partition-aware install sizes the rootfs to the target disk (a raw copy wastes everything past the image size); it must write a GPT + a protective MBR and lay down an ESP FAT with the bootloader/kernel. *(Design note: the ESP is laid down by a same-span raw copy of the source ESP rather than a from-scratch FAT format — the FAT's geometry is partition-relative and its `hidden sectors` field is the unchanged partition start LBA, so the copy is exactly as valid and needs no on-device FAT formatter; only the rootfs partition grows.)*
 
 **Acceptance:**
-- [ ] Writes a valid GPT (protective MBR + primary/backup headers + partition entries) onto the NVMe with an ESP + a Linux partition; the produced GPT parses with `usb_ext2_base_lba`-style logic.
-- [ ] Creates a FAT ESP and copies the bootloader + kernel into it; the firmware can boot the resulting disk (validated in `nvme-install-smoke`, Track E).
+- [x] Writes a valid GPT (protective MBR + primary/backup headers + partition entries + CRC32s) onto the NVMe with an ESP + a Linux partition grown to the target's last usable LBA; the produced GPT parses with `usb_ext2_base_lba`-style logic *(host test replays the kernel's exact `gpt_ext2_scan`)*, with the **independent `gpt` crate** *(the gate's host-side cross-check)*, and passes **`sgdisk --verify`** *(external-validator host test, skip-with-reason)*.
+- [x] The target carries a FAT ESP with the bootloader + kernel (same-span raw copy, sparse); the firmware boots the resulting disk (validated in `nvme-install-part-smoke`, Track E).
+- [x] Fails closed: a CRC-corrupt source GPT, a missing ESP/Linux partition, an unreadable source ext2, a too-small target, or `target-is-source` all abort before (or without) touching the target — `INSTALLER:error part-*` sentinels.
 
 ### C.5 — On-device `mkfs.ext2` 🟢 pure-logic core landed (2026-07-04)
 
@@ -196,7 +201,7 @@
 **Acceptance:**
 - [x] `format_ext2` produces a blank rev-1 ext2 image (correct group geometry, primary + per-group backup superblocks with the primary-vs-backup 1024-byte offset asymmetry, BGD table, zeroed-then-marked bitmaps, root inode + `lost+found`) sized to a given block count. Feature set is FILETYPE-only; 128-byte inodes; no `sparse_super`/journal/resize-inode. Geometry validated for degenerate-volume rejection. *(11 host tests in `ext2_format::tests`.)*
 - [x] A host test formats an in-memory image, then **re-mounts it through the existing `ext2.rs` reader and round-trips written content** — small file, indirect + double-indirect file, a directory tree with a symlink, 4 KiB blocks, and 60-file dir-block spill all read back byte-identical via `resolve_path`/`read_file_data`/`read_symlink_target`. **Plus** an external-validator test that runs real `e2fsck -fn` on the formatted+populated image and asserts a clean exit (skips-with-reason when `e2fsck` is absent; **ran and passed** on this host).
-- [ ] The installer can `format_ext2` the NVMe Linux partition, then copy the rootfs files into it (an alternative to the C.3 raw copy). **Deferred to C.4:** formatting is only meaningful against a partition C.4's GPT/ESP writer lays down, and populating needs a source-fs reader; the `Ext2Fs` writer (`create_file`/`create_dir`/`create_symlink`) is the ready building block. The `0x117x` raw syscalls give the installer the `BlockIo` backing.
+- [x] The installer can `format_ext2` the NVMe Linux partition, then copy the rootfs files into it (an alternative to the C.3 raw copy). **Landed with C.4** (`installer --part`): `kernel-core/src/fs/ext2_populate.rs` walks the source rootfs through the existing `BlockReader` read path and re-creates the tree via `Ext2Fs::create_*` (mode/uid/gid/timestamps preserved; `lost+found` skipped; a corrupt source's dir cycle terminates via a visited set). IO rides `WriteBackBlockIo` — an LRU write-back cache for metadata read-modify-writes + a contiguous-run coalescer that leaves as single ≤256-sector raw writes (`BlockIo::write_block_run`) — so the populate doesn't cost one IPC round trip per block. Host tests: cross-block-size tree equality, byte-identical cached-vs-direct equivalence, `e2fsck -fn` on a cache-populated target.
 
 ---
 

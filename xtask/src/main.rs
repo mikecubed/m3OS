@@ -1168,7 +1168,16 @@ fn main() {
                     eprintln!("Usage: {}", usage());
                     std::process::exit(1);
                 });
-            cmd_nvme_install_smoke(&smoke_args);
+            cmd_nvme_install_smoke(&smoke_args, false);
+        }
+        Some("nvme-install-part-smoke") => {
+            let smoke_args = parse_smoke_boot_args("nvme-install-part-smoke", &args[2..])
+                .unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_nvme_install_smoke(&smoke_args, true);
         }
         Some("session-smoke") => {
             let smoke_args =
@@ -1887,7 +1896,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm.\n\
      USB passthrough: --usb-passthrough <vid:pid> (e.g. `--usb-passthrough 0bda:8156`) passes a physical USB device into the guest's emulated xHCI (qemu-xhci,id=xhci_pt). The QEMU process must have access to the USB device node — add a udev rule granting the user/group read-write on the device, or run with sudo. The device is claimed from the host kernel while QEMU runs and is released on exit."
@@ -15606,10 +15615,25 @@ fn cmd_nvme_persist_smoke(args: &SmokeBootArgs) {
 /// flush + reboot (C.3), and the C.3 root-slot-release fix (init's
 /// Stage-1 NVMe adopts the root slot against the blank target, finds no
 /// ext2, releases + skips it, and falls through to the bootable USB).
+///
+/// Phase 106 C.4 — `part = true` (`nvme-install-part-smoke`) runs the
+/// **partition-aware** installer instead (`/sbin/installer --part`):
+/// fresh GPT sized to the target, raw ESP copy, on-device `format_ext2`
+/// of the grown rootfs partition, file-level populate. Boot 1 then also
+/// verifies host-side that the installed root partition really grew to
+/// the target's usable span (parsed from the `INSTALLER:gpt-written`
+/// sentinel against the source image's own GPT) and, when the host has
+/// `e2fsck`, that the freshly populated partition checks clean before
+/// boot 2 ever mounts it.
 #[allow(clippy::zombie_processes)]
-fn cmd_nvme_install_smoke(args: &SmokeBootArgs) {
+fn cmd_nvme_install_smoke(args: &SmokeBootArgs, part: bool) {
+    let name = if part {
+        "nvme-install-part-smoke"
+    } else {
+        "nvme-install-smoke"
+    };
     let fail = |msg: &str| -> ! {
-        eprintln!("nvme-install-smoke: FAILED\n{msg}");
+        eprintln!("{name}: FAILED\n{msg}");
         std::process::exit(SMOKE_EXIT_NVME_INSTALL_SMOKE_FAILED);
     };
 
@@ -15684,8 +15708,9 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs) {
     ];
 
     println!(
-        "nvme-install-smoke: boot 1 — installing from the USB image to a blank NVMe \
-         (source {usb_len} bytes, timeout {}s)",
+        "{name}: boot 1 — installing from the USB image to a blank NVMe \
+         (source {usb_len} bytes, mode {}, timeout {}s)",
+        if part { "partition-aware" } else { "raw" },
         args.timeout_secs
     );
     let mut child1 = Command::new("qemu-system-x86_64")
@@ -15703,8 +15728,30 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs) {
     let mut stdin1 = child1.stdin.take().expect("qemu stdin");
 
     let r1: Result<(), String> = (|| {
-        let wait = |pat: &str, b: &mut String, h: &mut String| {
-            wait_for_serial_pattern(&rx1, b, h, pat, timeout, start1, timeout)
+        // Fail fast on an `INSTALLER:error` line instead of idling out the
+        // full window waiting for a sentinel that can no longer arrive (the
+        // installer fails closed and exits on any error).
+        let wait = |pat: &str, b: &mut String, h: &mut String| -> Result<(), String> {
+            let step = std::time::Duration::from_millis(500);
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                match wait_for_serial_pattern(&rx1, b, h, pat, step, start1, timeout) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        if let Some(line) = strip_ansi(b)
+                            .lines()
+                            .find(|l| l.contains("INSTALLER:error"))
+                        {
+                            return Err(format!(
+                                "installer failed while waiting for '{pat}': {line}"
+                            ));
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
         };
         let send = |stdin: &mut std::process::ChildStdin, s: &str| -> Result<(), String> {
             use std::io::Write;
@@ -15722,7 +15769,7 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs) {
         // release logic itself is unit-tested (`skip_mask` in
         // `kernel/src/blk/remote.rs`).
         wait("m3OS login:", &mut buf1, &mut hist1)?;
-        println!("nvme-install-smoke: booted USB root to login (blank NVMe present)");
+        println!("{name}: booted USB root to login (blank NVMe present)");
         send(&mut stdin1, "root\n")?;
         wait("Password:", &mut buf1, &mut hist1)?;
         send(&mut stdin1, "root\n")?;
@@ -15732,13 +15779,25 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs) {
             &mut hist1,
         )?;
         std::thread::sleep(std::time::Duration::from_millis(500));
-        send(&mut stdin1, "/sbin/installer\n")?;
-        wait("INSTALLER:source", &mut buf1, &mut hist1)?;
-        wait("INSTALLER:copy", &mut buf1, &mut hist1)?;
-        println!("nvme-install-smoke: installer streaming USB → NVMe...");
-        wait("INSTALLER:done", &mut buf1, &mut hist1)?;
+        if part {
+            send(&mut stdin1, "/sbin/installer --part\n")?;
+            wait("INSTALLER:mode part", &mut buf1, &mut hist1)?;
+            wait("INSTALLER:source", &mut buf1, &mut hist1)?;
+            wait("INSTALLER:gpt-written root_sectors=", &mut buf1, &mut hist1)?;
+            println!("{name}: fresh GPT laid onto the NVMe, copying ESP + populating rootfs...");
+            wait("INSTALLER:esp-copied", &mut buf1, &mut hist1)?;
+            wait("INSTALLER:format blocks=", &mut buf1, &mut hist1)?;
+            wait("INSTALLER:populate dirs=", &mut buf1, &mut hist1)?;
+            wait("INSTALLER:done mode=part", &mut buf1, &mut hist1)?;
+        } else {
+            send(&mut stdin1, "/sbin/installer\n")?;
+            wait("INSTALLER:source", &mut buf1, &mut hist1)?;
+            wait("INSTALLER:copy", &mut buf1, &mut hist1)?;
+            println!("{name}: installer streaming USB → NVMe...");
+            wait("INSTALLER:done", &mut buf1, &mut hist1)?;
+        }
         wait("INSTALLER:rebooting", &mut buf1, &mut hist1)?;
-        println!("nvme-install-smoke: install complete, guest rebooting");
+        println!("{name}: install complete, guest rebooting");
         Ok(())
     })();
     let _ = child1.kill();
@@ -15760,6 +15819,19 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs) {
             eprintln!("{l}");
         }
         fail(&format!("boot 1 (install): {msg}"));
+    }
+
+    // ---- Part mode: host-side layout + fsck verification -----------------
+    // The serial oracle proves the installer *ran*; these prove what it
+    // *wrote*: the grown root span (sentinel vs the source image's own GPT),
+    // an independent GPT parse of the target (the `gpt` crate, not our
+    // writer's own parser), and an `e2fsck -fn` of the freshly populated
+    // partition before boot 2 ever mounts it.
+    if part {
+        match verify_part_install(&usb_img, &nvme_img, &hist1) {
+            Ok(summary) => println!("{name}: {summary}"),
+            Err(msg) => fail(&format!("partition-layout verification: {msg}")),
+        }
     }
 
     // ---- Boot 2: boot the installed NVMe alone ---------------------------
@@ -15788,7 +15860,7 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs) {
         "none".to_string(),
     ];
 
-    println!("nvme-install-smoke: boot 2 — booting the installed NVMe alone");
+    println!("{name}: boot 2 — booting the installed NVMe alone");
     let mut child2 = Command::new("qemu-system-x86_64")
         .args(&boot2_args)
         .stdin(std::process::Stdio::piped())
@@ -15820,7 +15892,7 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs) {
             &mut buf2,
             &mut hist2,
         )?;
-        println!("nvme-install-smoke: installed NVMe mounted ext2 root over nvme.block");
+        println!("{name}: installed NVMe mounted ext2 root over nvme.block");
         wait("m3OS login:", &mut buf2, &mut hist2)?;
         send(&mut stdin2, "root\n")?;
         wait("Password:", &mut buf2, &mut hist2)?;
@@ -15834,7 +15906,7 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs) {
         std::thread::sleep(std::time::Duration::from_millis(500));
         send(&mut stdin2, "echo installed-boot  ok\n")?;
         wait("installed-boot ok", &mut buf2, &mut hist2)?;
-        println!("nvme-install-smoke: installed system reached a live shell");
+        println!("{name}: installed system reached a live shell");
         Ok(())
     })();
     let _ = child2.kill();
@@ -15843,10 +15915,16 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs) {
     match r2 {
         Ok(()) => {
             let elapsed = start1.elapsed().as_secs();
+            let how = if part {
+                "/sbin/installer --part laid a fresh target-sized GPT, copied the ESP, \
+                 formatted + file-populated the grown rootfs partition"
+            } else {
+                "/sbin/installer raw-copied USB→NVMe"
+            };
             println!(
-                "nvme-install-smoke: PASSED ({elapsed}s) — the combined USB image \
+                "{name}: PASSED ({elapsed}s) — the combined USB image \
                  installed to a blank NVMe (init skipped the ext2-less NVMe and booted \
-                 USB, /sbin/installer raw-copied USB→NVMe + flushed + rebooted), then \
+                 USB, {how} + flushed + rebooted), then \
                  the machine booted the installed NVMe alone to a live login over nvme.block"
             );
         }
@@ -15866,6 +15944,156 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs) {
             fail(&format!("boot 2 (installed NVMe): {msg}"))
         }
     }
+}
+
+/// Phase 106 C.4 — host-side proof of what the partition-aware installer
+/// actually wrote (the serial oracle only proves it ran):
+///
+/// - the `INSTALLER:gpt-written root_sectors=` sentinel must equal the
+///   target's usable tail from the source's own Linux start LBA (the
+///   partition really grew to the disk, not just past the source span);
+/// - the target's GPT must parse with the **independent** `gpt` crate (not
+///   our writer's own parser) and carry exactly that grown Linux span + an
+///   ESP;
+/// - the `INSTALLER:populate` sentinel must report `skipped=0` (the m3OS
+///   rootfs has no unsupported entries to drop);
+/// - when the host has `e2fsck`, the installed rootfs partition (extracted
+///   by byte range) must check clean (`e2fsck -fn`) — before boot 2 ever
+///   mounts it.
+///
+/// Returns a one-line summary for the gate log.
+fn verify_part_install(
+    usb_img: &Path,
+    nvme_img: &Path,
+    boot1_serial: &str,
+) -> Result<String, String> {
+    // Source layout via the gpt crate.
+    let src_disk = gpt::GptConfig::new()
+        .writable(false)
+        .open(usb_img)
+        .map_err(|e| format!("source GPT parse failed: {e}"))?;
+    let src_linux = src_disk
+        .partitions()
+        .values()
+        .find(|p| p.part_type_guid == gpt::partition_types::LINUX_FS)
+        .ok_or("source image has no Linux partition")?;
+    let (src_first, src_last) = (src_linux.first_lba, src_linux.last_lba);
+
+    // Sentinel-reported grown span vs. the layout math (backup GPT = 33
+    // sectors, so last usable = total - 34 and the grown root spans
+    // src_first..=total-34, i.e. total - 33 - src_first sectors).
+    let serial = strip_ansi(boot1_serial);
+    let root_sectors: u64 = serial
+        .lines()
+        .find_map(|l| l.split("INSTALLER:gpt-written root_sectors=").nth(1))
+        .and_then(|v| v.trim().parse().ok())
+        .ok_or("INSTALLER:gpt-written sentinel missing/unparseable")?;
+    let target_sectors = fs::metadata(nvme_img)
+        .map_err(|e| format!("stat target image: {e}"))?
+        .len()
+        / 512;
+    let expected = target_sectors - 33 - src_first;
+    if root_sectors != expected {
+        return Err(format!(
+            "grown root span mismatch: sentinel {root_sectors}, expected {expected} \
+             (target {target_sectors} sectors, root start {src_first})"
+        ));
+    }
+    let src_root_sectors = src_last - src_first + 1;
+    if root_sectors <= src_root_sectors {
+        return Err(format!(
+            "root partition did not grow: {root_sectors} <= source {src_root_sectors}"
+        ));
+    }
+
+    // Independent parse of the written target GPT.
+    let dst_disk = gpt::GptConfig::new()
+        .writable(false)
+        .open(nvme_img)
+        .map_err(|e| format!("installed GPT does not parse with the gpt crate: {e}"))?;
+    let dst_linux = dst_disk
+        .partitions()
+        .values()
+        .find(|p| p.part_type_guid == gpt::partition_types::LINUX_FS)
+        .ok_or("installed disk has no Linux partition")?;
+    if dst_linux.first_lba != src_first || dst_linux.last_lba != target_sectors - 34 {
+        return Err(format!(
+            "installed Linux span {}..{} != expected {}..{}",
+            dst_linux.first_lba,
+            dst_linux.last_lba,
+            src_first,
+            target_sectors - 34
+        ));
+    }
+    let dst_esp = dst_disk
+        .partitions()
+        .values()
+        .find(|p| p.part_type_guid == gpt::partition_types::EFI)
+        .ok_or("installed disk has no ESP")?;
+    let esp_span = (dst_esp.first_lba, dst_esp.last_lba);
+
+    // Populate sentinel: no dropped entries.
+    let populate_line = serial
+        .lines()
+        .find(|l| l.contains("INSTALLER:populate "))
+        .ok_or("INSTALLER:populate sentinel missing")?;
+    if !populate_line.contains("skipped=0") {
+        return Err(format!("populate dropped entries: {populate_line}"));
+    }
+
+    // e2fsck the installed rootfs (extract the partition byte range to a
+    // temp file — e2fsck has no offset option). Skip-with-note when absent
+    // (CI parity with the kernel-core external-validator tests).
+    let have_fsck = Command::new("sh")
+        .args(["-c", "command -v e2fsck"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let fsck_note = if have_fsck {
+        let tmp = std::env::temp_dir().join(format!("m3os-part-fsck-{}.img", std::process::id()));
+        let extract = (|| -> std::io::Result<()> {
+            use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+            let mut src = fs::File::open(nvme_img)?;
+            src.seek(SeekFrom::Start(dst_linux.first_lba * 512))?;
+            let mut dst = fs::File::create(&tmp)?;
+            let mut remaining = (dst_linux.last_lba - dst_linux.first_lba + 1) * 512;
+            let mut buf = vec![0u8; 4 << 20];
+            while remaining > 0 {
+                let n = buf.len().min(remaining as usize);
+                src.read_exact(&mut buf[..n])?;
+                dst.write_all(&buf[..n])?;
+                remaining -= n as u64;
+            }
+            Ok(())
+        })();
+        if let Err(e) = extract {
+            let _ = fs::remove_file(&tmp);
+            return Err(format!("partition extract for e2fsck failed: {e}"));
+        }
+        let out = Command::new("e2fsck")
+            .args(["-fn", tmp.to_str().unwrap_or_default()])
+            .output();
+        let _ = fs::remove_file(&tmp);
+        match out {
+            Ok(o) if o.status.success() => "e2fsck clean",
+            Ok(o) => {
+                return Err(format!(
+                    "e2fsck rejected the installed rootfs:\n{}\n{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ));
+            }
+            Err(e) => return Err(format!("e2fsck spawn failed: {e}")),
+        }
+    } else {
+        "e2fsck not on host — fsck arm skipped"
+    };
+
+    Ok(format!(
+        "layout verified — root grew {src_root_sectors} → {root_sectors} sectors \
+         (ESP {}..{}, root {}..{}); {fsck_note}",
+        esp_span.0, esp_span.1, dst_linux.first_lba, dst_linux.last_lba
+    ))
 }
 
 /// Build the QEMU arg vector for the audio smoke.
