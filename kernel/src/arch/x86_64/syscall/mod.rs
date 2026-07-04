@@ -19854,7 +19854,7 @@ fn raw_request_bytes(dev_id: u64, count: u64) -> Result<usize, u64> {
     if dev_id != 0 && !crate::blk::is_remote_device_registered(dev_id as u32) {
         return Err(NEG_ENODEV);
     }
-    // count ≤ MAX_SECTORS_PER_RAW_REQUEST (128) so this cannot overflow.
+    // count ≤ MAX_SECTORS_PER_RAW_REQUEST (256) so this cannot overflow.
     Ok((count * SECTOR_BYTES) as usize)
 }
 

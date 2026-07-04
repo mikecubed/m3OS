@@ -1599,7 +1599,11 @@ pub fn sys_device_dma_map_shm(dev_cap: u32, shm_id: u32) -> isize {
         len,
     });
 
-    log::info!(
+    // debug (not info): the usb-storage shm bounce path maps/unmaps per bulk
+    // transfer, so at info this floods serial (tens of thousands of lines per
+    // installer image copy) and starves gate prompt matching — the same
+    // failure mode as the Phase 106 `dma_alloc` demotion above.
+    log::debug!(
         "device_host.dma_map_shm pid={} bdf={:04x}:{:02x}:{:02x}.{} shm_id={} iova={:#x} len={}",
         pid,
         key.segment,

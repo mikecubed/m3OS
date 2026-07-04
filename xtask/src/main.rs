@@ -15558,16 +15558,16 @@ fn cmd_nvme_persist_smoke(args: &SmokeBootArgs) {
 /// USB→NVMe + flush), and reboots. Boot 2 relaunches with **only** the
 /// (now-written) NVMe and asserts it boots to a login over `nvme.block`.
 ///
-/// **WIP — not yet in CI (no pre-push arm).** The installer runs and the
-/// C.3 root-slot-release fix works, but the gate is blocked on two
-/// USB-storage limits under the sustained raw-read workload: 256-sector
-/// (128 KiB) raw reads over `usb0.block` fail (the BOT read path caps
-/// well below the block-IPC max), and the boot's dual usb-storage
-/// instances leave the driver in transient restart windows. Both are a
-/// USB-storage-driver hardening follow-up; a full-image raw copy under
-/// TCG is also inherently slow (hence the sparse/zero-skip copy). Kept
-/// here as the finished scaffold — the installer + kernel fix it drives
-/// are correct and observed working in pieces.
+/// In CI behind `M3OS_NVME_INSTALL_REGRESSION=1` (pre-push arm). The two
+/// USB-storage blockers that originally kept this WIP are fixed:
+/// multi-sector reads/writes now ride the usb-storage **shm bounce path**
+/// (64 KiB `SubmitShmTransfer` data stages — 2 SCSI commands per
+/// 256-sector request instead of 37 inline sub-requests, which is what
+/// makes the ~1 GiB copy fit the gate window under TCG), and the
+/// **single-daemon guard** stops the service-manager `usb_storage`
+/// restarts from firing probe BOT commands into the bulk pipes the
+/// root-serving instance is mid-transfer on (that collision killed the
+/// copy at ~12%).
 ///
 /// Exercises the whole Track C surface live: the `0x117x` raw block
 /// syscalls + the installer exec-path gate (C.2), the `dd_copy` loop +
@@ -15712,6 +15712,21 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs) {
     let _ = child1.kill();
     let _ = child1.wait();
     if let Err(msg) = r1 {
+        // The generic 60-line serial tail is usually all compositor frame
+        // spam (`RENDER_FP`) on this image — surface the installer / block
+        // driver lines from the FULL boot-1 history so a CI failure is
+        // diagnosable without a manual serial-captured rerun.
+        eprintln!("--- boot 1 installer/driver serial lines ---");
+        for l in strip_ansi(&hist1).lines().filter(|l| {
+            l.contains("INSTALLER:")
+                || l.contains("usb-storage:")
+                || l.contains("USB_STORAGE:")
+                || l.contains("nvme_driver")
+                || l.contains("[blk]")
+                || l.contains("[xhci]")
+        }) {
+            eprintln!("{l}");
+        }
         fail(&format!("boot 1 (install): {msg}"));
     }
 
@@ -15803,7 +15818,21 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs) {
                  the machine booted the installed NVMe alone to a live login over nvme.block"
             );
         }
-        Err(msg) => fail(&format!("boot 2 (installed NVMe): {msg}")),
+        Err(msg) => {
+            // Same filtered dump as boot 1: the installed-NVMe boot's fate
+            // hangs on init's root bootstrap + nvme_driver lines, which the
+            // 60-line generic tail rarely retains.
+            eprintln!("--- boot 2 installer/driver serial lines ---");
+            for l in strip_ansi(&hist2).lines().filter(|l| {
+                l.contains("INSTALLER:")
+                    || l.contains("init:")
+                    || l.contains("nvme")
+                    || l.contains("[blk]")
+            }) {
+                eprintln!("{l}");
+            }
+            fail(&format!("boot 2 (installed NVMe): {msg}"))
+        }
     }
 }
 

@@ -1,17 +1,20 @@
 # Handoff — Phase 106: USB Installer & NVMe Install
 
 **Date:** 2026-07-03 (living doc — update on every session working this phase)
-**Branch:** `feat/phase-106-installer` (off `main`; head `6838f8ba`)
+**Branch:** `feat/phase-106-usb-storage-multisector` (off `main`)
 **State:** IN PROGRESS.
 - **Track A (M1)** ✅ merged — PR #294 (`40a9e685`). Combined GPT(ESP+ext2)
   USB image + USB-ext2 root bootstrap. `usb-root-smoke` green.
 - **Track B (M2)** ✅ merged — PR #295 (`9510a0a1`). NVMe root boot +
   `nvme-rw` / `nvme-persist` gates green.
-- **Track C (M3)** 🟡 foundation landed on `feat/phase-106-installer`
-  (**PR #296**, open): C.1 installer scaffold + C.2 capability-gated raw
-  block syscalls + C.3 raw `dd`-copy installer + kernel root-slot-release
-  fix. The end-to-end **`nvme-install-smoke` gate is written but WIP /
-  not-in-CI**, blocked on a USB-storage driver limitation (below).
+- **Track C (M3)** 🟡 foundation merged — PR #296 (`13d1cf6e`): C.1
+  installer scaffold + C.2 capability-gated raw block syscalls + C.3 raw
+  `dd`-copy installer + kernel root-slot-release fix. The former
+  `nvme-install-smoke` blockers are **fixed** on
+  `feat/phase-106-usb-storage-multisector` (see below) and the gate is
+  **GREEN end-to-end** (2026-07-03: USB boot → ~40 s 1 GiB sparse copy →
+  reboot → NVMe-alone boot to a live shell over `nvme.block`), wired into
+  pre-push behind `M3OS_NVME_INSTALL_REGRESSION=1`. C.4/C.5 pending.
 - **Tracks D / E** — not started (D first-user; E bare-metal sign-off).
 
 **Charter:** `docs/roadmap/106-usb-installer-nvme.md`
@@ -36,7 +39,9 @@
   Gates `nvme-rw` + `nvme-persist` (`M3OS_NVME_REGRESSION=1`) are direct analogs
   of the always-on `ahci-rw`/`ahci-persist` gates and pass.
 
-### On `feat/phase-106-installer` (PR #296, open) — Track C foundation
+- **PR #296 — Track C foundation (C.1+C.2+C.3).** Details below.
+
+### Merged via PR #296 — Track C foundation
 
 **C.1 — installer scaffold (four-place new-binary wiring).**
 `userspace/installer` (`/sbin/installer`), workspace member, xtask `bins`
@@ -88,35 +93,82 @@ Host tests added along the way: `kernel_core::installer` ABI+bounds;
 
 ---
 
-## The one real blocker — `nvme-install-smoke` (Track C / E.2)
+## The former blocker — `nvme-install-smoke` (Track C / E.2) — FIXED
 
-The gate `cmd_nvme_install_smoke` (`SMOKE_EXIT_NVME_INSTALL_SMOKE_FAILED=103`,
-`M3OS_NVME_INSTALL_REGRESSION` shape) is a **two-boot** oracle: boot 1 attaches
-both the combined USB image and a **blank** NVMe, runs `/sbin/installer`
-(USB→NVMe copy), reboots; boot 2 attaches **only** the NVMe and asserts a serial
-login. It is committed as finished scaffold but **marked WIP / not wired into
-CI**, blocked on:
+The gate `cmd_nvme_install_smoke` (`SMOKE_EXIT_NVME_INSTALL_SMOKE_FAILED=103`)
+is a **two-boot** oracle: boot 1 attaches both the combined USB image and a
+**blank** NVMe, runs `/sbin/installer` (USB→NVMe copy), reboots; boot 2
+attaches **only** the NVMe and asserts a serial login. It is wired into
+pre-push behind `M3OS_NVME_INSTALL_REGRESSION=1` (900 s timeout).
 
-1. **USB-storage 256-sector raw reads FAIL.** 1-sector raw reads over
-   `usb0.block` work (the installer's LBA0/LBA1 GPT probe succeeds —
-   diagnostic showed `lba1=4546492050415254` = `"EFI PART"`), but the first
-   256-sector (128 KiB) copy read returns an error (`INSTALLER:error
-   read-failed lba=0`). **The USB BOT read path caps well below the block-IPC
-   `MAX_SECTORS_PER_REQUEST=256`.** This is a `usb-storage` driver-hardening
-   problem, **not** an installer bug — the installer, the raw syscalls, the GPT
-   parse, the target resolve, and the copy loop are all correct and were
-   observed running live.
-2. **Dual `usb-storage` instance restart flakiness** — the two-drive boot-1
-   topology (USB stick + blank NVMe, both needing controllers) has a transient
-   restart window.
-3. **TCG raw-copy slowness** — a full sector-by-sector image copy under TCG is
-   slow; the sparse-copy optimization mitigates but does not eliminate it.
+The original blocker report ("256-sector raw reads fail / cap below the
+block-IPC max") was **misdiagnosed**. A manual boot-1 replication with full
+serial capture showed the real chain:
 
-**Fix direction:** harden the ring-3 `usb-storage` BOT `READ(10)` path to honor
-multi-sector (up to 256) requests — chunk internally to the controller's max
-transfer if needed, but present the full `read_sectors_dev` count to the caller.
-Once large reads are stable, revisit the dual-instance restart window, then wire
-the gate into CI behind `M3OS_NVME_INSTALL_REGRESSION=1`.
+1. **Throughput, not size.** The inline BOT path chunks at
+   `MAX_BOT_SECTORS=7` (the `USB_MSG_MAX=4096` inline-reply budget), so one
+   256-sector request = 37 SCSI commands = 111 IPC round-trips — a ~1 GiB
+   image copy can never fit a gate window under TCG. **Fix:** a persistent
+   64 KiB shm bounce buffer (`USB_STORAGE:shm-bounce-ok sectors=128`
+   sentinel) + `MAX_SHM_SECTORS=128`-sector SCSI commands whose data stage
+   is one zero-copy `SubmitShmTransfer` (2 commands / 6 round-trips per
+   256-sector request). 64 KiB per stage because the xHCI server programs
+   the stage as a **single Normal TRB** (17-bit length field, max
+   128 KiB − 1) — no TRB chaining needed at 64 KiB. Setup failure falls
+   back to the inline path; ≤7-sector tails stay inline.
+2. **Concurrent-instance BOT collision** (the real source of the original
+   `read-failed` reports, observed killing the copy at ~12%): on a USB-root
+   boot, init's bootstrap fork serves `usb0.block`, while the service
+   manager's `usb_storage` daemon (`restart=on-failure`, `max_restart=5`)
+   keeps probing the SAME device (GET_MAX_LUN / TEST UNIT READY / INQUIRY
+   are raw BOT commands on the same bulk pipes), failing to register the
+   taken name, exiting 1, and being restarted into the collision again.
+   **Fix (single-daemon guard):** before ANY device traffic, a fresh
+   instance checks the service registry (`usb{k}.block` lookup — the kernel
+   drops a dead owner's entries, so a hit means a live daemon) and exits
+   **0** when every discovered device is already served; a lost
+   registration race also exits 0. Multi-stick topologies still work: only
+   claimed devices are skipped.
+3. **Serial log flood:** `device_host.dma_map_shm` logged at INFO per
+   transfer (~33 k lines per copy) — demoted to DEBUG, same as the Phase
+   106 `dma_alloc` demotion.
+4. **xHCI completion-wait budget** (the residual mid-copy flake): the
+   bulk-event wait (`wait_for_bulk_out_event`) gave up after ~400 ms of
+   sleep-polls; a 64 KiB DMA under TCG scheduling jitter occasionally
+   exceeded that, and the abandoned TD's late completion desynced the
+   shared event ring (cascading CBW/INQUIRY failures at a random LBA).
+   Raised to 5000 sleep-polls (≥5 s) — only a genuinely dead transfer
+   fails, and failing then IS correct. Deliberately no retry-at-SCSI
+   layer: retrying after an abandoned transfer risks stale-event
+   off-by-one attribution, the worse failure.
+5. **Detach false-positive:** the C.4 reconcile treated ONE failed
+   `NextAttach` as a hot-unplug, so a transient glitch made the daemon
+   serving the root unmount and exit. `device_detached_confirmed` now
+   requires two verdicts 300 ms apart.
+
+---
+
+## Validation status (2026-07-04) + two repo-level discoveries
+
+The full battery ran manually against `feat/phase-106-usb-storage-multisector`
+(PR #297; matrix posted as a PR comment): 12 suite passes, 5 suite failures
+that all pass in isolation (the hook's documented flake pattern), and **one
+persistent failure that reproduces identically on `main`**:
+
+- **`usb-storage-dual-smoke` is broken on `main`** (pre-existing): times out
+  waiting for `mass-storage devices — multi-device mode`. Suspects: the wait
+  pattern has an **em-dash in a single-shot startup line** (see the serial
+  gotchas below — multi-byte sentinels split under lossy decode, and the
+  Phase 100 `RENDER_FP` per-frame compositor spam interleaves with early
+  boot), or the second stick misses the ~600 ms discovery stability window.
+  Needs its own investigation; consider an ASCII sentinel emitted more than
+  once.
+- **This clone's pushes were not running the QEMU battery.** `core.hooksPath`
+  pointed at a stale March-era `.git/hooks/pre-push` that only ran
+  `cargo xtask check` — every push since then skipped smoke-test / kernel
+  tests / regression / all env-gated arms. Fixed by re-running `./setup.sh`
+  (now `.githooks`). Assume any "hook-verified" claim between March and
+  2026-07-04 from this machine only covered `check`.
 
 ---
 
@@ -182,14 +234,32 @@ the gate into CI behind `M3OS_NVME_INSTALL_REGRESSION=1`.
   rebase stacked branches onto `main` around a merge.
 - **Kill stale QEMU:** `pkill -9 -f "qemu-system-x86_6[4] -bios"` (the bracket
   keeps `pkill` from matching itself).
+- **One xHCI shm transfer = one Normal TRB.** `submit_bulk_iova` programs the
+  whole `SubmitShmTransfer` stage as a single TRB; the TRB length field is 17
+  bits (max 128 KiB − 1), so a 128 KiB (256-sector) stage cannot be one TRB.
+  Keep shm data stages ≤ 64 KiB (`MAX_SHM_SECTORS=128`) or implement chained
+  TRBs first.
+- **Never let two processes drive BOT on the same device.** A BOT command is
+  2–3 bulk transfers; the xHCI server serializes *transfers*, not commands, so
+  a second process's innocent-looking probe (GET_MAX_LUN → TUR → INQUIRY)
+  interleaves mid-command and corrupts both streams. The usb-storage
+  single-daemon guard (registry lookup before any device traffic, clean exit 0)
+  is what keeps the service-manager restarts out of the root-serving
+  instance's pipes — preserve it when touching the daemon's startup.
+- **Gate-invisible progress:** the smoke gates don't echo guest serial; when a
+  copy "hangs", `du -h` on the target image (allocated blocks) vs
+  `--apparent-size` distinguishes "writes flowing", "reading a zero stretch
+  (sparse skip)", and "dead".
 
 ---
 
 ## Next actions (suggested order)
 
-1. **Land PR #296** (Track C foundation) — title updated to cover C.1+C.2+C.3.
-2. **Harden `usb-storage` multi-sector reads** so 256-sector raw reads succeed;
-   then green `nvme-install-smoke` and wire it into CI.
+1. ~~Land PR #296~~ ✅ merged (`13d1cf6e`).
+2. ~~Harden `usb-storage` multi-sector transfers + green `nvme-install-smoke`~~
+   — shm bounce path + single-daemon guard on
+   `feat/phase-106-usb-storage-multisector`; gate wired behind
+   `M3OS_NVME_INSTALL_REGRESSION=1`.
 3. **C.5 on-device `mkfs.ext2`** (host-tested pure logic) → **C.4** GPT/ESP writer.
 4. **Track D** first-user setup (reuse `adduser`/`passwd`; disable autologin).
 5. **Track E** bare-metal M1/M3 on the Dell (operator-owned).

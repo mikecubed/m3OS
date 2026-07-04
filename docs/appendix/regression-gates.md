@@ -463,6 +463,29 @@ down; boot 2 re-mounts ext2 fresh and re-reads the marker. Asserts boot
 — no musl). The per-request DMA-alloc kernel log was demoted INFO →
 DEBUG so the NVMe I/O path no longer floods the serial console.
 
+## nvme-install-smoke
+
+**Env var:** `M3OS_NVME_INSTALL_REGRESSION=1`
+
+The Phase 106 end-to-end installer proof (Track C / E.2): a two-boot
+gate. Boot 1 boots the combined GPT(ESP+ext2) USB image (`image
+--combined`) as a `usb-storage` stick with a **blank** NVMe target also
+attached — when init's Stage-1 NVMe arm adopts the ext2-less NVMe, the
+C.3 root-slot release + skip fires and the USB root mounts (the race is
+timing-dependent, so the gate asserts login-reached, not the release
+line). After a serial login, `/sbin/installer` runs the whole Track C
+surface live: the `0x117x` capability-gated raw block syscalls
+(installer exec-path trust), the GPT span parse (copy `0..=alt_lba`,
+never a whole stick), the target resolve + size probe, and the sparse
+`dd`-copy USB→NVMe + `BLK_FLUSH` + `reboot`. Boot 2 relaunches with
+**only** the written NVMe and asserts `init: / mounted (ext2 via ring-3
+nvme.block)` plus a live shell. The copy's read side rides the Phase
+106 usb-storage **shm bounce path** (64 KiB `SubmitShmTransfer` data
+stages — 2 SCSI commands per 256-sector request instead of 37 inline
+sub-requests), which is what makes a ~1 GiB image copy finish inside
+the gate window under TCG. Opt-in (two full QEMU boots + an image copy:
+minutes per run).
+
 ## power-smoke
 
 **Env var:** `M3OS_POWER_REGRESSION=1`

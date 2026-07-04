@@ -142,7 +142,7 @@ fn raw_write(dev_id: u64, start_lba: u64, count: u64, buf: &[u8]) -> Option<usiz
 const TARGET_SERVICE: &str = "nvme.block";
 
 /// Chunk (sectors) per raw read/write — the kernel bounds each request
-/// to `MAX_SECTORS_PER_RAW_REQUEST` (128 = 64 KiB).
+/// to `MAX_SECTORS_PER_RAW_REQUEST` (256 = 128 KiB).
 const CHUNK_SECTORS: u64 = kernel_core::installer::MAX_SECTORS_PER_RAW_REQUEST;
 
 syscall_lib::entry_point!(program_main);
