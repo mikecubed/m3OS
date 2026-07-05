@@ -427,6 +427,14 @@ mod driver_layer {
         pub prp_list: DmaBuffer<[u64; PRP_LIST_ENTRIES]>,
         pub bookkeeping: IoQueueBookkeeping,
         pub doorbell_stride: usize,
+        /// MSI-X subscription, retained for its side effects (enabling the
+        /// vector so QEMU routes completions, and keeping the kernel EOI/
+        /// binding alive for this queue's lifetime). Phase 106 Bug 2:
+        /// `wait_completion` no longer *reads* it — completions are detected
+        /// by polling the CQ, so a missed interrupt cannot hang the driver —
+        /// but the subscription is kept for the low-latency fast path. Held,
+        /// not read.
+        #[allow(dead_code)]
         pub irq: Option<IrqNotification>,
     }
 
@@ -568,62 +576,70 @@ mod driver_layer {
             drained
         }
 
-        /// Wait for a completion matching `cid`. Uses the IRQ
-        /// notification when present and falls back to a bounded polled
-        /// drain otherwise. Returns the slot snapshot — caller reads
-        /// `status_code` to classify the outcome.
+        /// Wait for a completion matching `cid`, then return the slot
+        /// snapshot (caller reads `status_code` to classify the outcome).
+        ///
+        /// **The completion is written to the CQ by the device whether or
+        /// not its MSI-X interrupt is delivered.** The MSI-X is therefore an
+        /// optimisation, NEVER a correctness dependency: this waits by
+        /// polling the CQ with a bounded spin-then-sleep budget, so a
+        /// missed/coalesced completion interrupt costs bounded latency
+        /// instead of a permanent hang.
+        ///
+        /// Phase 106 Bug 2 — the previous IRQ path blocked on an UNBOUNDED
+        /// `irq.wait()` (bounded only against *spurious* wakes, not against a
+        /// wake that never comes). Under load a completion IRQ was missed —
+        /// exactly the "completion posted, signals=0, never woken" hazard the
+        /// MSI-X-enable-ordering note at subscribe time already flags — and
+        /// the driver parked in `BlockedOnNotif` forever with the completion
+        /// sitting undrained in the CQ, stranding its block-IPC caller (the
+        /// installer) in `BlockedOnReply` with no reply ever delivered. The
+        /// polled fallback that already existed for the no-IRQ case is now the
+        /// path for BOTH cases; it mirrors the xhci server's bounded
+        /// event-ring poll. (The MSI-X subscription is retained for its
+        /// vector-enable side effect and low-latency fast path — a delivered
+        /// completion is caught on the very next spin — but the loop no longer
+        /// *depends* on it.)
         fn wait_completion(&mut self, mmio: &Mmio<NvmeRegsTag>, cid: u16) -> Option<InFlightSlot> {
-            // Fast path: drain any completions already published before
-            // parking on the IRQ wait.
+            // Fast path: a completion published before we started waiting.
             self.drain_completions(mmio);
             if let Some(slot) = self.bookkeeping.slot(cid)
                 && slot.filled
             {
                 return Some(slot);
             }
-            if self.irq.is_some() {
-                let mut rounds: u32 = 0;
-                while rounds < 64 {
-                    // Borrow the IRQ for just the wait+ack call, then
-                    // release so `drain_completions` can reborrow
-                    // `&mut self`. `wait` takes `&self` per C.3.
-                    let bits = match self.irq.as_ref() {
-                        Some(irq) => irq.wait(),
-                        None => 0,
-                    };
-                    if bits != 0
-                        && let Some(irq) = self.irq.as_ref()
-                    {
-                        let _ = irq.ack(bits);
-                    }
-                    self.drain_completions(mmio);
-                    if let Some(slot) = self.bookkeeping.slot(cid)
-                        && slot.filled
-                    {
-                        return Some(slot);
-                    }
-                    rounds += 1;
+            // Spin-poll: catches the common µs-latency completion (IRQ-driven
+            // or not) with no sleep, no context switch.
+            let mut i: u64 = 0;
+            while i < IO_SPIN_BUDGET {
+                core::hint::spin_loop();
+                self.drain_completions(mmio);
+                if let Some(slot) = self.bookkeeping.slot(cid)
+                    && slot.filled
+                {
+                    return Some(slot);
                 }
-                // After too many spurious wake-ups, treat as a failure
-                // so the IPC client observes an IoError.
-                None
-            } else {
-                // Polled fallback when IRQ subscription failed —
-                // bounded by IO_SPIN_BUDGET so a wedged controller
-                // cannot stall the driver forever.
-                let mut i: u64 = 0;
-                while i < IO_SPIN_BUDGET {
-                    self.drain_completions(mmio);
-                    if let Some(slot) = self.bookkeeping.slot(cid)
-                        && slot.filled
-                    {
-                        return Some(slot);
-                    }
-                    core::hint::spin_loop();
-                    i += 1;
-                }
-                None
+                i += 1;
             }
+            // Sleep-poll backstop: a genuinely slow — or IRQ-missed —
+            // completion re-drains the CQ every SLEEP_NS instead of hanging.
+            // ~5 s total, well under the block-IPC restart window, so only a
+            // truly dead controller fails the wait (and failing then is
+            // correct — the IPC client observes an IoError).
+            const SLEEP_POLLS: u32 = 5_000;
+            const SLEEP_NS: u32 = 1_000_000; // 1 ms
+            let mut n: u32 = 0;
+            while n < SLEEP_POLLS {
+                let _ = syscall_lib::nanosleep_for(0, SLEEP_NS);
+                self.drain_completions(mmio);
+                if let Some(slot) = self.bookkeeping.slot(cid)
+                    && slot.filled
+                {
+                    return Some(slot);
+                }
+                n += 1;
+            }
+            None
         }
     }
 

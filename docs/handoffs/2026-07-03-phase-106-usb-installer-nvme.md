@@ -273,32 +273,67 @@ service-manager `xhci` instance (config-space scans only, never claims —
 it before any BOT traffic), and the Track D changes themselves (the
 failing raw-arm data path is byte-identical to C.3's).
 
-**KNOWN, NOT YET FIXED — "Bug 2": a scheduler/IPC lost-wakeup strands
-`BlockedOnReply` tasks under the populate's block-IPC load.** DISTINCT
-from the (now-fixed) BOT transport-fail cascade — a `nvme-install-part-smoke`
-run failed with **zero** `transport-fail` lines and **zero** of the BOT
-recovery paths firing, so it is neither the installer nor the USB
-transport. Full boot-1 serial capture (the gate now writes
-`nvme-install-boot1-serial.log` and prints a `KNOWN-FLAKE: Phase 106
-Bug 2` banner on this signature): multiple `fork-child` tasks wedged with
-`[replystall] … state=BlockedOnReply … pending_msg=false reply_waker=true
-waker_flag=false … STRANDED(BlockedOnReply, no reply delivered)`, plus
-`[stallcensus] … BlockedOnService`, and the watchdog's `task pid=5 …
-BlockedOnReply stuck-since=…ms (no waker registered)` climbing past 100 s.
-`pending_msg=false` at strand means the SERVER never called
-`endpoint::reply()` for that caller (or the reply/wake was lost) — the
-classic **57e preempt-full lost-wakeup** class
-(`docs/handoffs/57e-preempt-full-userspace-hangs.md`), surfaced by the
-sustained multi-core block-IPC storm the partition populate generates
-(thousands of raw read/write syscalls fanned across cores). It is
-intermittent (~1 in a few heavy runs); a light standalone run usually
-passes. **Mitigation in place, not a fix:** the pre-push hook retries
-each install gate once (`run_install_gate`) — a real regression fails
-both attempts, this flake almost never repeats back-to-back. **The actual
-fix is core scheduler/IPC work** (the reply-waker / `wake_task_v2` path
-under contention) and is the recommended next Phase 106 item alongside
-Track E. Starting evidence is captured in `nvme-install-boot1-serial.log`
-on any failing run.
+**"Bug 2" — DEEPLY CHARACTERIZED, NOT YET FIXED (2026-07-05).** The
+earlier "scheduler/IPC lost-wakeup / 57e preempt-full" framing was
+**wrong** (this kernel runs `preempt-voluntary`; the 57e model is
+deferred). Investigation on branch `investigate/phase-106-bug2-lost-wakeup`
+narrowed it precisely but the reproduced strand is **not yet resolved** —
+read this before another attempt.
+
+*Diagnostic (the durable deliverable — keep).* `[replystall]` (in
+`kernel/src/task/scheduler.rs`) now reports, for each stranded caller,
+the **reply-cap-holder** pid + state + parked **syscall number** +
+`holder_pending` (whether the holder has an undelivered `pending_msg`),
+and triggers on `blocked_since` age (so it catches fork-children that
+block before a syscall-entry stamp). It classifies:
+`STRANDED-NO-HOLDER` (GAP 1: queued call on a non-owned endpoint),
+`STRANDED-DEAD-HOLDER` (GAP 2: reply cap in a Dead task, deferred-sweep
+miss), `STRANDED-SERVER-STUCK` (a live holder not replying). The gate
+writes `nvme-install-boot1-serial.log` and prints a `KNOWN-FLAKE: Phase
+106 Bug 2` banner on the signature. This tooling is what pinned the
+chain and should stay.
+
+*What the chain actually is (holder syscalls decoded).* Under load the
+`--part` install strands a **deadlock chain**:
+`installer (SYS_BLK_RAW_READ 0x1171) → usb-storage (ipc_call_buf 0x110d)
+→ xhci (ipc_recv_msg 0x110e, BlockedOnNotif, holder_pending=false)`.
+i.e. the **xhci USB server** is the root: alive, parked in its
+serve-loop recv, holding a `Reply(usb-storage)` cap it never answers,
+with **no queued `pending_msg`**. It correlates with the Bug 1
+transport-fail / BOT-recovery path firing (the recovery issues control
+transfers to xhci).
+
+*Two hypotheses tested and RULED OUT.*
+1. *Missed NVMe completion IRQ* (nvme `wait_completion` blocking on an
+   unbounded `irq.wait()`). A candidate fix — poll the CQ with a bounded
+   spin-then-sleep budget instead of blocking — is **in the working tree**
+   (`userspace/drivers/nvme/src/io.rs`) and is *correct hardening in its
+   own right* (a completion wait must never depend on the IRQ), but it did
+   **not** stop the reproduced strand, which is in **xhci**, not nvme.
+2. *Lost endpoint-delivery wake* (a request delivered — `pending_msg` set
+   — but the recv-wake lost). A candidate fix — `drain_pending_msg_waiters`,
+   a BSP backstop that re-wakes any `Blocked*` task holding an unconsumed
+   `pending_msg` (mirroring `drain_pending_waiters` for notifications) — is
+   **in the working tree** (`scheduler.rs`). But `holder_pending=false`
+   proves the xhci holder has **no** queued message, so this backstop is
+   correctly inert here — the wrong fix for this strand.
+
+*The unresolved contradiction (start here next).* The xhci server is
+**synchronous** (`server.rs` run loop: `recv → handle_request fully →
+reply`; `ipc_reply` atomically removes the reply cap, so no leak from a
+normal reply). Yet it is observed idle in its serve-loop recv
+(`ipc_recv_msg` 0x110e) **holding an unanswered `Reply(usb-storage)`**
+with `pending_msg=false` on BOTH xhci and usb-storage. That state should
+be unreachable in the synchronous model. Resolving it needs instrumenting
+the exact `handle_request` → `control_transfer` / `wait_for_transfer_event`
+path (does a transfer's bounded poll return to recv without replying on
+some error/timeout branch? is `last_syscall_nr` stale relative to the real
+block point? is there a re-entrant recv?). The `holder_nr`/`holder_pending`
+diagnostic + the `hp-caught-*.log` captures are the starting evidence.
+
+*Mitigation in place (unchanged).* The pre-push `run_qemu_gate_retry_once`
+guard retries each NVMe/install gate once, so the flake doesn't block
+unrelated pushes. Bug 2 remains the recommended next Phase 106 item.
 
 **Known pre-existing (NOT fixed):** `usb-storage-dual-smoke` fails identically on
 `main` — times out waiting for `mass-storage devices — multi-device mode`.

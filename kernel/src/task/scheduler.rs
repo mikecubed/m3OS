@@ -4874,6 +4874,52 @@ pub fn deliver_message_and_wake(id: TaskId, msg: Message) -> WakeOutcome {
     outcome
 }
 
+/// Phase 106 Bug 2 — backstop sweep for a **lost endpoint-delivery wake**:
+/// re-enqueue any `Blocked*` task that holds an unconsumed `pending_msg` but
+/// is not on any run queue.
+///
+/// A synchronous IPC `call` delivers its request to a waiting server via
+/// `deliver_message` (sets `pending_msg`) + `wake_task_v2`. If that wake is
+/// lost — the exact "parked in a `Blocked*` state with `pending_msg` set but
+/// no run-queue entry" signature `deliver_message_and_wake` documents — the
+/// server never returns from its `recv`, never processes the request, and
+/// never replies, deadlocking the whole caller chain (observed as the Phase
+/// 106 install strand: installer → usb-storage → xhci, the xHCI server stuck
+/// in its notif-bound `ipc_recv_msg` holding a `Reply` cap it never answers).
+///
+/// [`crate::ipc::notification::drain_pending_waiters`] is the analogous
+/// backstop for a lost *notification* wake, but it only inspects notification
+/// `PENDING` bits — it does **not** cover an endpoint-delivered `pending_msg`.
+/// This closes that gap. `wake_task_v2` is idempotent (a task that is not
+/// `Blocked*` yields `AlreadyAwake`), so re-waking a task whose primary wake
+/// is already in flight is a harmless no-op; the message is consumed by the
+/// task's own `take_message`. BSP-only, gated to run periodically so the
+/// per-tick cost stays negligible.
+pub fn drain_pending_msg_waiters() {
+    let to_wake: alloc::vec::Vec<TaskId> = {
+        let sched = scheduler_lock();
+        sched
+            .tasks
+            .iter()
+            .filter(|task| {
+                matches!(
+                    task.state,
+                    TaskState::BlockedOnRecv
+                        | TaskState::BlockedOnNotif
+                        | TaskState::BlockedOnReply
+                ) && task.pending_msg.is_some()
+                    && !task.on_cpu.load(Ordering::Acquire)
+            })
+            .map(|task| task.id)
+            .collect()
+    };
+    // Wake outside the scheduler lock: `wake_task_v2` takes its own locks
+    // (pi_lock + scheduler_lock) and may enqueue / IPI.
+    for id in to_wake {
+        let _ = wake_task_v2(id);
+    }
+}
+
 /// Store a [`Message`] only if the task's pending slot is empty.
 ///
 /// Returns `true` if the message was installed. Used by signal delivery so
@@ -5230,6 +5276,18 @@ pub fn run() -> ! {
         // will still catch the pending notification.
         if core_id == 0 {
             crate::ipc::notification::drain_pending_waiters();
+            // Phase 106 Bug 2 — backstop for a lost endpoint-delivery wake
+            // (a server parked in `Blocked*` with `pending_msg` set but not
+            // enqueued). Gated to every Nth dispatch so the O(n_tasks) scan +
+            // scheduler-lock acquisition stays off the hot path; the resulting
+            // wake latency (a handful of dispatches, sub-ms) is bounded and
+            // vastly better than the permanent hang it prevents.
+            const PENDING_MSG_SWEEP_INTERVAL: u32 = 16;
+            if PENDING_MSG_SWEEP_TICK.fetch_add(1, Ordering::Relaxed) % PENDING_MSG_SWEEP_INTERVAL
+                == 0
+            {
+                drain_pending_msg_waiters();
+            }
         }
         crate::ipc::registry::drain_pending_service_waiters();
 
@@ -6276,6 +6334,11 @@ pub fn sys_sched_getaffinity(pid: u32) -> i64 {
 /// Tick counter gating watchdog scans (BSP-only, matches `BALANCE_COUNTER`).
 static WATCHDOG_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Phase 106 Bug 2 — tick counter gating the [`drain_pending_msg_waiters`]
+/// backstop sweep (BSP-only).
+static PENDING_MSG_SWEEP_TICK: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 /// DIAGNOSTIC (claude -p stall hunt, 2026-06-16) — bounded boot budget for the
 /// reply-stall scan's per-task dumps so a persistent stall doesn't flood serial.
 static REPLY_STALL_DIAG_BUDGET: core::sync::atomic::AtomicU32 =
@@ -6924,6 +6987,20 @@ fn reply_stall_scan(now: u64) {
         waker_present: bool,
         waker_flag: bool,
         on_cpu: bool,
+        /// Syscall number the task is parked in (identifies the call/op).
+        syscall_nr: u32,
+        /// Phase 106 Bug 2 — the task holding a `Reply(this)` cap (the
+        /// server that owes this caller its reply), if any, plus that
+        /// server's pid + state. Decides the two mechanisms:
+        ///   * holder present + a Blocked* state → the SERVER is stuck
+        ///     (a dependency deadlock), the caller is correctly parked.
+        ///   * NO holder → the reply cap was dropped without waking the
+        ///     caller (a cleanup gap / lost reply-cap-holder).
+        holder_pid: u32,
+        holder_state: Option<super::TaskState>,
+        holder_found: bool,
+        holder_nr: u32,
+        holder_pending: bool,
     }
 
     let mut rows: [Option<StallRow>; 8] = [const { None }; 8];
@@ -6957,15 +7034,60 @@ fn reply_stall_scan(now: u64) {
             let syscall_age = now.saturating_sub(entry);
             let lost_wake =
                 has_pending && entry != 0 && syscall_age >= REPLY_STALL_LOSTWAKE_AGE_TICKS;
+            // Phase 106 Bug 2 — a BlockedOnReply task whose `last_syscall_entry_tick`
+            // is 0 (a fork-child that blocked before any syscall-entry stamp, e.g.
+            // pid=5 in the install stall) was skipped by the syscall-age gate,
+            // so this scan's holder diagnostic never ran for exactly the stranded
+            // tasks the `[sched]` watchdog reports. Also trigger on `blocked_since`
+            // age so the holder verdict is emitted for them.
+            let blocked_age = now.saturating_sub(task.blocked_since_tick);
             let reply_wedged = task.state == super::TaskState::BlockedOnReply
-                && entry != 0
-                && syscall_age >= REPLY_STALL_SYSCALL_AGE_TICKS;
+                && ((entry != 0 && syscall_age >= REPLY_STALL_SYSCALL_AGE_TICKS)
+                    || blocked_age >= REPLY_STALL_SYSCALL_AGE_TICKS);
             if !lost_wake && !reply_wedged {
                 continue;
             }
             if n >= rows.len() {
                 break;
             }
+            // Phase 106 Bug 2 — find the task that holds a `Reply(this)` cap
+            // (the server that owes this caller its reply). A stranded
+            // BlockedOnReply caller with NO such holder means the reply cap
+            // was dropped without waking it (cleanup gap); a holder in a
+            // Blocked* state means the SERVER is stuck (dependency deadlock).
+            // Scan ALL tasks (including Dead) — a reply cap lingering in a
+            // Dead-but-uncleaned holder is GAP 2 (deferred-sweep miss), which
+            // must be distinguished from GAP 1 (truly no holder: a queued
+            // call on an endpoint the dying server never owned). Skipping Dead
+            // tasks here would collapse the two into one misleading verdict.
+            let caller_id = task.id;
+            let (holder_found, holder_pid, holder_state, holder_nr, holder_pending) = {
+                let mut found = false;
+                let mut hpid = 0u32;
+                let mut hstate = None;
+                let mut hnr = 0u32;
+                let mut hpending = false;
+                for other in sched.tasks.iter() {
+                    if other.caps.reply_targets().contains(&caller_id) {
+                        found = true;
+                        hpid = other.pid;
+                        hstate = Some(other.state);
+                        // The holder's parked syscall distinguishes a driver
+                        // stuck in its per-request completion wait vs. one
+                        // stuck in its serve-loop recv (a request-delivery
+                        // lost-wakeup) — both show BlockedOnNotif.
+                        hnr = other.last_syscall_nr.load(Ordering::Relaxed);
+                        // Whether the holder has an undelivered pending_msg:
+                        // true => a delivered-but-not-woken request (lost
+                        // endpoint wake, backstop territory); false => the
+                        // holder is blocked without a queued message (its own
+                        // downstream dependency never completed).
+                        hpending = other.pending_msg.is_some();
+                        break;
+                    }
+                }
+                (found, hpid, hstate, hnr, hpending)
+            };
             rows[n] = Some(StallRow {
                 idx,
                 pid: task.pid,
@@ -6983,6 +7105,12 @@ fn reply_stall_scan(now: u64) {
                     .map(|w| w.load(Ordering::Acquire))
                     .unwrap_or(false),
                 on_cpu: task.on_cpu.load(Ordering::Acquire),
+                syscall_nr: task.last_syscall_nr.load(Ordering::Relaxed),
+                holder_pid,
+                holder_state,
+                holder_found,
+                holder_nr,
+                holder_pending,
             });
             n += 1;
         }
@@ -7016,12 +7144,19 @@ fn reply_stall_scan(now: u64) {
             }
         }
         // Classify for the log line so the verdict is legible without re-deriving.
+        // Phase 106 Bug 2 — the reply-cap-holder decides the STRANDED mechanism.
         let verdict = if row.pending_msg && !in_runq && !row.on_cpu {
             "LOST-WAKE(msg delivered, task not enqueued)"
         } else if row.pending_msg {
             "LOST-WAKE?(msg delivered, but enqueued/on_cpu — racing)"
+        } else if row.state == super::TaskState::BlockedOnReply && !row.holder_found {
+            "STRANDED-NO-HOLDER(no reply cap anywhere — queued call on non-owned endpoint, GAP 1)"
+        } else if row.state == super::TaskState::BlockedOnReply
+            && row.holder_state == Some(super::TaskState::Dead)
+        {
+            "STRANDED-DEAD-HOLDER(reply cap in a Dead task — deferred-cleanup miss, GAP 2)"
         } else if row.state == super::TaskState::BlockedOnReply {
-            "STRANDED(BlockedOnReply, no reply delivered)"
+            "STRANDED-SERVER-STUCK(reply-cap holder alive but not replying — deadlock)"
         } else {
             "BLOCKED-NO-MSG(by-design wait or stranded request)"
         };
@@ -7030,13 +7165,14 @@ fn reply_stall_scan(now: u64) {
             .map(|d| (d as i64) - (now as i64))
             .unwrap_or(0);
         log::warn!(
-            "[replystall] pid={} name={} idx={} state={:?} syscall_age={}ms blocked_age={}ms \
+            "[replystall] pid={} name={} idx={} state={:?} nr={:#x} syscall_age={}ms blocked_age={}ms \
              last_ready_age={}ms wake_deadline_in={}ms pending_msg={} reply_waker={} waker_flag={} \
-             on_cpu={} in_runq={} runq_core={} :: {}",
+             on_cpu={} in_runq={} runq_core={} holder_pid={} holder_state={:?} holder_nr={:#x} holder_pending={} :: {}",
             row.pid,
             row.name,
             row.idx,
             row.state,
+            row.syscall_nr,
             row.syscall_age,
             row.blocked_age,
             row.last_ready_age,
@@ -7047,6 +7183,10 @@ fn reply_stall_scan(now: u64) {
             row.on_cpu,
             in_runq,
             runq_core,
+            if row.holder_found { row.holder_pid as i64 } else { -1 },
+            row.holder_state,
+            row.holder_nr,
+            row.holder_pending,
             verdict,
         );
     }

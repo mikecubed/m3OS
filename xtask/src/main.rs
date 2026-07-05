@@ -15855,13 +15855,19 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs, part: bool) {
         // installer or the (fixed) BOT transport-fail cascade. See
         // docs/handoffs/2026-07-03-phase-106-usb-installer-nvme.md.
         let clean = strip_ansi(&hist1);
-        if clean.contains("STRANDED(BlockedOnReply") || clean.contains("(no waker registered)") {
+        if clean.contains("STRANDED-NO-HOLDER")
+            || clean.contains("STRANDED-SERVER-STUCK")
+            || clean.contains("STRANDED(BlockedOnReply")
+            || clean.contains("(no waker registered)")
+        {
             eprintln!(
-                "*** KNOWN-FLAKE: Phase 106 Bug 2 — scheduler/IPC lost-wakeup \
-                 (BlockedOnReply stranded, no reply delivered) under the populate's \
-                 heavy multi-core block-IPC load. This is NOT the installer and NOT \
-                 the fixed BOT transport-fail cascade (zero transport-fail lines this \
-                 run). It is the pre-existing 57e preempt-full hang class. ***"
+                "*** KNOWN-FLAKE: Phase 106 Bug 2 — a task stranded in \
+                 BlockedOnReply with no reply ever delivered under heavy \
+                 multi-core IPC load. This is NOT the installer and NOT the \
+                 fixed BOT transport-fail cascade (zero transport-fail lines \
+                 this run). See the `[replystall]` lines' holder_pid / verdict \
+                 (STRANDED-NO-HOLDER = cleanup gap; STRANDED-SERVER-STUCK = \
+                 dependency deadlock) and the handoff's Bug 2 section. ***"
             );
         }
         fail(&format!("boot 1 (install): {msg}"));
