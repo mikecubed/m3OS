@@ -557,6 +557,24 @@ pub fn recv_msg_with_notif(
     use super::notification;
     use kernel_core::ipc::wake_kind::{RECV_KIND_MESSAGE, RECV_KIND_NOTIFICATION, classify_recv};
 
+    // Phase 106 Bug 2 — drain an already-delivered message FIRST, before the
+    // notification fast-path below and before servicing a queued sender. A prior
+    // recv can return a NOTIFICATION while a request is still sitting in
+    // `pending_msg` (the fast-path at the next lines, the `register_recv_waiter`
+    // early return, and the None-arm notif return all skip `pending_msg`). On the
+    // next recv entry, if a sender is queued, the `Some`-arm delivers on top of
+    // that leftover (`deliver_message` at ~line 640) and **overwrites** it —
+    // orphaning the leftover request's reply cap and deadlocking its caller (the
+    // intermittent installer→usb-storage→xhci strand: xhci idle in recv holding
+    // an unanswered `Reply` cap). `recv` must always surface a pending message
+    // before anything else; the reply-cap handle rides in the message (`data[3]`)
+    // so it is preserved. A pending notification is not lost — it stays set and
+    // is returned on the next recv (and the driver's Message arm drains the event
+    // ring regardless).
+    if let Some(msg) = scheduler::take_message(receiver) {
+        return (RECV_KIND_MESSAGE, msg);
+    }
+
     let bits = notification::drain_bits(notif_id);
     if classify_recv(bits) == RECV_KIND_NOTIFICATION {
         let mut msg = Message::new(0);
@@ -675,6 +693,22 @@ pub fn recv_msg_with_notif(
             notification::unregister_recv_waiter(notif_id, receiver);
 
             if let Some(msg) = scheduler::take_message(receiver) {
+                // Phase 106 Bug 2 — remove ourselves from the receiver queue,
+                // symmetric with every OTHER return path (the notif returns
+                // above/below all `retain`). We reach here woken by a message;
+                // if that wake came from `block_current_on_notif_v2`'s
+                // `has_pending_message` self-revert rather than a `call_msg`
+                // pop, we are STILL enqueued in `ep.receivers`. Leaving a stale
+                // entry lets a later `call_msg` pop-and-deliver a SECOND message
+                // on top of this one — `deliver_message` overwrites the unconsumed
+                // `pending_msg` and orphans its reply cap, deadlocking the caller
+                // (the intermittent installer→usb-storage→xhci strand).
+                {
+                    let mut reg = ENDPOINTS.lock();
+                    if let Some(ep) = reg.get_mut(ep_id) {
+                        ep.receivers.retain(|&r| r != receiver);
+                    }
+                }
                 return (RECV_KIND_MESSAGE, msg);
             }
 

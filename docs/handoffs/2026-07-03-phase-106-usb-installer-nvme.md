@@ -273,23 +273,42 @@ service-manager `xhci` instance (config-space scans only, never claims —
 it before any BOT traffic), and the Track D changes themselves (the
 failing raw-arm data path is byte-identical to C.3's).
 
-**"Bug 2" — TWO SMP STALE-WAKE RACES FIXED (strand ~1/4 → ~1/19 under load);
-a rare residual remains (2026-07-05).** Branch
-`investigate/phase-106-bug2-lost-wakeup`. The bug is **not** in USB/xhci/storage
-and **not** an `ep.senders` lost-wake (an interim `ep.senders` BSP backstop was
-written, disproven by ground-truth, and **reverted** — see "false trails"). It
-is a **stale-wake race**: under `-smp 4`, a `deliver_message` + plain
-`wake_task_v2` pair are two separate `scheduler_lock` sections, so the target
-task can run on another core, consume the delivered message, and re-block on its
-*next* IPC between them; the delayed state-only `wake_task_v2` then CASes that
-unrelated re-block `Blocked* → Ready` without setting its `woken` flag, and
-`block_current_until` resumes it with a bogus outcome (dropping the request/
-reply). Two instances of this class were found and fixed — the **reply path**
-(`reply()`, the loud one: `reply_v2:deadline_expired_no_deadline`) and the
-**request-delivery path** (the `call`/`send` hand-offs, the quiet one that leaves
-a server idle in recv holding an unanswered `Reply` cap). A rarer third residual
-(~1/19, no instrumentation fires) survives — same terminal state, different
-uninstrumented trigger; see "residual" below.
+**"Bug 2" — FULLY RESOLVED (strand ~1/4 → 0; three distinct IPC races fixed)
+(2026-07-05).** Branch `investigate/phase-106-bug2-lost-wakeup` → PR #305. The
+bug is **not** in USB/xhci/storage and **not** an `ep.senders` lost-wake (an
+interim `ep.senders` BSP backstop was written, disproven by ground-truth, and
+**reverted** — see "false trails"). Three distinct core-IPC races in the same
+install strand were found and fixed:
+
+- **(A) stale-wake in `deliver_message` + plain `wake_task_v2`.** The pair are
+  two separate `scheduler_lock` sections, so under `-smp 4` the target can run on
+  another core, consume the delivered message, and re-block on its *next* IPC
+  between them; the delayed state-only `wake_task_v2` then CASes that unrelated
+  re-block `Blocked* → Ready` without setting its `woken` flag, and
+  `block_current_until` returns a bogus `DeadlineExpired` (dropping the request/
+  reply). Two instances — the **reply path** (`reply()`, loud:
+  `reply_v2:deadline_expired_no_deadline`) and the **request-delivery** `call`/
+  `send` hand-offs (quiet). Fixed by gating all six real-message deliver+wake
+  sites with `wake_task_v2_if(x, |t| t.pending_msg.is_some())`.
+- **(B) stale `ep.receivers` entry → double-delivery overwrite (the ~1/19
+  residual).** `recv_msg_with_notif`'s message-return-after-block path returned
+  `RECV_KIND_MESSAGE` **without** the `ep.receivers.retain(remove)` that every
+  other return path performs. When woken by a message via
+  `block_current_on_notif_v2`'s `has_pending_message` self-revert (not a
+  `call_msg` pop), the server stayed enqueued in `ep.receivers`; a later
+  `call_msg` popped it again and `deliver_message` **overwrote** the unconsumed
+  `pending_msg`, orphaning the first request's reply cap → xhci idle in recv
+  holding an unanswered `Reply` cap. Pinned with a `#[track_caller]`
+  `deliver_message`-overwrite probe (caller = `endpoint.rs:632` Some-arm, then
+  `:1112` call_msg after a partial fix). Fixed by (1) draining `pending_msg`
+  first at the top of `recv_msg_with_notif`, and (2) adding the missing
+  `retain(remove)` to the message-return-after-block path.
+- **(C) copy-to-user failure orphaning the cap (defensive).** `ipc_recv_msg`
+  dequeues the message *before* the userspace copy, so a rare header/bulk
+  copy-to-user failure (OOM / demand-fault) dropped the message with its reply
+  cap still held. Hardened to **re-pend** the message (and bulk) before the
+  `u64::MAX` return so the driver re-loops cleanly. (Unconfirmed in the wild —
+  belt-and-suspenders alongside (B).)
 
 *Ground truth (the two decisive diagnostics — keep both).*
 1. `[replystall]` (`kernel/src/task/scheduler.rs reply_stall_scan`) reports,
@@ -385,34 +404,29 @@ the five send / `call`-hand-off deliveries. The `complete_send`+wake sender-wake
 
 *Repro + validation.* Intermittent under CPU+IO load: 4 CPU spinners + a `dd`
 loop, then `M3OS_SMOKE_SERIAL_DUMP=1 cargo xtask nvme-install-part-smoke
---timeout 300` in a loop, grepping the boot-1 serial for `STRANDED-`. Rates
-under that load: **pre-fix ~1/4** (strand on run 4, twice); **`reply()`-guard
-only ~1/7** (the `reply_v2` warnings *and* the usb-storage transport-fail/
-BOT-recovery churn — a manifestation of the reply-path race — vanished, but a
-warning-free strand at the same terminal state remained); **all-6-site guard
-~1/19** (18/19 clean; run 19 stranded, again warning-free). Across the 6-site
-validation the `reply_v2:deadline_expired_no_deadline` /
-`wake_task_v2 on BlockedOnReply … has_pending_msg=false` warnings were **0/19**
-— direct confirmation both fixed races are closed. `cargo xtask check` is green.
-The pre-push `run_qemu_gate_retry_once` guard retries each NVMe/install gate
-once, so at ~1/19 the effective flake is ~1/360 and does not block pushes.
+--timeout 300` in a loop, grepping the boot-1 serial for `STRANDED-`. Strand
+rate as each race was closed: **pre-fix ~1/4** → **`reply()`-guard only ~1/7**
+→ **all-6 deliver+wake guards ~1/19** (race A closed: the
+`reply_v2:deadline_expired_no_deadline` / `wake_task_v2 on BlockedOnReply …
+has_pending_msg=false` warnings went to 0) → **+ the recv fix (B) 0/25**, with a
+`#[track_caller]` `deliver_message`-overwrite probe silent across all 25 runs
+(direct confirmation the double-delivery is gone) → **+ copy-fault hardening (C),
+probes removed 0/20**. Notably, once (B) landed the usb-storage
+transport-fail/BOT-recovery churn **disappeared entirely** across all runs — the
+IPC race had been corrupting the transfers themselves, so fixing it removed the
+whole cascade, not just the terminal strand. `cargo xtask check` green; pre-push
+smoke-test (`ipc-wake`) + regression pass. The `run_qemu_gate_retry_once` guard
+stays as belt-and-suspenders.
 
-*The residual (~1/19 — recommended next step).* Same terminal state
-(usb-storage `BlockedOnReply` → xhci idle in recv holding one unconsumed
-`Reply(usb-storage)` cap), but **no** `reply_v2` warning and **no**
-`spurious block wake` warning fires, so it is neither of the two fixed
-stale-wake sites nor a bogus `block_current_until:3843` `DeadlineExpired` (the
-notif recv path ignores that outcome and re-checks `pending_msg`, so it is
-robust to it). It correlates with the Bug 1 BOT-recovery churn (run 19 had
-transport-fails; run-6-class residuals had none — likely two sub-cases). Next
-step: extend `[replystall]` to dump the stuck holder's **owned-endpoint state**
-(`ep.senders`/`ep.receivers` lengths, whether the holder is in its own receiver
-queue, and the reply cap's exact insertion path) — but that read must be done
-**without** taking `ENDPOINTS` under `SCHEDULER` (lock-order: `ENDPOINTS`→
-`SCHEDULER` is the established order; collect endpoint state in a separate pass).
-That will disambiguate whether the request was received-but-dropped in the recv
-`Some`-arm (`take_message` returning `None` after a racing consume → `u64::MAX` →
-serve-loop re-loop without reply, leaking the cap) vs. a fourth wake path.
+*Diagnostics retained; probes removed.* The durable `[replystall]` diagnostic
+(now with `holder_name` + `holder_reply_caps`) stays. The three **temporary**
+probes used to pin race (B) — the `#[track_caller]` `deliver_message`-overwrite
+warning, and the recv `Some`-arm orphan warning — were **removed** after the fix
+validated. `holder_name=fork-child` is a stale post-`exec` task name (pid 4 =
+`/drivers/xhci`, pid 5 = `/drivers/usb-storage`); a cosmetic follow-up is to set
+the task name on `exec`. The same copy-fault gap (C) exists in the sibling
+`ipc_recv_msg_timeout` / `ipc_try_recv_msg` recv variants — a low-priority
+follow-up to mirror the re-pend there.
 
 **Known pre-existing (NOT fixed):** `usb-storage-dual-smoke` fails identically on
 `main` — times out waiting for `mass-storage devices — multi-device mode`.
