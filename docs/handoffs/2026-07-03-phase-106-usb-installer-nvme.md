@@ -1,10 +1,11 @@
 # Handoff — Phase 106: USB Installer & NVMe Install
 
 **Date:** 2026-07-05 (living doc — update on every session working this phase)
-**Branch:** `fix/phase-106-bug2-followups` (off `main`) — the active feature
-branch (Bug 2 follow-up cleanups). All Phase 106 tracks A–D merged (PRs
-#294–#306).
-**State:** IN PROGRESS.
+**Branch:** none — no active feature branch. All Phase 106 in-repo work is
+merged to `main` (PRs #294–#307; the Bug 2 follow-ups + dual-smoke fix landed
+as PR #307, squash `10b958fb`).
+**State:** IN PROGRESS — **Track E bare-metal sign-off is the only open item**
+(operator-owned; needs physical Dell access).
 - **Track A (M1)** ✅ merged — PR #294 (`40a9e685`). Combined GPT(ESP+ext2)
   USB image + USB-ext2 root bootstrap. `usb-root-smoke` green.
 - **Track B (M2)** ✅ merged — PR #295 (`9510a0a1`). NVMe root boot +
@@ -277,7 +278,7 @@ failing raw-arm data path is byte-identical to C.3's).
 **"Bug 2" — FULLY RESOLVED and MERGED to `main` (strand ~1/4 → 0; three
 distinct IPC races fixed) (2026-07-05).** PR #305 (squash-merged as `25261a1a`;
 branch `investigate/phase-106-bug2-lost-wakeup` deleted). Follow-up cleanups
-✅ **done on `fix/phase-106-bug2-followups`** (2026-07-05): the
+✅ **merged to `main`** (2026-07-05, PR #307 squash `10b958fb`): the
 `run_qemu_gate_retry_once` pre-push guard (all four uses) and the
 `KNOWN-FLAKE: Phase 106 Bug 2` boot-serial banner are removed; the task name
 is now set on `exec` (`intern_task_name` + `set_current_task_name`, so
@@ -652,9 +653,9 @@ first-boot disk), and QEMU auto-inserts a USB hub in the 5-device topology
    literal serial-autologin marker to strip — the serial image boots to an
    interactive `login`; D.2's substance was replacing the well-known seeded
    `root:root`/`user:user` credentials, which first-user mode never copies.)
-5. ~~Bug 2 follow-up cleanups~~ ✅ on `fix/phase-106-bug2-followups` (PR #307):
-   retry guard + KNOWN-FLAKE banner removed, task name set on exec,
-   copy-fault re-pend mirrored into the sibling recv variants.
+5. ~~Bug 2 follow-up cleanups~~ ✅ merged (PR #307, `10b958fb`): retry guard +
+   KNOWN-FLAKE banner removed, task name set on exec, copy-fault re-pend
+   mirrored into the sibling recv variants.
 6. ~~**`usb-storage-dual-smoke` pre-existing failure**~~ ✅ root-caused and
    fixed (same session; see the ROOT-CAUSED section above): reader-side
    UTF-8 carry so serial chunks never split a multi-byte char, plus the
