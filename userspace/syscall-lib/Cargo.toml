@@ -4,4 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [features]
+# `alloc` gates only `heap` (BrkAllocator) — a GlobalAlloc *impl*, no
+# alloc-crate usage — so a consumer that enables it without a global allocator
+# still links (feature unification stays harmless across the combined clippy).
 alloc = []
+# `argon2` gates the argon2id/BLAKE2b password hash, which *uses* the alloc
+# crate (a heap memory matrix); a consumer enabling it MUST provide a
+# `#[global_allocator]`. Kept separate from `alloc` so `edit`/`init`/etc.
+# (allocator-carrying but argon2-free) don't drag alloc-crate usage into the
+# allocator-less binaries via unification.
+argon2 = ["alloc"]

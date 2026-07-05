@@ -25,5 +25,7 @@ path = "host-tests/passwd_host.rs"
 required-features = ["host-tests"]
 
 [dependencies]
-syscall-lib = { path = "../syscall-lib" }
+# `alloc` for the argon2id password hash (Phase 110 Track C) — needs a heap
+# matrix, so the passwd binary carries a `BrkAllocator`.
+syscall-lib = { path = "../syscall-lib", features = ["argon2"] }
 shadow = { path = "../lib/shadow" }

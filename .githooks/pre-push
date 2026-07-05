@@ -376,6 +376,19 @@ if [ "${M3OS_MITIGATIONS_REGRESSION:-0}" = "1" ]; then
     cargo xtask mitigations-status-smoke --timeout 150
 fi
 
+# Phase 110 Track C — argon2id password hashing gate. Gated behind
+# M3OS_ARGON2_REGRESSION=1 because it boots the OS: it logs in as the
+# argon2id-seeded root, plants a legacy `$sha256i$` user, and drives a fresh
+# `login` that must authenticate the legacy entry via the fallback verify arm
+# and transparently re-hash it to `$argon2id$` on disk. Set on branches
+# touching the argon2id/blake2b modules, verify_password, passwd/adduser/login/
+# su, or generate_seeded_shadow_line. (The RFC 9106 vector + format round-trips
+# are always-on host tests in `cargo xtask check` via crypto-lib.)
+if [ "${M3OS_ARGON2_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask argon2-smoke..."
+    cargo xtask argon2-smoke --timeout 240
+fi
+
 # Phase 107 — networked + signed package distribution. Gated behind
 # M3OS_PKG_NET_REGRESSION=1 because it boots QEMU against a host-served
 # SLIRP HTTP repo and asserts the full trust pipeline: ed25519 index

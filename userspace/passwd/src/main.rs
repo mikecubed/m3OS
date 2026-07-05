@@ -3,15 +3,29 @@
 //! Only root can change passwords (non-root support requires setuid-bit, deferred).
 #![no_std]
 #![no_main]
+#![feature(alloc_error_handler)]
 
+extern crate alloc;
+
+use core::alloc::Layout;
 use passwd::{
-    HASH_ROUNDS, ShadowRewriteError, build_hash_field, find_username_by_uid, requested_username,
-    rewrite_shadow_file, user_exists,
+    ShadowRewriteError, find_username_by_uid, requested_username, rewrite_shadow_file, user_exists,
 };
 use shadow::{ShadowError, shadow_write_atomic};
+use syscall_lib::argon2::{DEFAULT_PARAMS, build_shadow_field};
+use syscall_lib::heap::BrkAllocator;
 use syscall_lib::{
     O_RDONLY, STDOUT_FILENO, close, geteuid, getrandom, getuid, open, read, write, write_str,
 };
+
+#[global_allocator]
+static ALLOCATOR: BrkAllocator = BrkAllocator::new();
+
+#[alloc_error_handler]
+fn alloc_error(_layout: Layout) -> ! {
+    write_str(STDOUT_FILENO, "passwd: alloc error\n");
+    syscall_lib::exit(1)
+}
 
 const SHADOW_PATH: &[u8] = b"/etc/shadow\0";
 const SHADOW_PATH_STR: &str = "/etc/shadow";
@@ -78,27 +92,22 @@ fn passwd_main(args: &[&str]) -> i32 {
         return 1;
     }
 
-    // Generate new hash with random salt and iterated SHA-256.
+    // Generate the new hash with a random salt using argon2id (Phase 110).
     let mut salt = [0u8; 16];
     if getrandom(&mut salt) != 16 {
         write_str(STDOUT_FILENO, "passwd: failed to generate random salt\n");
         return 1;
     }
-    let hash =
-        syscall_lib::sha256::hash_password_iterated(&new_input[..new_len], &salt, HASH_ROUNDS);
-    let mut salt_hex = [0u8; 64];
-    let salt_hex_len = syscall_lib::sha256::to_hex(&salt, &mut salt_hex);
-    let mut hash_hex = [0u8; 64];
-    let hash_hex_len = syscall_lib::sha256::to_hex(&hash, &mut hash_hex);
-    let mut hash_field = [0u8; 128];
-    let hash_field_len = match build_hash_field(
-        &salt_hex[..salt_hex_len],
-        &hash_hex[..hash_hex_len],
+    let mut hash_field = [0u8; 200];
+    let hash_field_len = match build_shadow_field(
+        &new_input[..new_len],
+        &salt,
+        &DEFAULT_PARAMS,
         &mut hash_field,
     ) {
         Some(len) => len,
         None => {
-            write_str(STDOUT_FILENO, "passwd: updated hash is too large\n");
+            write_str(STDOUT_FILENO, "passwd: failed to hash password\n");
             return 1;
         }
     };
@@ -168,7 +177,7 @@ fn passwd_main(args: &[&str]) -> i32 {
     write_str(STDOUT_FILENO, "passwd: password updated successfully\n");
     write_str(
         STDOUT_FILENO,
-        "[security] getrandom salt + iterated SHA-256 hash written\n",
+        "[security] getrandom salt + argon2id hash written\n",
     );
     0
 }

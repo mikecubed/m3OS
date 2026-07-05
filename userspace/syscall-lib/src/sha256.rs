@@ -213,12 +213,21 @@ fn parse_u32_bytes(s: &[u8]) -> u32 {
 
 /// Verify a password against a shadow entry.
 ///
-/// Supports two formats:
-/// - Legacy: `$sha256$<hex_salt>$<hex_hash>`
+/// Supports, in dispatch order:
+/// - Argon2id (Phase 110): `$argon2id$v=19$m=…,t=…,p=…$<hex_salt>$<hex_hash>`
+///   (only when the `alloc` feature is enabled — argon2id needs a heap matrix).
 /// - Iterated: `$sha256i$<rounds>$<hex_salt>$<hex_hash>`
+/// - Legacy: `$sha256$<hex_salt>$<hex_hash>`
 ///
+/// The `$sha256i$` / `$sha256$` arms are the **fallback read path**: pre-Phase-110
+/// entries and seeded images keep authenticating (new writes emit `$argon2id$`,
+/// and a successful legacy login re-hashes to argon2id — see the login/su hook).
 /// Uses constant-time comparison to prevent timing attacks.
 pub fn verify_password(password: &[u8], shadow_entry: &[u8]) -> bool {
+    #[cfg(feature = "argon2")]
+    if shadow_entry.starts_with(crate::argon2::SHADOW_PREFIX) {
+        return crate::argon2::verify_shadow_field(password, shadow_entry);
+    }
     if shadow_entry.starts_with(b"$sha256i$") {
         // Iterated format: $sha256i$<rounds>$<hex_salt>$<hex_hash>
         let rest = &shadow_entry[9..]; // skip "$sha256i$"

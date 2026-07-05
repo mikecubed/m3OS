@@ -1,11 +1,28 @@
 //! m3OS su — switch user (Phase 27).
 #![no_std]
 #![no_main]
+#![feature(alloc_error_handler)]
 
+extern crate alloc;
+
+use core::alloc::Layout;
+use syscall_lib::heap::BrkAllocator;
 use syscall_lib::{
     O_RDONLY, STDOUT_FILENO, close, execve, exit, open, read, setgid, setuid, write, write_str,
     write_u64,
 };
+
+// Phase 110 — `verify_password`'s `$argon2id$` arm is `alloc`-gated (argon2id
+// needs a heap matrix). Without this allocator + the `alloc` feature, that arm
+// compiles out and every argon2id user would fail authentication under `su`.
+#[global_allocator]
+static ALLOCATOR: BrkAllocator = BrkAllocator::new();
+
+#[alloc_error_handler]
+fn alloc_error(_layout: Layout) -> ! {
+    write_str(STDOUT_FILENO, "su: alloc error\n");
+    exit(1)
+}
 
 syscall_lib::entry_point!(su_main);
 

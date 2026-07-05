@@ -39,7 +39,6 @@ dependencies = [
 name = "adduser"
 version = "0.99.0"
 dependencies = [
- "passwd",
  "shadow",
  "syscall-lib",
 ]
@@ -3033,7 +3032,6 @@ dependencies = [
  "crypto-lib",
  "fatfs",
  "gpt",
- "passwd",
  "pkg-format",
  "serde_json",
  "sha2",

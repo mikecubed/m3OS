@@ -11,7 +11,7 @@
 |---|---|---|---|
 | A | Activate + bare-metal-validate KPTI (PML4 pair, CR3 trampoline, `KPTI_WIRED`, PCID, Meltdown PoC) | Phase 84 ✅, Phase 99 ✅ | Planned |
 | B | Userspace ASLR + stack canaries + CET shadow stacks | Phase 86a ✅, A (shares the mm/exec path) | Planned |
-| C | argon2id password hashing migration (fallback read path + re-hash) | Phase 48 ✅ | Planned |
+| C | argon2id password hashing migration (fallback read path + re-hash) | Phase 48 ✅ | ✅ **Landed** — RFC 9106 argon2id (+ BLAKE2b) host-tested; passwd/adduser/login write argon2id; verify_password fallback + login re-hash; seeded images argon2id; `argon2-smoke` PASS |
 | D | Secure Boot on-metal validation + Phase 59 Track J / Phase 10 C.3 closeout | Phase 10 ✅, A (validated boot platform) | Planned |
 
 ---
@@ -137,56 +137,45 @@
 
 ## Track C — argon2id Password Hashing
 
-### C.1 — argon2id implementation + host tests
+### C.1 — argon2id implementation + host tests ✅
 
-**File:** new: `userspace/crypto-lib/src/argon2.rs` (+ `userspace/crypto-lib/src/lib.rs` export)
-**Symbol:** `argon2id_hash`, `argon2id_verify`
-**Why it matters:** Iterated SHA-256 has no memory-hardness; a stolen `/etc/shadow` is cheap to crack on GPU/ASIC. argon2id (RFC 9106) is the modern memory-hard, side-channel-resistant answer. Must be `no_std` and host-testable.
-
-**Acceptance:**
-- [ ] `argon2id_hash`/`argon2id_verify` implement RFC 9106 argon2id with fixed conservative `m`/`t`/`p` parameters.
-- [ ] Host tests in `crypto-lib` pass against the RFC 9106 reference test vectors (added to `cargo xtask check`).
-- [ ] Verify uses constant-time comparison (no early-out on mismatch).
-
-### C.2 — `$argon2id$` shadow prefix + `verify_password` fallback arm
-
-**File:** `userspace/syscall-lib/src/sha256.rs`
-**Symbol:** `verify_password`
-**Why it matters:** `verify_password` currently dispatches on `$sha256i$` / legacy `$sha256$`. An `$argon2id$` arm must be added **ahead** of those, while the existing arms stay verbatim so seeded images and every pre-migration entry keep authenticating (the fallback read path).
+**Landed as:** `userspace/syscall-lib/src/argon2.rs` + `userspace/syscall-lib/src/blake2b.rs`, re-exported by `userspace/crypto-lib/src/argon2.rs`.
+**Symbol:** `argon2id_hash`, `argon2id_verify`, `argon2id_raw` (+ `Blake2b`)
+**Deviation (intentional):** the charter located this in `crypto-lib`, but `crypto-lib` depends on `syscall-lib` (for `getrandom`), so `verify_password` (in `syscall-lib`) can't call *up* into `crypto-lib` without a dependency cycle. The impl lives in `syscall-lib` (no new deps — BLAKE2b is dependency-free) and `crypto-lib` re-exports it, giving the charter's `crypto_lib::argon2::*` API and running the RFC vector in the merge gate.
 
 **Acceptance:**
-- [ ] `verify_password` accepts `$argon2id$v=19$m=…,t=…,p=…$<salt>$<hash>` via `crypto-lib::argon2id_verify`.
-- [ ] A pre-existing `$sha256i$10000$…` entry and a legacy `$sha256$…` entry still verify (the existing arms are unchanged; host tests assert all three formats).
-- [ ] A malformed `$argon2id$` field returns `false` (fail-closed), not a panic.
+- [x] `argon2id_hash`/`argon2id_verify` implement RFC 9106 argon2id; `DEFAULT_PARAMS` = 4 MiB / t=3 / p=1 (conservative, ~6 ms native).
+- [x] Host tests pass against the RFC 9106 §5.3 reference vector (`crypto-lib`'s `argon2id_rfc9106_vector`, in `cargo xtask check`) + the RFC 7693 BLAKE2b Appendix A vectors.
+- [x] Verify uses constant-time comparison (`ct_eq`, no early-out).
 
-### C.3 — New writes use argon2id + transparent re-hash on legacy login
+### C.2 — `$argon2id$` shadow prefix + `verify_password` fallback arm ✅
 
-**Files:**
-- `userspace/passwd/src/lib.rs` (`HASH_FORMAT_PREFIX`, `build_hash_field`)
-- `userspace/passwd/src/main.rs`, `userspace/adduser` (write path)
-- `userspace/lib/shadow/src/lib.rs` (atomic write — reused unchanged)
-
-**Symbol:** `HASH_FORMAT_PREFIX`, `build_hash_field`, the login re-hash hook
-**Why it matters:** `passwd`/`adduser` must emit the new format, and a successful login against an old-format entry should upgrade it in place so the population migrates without an admin sweep — using the existing atomic `shadow_write_atomic` so a torn write never corrupts `/etc/shadow`.
+**File:** `userspace/syscall-lib/src/sha256.rs` (dispatch) + `userspace/syscall-lib/src/argon2.rs` (format).
+**Symbol:** `verify_password`, `argon2::verify_shadow_field`
 
 **Acceptance:**
-- [ ] `HASH_FORMAT_PREFIX` / `build_hash_field` emit `$argon2id$…`; new `passwd` and `adduser` writes use argon2id exclusively.
-- [ ] On a successful login/`su` against a `$sha256i$`/`$sha256$` entry, the shadow line is re-hashed to argon2id via `shadow::shadow_write_atomic` (atomic; original preserved on any write failure).
-- [ ] Existing `passwd`/`shadow` host tests pass (the rewrite/atomic-write state machines are unchanged).
+- [x] `verify_password` accepts `$argon2id$v=19$m=…,t=…,p=…$<hex_salt>$<hex_hash>` via the local `argon2::verify_shadow_field` (alloc-gated — argon2id needs a heap matrix; parses cost params from the stored entry). Hex (not PHC base64) matches the existing shadow convention.
+- [x] The pre-existing `$sha256i$10000$…` and legacy `$sha256$…` arms are unchanged and still verify (the fallback read path; host tests assert all three).
+- [x] A malformed `$argon2id$` field returns `false` (fail-closed) — `verify_shadow_field_fails_closed_on_malformed` covers wrong version, missing param, non-hex, over-cap memory, wrong prefix.
 
-### C.4 — Update the seeded-shadow regenerator + argon2-smoke
+### C.3 — New writes use argon2id + transparent re-hash on legacy login ✅
 
-**Files:**
-- `xtask/src/main.rs` (`generate_seeded_shadow_line`)
-- new: `cmd_argon2_smoke` in `xtask/src/main.rs`
-
-**Symbol:** `generate_seeded_shadow_line`, `cmd_argon2_smoke`
-**Why it matters:** The host-side regenerator must match the in-guest format byte-for-byte (it currently mirrors `$sha256i$`), or seeded images and the running OS diverge. The gate proves the migration end-to-end.
+**Files:** `userspace/passwd/src/main.rs`, `userspace/adduser/src/main.rs` (write path), `userspace/login/src/main.rs` (re-hash + set-initial-password).
+**Deviations (intentional):** (a) the passwd-lib `HASH_FORMAT_PREFIX`/`build_hash_field` (the `$sha256i$` builders) are **left in place** as the legacy-format reference; the binaries now call `argon2::build_shadow_field` directly instead. (b) the re-hash lives in **`login`** (which runs as root) via login's existing non-atomic shadow-write path — **`su` does not re-hash** because when `su` requires a password the caller is not yet root and cannot write `/etc/shadow` (`su` only gains the alloc-gated argon2id *verify* arm).
 
 **Acceptance:**
-- [ ] `generate_seeded_shadow_line` emits `$argon2id$…` matching `crypto-lib::argon2id_hash` byte-for-byte (host test asserts parity).
-- [ ] `argon2-smoke` (new, CI-able): boots, logs in against an argon2id-seeded user, logs in against a `$sha256i$`-seeded user, and asserts the legacy user's shadow line was re-hashed to `$argon2id$` after login.
-- [ ] `M3OS_ARGON2_REGRESSION` row added to the `AGENTS.md` gate table (per the Phase 98 Track D slimmed format).
+- [x] New `passwd`/`adduser` writes use argon2id exclusively (`build_shadow_field` + `DEFAULT_PARAMS`); all four auth binaries carry a `BrkAllocator` (`needs_alloc`).
+- [x] A successful **login** against a `$sha256i$`/`$sha256$` entry re-hashes the shadow line to argon2id in place (best-effort; sentinel `[security] rehashed login password to argon2id`; `argon2-smoke` asserts the on-disk `$argon2id$` result).
+- [x] Existing `passwd`/`shadow` host tests pass (`rewrite_shadow_file`/atomic-write state machines untouched).
+
+### C.4 — Update the seeded-shadow regenerator + argon2-smoke ✅
+
+**Files:** `xtask/src/main.rs` (`generate_seeded_shadow_line`, `legacy_sha256i_shadow_field`, `cmd_argon2_smoke`).
+
+**Acceptance:**
+- [x] `generate_seeded_shadow_line` emits `$argon2id$…` through the **same** `crypto_lib::argon2::build_shadow_field` the in-guest binaries use — byte-for-byte parity by construction, not just a matching host test.
+- [x] `argon2-smoke` (CI-able, `M3OS_ARGON2_REGRESSION=1`): logs in as the argon2id-seeded root, plants a `$sha256i$` legacy user, drives a fresh `login` that fallback-verifies + re-hashes it, and confirms the on-disk `$argon2id$` result. **PASS (30 steps, ~36 s locally.)** The always-on `security-floor` regression step also now asserts `$argon2id$` in `/etc/shadow`.
+- [x] `M3OS_ARGON2_REGRESSION` row added to the `AGENTS.md` gate table.
 
 ---
 

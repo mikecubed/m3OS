@@ -11,6 +11,10 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+// Phase 110 Track C — argon2id (RFC 9106) re-exported from `syscall-lib`
+// (see the module doc for why the impl lives there, not here). Needs `alloc`.
+#[cfg(feature = "alloc")]
+pub mod argon2;
 pub mod asymmetric;
 pub mod hash;
 pub mod random;
