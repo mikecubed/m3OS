@@ -1,10 +1,11 @@
 # Handoff — Phase 106: USB Installer & NVMe Install
 
 **Date:** 2026-07-05 (living doc — update on every session working this phase)
-**Branch:** `fix/phase-106-bug2-followups` (off `main`) — the active feature
-branch (Bug 2 follow-up cleanups). All Phase 106 tracks A–D merged (PRs
-#294–#306).
-**State:** IN PROGRESS.
+**Branch:** none — no active feature branch. All Phase 106 in-repo work is
+merged to `main` (PRs #294–#307; the Bug 2 follow-ups + dual-smoke fix landed
+as PR #307, squash `10b958fb`).
+**State:** IN PROGRESS — **Track E bare-metal sign-off is the only open item**
+(operator-owned; needs physical Dell access).
 - **Track A (M1)** ✅ merged — PR #294 (`40a9e685`). Combined GPT(ESP+ext2)
   USB image + USB-ext2 root bootstrap. `usb-root-smoke` green.
 - **Track B (M2)** ✅ merged — PR #295 (`9510a0a1`). NVMe root boot +
@@ -277,7 +278,7 @@ failing raw-arm data path is byte-identical to C.3's).
 **"Bug 2" — FULLY RESOLVED and MERGED to `main` (strand ~1/4 → 0; three
 distinct IPC races fixed) (2026-07-05).** PR #305 (squash-merged as `25261a1a`;
 branch `investigate/phase-106-bug2-lost-wakeup` deleted). Follow-up cleanups
-✅ **done on `fix/phase-106-bug2-followups`** (2026-07-05): the
+✅ **merged to `main`** (2026-07-05, PR #307 squash `10b958fb`): the
 `run_qemu_gate_retry_once` pre-push guard (all four uses) and the
 `KNOWN-FLAKE: Phase 106 Bug 2` boot-serial banner are removed; the task name
 is now set on `exec` (`intern_task_name` + `set_current_task_name`, so
@@ -652,12 +653,54 @@ first-boot disk), and QEMU auto-inserts a USB hub in the 5-device topology
    literal serial-autologin marker to strip — the serial image boots to an
    interactive `login`; D.2's substance was replacing the well-known seeded
    `root:root`/`user:user` credentials, which first-user mode never copies.)
-5. ~~Bug 2 follow-up cleanups~~ ✅ on `fix/phase-106-bug2-followups` (PR #307):
-   retry guard + KNOWN-FLAKE banner removed, task name set on exec,
-   copy-fault re-pend mirrored into the sibling recv variants.
+5. ~~Bug 2 follow-up cleanups~~ ✅ merged (PR #307, `10b958fb`): retry guard +
+   KNOWN-FLAKE banner removed, task name set on exec, copy-fault re-pend
+   mirrored into the sibling recv variants.
 6. ~~**`usb-storage-dual-smoke` pre-existing failure**~~ ✅ root-caused and
    fixed (same session; see the ROOT-CAUSED section above): reader-side
    UTF-8 carry so serial chunks never split a multi-byte char, plus the
    role-gated `usb-hid` bind log.
 7. **Track E** bare-metal M1/M3 on the Dell (operator-owned) — the only
    remaining Phase 106 work.
+
+---
+
+## What comes next (beyond Phase 106)
+
+Phase 106's in-repo work is complete; everything below is the road ahead as
+of 2026-07-05, per the roadmap sequencing `106 → 107 → 108/109/110` (+ 111
+appended). See `docs/roadmap/README.md` for the authoritative table.
+
+**Operator-owned near-term (needs the human, not a coding session):**
+
+- **Phase 106 Track E** — bare-metal M1/M3 on the Dell: USB boot → writable
+  ext2 root; installer writes the internal NVMe; reboot into the installed
+  system as the created first user. Protocol: `docs/appendix/bare-metal-validation.md`;
+  session prep: `docs/handoffs/next-dell-session.md`. Record
+  `Validated-on-HW (run N, date)` in the tasks doc (E.3).
+- **Phase 107 finish** — Tracks A–D are already landed and green (107 ran
+  *ahead* of 106; `pkg-net-smoke` passes). Remaining: the owner creates the
+  public `m3os-pkgs` GitHub repo + CI signing secret, then flips on the
+  opt-in live-HTTPS arm. Runbook: `docs/appendix/m3os-pkgs/`.
+- **Dell-live residual arms** parked across earlier phases: 103 (battery/
+  backlight/HWP-MSR on metal; GPE re-arm + S0ix residuals), 105 D.5
+  (toolkit/settings on metal).
+
+**Next off-hardware engineering (what a session without the Dell can build):**
+
+- **Phase 110 software arms** — activate KPTI (Phase 84 scaffolding exists,
+  never turned on), ASLR + stack canaries, argon2id password hashing. All
+  QEMU-gateable now; only the "on metal" validation rungs wait for hardware.
+- **Phase 111 Track A (pull-forward)** — QEMU-gdbstub source-level kernel
+  debugging (`cargo xtask debug` → `-s -S` + DWARF build). Explicitly marked
+  pull-forward in the roadmap: near-free and immediately useful to whoever
+  works the 101–110 bare-metal arc. Tracks B (#DB/DR substrate) and D
+  (ptrace + `m3gdbserver`) are also largely QEMU-testable.
+- **Phase 95c residuals** — B (kernel page cache for file-backed pages) and
+  D (installer coalescing) are still "planned" in the 95c charter; A/C/E
+  landed. Speeds every large `pkg install` and cold load under TCG.
+
+**Hardware-dependent queue (needs physical machines, in order):** 102
+(I2C-HID touchpad, Dell), 104 (AX201 Wi-Fi + supplicant, Dell), 108 (HP
+OmniBook / AMD Strix Point bring-up), 109 (bare-metal audio — first
+*determine* HDA vs SoundWire+SOF on the Dell).
