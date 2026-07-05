@@ -440,14 +440,39 @@ gap (C) exists in the sibling `ipc_recv_msg_timeout` / `ipc_try_recv_msg`
 recv variants~~ ✅ done (follow-ups branch, incl. `ipc_recv_with_caps` and the
 prerequisite drain-first guards in the three endpoint recv paths).
 
-**Known pre-existing (NOT fixed):** `usb-storage-dual-smoke` fails identically on
-`main` — times out waiting for `mass-storage devices — multi-device mode`.
-Suspects: an **em-dash in a single-shot startup sentinel** (multi-byte split
-under lossy decode), or the second stick missing the ~600 ms discovery
-stability window. Note the `RENDER_FP`-flood mechanism above may also contribute
-(that sentinel is a `Wait` on a line that the flood can displace); worth
-re-checking now that #301 strips the flood. Needs its own investigation —
-consider an ASCII sentinel emitted more than once.
+**`usb-storage-dual-smoke` — ROOT-CAUSED and FIXED (2026-07-05,
+`fix/phase-106-bug2-followups` session).** The failing wait was the first one
+(`mass-storage devices — multi-device mode`), and the mechanism is the
+handoff's original em-dash suspect — but with the real trigger pinned:
+`spawn_serial_reader` reads QEMU stdout in chunks and `append_serial_chunk`
+decodes **each chunk independently** with `from_utf8_lossy`. QEMU dribbles
+serial output in real time, so the reader's `read()`s return **tiny (3-6
+byte) chunks** (measured with a temporary `M3OS_CHUNK_LOG` boundary logger —
+in one captured run the em-dash at bytes 46202..46204 sat wholly inside
+chunk `[46201,46206)` and the gate PASSED; a boundary one byte later would
+have split it). With ~4-byte chunks a 3-byte UTF-8 char straddles a boundary
+roughly every other run, the halves decode to U+FFFD, and the pattern never
+matches even though the raw serial provably contains the banner — a
+per-run coin flip that read as "fails identically" (3 consecutive failures
+that day). The guest side was healthy all along: banner + both
+`usb0.block`/`usb1.block` registrations appear in every raw capture, and
+once the matcher survives the banner the whole gate passes (login, both
+mounts, distinct per-stick content). **Fix:** the reader thread now holds
+back an incomplete UTF-8 suffix (≤3 bytes, `utf8_incomplete_suffix_len`)
+until its continuation bytes arrive, so no sent chunk ever splits a
+multi-byte char — this hardens EVERY serial-pattern gate, not just this one
+(the "use ASCII-only sentinels" gotcha is now defense-in-depth rather than a
+correctness requirement). Host tests: `utf8_incomplete_suffix_len_cases` +
+`serial_pattern_with_em_dash_survives_chunk_split` (brute-forces the banner
+split at every byte). Also fixed: `usb-hid`'s `enumerate_once` printed
+`bound HID device (proto 80)` for mass-storage sticks/hubs it actually
+`Ignore`s (the poll loop never touched them — but the line sent this
+investigation down a false trail; the print is now role-gated).
+Investigation by-catch worth keeping: probes replicating the gate's exact
+QEMU argv proved serial login input works on this topology at every timing
+(immediate, +25 s idle-first-write, 204 s of 5 s echo-canaries, fresh
+first-boot disk), and QEMU auto-inserts a USB hub in the 5-device topology
+(one stick enumerates tier-2 behind it via `usbhub`) — both fine.
 
 ---
 
@@ -567,8 +592,12 @@ consider an ASCII sentinel emitted more than once.
   xhci took the same slot in the multi-device install topology. Pin it:
   `-device nvme,...,addr=0x4`.
 - **Serial-pattern matching (the recurring one):**
-  - Multi-byte UTF-8 (em-dash `—`) can split across a `read()` boundary under
-    lossy decode and **never match**. Use ASCII-only sentinel patterns.
+  - ~~Multi-byte UTF-8 (em-dash `—`) can split across a `read()` boundary under
+    lossy decode and **never match**.~~ **Fixed at the decode layer**
+    (2026-07-05): `spawn_serial_reader` now carries an incomplete UTF-8
+    suffix to the next chunk, so split multi-byte chars decode intact.
+    ASCII-only sentinels remain good practice, but are no longer a
+    correctness requirement.
   - `serial_buf` trims to a 48 KB tail, so an **early** pattern can be evicted
     before the first `.contains()` on a fast boot. Prefer waiting on a
     **tail-stable** sentinel that only appears once the thing you care about
@@ -622,11 +651,12 @@ consider an ASCII sentinel emitted more than once.
    literal serial-autologin marker to strip — the serial image boots to an
    interactive `login`; D.2's substance was replacing the well-known seeded
    `root:root`/`user:user` credentials, which first-user mode never copies.)
-5. ~~Bug 2 follow-up cleanups~~ ✅ on `fix/phase-106-bug2-followups`: retry
-   guard + KNOWN-FLAKE banner removed, task name set on exec, copy-fault
-   re-pend mirrored into the sibling recv variants.
-6. **`usb-storage-dual-smoke` pre-existing failure** — fails identically on
-   `main` (see "Known pre-existing" above); needs its own investigation now
-   that #301 strips the `RENDER_FP` flood.
+5. ~~Bug 2 follow-up cleanups~~ ✅ on `fix/phase-106-bug2-followups` (PR #307):
+   retry guard + KNOWN-FLAKE banner removed, task name set on exec,
+   copy-fault re-pend mirrored into the sibling recv variants.
+6. ~~**`usb-storage-dual-smoke` pre-existing failure**~~ ✅ root-caused and
+   fixed (same session; see the ROOT-CAUSED section above): reader-side
+   UTF-8 carry so serial chunks never split a multi-byte char, plus the
+   role-gated `usb-hid` bind log.
 7. **Track E** bare-metal M1/M3 on the Dell (operator-owned) — the only
-   other remaining Phase 106 work.
+   remaining Phase 106 work.
