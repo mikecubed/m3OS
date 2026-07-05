@@ -273,9 +273,13 @@ service-manager `xhci` instance (config-space scans only, never claims —
 it before any BOT traffic), and the Track D changes themselves (the
 failing raw-arm data path is byte-identical to C.3's).
 
-**"Bug 2" — FULLY RESOLVED (strand ~1/4 → 0; three distinct IPC races fixed)
-(2026-07-05).** Branch `investigate/phase-106-bug2-lost-wakeup` → PR #305. The
-bug is **not** in USB/xhci/storage and **not** an `ep.senders` lost-wake (an
+**"Bug 2" — FULLY RESOLVED and MERGED to `main` (strand ~1/4 → 0; three
+distinct IPC races fixed) (2026-07-05).** PR #305 (squash-merged as `25261a1a`;
+branch `investigate/phase-106-bug2-lost-wakeup` deleted). Follow-up cleanup now
+that the strand is gone: the `nvme-install-part` gate's `run_qemu_gate_retry_once`
+guard + the `KNOWN-FLAKE: Phase 106 Bug 2` boot-serial banner are no longer
+needed and can be removed. The bug is **not** in USB/xhci/storage and **not** an
+`ep.senders` lost-wake (an
 interim `ep.senders` BSP backstop was written, disproven by ground-truth, and
 **reverted** — see "false trails"). Three distinct core-IPC races in the same
 install strand were found and fixed:
