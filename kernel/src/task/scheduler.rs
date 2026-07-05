@@ -5283,8 +5283,9 @@ pub fn run() -> ! {
             // wake latency (a handful of dispatches, sub-ms) is bounded and
             // vastly better than the permanent hang it prevents.
             const PENDING_MSG_SWEEP_INTERVAL: u32 = 16;
-            if PENDING_MSG_SWEEP_TICK.fetch_add(1, Ordering::Relaxed) % PENDING_MSG_SWEEP_INTERVAL
-                == 0
+            if PENDING_MSG_SWEEP_TICK
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(PENDING_MSG_SWEEP_INTERVAL)
             {
                 drain_pending_msg_waiters();
             }
@@ -7001,6 +7002,13 @@ fn reply_stall_scan(now: u64) {
         holder_found: bool,
         holder_nr: u32,
         holder_pending: bool,
+        /// Phase 106 Bug 2 (ground-truth) — the holder's task name and how many
+        /// `Reply(*)` caps it currently holds. A synchronous server should hold
+        /// **at most one** while mid-request; an idle-in-recv holder that still
+        /// owns a reply cap means the reply obligation was dropped (received but
+        /// never answered), and a count > 1 points at a reply-cap leak.
+        holder_name: &'static str,
+        holder_reply_caps: usize,
     }
 
     let mut rows: [Option<StallRow>; 8] = [const { None }; 8];
@@ -7061,14 +7069,25 @@ fn reply_stall_scan(now: u64) {
             // call on an endpoint the dying server never owned). Skipping Dead
             // tasks here would collapse the two into one misleading verdict.
             let caller_id = task.id;
-            let (holder_found, holder_pid, holder_state, holder_nr, holder_pending) = {
+            let (
+                holder_found,
+                holder_pid,
+                holder_state,
+                holder_nr,
+                holder_pending,
+                holder_name,
+                holder_reply_caps,
+            ) = {
                 let mut found = false;
                 let mut hpid = 0u32;
                 let mut hstate = None;
                 let mut hnr = 0u32;
                 let mut hpending = false;
+                let mut hname = "?";
+                let mut hcaps = 0usize;
                 for other in sched.tasks.iter() {
-                    if other.caps.reply_targets().contains(&caller_id) {
+                    let reply_targets = other.caps.reply_targets();
+                    if reply_targets.contains(&caller_id) {
                         found = true;
                         hpid = other.pid;
                         hstate = Some(other.state);
@@ -7083,10 +7102,12 @@ fn reply_stall_scan(now: u64) {
                         // holder is blocked without a queued message (its own
                         // downstream dependency never completed).
                         hpending = other.pending_msg.is_some();
+                        hname = other.name;
+                        hcaps = reply_targets.len();
                         break;
                     }
                 }
-                (found, hpid, hstate, hnr, hpending)
+                (found, hpid, hstate, hnr, hpending, hname, hcaps)
             };
             rows[n] = Some(StallRow {
                 idx,
@@ -7111,6 +7132,8 @@ fn reply_stall_scan(now: u64) {
                 holder_found,
                 holder_nr,
                 holder_pending,
+                holder_name,
+                holder_reply_caps,
             });
             n += 1;
         }
@@ -7167,7 +7190,8 @@ fn reply_stall_scan(now: u64) {
         log::warn!(
             "[replystall] pid={} name={} idx={} state={:?} nr={:#x} syscall_age={}ms blocked_age={}ms \
              last_ready_age={}ms wake_deadline_in={}ms pending_msg={} reply_waker={} waker_flag={} \
-             on_cpu={} in_runq={} runq_core={} holder_pid={} holder_state={:?} holder_nr={:#x} holder_pending={} :: {}",
+             on_cpu={} in_runq={} runq_core={} holder_pid={} holder_name={} holder_state={:?} holder_nr={:#x} \
+             holder_pending={} holder_reply_caps={} :: {}",
             row.pid,
             row.name,
             row.idx,
@@ -7183,10 +7207,16 @@ fn reply_stall_scan(now: u64) {
             row.on_cpu,
             in_runq,
             runq_core,
-            if row.holder_found { row.holder_pid as i64 } else { -1 },
+            if row.holder_found {
+                row.holder_pid as i64
+            } else {
+                -1
+            },
+            row.holder_name,
             row.holder_state,
             row.holder_nr,
             row.holder_pending,
+            row.holder_reply_caps,
             verdict,
         );
     }
