@@ -314,6 +314,16 @@ pub fn set_endpoint_pending_send_hook(ep_id: EndpointId, hook: fn()) {
 /// `label = u64::MAX` on error.  Use this when the server needs the data
 /// payload; use [`recv`] when only the label is needed.
 pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
+    // Phase 106 Bug 2 follow-up — drain an already-delivered message FIRST,
+    // mirroring `recv_msg_with_notif`. A copy-to-user failure in the syscall
+    // wrapper re-pends the dequeued message (its reply cap is already in this
+    // receiver's table); without this drain, the Some-arm below would
+    // `deliver_message` a fresh sender's request on top of the re-pended one,
+    // orphaning its reply cap — the race (B) overwrite. See the block comment
+    // in `recv_msg_with_notif` for the full mechanism.
+    if let Some(msg) = scheduler::take_message(receiver) {
+        return msg;
+    }
     // Bounds check is done by get_mut() below — it returns None for
     // out-of-range IDs, which is handled by the match.
     let action = {
@@ -460,6 +470,14 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
 /// authoritative source of an IPC message — a future blocking caller would
 /// observe a consistent state if a wake races with a delivery.
 pub fn recv_msg_nowait(receiver: TaskId, ep_id: EndpointId) -> Option<Message> {
+    // Phase 106 Bug 2 follow-up — surface a re-pended message before popping
+    // a new sender (see `recv_msg`'s drain-first comment). For a pure poller
+    // (`ipc_try_recv_msg` callers never block in recv) this drain is the ONLY
+    // path that ever re-surfaces a message the syscall wrapper re-pended
+    // after a copy-to-user failure.
+    if let Some(msg) = scheduler::take_message(receiver) {
+        return Some(msg);
+    }
     let mut pending = {
         let mut reg = ENDPOINTS.lock();
         let ep = reg.get_mut(ep_id).filter(|e| !e.closed)?;
@@ -1200,6 +1218,12 @@ pub fn recv_msg_with_deadline(
     deadline_ticks: Option<u64>,
 ) -> Message {
     const NEG_ETIMEDOUT: u64 = (-110_i64) as u64;
+
+    // Phase 106 Bug 2 follow-up — surface a re-pended message before
+    // servicing a new sender (see `recv_msg`'s drain-first comment).
+    if let Some(msg) = scheduler::take_message(receiver) {
+        return msg;
+    }
 
     // Fast path: sender already queued. Reuse `recv_msg`'s pop-sender
     // motion since it carries the full delivery atomicity.

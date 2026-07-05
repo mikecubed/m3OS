@@ -1,8 +1,9 @@
 # Handoff — Phase 106: USB Installer & NVMe Install
 
-**Date:** 2026-07-04 (living doc — update on every session working this phase)
-**Branch:** `feat/phase-106-c4-partition-installer` (off `main`; PR #302) — the
-active feature branch. Earlier tracks merged (below; PR #299 merged 2026-07-04).
+**Date:** 2026-07-05 (living doc — update on every session working this phase)
+**Branch:** `fix/phase-106-bug2-followups` (off `main`) — the active feature
+branch (Bug 2 follow-up cleanups). All Phase 106 tracks A–D merged (PRs
+#294–#306).
 **State:** IN PROGRESS.
 - **Track A (M1)** ✅ merged — PR #294 (`40a9e685`). Combined GPT(ESP+ext2)
   USB image + USB-ext2 root bootstrap. `usb-root-smoke` green.
@@ -275,10 +276,17 @@ failing raw-arm data path is byte-identical to C.3's).
 
 **"Bug 2" — FULLY RESOLVED and MERGED to `main` (strand ~1/4 → 0; three
 distinct IPC races fixed) (2026-07-05).** PR #305 (squash-merged as `25261a1a`;
-branch `investigate/phase-106-bug2-lost-wakeup` deleted). Follow-up cleanup now
-that the strand is gone: the `nvme-install-part` gate's `run_qemu_gate_retry_once`
-guard + the `KNOWN-FLAKE: Phase 106 Bug 2` boot-serial banner are no longer
-needed and can be removed. The bug is **not** in USB/xhci/storage and **not** an
+branch `investigate/phase-106-bug2-lost-wakeup` deleted). Follow-up cleanups
+✅ **done on `fix/phase-106-bug2-followups`** (2026-07-05): the
+`run_qemu_gate_retry_once` pre-push guard (all four uses) and the
+`KNOWN-FLAKE: Phase 106 Bug 2` boot-serial banner are removed; the task name
+is now set on `exec` (`intern_task_name` + `set_current_task_name`, so
+diagnostics never show `fork-child` for exec'd drivers again); the copy-fault
+re-pend (race C) is mirrored into `ipc_recv_msg_timeout` / `ipc_try_recv_msg`
+/ `ipc_recv_with_caps`, with matching drain-first guards added to `recv_msg`
+/ `recv_msg_nowait` / `recv_msg_with_deadline` (without which a re-pended
+message would be overwritten by the next queued-sender delivery — the race
+(B) mechanism). The bug is **not** in USB/xhci/storage and **not** an
 `ep.senders` lost-wake (an
 interim `ep.senders` BSP backstop was written, disproven by ground-truth, and
 **reverted** — see "false trails"). Three distinct core-IPC races in the same
@@ -426,11 +434,11 @@ stays as belt-and-suspenders.
 (now with `holder_name` + `holder_reply_caps`) stays. The three **temporary**
 probes used to pin race (B) — the `#[track_caller]` `deliver_message`-overwrite
 warning, and the recv `Some`-arm orphan warning — were **removed** after the fix
-validated. `holder_name=fork-child` is a stale post-`exec` task name (pid 4 =
-`/drivers/xhci`, pid 5 = `/drivers/usb-storage`); a cosmetic follow-up is to set
-the task name on `exec`. The same copy-fault gap (C) exists in the sibling
-`ipc_recv_msg_timeout` / `ipc_try_recv_msg` recv variants — a low-priority
-follow-up to mirror the re-pend there.
+validated. ~~`holder_name=fork-child` is a stale post-`exec` task name … set
+the task name on `exec`~~ ✅ done (follow-ups branch). ~~The same copy-fault
+gap (C) exists in the sibling `ipc_recv_msg_timeout` / `ipc_try_recv_msg`
+recv variants~~ ✅ done (follow-ups branch, incl. `ipc_recv_with_caps` and the
+prerequisite drain-first guards in the three endpoint recv paths).
 
 **Known pre-existing (NOT fixed):** `usb-storage-dual-smoke` fails identically on
 `main` — times out waiting for `mass-storage devices — multi-device mode`.
@@ -614,5 +622,11 @@ consider an ASCII sentinel emitted more than once.
    literal serial-autologin marker to strip — the serial image boots to an
    interactive `login`; D.2's substance was replacing the well-known seeded
    `root:root`/`user:user` credentials, which first-user mode never copies.)
-5. **Track E** bare-metal M1/M3 on the Dell (operator-owned) — the only
-   remaining Phase 106 work.
+5. ~~Bug 2 follow-up cleanups~~ ✅ on `fix/phase-106-bug2-followups`: retry
+   guard + KNOWN-FLAKE banner removed, task name set on exec, copy-fault
+   re-pend mirrored into the sibling recv variants.
+6. **`usb-storage-dual-smoke` pre-existing failure** — fails identically on
+   `main` (see "Known pre-existing" above); needs its own investigation now
+   that #301 strips the `RENDER_FP` flood.
+7. **Track E** bare-metal M1/M3 on the Dell (operator-owned) — the only
+   other remaining Phase 106 work.

@@ -5611,6 +5611,10 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             }
         }
     }
+    // Phase 106 Bug 2 follow-up — replace the stale scheduler task name
+    // (fork children spawn as "fork-child") with the exec'd binary path so
+    // `[replystall]` / stall-scan diagnostics name the real process.
+    crate::task::scheduler::set_current_task_name(crate::task::scheduler::intern_task_name(name));
     if is_interactive_debug_exec_path(name) {
         // Downgraded from INFO to DEBUG — see matching note in the fork
         // logger above. Service-supervisor debug aid that's no longer the
