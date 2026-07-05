@@ -1037,6 +1037,14 @@ fn ipc_recv_msg(
             .and_then(|s| s.copy_from_kernel(&header))
             .is_err()
         {
+            // Phase 106 Bug 2 (defensive) — the message was already dequeued
+            // from `pending_msg` by `recv_msg_with_notif`, and any reply cap for
+            // it is already in this server's table. Dropping it on a copy-to-user
+            // failure would orphan that cap and deadlock the caller. Re-pend it:
+            // the driver sees `Err` and re-loops, and the next recv drains it via
+            // the drain-first path and replies, consuming the cap. (Copy failure
+            // here is rare — OOM / bad address after demand-fault resolution.)
+            scheduler::deliver_message(task_id, msg);
             return u64::MAX;
         }
     }
@@ -1052,6 +1060,12 @@ fn ipc_recv_msg(
                 .and_then(|s| s.copy_from_kernel(&bulk[..copy_len]))
                 .is_err()
         {
+            // Phase 106 Bug 2 (defensive) — re-pend both the message and its
+            // bulk so a copy-to-user failure re-loops cleanly instead of
+            // orphaning the reply cap (the header already landed; the driver
+            // discards the partial on `Err` and re-recvs the whole message).
+            scheduler::deliver_message(task_id, msg);
+            scheduler::deliver_bulk(task_id, bulk);
             return u64::MAX;
         }
     }

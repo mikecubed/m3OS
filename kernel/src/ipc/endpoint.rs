@@ -557,6 +557,24 @@ pub fn recv_msg_with_notif(
     use super::notification;
     use kernel_core::ipc::wake_kind::{RECV_KIND_MESSAGE, RECV_KIND_NOTIFICATION, classify_recv};
 
+    // Phase 106 Bug 2 — drain an already-delivered message FIRST, before the
+    // notification fast-path below and before servicing a queued sender. A prior
+    // recv can return a NOTIFICATION while a request is still sitting in
+    // `pending_msg` (the fast-path at the next lines, the `register_recv_waiter`
+    // early return, and the None-arm notif return all skip `pending_msg`). On the
+    // next recv entry, if a sender is queued, the `Some`-arm delivers on top of
+    // that leftover (`deliver_message` at ~line 640) and **overwrites** it —
+    // orphaning the leftover request's reply cap and deadlocking its caller (the
+    // intermittent installer→usb-storage→xhci strand: xhci idle in recv holding
+    // an unanswered `Reply` cap). `recv` must always surface a pending message
+    // before anything else; the reply-cap handle rides in the message (`data[3]`)
+    // so it is preserved. A pending notification is not lost — it stays set and
+    // is returned on the next recv (and the driver's Message arm drains the event
+    // ring regardless).
+    if let Some(msg) = scheduler::take_message(receiver) {
+        return (RECV_KIND_MESSAGE, msg);
+    }
+
     let bits = notification::drain_bits(notif_id);
     if classify_recv(bits) == RECV_KIND_NOTIFICATION {
         let mut msg = Message::new(0);
@@ -675,6 +693,22 @@ pub fn recv_msg_with_notif(
             notification::unregister_recv_waiter(notif_id, receiver);
 
             if let Some(msg) = scheduler::take_message(receiver) {
+                // Phase 106 Bug 2 — remove ourselves from the receiver queue,
+                // symmetric with every OTHER return path (the notif returns
+                // above/below all `retain`). We reach here woken by a message;
+                // if that wake came from `block_current_on_notif_v2`'s
+                // `has_pending_message` self-revert rather than a `call_msg`
+                // pop, we are STILL enqueued in `ep.receivers`. Leaving a stale
+                // entry lets a later `call_msg` pop-and-deliver a SECOND message
+                // on top of this one — `deliver_message` overwrites the unconsumed
+                // `pending_msg` and orphans its reply cap, deadlocking the caller
+                // (the intermittent installer→usb-storage→xhci strand).
+                {
+                    let mut reg = ENDPOINTS.lock();
+                    if let Some(ep) = reg.get_mut(ep_id) {
+                        ep.receivers.retain(|&r| r != receiver);
+                    }
+                }
                 return (RECV_KIND_MESSAGE, msg);
             }
 
@@ -863,7 +897,10 @@ pub fn send_tx_owned(
     });
     crate::task::scheduler::preempt_disable();
     scheduler::deliver_message(receiver, msg);
-    let _ = crate::task::scheduler::wake_task_v2(receiver);
+    // Phase 106 Bug 2 — precondition-guard the re-enqueue (see the sibling
+    // deliver+wake sites and `reply()`): suppress a stale wake that would
+    // otherwise land on the receiver's next recv-block.
+    let _ = crate::task::scheduler::wake_task_v2_if(receiver, |t| t.pending_msg.is_some());
     crate::task::scheduler::preempt_enable();
     Ok(())
 }
@@ -921,7 +958,15 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
             crate::task::scheduler::preempt_disable();
             scheduler::deliver_message(receiver, msg);
             // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-            let _ = crate::task::scheduler::wake_task_v2(receiver);
+            // Phase 106 Bug 2 — guard the re-enqueue on the message still being
+            // pending (same stale-wake race as `reply()` below / the deadline
+            // scanner): under `-smp`, deliver and wake are separate lock
+            // sections, so the receiver can consume this message and re-block on
+            // its NEXT recv in between; a plain state-only wake would then CAS
+            // that unrelated block to Ready without its `woken` flag, yielding a
+            // bogus `DeadlineExpired` and a dropped request. `pending_msg.is_some()`
+            // is true exactly when THIS delivery is the one it is still parked on.
+            let _ = crate::task::scheduler::wake_task_v2_if(receiver, |t| t.pending_msg.is_some());
             // Bug #12 part 4: defer reschedule instead of eager-yielding.
             crate::task::scheduler::preempt_enable();
         }
@@ -1068,7 +1113,15 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
             crate::task::scheduler::preempt_disable();
             scheduler::deliver_message(receiver, msg.with_reply_cap_handle(reply_cap_handle));
             // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-            let _ = crate::task::scheduler::wake_task_v2(receiver);
+            // Phase 106 Bug 2 — guard the re-enqueue on the message still being
+            // pending (same stale-wake race as `reply()` below / the deadline
+            // scanner): under `-smp`, deliver and wake are separate lock
+            // sections, so the receiver can consume this message and re-block on
+            // its NEXT recv in between; a plain state-only wake would then CAS
+            // that unrelated block to Ready without its `woken` flag, yielding a
+            // bogus `DeadlineExpired` and a dropped request. `pending_msg.is_some()`
+            // is true exactly when THIS delivery is the one it is still parked on.
+            let _ = crate::task::scheduler::wake_task_v2_if(receiver, |t| t.pending_msg.is_some());
             // Bug #12 part 4: defer reschedule instead of eager-yielding.
             crate::task::scheduler::preempt_enable();
         }
@@ -1271,7 +1324,10 @@ pub fn call_msg_with_deadline(
         transfer_bulk(caller, receiver);
         crate::task::scheduler::preempt_disable();
         scheduler::deliver_message(receiver, delivered.with_reply_cap_handle(reply_cap_handle));
-        let _ = crate::task::scheduler::wake_task_v2(receiver);
+        // Phase 106 Bug 2 — precondition-guard the re-enqueue (see the sibling
+        // deliver+wake sites and `reply()`): suppress a stale wake that would
+        // otherwise land on the receiver's next recv-block.
+        let _ = crate::task::scheduler::wake_task_v2_if(receiver, |t| t.pending_msg.is_some());
         crate::task::scheduler::preempt_enable();
     }
 
@@ -1358,8 +1414,24 @@ pub fn reply(server: TaskId, caller: TaskId, reply_msg: Message) {
     // and the caller will observe it and skip blocking.
     crate::task::scheduler::preempt_disable();
     scheduler::deliver_message(caller, reply_msg);
-    // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-    let _ = crate::task::scheduler::wake_task_v2(caller);
+    // Phase 106 Bug 2 — gate the re-enqueue on the reply payload still being
+    // pending, closing the reply-path analog of the `reply_v2` stale-wake race
+    // fixed for the deadline scanner in `fix/wake-task-v2-precondition-race`
+    // (`drive_expired_wake_deadlines`). Under `-smp`, `deliver_message` above
+    // and this wake are two separate `scheduler_lock` sections; another core can
+    // run the caller in between — it self-reverts on the reply payload we just
+    // delivered, consumes it, and re-blocks on its NEXT request with a fresh
+    // waker and `pending_msg == None`. A plain state-only `wake_task_v2` would
+    // then CAS that unrelated re-block to `Ready` without setting its `woken`
+    // flag, so `block_current_until` resumes it with `woken == false` and returns
+    // a bogus `DeadlineExpired` (no deadline was set) — the caller abandons the
+    // wait and the server's reply obligation is dropped, deadlocking the chain
+    // (installer → usb-storage → xhci). `pending_msg.is_some()` is true exactly
+    // when THIS reply is the one the caller is still parked on; the closure is a
+    // pure field read evaluated under the CAS's own locks (the `wake_task_v2_if`
+    // contract). No legitimate wake is lost: a caller that already consumed the
+    // reply is `Running`/`Ready` and yields `AlreadyAwake` regardless.
+    let _ = crate::task::scheduler::wake_task_v2_if(caller, |t| t.pending_msg.is_some());
     // Bug #12 part 4: defer reschedule instead of eager-yielding.
     crate::task::scheduler::preempt_enable();
     // ep is u32::MAX because reply() operates on a caller TaskId, not an
@@ -1514,7 +1586,15 @@ pub fn send_with_cap(sender: TaskId, ep_id: EndpointId, mut msg: Message) -> boo
             crate::task::scheduler::preempt_disable();
             scheduler::deliver_message(receiver, msg);
             // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-            let _ = crate::task::scheduler::wake_task_v2(receiver);
+            // Phase 106 Bug 2 — guard the re-enqueue on the message still being
+            // pending (same stale-wake race as `reply()` below / the deadline
+            // scanner): under `-smp`, deliver and wake are separate lock
+            // sections, so the receiver can consume this message and re-block on
+            // its NEXT recv in between; a plain state-only wake would then CAS
+            // that unrelated block to Ready without its `woken` flag, yielding a
+            // bogus `DeadlineExpired` and a dropped request. `pending_msg.is_some()`
+            // is true exactly when THIS delivery is the one it is still parked on.
+            let _ = crate::task::scheduler::wake_task_v2_if(receiver, |t| t.pending_msg.is_some());
             // Bug #12 part 4: defer reschedule instead of eager-yielding.
             crate::task::scheduler::preempt_enable();
         }

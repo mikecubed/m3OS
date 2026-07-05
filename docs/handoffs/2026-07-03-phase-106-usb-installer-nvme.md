@@ -273,32 +273,160 @@ service-manager `xhci` instance (config-space scans only, never claims —
 it before any BOT traffic), and the Track D changes themselves (the
 failing raw-arm data path is byte-identical to C.3's).
 
-**KNOWN, NOT YET FIXED — "Bug 2": a scheduler/IPC lost-wakeup strands
-`BlockedOnReply` tasks under the populate's block-IPC load.** DISTINCT
-from the (now-fixed) BOT transport-fail cascade — a `nvme-install-part-smoke`
-run failed with **zero** `transport-fail` lines and **zero** of the BOT
-recovery paths firing, so it is neither the installer nor the USB
-transport. Full boot-1 serial capture (the gate now writes
-`nvme-install-boot1-serial.log` and prints a `KNOWN-FLAKE: Phase 106
-Bug 2` banner on this signature): multiple `fork-child` tasks wedged with
-`[replystall] … state=BlockedOnReply … pending_msg=false reply_waker=true
-waker_flag=false … STRANDED(BlockedOnReply, no reply delivered)`, plus
-`[stallcensus] … BlockedOnService`, and the watchdog's `task pid=5 …
-BlockedOnReply stuck-since=…ms (no waker registered)` climbing past 100 s.
-`pending_msg=false` at strand means the SERVER never called
-`endpoint::reply()` for that caller (or the reply/wake was lost) — the
-classic **57e preempt-full lost-wakeup** class
-(`docs/handoffs/57e-preempt-full-userspace-hangs.md`), surfaced by the
-sustained multi-core block-IPC storm the partition populate generates
-(thousands of raw read/write syscalls fanned across cores). It is
-intermittent (~1 in a few heavy runs); a light standalone run usually
-passes. **Mitigation in place, not a fix:** the pre-push hook retries
-each install gate once (`run_install_gate`) — a real regression fails
-both attempts, this flake almost never repeats back-to-back. **The actual
-fix is core scheduler/IPC work** (the reply-waker / `wake_task_v2` path
-under contention) and is the recommended next Phase 106 item alongside
-Track E. Starting evidence is captured in `nvme-install-boot1-serial.log`
-on any failing run.
+**"Bug 2" — FULLY RESOLVED (strand ~1/4 → 0; three distinct IPC races fixed)
+(2026-07-05).** Branch `investigate/phase-106-bug2-lost-wakeup` → PR #305. The
+bug is **not** in USB/xhci/storage and **not** an `ep.senders` lost-wake (an
+interim `ep.senders` BSP backstop was written, disproven by ground-truth, and
+**reverted** — see "false trails"). Three distinct core-IPC races in the same
+install strand were found and fixed:
+
+- **(A) stale-wake in `deliver_message` + plain `wake_task_v2`.** The pair are
+  two separate `scheduler_lock` sections, so under `-smp 4` the target can run on
+  another core, consume the delivered message, and re-block on its *next* IPC
+  between them; the delayed state-only `wake_task_v2` then CASes that unrelated
+  re-block `Blocked* → Ready` without setting its `woken` flag, and
+  `block_current_until` returns a bogus `DeadlineExpired` (dropping the request/
+  reply). Two instances — the **reply path** (`reply()`, loud:
+  `reply_v2:deadline_expired_no_deadline`) and the **request-delivery** `call`/
+  `send` hand-offs (quiet). Fixed by gating all six real-message deliver+wake
+  sites with `wake_task_v2_if(x, |t| t.pending_msg.is_some())`.
+- **(B) stale `ep.receivers` entry → double-delivery overwrite (the ~1/19
+  residual).** `recv_msg_with_notif`'s message-return-after-block path returned
+  `RECV_KIND_MESSAGE` **without** the `ep.receivers.retain(remove)` that every
+  other return path performs. When woken by a message via
+  `block_current_on_notif_v2`'s `has_pending_message` self-revert (not a
+  `call_msg` pop), the server stayed enqueued in `ep.receivers`; a later
+  `call_msg` popped it again and `deliver_message` **overwrote** the unconsumed
+  `pending_msg`, orphaning the first request's reply cap → xhci idle in recv
+  holding an unanswered `Reply` cap. Pinned with a `#[track_caller]`
+  `deliver_message`-overwrite probe (caller = `endpoint.rs:632` Some-arm, then
+  `:1112` call_msg after a partial fix). Fixed by (1) draining `pending_msg`
+  first at the top of `recv_msg_with_notif`, and (2) adding the missing
+  `retain(remove)` to the message-return-after-block path.
+- **(C) copy-to-user failure orphaning the cap (defensive).** `ipc_recv_msg`
+  dequeues the message *before* the userspace copy, so a rare header/bulk
+  copy-to-user failure (OOM / demand-fault) dropped the message with its reply
+  cap still held. Hardened to **re-pend** the message (and bulk) before the
+  `u64::MAX` return so the driver re-loops cleanly. (Unconfirmed in the wild —
+  belt-and-suspenders alongside (B).)
+
+*Ground truth (the two decisive diagnostics — keep both).*
+1. `[replystall]` (`kernel/src/task/scheduler.rs reply_stall_scan`) reports,
+   per stranded caller, the **reply-cap holder** pid + **name** + state +
+   parked syscall nr + `holder_pending` + **`holder_reply_caps`** (how many
+   `Reply(*)` caps the holder owns). Classes: `STRANDED-NO-HOLDER`,
+   `STRANDED-DEAD-HOLDER`, `STRANDED-SERVER-STUCK`. It writes
+   `nvme-install-boot1-serial.log` and prints `KNOWN-FLAKE: Phase 106 Bug 2`.
+2. The scheduler's own `[sched] wake_task_v2 on BlockedOnReply … has_pending_msg=false`
+   and `[sched] spurious block wake … site=reply_v2:deadline_expired_no_deadline`
+   warnings — pre-existing instrumentation that fires exactly on this bug.
+
+   NB: the captured `holder_name=fork-child` is a **stale task name** — the
+   drivers are exec'd from a forked child whose name isn't updated on `exec`;
+   `pid=4 = /drivers/xhci`, `pid=5 = /drivers/usb-storage` (confirmed by the
+   `elf: mapped pid=N binary=…` lines). Do not read "fork-child" as a distinct
+   process class. (Cosmetic fix worth doing: set the task name on `exec`.)
+
+*What actually happens (chain + mechanism).* Chain:
+`installer child (SYS_BLK_RAW_READ 0x1171) → usb-storage (pid5, ipc_call
+0x110d, BlockedOnReply) → xhci (pid4)`. In the captured deadlock, **xhci is
+idle in its notif-bound recv (`0x110e`, BlockedOnNotif) still holding exactly
+one unconsumed `Reply(usb-storage)` cap** (`holder_reply_caps=1`,
+`holder_pending=false`), and usb-storage is `BlockedOnReply` on it forever.
+Immediately upstream in the serial, for the SAME usb-storage task:
+`wake_task_v2 on BlockedOnReply … caller=endpoint.rs:1400 has_pending_msg=false`
+(that call site is the `wake_task_v2(caller)` **inside `reply()`**, one line
+after `deliver_message(caller, reply_msg)` at endpoint.rs:1398 — so the reply's
+`deliver_message` left **no** pending message), immediately followed by
+`spurious block wake … reply_v2:deadline_expired_no_deadline outcome=DeadlineExpired
+woken_flag=false pending_at_clear=false` (the client's reply-block returned
+`DeadlineExpired` although reply_v2 passes **no deadline**, with the `woken`
+flag false). Net: a reply is issued but its message never lands and the client's
+block returns a spurious timeout — the client abandons/re-blocks, the server's
+reply obligation is dropped (cap still held), deadlock. The Bug 1
+transport-fail/BOT-recovery path is the *trigger* (it drives the high-rate
+`call`/`reply` churn that exposes the race), not the cause.
+
+*The fix (applied — `kernel/src/ipc/endpoint.rs`, `reply()`).* This is the
+**reply-path analog** of a race already fixed elsewhere. On 2026-05-14 the
+`reply_v2:deadline_expired_no_deadline` signature was root-caused and fixed for
+the *deadline-scanner* wake site (`drive_expired_wake_deadlines`) on branch
+`fix/wake-task-v2-precondition-race` (handoff
+`docs/handoffs/2026-05-13-reply-v2-deadline-residual-race.md`) by converting its
+`wake_task_v2` to `wake_task_v2_if(id, |t| t.wake_deadline == Some(expected))` —
+a precondition re-checked atomically under the CAS's own locks. **`reply()`'s
+wake at `endpoint.rs` never got that treatment** and remained a plain
+`wake_task_v2(caller)`. The mechanism: `reply()` does `deliver_message(caller)`
+then `wake_task_v2(caller)` as two separate `scheduler_lock` sections (the
+`preempt_disable` bracket only gates the *local* core, not other cores). Under
+`-smp`, between them the caller can run on another core, self-revert on the reply
+payload we just delivered, consume it, and **re-block on its NEXT request** with
+a fresh waker and `pending_msg == None`. The delayed state-only `wake_task_v2`
+then CASes that unrelated re-block `BlockedOnReply → Ready` **without** setting
+its `woken` flag, so `block_current_until` (`scheduler.rs:3843-3848`) resumes it
+with `woken == false` and returns `DeadlineExpired` although no deadline was set
+— the caller abandons the wait (`call_msg` surfaces `u64::MAX`), the server's
+reply obligation is dropped, and the chain deadlocks. (`deliver_message` is
+*not* at fault — it `find`s by unique `TaskId` and always writes; a kernel
+backstop can't help because the payload is already consumed.) **Fix:** gate the
+re-enqueue on the payload still being pending —
+`wake_task_v2_if(caller, |t| t.pending_msg.is_some())`. True exactly when THIS
+reply is the one the caller is still parked on; false for the racy re-block, so
+the stale CAS (and both warnings) never happen. No legit wake is lost: a caller
+that already consumed the reply is `Running`/`Ready` → `AlreadyAwake`.
+
+*Then the symmetric strand.* Guarding only `reply()` closed the reply-path race
+(the `reply_v2` warnings **and** the usb-storage transport-fail/BOT-recovery
+churn — themselves a manifestation of it — vanished) but the load-stress loop
+still stranded ~1/7, now **warning-free**, at the same terminal state: xhci idle
+in recv holding an unconsumed `Reply(usb-storage)` cap it never processed. That
+is the **request-delivery** analog: the same stale-wake on the `deliver_message
++ wake_task_v2` pair that hands a *request* to a server blocked in recv, so the
+wake lands on the server's next recv-block (no `reply_v2` warning because the
+victim is `BlockedOnNotif`, not `BlockedOnReply`). Fix: the **same precondition
+guard** applied to all six real-message `deliver_message + wake_task_v2` sites
+(the "Phase 57e Bug #12 minimum atomic" pairs) in `endpoint.rs` — `reply()` plus
+the five send / `call`-hand-off deliveries. The `complete_send`+wake sender-wake
+(different precondition: send-completion, not `pending_msg`) and the
+`deliver_message_and_wake` error-sentinel paths are deliberately **not** touched.
+
+*False trails (recorded so they aren't re-walked).*
+- *"xhci idle in recv holding an unanswered reply = unreachable paradox"* —
+  wrong framing; it IS reachable, via the lost reply-delivery above.
+- *`ep.senders` lost-wake + BSP `stranded_sender_owners` backstop* — written,
+  then disproven: the holder holds a `Reply` cap, so the request was
+  **received**, never queued on `senders`. **Reverted.** (A first cut also
+  regressed by waking `BlockedOnReply` owners — the very `reply_v2` spurious
+  wake above — a useful confirmation that poking this path is dangerous.)
+- *nvme `wait_completion` unbounded `irq.wait()`* — real hardening (a
+  completion wait must never depend on the IRQ), **kept** in
+  `userspace/drivers/nvme/src/io.rs`, but not this strand.
+
+*Repro + validation.* Intermittent under CPU+IO load: 4 CPU spinners + a `dd`
+loop, then `M3OS_SMOKE_SERIAL_DUMP=1 cargo xtask nvme-install-part-smoke
+--timeout 300` in a loop, grepping the boot-1 serial for `STRANDED-`. Strand
+rate as each race was closed: **pre-fix ~1/4** → **`reply()`-guard only ~1/7**
+→ **all-6 deliver+wake guards ~1/19** (race A closed: the
+`reply_v2:deadline_expired_no_deadline` / `wake_task_v2 on BlockedOnReply …
+has_pending_msg=false` warnings went to 0) → **+ the recv fix (B) 0/25**, with a
+`#[track_caller]` `deliver_message`-overwrite probe silent across all 25 runs
+(direct confirmation the double-delivery is gone) → **+ copy-fault hardening (C),
+probes removed 0/20**. Notably, once (B) landed the usb-storage
+transport-fail/BOT-recovery churn **disappeared entirely** across all runs — the
+IPC race had been corrupting the transfers themselves, so fixing it removed the
+whole cascade, not just the terminal strand. `cargo xtask check` green; pre-push
+smoke-test (`ipc-wake`) + regression pass. The `run_qemu_gate_retry_once` guard
+stays as belt-and-suspenders.
+
+*Diagnostics retained; probes removed.* The durable `[replystall]` diagnostic
+(now with `holder_name` + `holder_reply_caps`) stays. The three **temporary**
+probes used to pin race (B) — the `#[track_caller]` `deliver_message`-overwrite
+warning, and the recv `Some`-arm orphan warning — were **removed** after the fix
+validated. `holder_name=fork-child` is a stale post-`exec` task name (pid 4 =
+`/drivers/xhci`, pid 5 = `/drivers/usb-storage`); a cosmetic follow-up is to set
+the task name on `exec`. The same copy-fault gap (C) exists in the sibling
+`ipc_recv_msg_timeout` / `ipc_try_recv_msg` recv variants — a low-priority
+follow-up to mirror the re-pend there.
 
 **Known pre-existing (NOT fixed):** `usb-storage-dual-smoke` fails identically on
 `main` — times out waiting for `mass-storage devices — multi-device mode`.
