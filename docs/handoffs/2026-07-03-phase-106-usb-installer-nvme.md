@@ -662,3 +662,45 @@ first-boot disk), and QEMU auto-inserts a USB hub in the 5-device topology
    role-gated `usb-hid` bind log.
 7. **Track E** bare-metal M1/M3 on the Dell (operator-owned) — the only
    remaining Phase 106 work.
+
+---
+
+## What comes next (beyond Phase 106)
+
+Phase 106's in-repo work is complete; everything below is the road ahead as
+of 2026-07-05, per the roadmap sequencing `106 → 107 → 108/109/110` (+ 111
+appended). See `docs/roadmap/README.md` for the authoritative table.
+
+**Operator-owned near-term (needs the human, not a coding session):**
+
+- **Phase 106 Track E** — bare-metal M1/M3 on the Dell: USB boot → writable
+  ext2 root; installer writes the internal NVMe; reboot into the installed
+  system as the created first user. Protocol: `docs/appendix/bare-metal-validation.md`;
+  session prep: `docs/handoffs/next-dell-session.md`. Record
+  `Validated-on-HW (run N, date)` in the tasks doc (E.3).
+- **Phase 107 finish** — Tracks A–D are already landed and green (107 ran
+  *ahead* of 106; `pkg-net-smoke` passes). Remaining: the owner creates the
+  public `m3os-pkgs` GitHub repo + CI signing secret, then flips on the
+  opt-in live-HTTPS arm. Runbook: `docs/appendix/m3os-pkgs/`.
+- **Dell-live residual arms** parked across earlier phases: 103 (battery/
+  backlight/HWP-MSR on metal; GPE re-arm + S0ix residuals), 105 D.5
+  (toolkit/settings on metal).
+
+**Next off-hardware engineering (what a session without the Dell can build):**
+
+- **Phase 110 software arms** — activate KPTI (Phase 84 scaffolding exists,
+  never turned on), ASLR + stack canaries, argon2id password hashing. All
+  QEMU-gateable now; only the "on metal" validation rungs wait for hardware.
+- **Phase 111 Track A (pull-forward)** — QEMU-gdbstub source-level kernel
+  debugging (`cargo xtask debug` → `-s -S` + DWARF build). Explicitly marked
+  pull-forward in the roadmap: near-free and immediately useful to whoever
+  works the 101–110 bare-metal arc. Tracks B (#DB/DR substrate) and D
+  (ptrace + `m3gdbserver`) are also largely QEMU-testable.
+- **Phase 95c residuals** — B (kernel page cache for file-backed pages) and
+  D (installer coalescing) are still "planned" in the 95c charter; A/C/E
+  landed. Speeds every large `pkg install` and cold load under TCG.
+
+**Hardware-dependent queue (needs physical machines, in order):** 102
+(I2C-HID touchpad, Dell), 104 (AX201 Wi-Fi + supplicant, Dell), 108 (HP
+OmniBook / AMD Strix Point bring-up), 109 (bare-metal audio — first
+*determine* HDA vs SoundWire+SOF on the Dell).
