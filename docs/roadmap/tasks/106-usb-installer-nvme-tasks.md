@@ -242,9 +242,9 @@
 **Why it matters:** QEMU *can* model a USB stick, so the M1 "writable ext2 root from USB" claim is CI-testable even though the Dell boot is not.
 
 **Acceptance:**
-- [ ] Builds the combined image (A.1), attaches it as a QEMU `usb-storage` device, boots, and asserts `init: / mounted (ext2 via ring-3 usb0.block)`.
-- [ ] Writes a file under `/` and byte-verifies the read-back from a fresh process (proving the root is **writable**, not the ramdisk fallback) — a regression to read-only fails the gate.
-- [ ] Runs at a timeout sized for a fresh-disk USB boot (floored ≥ 360 s).
+- [x] Builds the combined image (A.1), attaches it as a QEMU `usb-storage` device, boots, and asserts `init: / mounted (ext2 via ring-3 usb0.block)`. *(Green — Track A, PR #294; in pre-push behind `M3OS_USB_ROOT_REGRESSION=1`.)*
+- [x] Writes a file under `/` and byte-verifies the read-back from a fresh process (proving the root is **writable**, not the ramdisk fallback) — a regression to read-only fails the gate. *(Green — `echo`/`cat` round-trip on `/home/usbprobe.txt`.)*
+- [ ] Runs at a timeout sized for a fresh-disk USB boot (floored ≥ 360 s). *(Not yet — the gate does not floor its timeout; pre-push invokes it at 300 s, which has been sufficient in practice.)*
 
 ### E.2 — `nvme-install-smoke` (M3 QEMU arm)
 

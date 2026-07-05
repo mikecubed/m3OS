@@ -1124,10 +1124,22 @@ fn enumerate_once(usb_ep: u32) -> (Vec<HidDevice>, bool) {
                 if !notice.attached {
                     continue;
                 }
+                let dev = build_device(usb_ep, notice, idx);
+                // Only claim "bound" for interfaces this daemon actually
+                // drives. The attach table also surfaces mass-storage sticks,
+                // hubs, and NICs (role `Ignore` — the poll loop skips them);
+                // the old unconditional print here logged e.g. `bound HID
+                // device (proto 80)` for a BOT mass-storage interface, which
+                // sent the Phase 106 dual-smoke investigation down a false
+                // trail.
+                if dev.role == DeviceRole::Ignore {
+                    devices.push(dev);
+                    continue;
+                }
                 syscall_lib::write_str(STDOUT_FILENO, "usb-hid: bound HID device (proto ");
                 write_u8_dec(notice.interface_protocol);
                 syscall_lib::write_str(STDOUT_FILENO, ")\n");
-                devices.push(build_device(usb_ep, notice, idx));
+                devices.push(dev);
             }
             // End of the attach table (`Attach { notice: None }`), a transport
             // failure, or any other reply: the walk is done and the server was

@@ -7853,6 +7853,32 @@ fn idle_prompt_fallback_matches(
 ///
 /// Spawns a thread that reads from `stdout` and sends chunks over the channel.
 /// The thread exits when the pipe closes (QEMU exits).
+/// Length (0..=3) of an incomplete UTF-8 sequence at the END of `chunk`.
+///
+/// Scans back at most 3 bytes for a lead byte; if that lead starts a sequence
+/// extending past the chunk end, those trailing bytes are an incomplete prefix
+/// the reader must hold back until the continuation bytes arrive (see the
+/// carry buffer in [`spawn_serial_reader`]). Invalid bytes (a stray
+/// continuation with no lead in reach, or a >4-byte "lead") return 0 — they
+/// are shipped as-is and decode to U+FFFD, which is correct for genuinely
+/// mangled input rather than a mid-sequence chunk split.
+fn utf8_incomplete_suffix_len(chunk: &[u8]) -> usize {
+    let n = chunk.len();
+    for back in 1..=n.min(3) {
+        let b = chunk[n - back];
+        let width = match b {
+            0x00..=0x7F => 1,
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            // Continuation byte (0x80..=0xBF) or invalid lead: keep scanning.
+            _ => continue,
+        };
+        return if width > back { back } else { 0 };
+    }
+    0
+}
+
 fn spawn_serial_reader(stdout: std::process::ChildStdout) -> std::sync::mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = std::sync::mpsc::channel();
     // Debug: when M3OS_SERIAL_LOG=<path> is set, tee the COMPLETE raw serial
@@ -7864,19 +7890,56 @@ fn spawn_serial_reader(stdout: std::process::ChildStdout) -> std::sync::mpsc::Re
         .ok()
         .filter(|p| !p.is_empty())
         .and_then(|p| std::fs::File::create(p).ok());
+    // Debug: when M3OS_CHUNK_LOG=<path> is set, record each read() chunk's
+    // (cumulative_offset, len) so a pattern-miss can be checked against the
+    // actual chunk boundaries (a multi-byte UTF-8 char split across two
+    // chunks is mangled by the per-chunk lossy decode in append_serial_chunk).
+    let mut chunk_log = std::env::var("M3OS_CHUNK_LOG")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .and_then(|p| std::fs::File::create(p).ok());
     std::thread::spawn(move || {
         use std::io::{Read, Write};
         let mut reader = std::io::BufReader::new(stdout);
         let mut buf = [0u8; 4096];
+        let mut offset: u64 = 0;
+        // Carry buffer for an incomplete UTF-8 sequence at a chunk end.
+        // `append_serial_chunk` decodes each chunk independently with
+        // `from_utf8_lossy`, so a multi-byte char (the multi-device banner's
+        // em-dash) split across two read() chunks decodes to U+FFFD and a
+        // serial pattern containing it NEVER matches — the deterministic
+        // usb-storage-dual-smoke failure (boot spew keeps the pipe saturated,
+        // so read() returns full buffers and the split lands at the same
+        // stream offset every run). Holding back the ≤3-byte incomplete
+        // suffix until the continuation bytes arrive makes every sent chunk
+        // decode cleanly.
+        let mut carry: Vec<u8> = Vec::new();
         loop {
             match reader.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) => {
+                    // Stream over: flush any dangling partial (guest died
+                    // mid-char) so the tail is not silently dropped.
+                    if !carry.is_empty() {
+                        let _ = tx.send(std::mem::take(&mut carry));
+                    }
+                    break;
+                }
                 Ok(n) => {
                     if let Some(f) = serial_log.as_mut() {
                         let _ = f.write_all(&buf[..n]);
                         let _ = f.flush();
                     }
-                    if tx.send(buf[..n].to_vec()).is_err() {
+                    if let Some(f) = chunk_log.as_mut() {
+                        let _ = writeln!(f, "{offset} {n}");
+                    }
+                    offset += n as u64;
+                    let mut chunk = std::mem::take(&mut carry);
+                    chunk.extend_from_slice(&buf[..n]);
+                    let keep = utf8_incomplete_suffix_len(&chunk);
+                    let send_len = chunk.len() - keep;
+                    carry = chunk[send_len..].to_vec();
+                    chunk.truncate(send_len);
+                    if !chunk.is_empty() && tx.send(chunk).is_err() {
                         break;
                     }
                 }
@@ -15845,30 +15908,6 @@ fn cmd_nvme_install_smoke(args: &SmokeBootArgs, part: bool) {
         let dump = output_dir.join("nvme-install-boot1-serial.log");
         if std::fs::write(&dump, strip_ansi(&hist1)).is_ok() {
             eprintln!("full boot-1 serial history: {}", dump.display());
-        }
-        // Classify the failure: the Phase 106 "Bug 2" scheduler/IPC
-        // lost-wakeup (a fork-child stranded in BlockedOnReply with no
-        // reply ever delivered) is a SEPARATE pre-existing hang from any
-        // installer / USB-transport fault, and its `[replystall]` /
-        // `no waker registered` watchdog lines are the tell. Name it
-        // explicitly so a future failure is never re-misattributed to the
-        // installer or the (fixed) BOT transport-fail cascade. See
-        // docs/handoffs/2026-07-03-phase-106-usb-installer-nvme.md.
-        let clean = strip_ansi(&hist1);
-        if clean.contains("STRANDED-NO-HOLDER")
-            || clean.contains("STRANDED-SERVER-STUCK")
-            || clean.contains("STRANDED(BlockedOnReply")
-            || clean.contains("(no waker registered)")
-        {
-            eprintln!(
-                "*** KNOWN-FLAKE: Phase 106 Bug 2 — a task stranded in \
-                 BlockedOnReply with no reply ever delivered under heavy \
-                 multi-core IPC load. This is NOT the installer and NOT the \
-                 fixed BOT transport-fail cascade (zero transport-fail lines \
-                 this run). See the `[replystall]` lines' holder_pid / verdict \
-                 (STRANDED-NO-HOLDER = cleanup gap; STRANDED-SERVER-STUCK = \
-                 dependency deadlock) and the handoff's Bug 2 section. ***"
-            );
         }
         fail(&format!("boot 1 (install): {msg}"));
     }
@@ -39421,6 +39460,73 @@ mod tests {
              RENDER_FP (and ure/USB-HID heartbeats) after it — the cleaned buffer \
              should end with the prompt so the strict matcher fires"
         );
+    }
+
+    #[test]
+    fn utf8_incomplete_suffix_len_cases() {
+        // ASCII tail: nothing to carry.
+        assert_eq!(utf8_incomplete_suffix_len(b"hello"), 0);
+        assert_eq!(utf8_incomplete_suffix_len(b""), 0);
+        // Complete em-dash (E2 80 94): nothing to carry.
+        assert_eq!(utf8_incomplete_suffix_len("devices —".as_bytes()), 0);
+        // Em-dash truncated after 1 and 2 bytes: carry the prefix.
+        assert_eq!(utf8_incomplete_suffix_len(b"devices \xE2"), 1);
+        assert_eq!(utf8_incomplete_suffix_len(b"devices \xE2\x80"), 2);
+        // 2-byte sequence truncated after its lead.
+        assert_eq!(utf8_incomplete_suffix_len(b"caf\xC3"), 1);
+        // 4-byte sequence truncated at every split point.
+        assert_eq!(utf8_incomplete_suffix_len(b"x\xF0"), 1);
+        assert_eq!(utf8_incomplete_suffix_len(b"x\xF0\x9F"), 2);
+        assert_eq!(utf8_incomplete_suffix_len(b"x\xF0\x9F\x92"), 3);
+        assert_eq!(utf8_incomplete_suffix_len(b"x\xF0\x9F\x92\x96"), 0);
+        // A stray continuation byte with no lead in reach is invalid input,
+        // not a split — ship it (decodes to U+FFFD, which is honest).
+        assert_eq!(utf8_incomplete_suffix_len(b"x\x80"), 0);
+        assert_eq!(utf8_incomplete_suffix_len(b"x\x80\x80\x80"), 0);
+    }
+
+    #[test]
+    fn serial_pattern_with_em_dash_survives_chunk_split() {
+        // Root cause of the usb-storage-dual-smoke "timed out waiting for
+        // 'mass-storage devices — multi-device mode'" failures: QEMU dribbles
+        // serial output in tiny (3-6 byte) bursts, so the reader's read()
+        // chunks split the banner's 3-byte em-dash roughly every other run;
+        // `append_serial_chunk`'s per-chunk `from_utf8_lossy` then decodes
+        // the halves to U+FFFD and the pattern never matches, though the raw
+        // serial provably contains it. The reader-side carry (holding back an
+        // incomplete UTF-8 suffix until its continuation arrives) must make
+        // the pattern match regardless of where the chunk boundary falls.
+        let line = "usb-storage: 2 mass-storage devices — multi-device mode\n";
+        let raw = line.as_bytes();
+        let pattern = "mass-storage devices — multi-device mode";
+        for split in 1..raw.len() {
+            // Simulate the reader loop: two read() chunks with the carry.
+            let mut sent: Vec<Vec<u8>> = Vec::new();
+            let mut carry: Vec<u8> = Vec::new();
+            for piece in [&raw[..split], &raw[split..]] {
+                let mut chunk = std::mem::take(&mut carry);
+                chunk.extend_from_slice(piece);
+                let keep = utf8_incomplete_suffix_len(&chunk);
+                let send_len = chunk.len() - keep;
+                carry = chunk[send_len..].to_vec();
+                chunk.truncate(send_len);
+                if !chunk.is_empty() {
+                    sent.push(chunk);
+                }
+            }
+            if !carry.is_empty() {
+                sent.push(carry); // EOF flush
+            }
+            let mut serial_buf = String::new();
+            let mut serial_history = String::new();
+            for chunk in &sent {
+                append_serial_chunk(&mut serial_buf, &mut serial_history, chunk);
+            }
+            assert!(
+                strip_ansi(&serial_buf).contains(pattern),
+                "banner must match with the chunk boundary at byte {split}"
+            );
+        }
     }
 
     #[test]

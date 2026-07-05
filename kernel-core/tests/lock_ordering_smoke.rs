@@ -20,10 +20,27 @@
 //! model the invariant with a plain `AtomicBool` that plays the same role as
 //! `PerCoreData::holds_scheduler_lock`.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Simulates the `holds_scheduler_lock` per-CPU flag.
 static HOLDS_SCHED_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// Serializes the tests in this file. They all mutate the shared
+/// [`HOLDS_SCHED_LOCK`] static, and cargo runs `#[test]`s on parallel
+/// threads — without this, another test's `store(false)` can land between
+/// one test's `acquire_scheduler_lock()` and its `check_pi_lock_ordering()`,
+/// making the violation invisible (observed as a rare CI-runner failure of
+/// `pi_lock_while_scheduler_lock_held_is_violation`).
+static TEST_SERIALIZER: Mutex<()> = Mutex::new(());
+
+/// Take the serializer, surviving a poisoned lock from a prior panicked test
+/// (the shared flag is unconditionally re-initialized by each test anyway).
+fn serialize_test() -> std::sync::MutexGuard<'static, ()> {
+    TEST_SERIALIZER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Model of the lock-ordering check inside `Task::with_block_state`.
 ///
@@ -51,6 +68,7 @@ fn release_scheduler_lock() {
 /// Invariant holds: no SCHEDULER lock held when acquiring pi_lock.
 #[test]
 fn pi_lock_without_scheduler_lock_is_ok() {
+    let _serial = serialize_test();
     // Ensure the flag is clear before we start.
     HOLDS_SCHED_LOCK.store(false, Ordering::Relaxed);
     assert!(
@@ -65,6 +83,7 @@ fn pi_lock_without_scheduler_lock_is_ok() {
 /// `Err` return from our model function.
 #[test]
 fn pi_lock_while_scheduler_lock_held_is_violation() {
+    let _serial = serialize_test();
     HOLDS_SCHED_LOCK.store(false, Ordering::Relaxed);
     acquire_scheduler_lock();
     let result = check_pi_lock_ordering();
@@ -83,6 +102,7 @@ fn pi_lock_while_scheduler_lock_held_is_violation() {
 /// Allowed sequence: SCHEDULER.lock released before pi_lock acquired.
 #[test]
 fn pi_lock_after_scheduler_lock_released_is_ok() {
+    let _serial = serialize_test();
     HOLDS_SCHED_LOCK.store(false, Ordering::Relaxed);
     acquire_scheduler_lock();
     release_scheduler_lock();
@@ -101,6 +121,7 @@ fn pi_lock_after_scheduler_lock_released_is_ok() {
 /// the correct outer→inner direction.
 #[test]
 fn outer_to_inner_direction_is_ok() {
+    let _serial = serialize_test();
     HOLDS_SCHED_LOCK.store(false, Ordering::Relaxed);
     // 1. Check pi_lock ordering (pi_lock is outer — check passes).
     assert!(

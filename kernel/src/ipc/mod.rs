@@ -1104,13 +1104,20 @@ fn ipc_recv_msg_timeout(
         return u64::MAX;
     }
 
-    // Header + bulk copy is identical to `ipc_recv_msg`'s message path.
+    // Header + bulk copy is identical to `ipc_recv_msg`'s message path,
+    // including the Phase 106 Bug 2 defensive re-pend on copy-to-user
+    // failure (the reply cap is already in this server's table; dropping
+    // the message would orphan it and deadlock the caller — see
+    // `ipc_recv_msg` for the full rationale). The next
+    // `recv_msg_with_deadline` surfaces the re-pended message via its
+    // drain-first path.
     if msg_ptr != 0 {
         let header = build_cap_msg_wire(&msg);
         if UserSliceWo::new(msg_ptr, header.len())
             .and_then(|s| s.copy_from_kernel(&header))
             .is_err()
         {
+            scheduler::deliver_message(task_id, msg);
             return u64::MAX;
         }
     }
@@ -1123,6 +1130,8 @@ fn ipc_recv_msg_timeout(
                 .and_then(|s| s.copy_from_kernel(&bulk[..copy_len]))
                 .is_err()
         {
+            scheduler::deliver_message(task_id, msg);
+            scheduler::deliver_bulk(task_id, bulk);
             return u64::MAX;
         }
     }
@@ -1176,12 +1185,18 @@ fn ipc_try_recv_msg(
     // `build_cap_msg_wire` so non-blocking recv callers also observe
     // any Phase 74 cap_slots a sender transferred. See `ipc_recv_msg`
     // for the wire-format rationale.
+    // Phase 106 Bug 2 defensive re-pend on copy-to-user failure, mirroring
+    // `ipc_recv_msg` (see there for the orphaned-reply-cap rationale). The
+    // returned `u64::MAX` reads as "no sender pending" to the poller; the
+    // re-pended message is surfaced by `recv_msg_nowait`'s drain-first path
+    // on the next poll.
     if msg_ptr != 0 {
         let header = build_cap_msg_wire(&msg);
         if UserSliceWo::new(msg_ptr, header.len())
             .and_then(|s| s.copy_from_kernel(&header))
             .is_err()
         {
+            scheduler::deliver_message(task_id, msg);
             return u64::MAX;
         }
     }
@@ -1195,6 +1210,8 @@ fn ipc_try_recv_msg(
                 .and_then(|s| s.copy_from_kernel(&bulk[..copy_len]))
                 .is_err()
         {
+            scheduler::deliver_message(task_id, msg);
+            scheduler::deliver_bulk(task_id, bulk);
             return u64::MAX;
         }
     }
@@ -1664,7 +1681,10 @@ fn ipc_recv_with_caps(
     if msg.label == u64::MAX && kind == RECV_KIND_MESSAGE {
         return u64::MAX;
     }
+    // Phase 106 Bug 2 defensive re-pend on copy-to-user failure, mirroring
+    // `ipc_recv_msg` (see there for the orphaned-reply-cap rationale).
     if !write_cap_msg_to_user(msg_ptr, &msg) {
+        scheduler::deliver_message(task_id, msg);
         return u64::MAX;
     }
 
@@ -1678,6 +1698,8 @@ fn ipc_recv_with_caps(
                 .and_then(|s| s.copy_from_kernel(&bulk[..copy_len]))
                 .is_err()
         {
+            scheduler::deliver_message(task_id, msg);
+            scheduler::deliver_bulk(task_id, bulk);
             return u64::MAX;
         }
     }

@@ -2844,6 +2844,39 @@ pub fn set_current_task_pid(pid: u32) {
     }
 }
 
+/// Rename the current task after a successful `execve`.
+///
+/// Fork children are spawned with the static name `"fork-child"`; without a
+/// rename on exec every scheduler diagnostic that prints `task.name`
+/// (`[replystall]`, the stall scans, task dumps) reports the stale name for
+/// exec'd processes — during the Phase 106 Bug 2 investigation
+/// `/drivers/xhci` and `/drivers/usb-storage` both showed as `fork-child`,
+/// which cost real diagnosis time. Pass a name from [`intern_task_name`].
+pub fn set_current_task_name(name: &'static str) {
+    if let Some(idx) = get_current_task_idx() {
+        scheduler_lock().tasks[idx].name = name;
+    }
+}
+
+/// Intern a task name, returning a `&'static str` usable in [`Task::name`].
+///
+/// `Task::name` is `&'static str` because diagnostics read it from
+/// IRQ-adjacent paths without allocating; exec paths are runtime strings, so
+/// each **unique** name is leaked exactly once and reused thereafter. The
+/// leak is bounded by the set of distinct binary paths ever exec'd (a small
+/// closed set: `/bin/*`, `/sbin/*`, `/drivers/*`), not by exec count.
+pub fn intern_task_name(name: &str) -> &'static str {
+    static INTERNED: spin::Mutex<alloc::vec::Vec<&'static str>> =
+        spin::Mutex::new(alloc::vec::Vec::new());
+    let mut table = INTERNED.lock();
+    if let Some(existing) = table.iter().find(|s| **s == name) {
+        return existing;
+    }
+    let leaked: &'static str = alloc::boxed::Box::leak(alloc::string::String::from(name).into());
+    table.push(leaked);
+    leaked
+}
+
 /// Phase 52d B.1: set the current task's `UserReturnState` from the
 /// syscall entry snapshot.  Called by `snapshot_user_return_state` in
 /// `arch/x86_64/syscall/mod.rs`.
