@@ -427,8 +427,9 @@ probes removed 0/20**. Notably, once (B) landed the usb-storage
 transport-fail/BOT-recovery churn **disappeared entirely** across all runs — the
 IPC race had been corrupting the transfers themselves, so fixing it removed the
 whole cascade, not just the terminal strand. `cargo xtask check` green; pre-push
-smoke-test (`ipc-wake`) + regression pass. The `run_qemu_gate_retry_once` guard
-stays as belt-and-suspenders.
+smoke-test (`ipc-wake`) + regression pass. ~~The `run_qemu_gate_retry_once`
+guard stays as belt-and-suspenders.~~ (Removed 2026-07-05 on the follow-ups
+branch — with the strand at 0 the guard only masked genuine regressions.)
 
 *Diagnostics retained; probes removed.* The durable `[replystall]` diagnostic
 (now with `holder_name` + `holder_reply_caps`) stays. The three **temporary**
