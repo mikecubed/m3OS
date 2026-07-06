@@ -389,6 +389,22 @@ if [ "${M3OS_ARGON2_REGRESSION:-0}" = "1" ]; then
     cargo xtask argon2-smoke --timeout 240
 fi
 
+# Phase 110 Track B — userspace ASLR + stack-canary gates. Gated behind
+# M3OS_ASLR_REGRESSION=1 because they boot the OS. `aslr-smoke` execs
+# /bin/aslr-probe several times and asserts the stack address is not identical
+# across execs (the ELF loader CSPRNG-jitters the stack top per execve).
+# `stack-smash-smoke` runs /bin/stack-smash, which overflows a stack buffer
+# past its canary; `-Z stack-protector=strong` + syscall_lib::stack_protector
+# must abort via __stack_chk_fail. Set on branches touching mm/elf.rs ASLR, the
+# stack_protector runtime, the x86_64-m3os stack-protector rustflag, or the two
+# probe binaries.
+if [ "${M3OS_ASLR_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask aslr-smoke..."
+    cargo xtask aslr-smoke --timeout 240
+    echo "pre-push: running cargo xtask stack-smash-smoke..."
+    cargo xtask stack-smash-smoke --timeout 240
+fi
+
 # Phase 107 — networked + signed package distribution. Gated behind
 # M3OS_PKG_NET_REGRESSION=1 because it boots QEMU against a host-served
 # SLIRP HTTP repo and asserts the full trust pipeline: ed25519 index

@@ -81,6 +81,9 @@ static PASSWD_FILE: &[u8] = static_initrd_asset!("etc/passwd");
 static GROUP_FILE: &[u8] = static_initrd_asset!("etc/group");
 static SHADOW_FILE: &[u8] = static_initrd_asset!("etc/shadow");
 static EXIT0_ELF: &[u8] = generated_initrd_asset!("exit0");
+// Phase 110 Track B — ASLR + stack-canary probes.
+static ASLR_PROBE_ELF: &[u8] = generated_initrd_asset!("aslr-probe");
+static STACK_SMASH_ELF: &[u8] = generated_initrd_asset!("stack-smash");
 static FORK_TEST_ELF: &[u8] = generated_initrd_asset!("fork-test");
 static ECHO_ARGS_ELF: &[u8] = generated_initrd_asset!("echo-args");
 static HELLO_ELF: &[u8] = generated_initrd_asset!("hello");
@@ -531,6 +534,18 @@ static TERM_TTF: &[u8] = include_bytes!(concat!(
 
 static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     ("exit0", RamdiskNode::File { content: EXIT0_ELF }),
+    (
+        "aslr-probe",
+        RamdiskNode::File {
+            content: ASLR_PROBE_ELF,
+        },
+    ),
+    (
+        "stack-smash",
+        RamdiskNode::File {
+            content: STACK_SMASH_ELF,
+        },
+    ),
     (
         "fork-test",
         RamdiskNode::File {

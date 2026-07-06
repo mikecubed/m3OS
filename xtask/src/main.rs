@@ -1215,6 +1215,24 @@ fn main() {
                 });
             cmd_argon2_smoke(&smoke_args);
         }
+        Some("aslr-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("aslr-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_aslr_smoke(&smoke_args);
+        }
+        Some("stack-smash-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("stack-smash-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_stack_smash_smoke(&smoke_args);
+        }
         Some("session-recover-smoke") => {
             let smoke_args = parse_smoke_boot_args("session-recover-smoke", &args[2..])
                 .unwrap_or_else(|err| {
@@ -1905,7 +1923,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|argon2-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|argon2-smoke [--timeout <secs>] [--display]|aslr-smoke [--timeout <secs>] [--display]|stack-smash-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm.\n\
      USB passthrough: --usb-passthrough <vid:pid> (e.g. `--usb-passthrough 0bda:8156`) passes a physical USB device into the guest's emulated xHCI (qemu-xhci,id=xhci_pt). The QEMU process must have access to the USB device node — add a udev rule granting the user/group read-write on the device, or run with sudo. The device is claimed from the host kernel while QEMU runs and is released on exit."
@@ -2005,6 +2023,9 @@ fn build_userspace_bins() {
     // (package, binary, needs_alloc)
     let bins: &[(&str, &str, bool)] = &[
         ("exit0", "exit0", false),
+        // Phase 110 Track B — ASLR + stack-canary probes.
+        ("aslr-probe", "aslr-probe", false),
+        ("stack-smash", "stack-smash", false),
         ("fork-test", "fork-test", false),
         ("echo-args", "echo-args", false),
         ("ping", "ping", false),
@@ -17218,6 +17239,250 @@ fn cmd_argon2_smoke(args: &SmokeBootArgs) {
             let _ = child.kill();
             let _ = child.wait();
             eprintln!("argon2-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 110 Track B.2 — `stack-smash-smoke`: prove the userspace stack-canary
+/// (`-Z stack-protector=strong` + `syscall_lib::stack_protector`) catches a
+/// deliberate buffer overflow. Runs `/bin/stack-smash`, which overflows a
+/// 16-byte stack buffer past its canary; the compiler's epilogue check must
+/// call `__stack_chk_fail` (printing `*** stack smashing detected`) rather than
+/// return into the corrupted frame (`STACK_SMASH:after-NOT-CAUGHT`).
+fn stack_smash_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Send {
+        input: "stack-smash\n",
+        label: "stack-smash: run the overflow probe",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "STACK_SMASH:before",
+        timeout_secs: 10,
+        label: "stack-smash: probe started",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "*** stack smashing detected",
+        fail_prefixes: &["STACK_SMASH:after-NOT-CAUGHT"],
+        timeout_secs: 15,
+        label: "stack-smash: canary aborts before the corrupted frame returns",
+        exit_code_on_fail: 1,
+    });
+    steps
+}
+
+/// Phase 110 Track B.2 — `stack-smash-smoke` gate (see [`stack_smash_smoke_steps`]).
+fn cmd_stack_smash_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let ovmf = find_ovmf();
+    let qemu_args = session_smoke_qemu_args(&uefi_image, &ovmf, args.display);
+    let steps = stack_smash_smoke_steps();
+    println!(
+        "stack-smash-smoke: launching QEMU (timeout {}s)",
+        args.timeout_secs
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "stack-smash-smoke: PASSED ({} steps in {elapsed}s) — the stack \
+                 canary aborted the deliberate overflow via __stack_chk_fail",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("stack-smash-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 110 Track B.1 — `aslr-smoke`: prove userspace ASLR randomizes the
+/// stack per `execve`. Boots, logs in, execs `/bin/aslr-probe` several times
+/// (each prints the address of a stack local, `ASLR_PROBE:sp=<addr>`), and
+/// asserts the observed addresses are **not all identical** — the initial RSP
+/// (hence every stack address) is CSPRNG-jittered per exec. CI-able under QEMU.
+fn cmd_aslr_smoke(args: &SmokeBootArgs) {
+    const RUNS: usize = 5;
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let ovmf = find_ovmf();
+    let qemu_args = session_smoke_qemu_args(&uefi_image, &ovmf, args.display);
+    println!(
+        "aslr-smoke: launching QEMU (timeout {}s)",
+        args.timeout_secs
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut buf = String::new();
+    let mut hist = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let step = std::time::Duration::from_secs(args.timeout_secs.min(120));
+
+    let result: Result<Vec<u64>, String> = (|| {
+        // Boot to a root shell (reuse the shared login sequence).
+        wait_for_serial_pattern(
+            &rx,
+            &mut buf,
+            &mut hist,
+            "m3OS login:",
+            step,
+            global_start,
+            global_timeout,
+        )?;
+        std::thread::sleep(std::time::Duration::from_millis(25000));
+        smoke_send_line(&mut child, &mut buf, "root\n")?;
+        wait_for_serial_pattern(
+            &rx,
+            &mut buf,
+            &mut hist,
+            "Password:",
+            step,
+            global_start,
+            global_timeout,
+        )?;
+        smoke_send_line(&mut child, &mut buf, "root\n")?;
+        wait_for_serial_pattern(
+            &rx,
+            &mut buf,
+            &mut hist,
+            "[security] credential transition complete",
+            step,
+            global_start,
+            global_timeout,
+        )?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Exec the probe RUNS times, capturing each printed stack address.
+        let mut addrs: Vec<u64> = Vec::new();
+        for i in 0..RUNS {
+            smoke_send_line(&mut child, &mut buf, "aslr-probe\n")?;
+            wait_for_serial_pattern(
+                &rx,
+                &mut buf,
+                &mut hist,
+                "ASLR_PROBE:sp=",
+                step,
+                global_start,
+                global_timeout,
+            )?;
+            // The sentinel matches on the `=`, but the address digits + newline
+            // arrive just after — drain briefly so the full number is buffered
+            // before parsing (otherwise we capture a truncated prefix).
+            let drain_until = std::time::Instant::now() + std::time::Duration::from_millis(400);
+            while std::time::Instant::now() < drain_until {
+                match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok(chunk) => append_serial_chunk(&mut buf, &mut hist, &chunk),
+                    Err(_) => {
+                        if strip_ansi(&buf).contains("ASLR_PROBE:sp=") {
+                            // Stop early once a newline terminates the probe line.
+                            let c = strip_ansi(&buf);
+                            if let Some((idx, _)) = c.rmatch_indices("ASLR_PROBE:sp=").next()
+                                && c[idx..].contains('\n')
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            // Parse the number after the last "ASLR_PROBE:sp=" in the cleaned buffer.
+            let clean = strip_ansi(&buf);
+            let val = clean
+                .rmatch_indices("ASLR_PROBE:sp=")
+                .next()
+                .and_then(|(idx, _)| {
+                    let rest = &clean[idx + "ASLR_PROBE:sp=".len()..];
+                    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    digits.parse::<u64>().ok()
+                })
+                .ok_or_else(|| format!("run {i}: could not parse ASLR_PROBE:sp= address"))?;
+            addrs.push(val);
+        }
+        Ok(addrs)
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    match result {
+        Ok(addrs) => {
+            let all_same = addrs.iter().all(|a| *a == addrs[0]);
+            if all_same {
+                eprintln!(
+                    "aslr-smoke: FAILED — the stack address was identical across all \
+                     {RUNS} execs ({:#x}); ASLR did not randomize the stack top",
+                    addrs[0]
+                );
+                std::process::exit(1);
+            }
+            let distinct = {
+                let mut s = addrs.clone();
+                s.sort_unstable();
+                s.dedup();
+                s.len()
+            };
+            let elapsed = global_start.elapsed().as_secs();
+            println!(
+                "aslr-smoke: PASSED ({elapsed}s) — {distinct}/{RUNS} distinct stack \
+                 addresses across execs (e.g. {:#x}, {:#x}); the initial RSP is \
+                 CSPRNG-randomized per execve",
+                addrs[0], addrs[1]
+            );
+        }
+        Err(msg) => {
+            eprintln!("aslr-smoke: FAILED\n{msg}");
             std::process::exit(1);
         }
     }

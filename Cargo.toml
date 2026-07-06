@@ -9,6 +9,9 @@ members = [
     # Phase 11 userspace test binaries
     "userspace/syscall-lib",
     "userspace/exit0",
+    # Phase 110 Track B — ASLR + stack-canary probe binaries
+    "userspace/aslr-probe",
+    "userspace/stack-smash",
     "userspace/fork-test",
     "userspace/echo-args",
     # Phase 20 userspace init and shell

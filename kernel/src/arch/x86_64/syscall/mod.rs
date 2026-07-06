@@ -5569,7 +5569,13 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             proc.entry_point = loaded.entry;
             proc.user_stack_top = user_rsp;
             proc.brk_current = 0;
-            proc.mmap_next = 0;
+            // Phase 110 B.1 — ASLR the anonymous mmap base per exec. Seeding
+            // `mmap_next` non-zero here means the first `mmap(NULL, …)` grows
+            // from the randomized base (the `mmap_next == 0 → ANON_MMAP_BASE`
+            // fallbacks in the mmap path are simply never reached). Falls back
+            // to the fixed base until the CSPRNG is seeded.
+            proc.mmap_next =
+                ANON_MMAP_BASE + crate::mm::elf::aslr_offset_bytes(crate::mm::elf::MMAP_ASLR_PAGES);
             proc.vma_tree.clear(); // Phase 36: clear stale VMAs from old address space.
             // Phase 90a B.3 — execve replaces the address space, so the
             // protection-key table is reset to fresh (Linux: pkeys are per-mm

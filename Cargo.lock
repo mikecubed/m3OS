@@ -120,6 +120,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d92bec98840b8f03a5ff5413de5293bfcd8bf96467cf5452609f939ec6f5de16"
 
 [[package]]
+name = "aslr-probe"
+version = "0.99.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
 name = "async-rt"
 version = "0.99.0"
 dependencies = [
@@ -2209,6 +2216,13 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "stack-smash"
+version = "0.99.0"
+dependencies = [
+ "syscall-lib",
+]
 
 [[package]]
 name = "stdin_feeder"

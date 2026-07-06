@@ -50,6 +50,11 @@ unsafe fn parse_cstr<'a>(ptr: *const u8, max_len: usize) -> Option<&'a str> {
 ///
 /// `stack_ptr` must point to the original process entry stack (argc at `*stack_ptr`).
 pub unsafe fn run_main(stack_ptr: *const u64, main_fn: fn(&[&str]) -> i32) -> ! {
+    // Phase 110 B.2 — seed the stack canary from the CSPRNG before main. Safe
+    // here because `run_main` diverges (ends in `exit`): its own epilogue
+    // canary check is never reached, so rewriting the guard mid-function cannot
+    // self-mismatch, and every function `main` calls sees the seeded value.
+    crate::stack_protector::seed_guard();
     let argc = unsafe { *stack_ptr } as usize;
     let argv_base = unsafe { stack_ptr.add(1) } as *const *const u8;
 
@@ -78,6 +83,8 @@ pub unsafe fn run_main(stack_ptr: *const u64, main_fn: fn(&[&str]) -> i32) -> ! 
 ///
 /// `stack_ptr` must point to the original process entry stack (argc at `*stack_ptr`).
 pub unsafe fn run_main_with_env(stack_ptr: *const u64, main_fn: fn(&[&str], &[&str]) -> i32) -> ! {
+    // Phase 110 B.2 — seed the stack canary before main (see `run_main`).
+    crate::stack_protector::seed_guard();
     let argc = unsafe { *stack_ptr } as usize;
     let argv_base = unsafe { stack_ptr.add(1) } as *const *const u8;
 
