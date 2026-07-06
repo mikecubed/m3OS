@@ -1206,6 +1206,15 @@ fn main() {
                 });
             cmd_mitigations_status_smoke(&smoke_args);
         }
+        Some("argon2-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("argon2-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_argon2_smoke(&smoke_args);
+        }
         Some("session-recover-smoke") => {
             let smoke_args = parse_smoke_boot_args("session-recover-smoke", &args[2..])
                 .unwrap_or_else(|err| {
@@ -1896,7 +1905,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|argon2-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm.\n\
      USB passthrough: --usb-passthrough <vid:pid> (e.g. `--usb-passthrough 0bda:8156`) passes a physical USB device into the guest's emulated xHCI (qemu-xhci,id=xhci_pt). The QEMU process must have access to the USB device node — add a udev rule granting the user/group read-write on the device, or run with sudo. The device is claimed from the host kernel while QEMU runs and is released on exit."
@@ -2012,10 +2021,12 @@ fn build_userspace_bins() {
         ("init", "init", true),
         ("shell", "sh0", false),
         ("edit", "edit", true),
-        ("login", "login", false),
-        ("su", "su", false),
-        ("passwd", "passwd", false),
-        ("adduser", "adduser", false),
+        // Phase 110 Track C — argon2id password hashing needs a heap matrix,
+        // so all four auth binaries carry a `BrkAllocator` (`needs_alloc`).
+        ("login", "login", true),
+        ("su", "su", true),
+        ("passwd", "passwd", true),
+        ("adduser", "adduser", true),
         ("id", "id", false),
         ("whoami", "whoami", false),
         ("ktrace", "ktrace", false), // deep per-task scheduler trace tool
@@ -6402,10 +6413,13 @@ fn cmd_check() {
         "ping6",
         "ipv6-smoke",
         "edit",
-        "login",
-        "su",
-        "passwd",
-        "adduser",
+        // NOTE: Phase 110 Track C — `login`/`su`/`passwd`/`adduser` are
+        // clippy-checked in a SEPARATE invocation below. They enable
+        // `syscall-lib/argon2`, which pulls the `alloc` crate into `syscall-lib`;
+        // feature unification in this combined invocation would drag that into
+        // the allocator-less binaries here (`exit0`/`ping`/`whoami`/…), which have
+        // no `#[global_allocator]`. (The generic `alloc` feature that `edit`/
+        // `init` enable stays harmless — it gates only the BrkAllocator impl.)
         "id",
         "whoami",
         "pty-test",
@@ -6481,7 +6495,8 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
-    // Clippy for syscall-lib with the alloc feature enabled (heap code is feature-gated).
+    // Clippy for syscall-lib with the argon2 feature enabled (heap +
+    // blake2b/argon2 modules are feature-gated; `argon2` implies `alloc`).
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
         .args([
@@ -6489,7 +6504,7 @@ fn cmd_check() {
             "--package",
             "syscall-lib",
             "--features",
-            "alloc",
+            "argon2",
             "--target",
             userspace_target_str.as_str(),
             "-Zbuild-std=core,compiler_builtins,alloc",
@@ -6500,10 +6515,44 @@ fn cmd_check() {
             "warnings",
         ])
         .status()
-        .expect("failed to run syscall-lib alloc clippy");
+        .expect("failed to run syscall-lib argon2 clippy");
 
     if !status.success() {
-        eprintln!("syscall-lib (alloc feature) clippy reported errors");
+        eprintln!("syscall-lib (argon2 feature) clippy reported errors");
+        std::process::exit(1);
+    }
+
+    // Phase 110 Track C — clippy the argon2-using auth binaries in their OWN
+    // invocation. They enable `syscall-lib/argon2` (alloc-crate usage); each
+    // carries a `#[global_allocator]`, so isolating them keeps feature
+    // unification from dragging that into the allocator-less binaries in the
+    // combined invocation above.
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args([
+            "clippy",
+            "--package",
+            "login",
+            "--package",
+            "su",
+            "--package",
+            "passwd",
+            "--package",
+            "adduser",
+            "--target",
+            userspace_target_str.as_str(),
+            "-Zbuild-std=core,compiler_builtins,alloc",
+            "-Zbuild-std-features=compiler-builtins-mem",
+            "-Zjson-target-spec",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .status()
+        .expect("failed to run auth-binary clippy");
+
+    if !status.success() {
+        eprintln!("auth-binary (argon2) clippy reported errors");
         std::process::exit(1);
     }
 
@@ -16989,6 +17038,191 @@ fn mitigations_status_smoke_steps() -> Vec<SmokeStep> {
 
 /// `cargo xtask mitigations-status-smoke` — boot + assert the boot policy log
 /// and the `m3ctl mitigations status` reporter output (Phase 84 D.3).
+/// Phase 110 Track C — `argon2-smoke`: prove the argon2id password path
+/// end-to-end.
+///
+/// 1. Boot + login as the seeded **root** — root's `/etc/shadow` entry is
+///    argon2id, so reaching the shell IS a successful argon2id verification;
+///    `grep` confirms the `$argon2id$` prefix on disk.
+/// 2. Plant a **legacy** `$sha256i$` user at runtime (the fallback read path
+///    must keep authenticating pre-migration entries).
+/// 3. Run `login` as that legacy user: `verify_password` authenticates via the
+///    `$sha256i$` fallback arm, then login **transparently re-hashes** the entry
+///    to argon2id (the `[security] rehashed login password to argon2id`
+///    sentinel), lands in the user's shell, and a final `grep` confirms the
+///    on-disk entry is now `$argon2id$`.
+fn argon2_smoke_steps() -> Vec<SmokeStep> {
+    // Legacy shadow field computed by the same iterated-SHA-256 the pre-Phase-110
+    // format used. Leaked to `&'static str` (xtask is short-lived; the strings
+    // are a handful of bytes) so they satisfy `SmokeStep`'s static lifetimes.
+    let legacy_field = legacy_sha256i_shadow_field(b"legacypw", b"legacy_salt_1234");
+    let add_passwd: &'static str = Box::leak(
+        "echo 'legacy:x:1500:1500:legacy:/tmp:/bin/ion' >> /etc/passwd\n"
+            .to_string()
+            .into_boxed_str(),
+    );
+    let add_shadow: &'static str =
+        Box::leak(format!("echo 'legacy:{legacy_field}::::::' >> /etc/shadow\n").into_boxed_str());
+
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 300 });
+
+    // 1. The seeded root entry is argon2id.
+    steps.push(SmokeStep::Send {
+        input: "/bin/grep root /etc/shadow\n",
+        label: "argon2: inspect root shadow format",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "$argon2id$",
+        timeout_secs: 10,
+        label: "argon2: root shadow is argon2id",
+    });
+
+    // 2. Plant a legacy $sha256i$ user.
+    steps.push(SmokeStep::Send {
+        input: add_passwd,
+        label: "argon2: add legacy user to /etc/passwd",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "argon2: prompt after passwd append",
+    });
+    steps.push(SmokeStep::Send {
+        input: add_shadow,
+        label: "argon2: add legacy $sha256i$ entry to /etc/shadow",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "argon2: prompt after shadow append",
+    });
+    // Confirm the planted entry really is the legacy format before we log in.
+    steps.push(SmokeStep::Send {
+        input: "/bin/grep legacy /etc/shadow\n",
+        label: "argon2: inspect planted legacy entry",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "$sha256i$",
+        timeout_secs: 10,
+        label: "argon2: planted entry is legacy $sha256i$",
+    });
+
+    // 3. Log in as the legacy user → fallback verify + transparent re-hash.
+    steps.push(SmokeStep::Send {
+        input: "login\n",
+        label: "argon2: start a fresh login",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "m3OS login: ",
+        timeout_secs: 10,
+        label: "argon2: login username prompt",
+    });
+    steps.push(SmokeStep::Send {
+        input: "legacy\n",
+        label: "argon2: enter legacy username",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Password: ",
+        timeout_secs: 10,
+        label: "argon2: login password prompt",
+    });
+    steps.push(SmokeStep::Send {
+        input: "legacypw\n",
+        label: "argon2: enter legacy password",
+    });
+    // The re-hash sentinel proves BOTH the $sha256i$ fallback verify AND the
+    // in-place upgrade; "Login incorrect" would mean the fallback arm failed.
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "[security] rehashed login password to argon2id",
+        fail_prefixes: &["Login incorrect"],
+        timeout_secs: 30,
+        label: "argon2: legacy login re-hashes to argon2id",
+        exit_code_on_fail: 1,
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Welcome to m3OS! uid=1500",
+        timeout_secs: 15,
+        label: "argon2: legacy user reaches its shell",
+    });
+
+    // 4. Return to the root shell and confirm the re-hash persisted on disk.
+    steps.push(SmokeStep::Send {
+        input: "exit\n",
+        label: "argon2: leave the legacy shell",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "argon2: back at the root prompt",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/grep legacy /etc/shadow\n",
+        label: "argon2: re-inspect the legacy entry",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "$argon2id$",
+        timeout_secs: 10,
+        label: "argon2: legacy entry is now argon2id on disk",
+    });
+    steps
+}
+
+/// Phase 110 Track C — `argon2-smoke` gate (see [`argon2_smoke_steps`]).
+fn cmd_argon2_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let ovmf = find_ovmf();
+    let qemu_args = session_smoke_qemu_args(&uefi_image, &ovmf, args.display);
+    let steps = argon2_smoke_steps();
+
+    println!(
+        "argon2-smoke: launching QEMU (timeout {}s)",
+        args.timeout_secs
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "argon2-smoke: PASSED ({} steps in {elapsed}s) — argon2id login, \
+                 $sha256i$ fallback verify, and transparent re-hash to argon2id",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("argon2-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn cmd_mitigations_status_smoke(args: &SmokeBootArgs) {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
@@ -29942,44 +30176,56 @@ fn create_data_disk(
     disk_path
 }
 
-/// Populate the ext2 partition image with initial directories and files
-/// using `debugfs -w`. Creates temp host files for the `write` command.
-/// Phase 66 Track E.1 — bootstrap a single `/etc/shadow` password
-/// field using the same canonical format the in-guest `passwd` helper
-/// writes (`$sha256i$10000$<hex_salt>$<hex_hash>`).
+/// Bootstrap a single `/etc/shadow` password field using the same canonical
+/// format the in-guest `passwd`/`login` helpers write.
 ///
-/// Mirrors `syscall_lib::sha256::hash_password_iterated` byte-for-byte:
-/// round 1 hashes `salt || password`; subsequent rounds hash
-/// `prev_hash || salt || password`. Iteration count is pinned to
-/// [`passwd::HASH_ROUNDS`] (= 10000) so the boot image, runtime
-/// `passwd`, and `verify_password` cannot drift.
+/// Phase 110 Track C — this now emits **argon2id** via
+/// `crypto_lib::argon2::build_shadow_field`, the exact same code path the
+/// in-guest binaries use (`crypto-lib` re-exports `syscall_lib::argon2`), so
+/// the boot image, runtime `passwd`, and `verify_password` cannot drift.
+/// `salt` is a fixed per-CI-user value (≥ 8 bytes) for reproducible images; the
+/// runtime `passwd` path draws a fresh `getrandom` salt.
 fn generate_seeded_shadow_line(password: &[u8], salt: &[u8]) -> String {
+    let mut buf = [0u8; 256];
+    let n = crypto_lib::argon2::build_shadow_field(
+        password,
+        salt,
+        &crypto_lib::argon2::DEFAULT_PARAMS,
+        &mut buf,
+    )
+    .expect("argon2id shadow field fits in the 256-byte buffer");
+    String::from_utf8(buf[..n].to_vec()).expect("argon2id shadow field is ASCII")
+}
+
+/// Reproduce a **legacy** `$sha256i$10000$<hex_salt>$<hex_hash>` shadow field on
+/// the host (the pre-Phase-110 iterated-SHA-256 format). Used only by
+/// `argon2-smoke` to plant a pre-migration entry whose fallback verify + login
+/// re-hash the gate then exercises. Mirrors the old
+/// `syscall_lib::sha256::hash_password_iterated`: round 1 = `SHA256(salt||pw)`,
+/// rounds 2..N = `SHA256(prev||salt||pw)`, N = 10000.
+fn legacy_sha256i_shadow_field(password: &[u8], salt: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-
+    const ROUNDS: u32 = 10000;
     let mut hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(salt);
-        hasher.update(password);
-        hasher.finalize().to_vec()
+        let mut h = Sha256::new();
+        h.update(salt);
+        h.update(password);
+        h.finalize().to_vec()
     };
-    for _ in 1..passwd::HASH_ROUNDS {
-        let mut hasher = Sha256::new();
-        hasher.update(&hash);
-        hasher.update(salt);
-        hasher.update(password);
-        hash = hasher.finalize().to_vec();
+    for _ in 1..ROUNDS {
+        let mut h = Sha256::new();
+        h.update(&hash);
+        h.update(salt);
+        h.update(password);
+        hash = h.finalize().to_vec();
     }
-
-    let prefix =
-        std::str::from_utf8(passwd::HASH_FORMAT_PREFIX).expect("HASH_FORMAT_PREFIX is ASCII");
-    let mut out = String::with_capacity(prefix.len() + salt.len() * 2 + 1 + 64);
-    out.push_str(prefix);
+    let mut out = String::from("$sha256i$10000$");
     for &b in salt {
-        out.push_str(&format!("{:02x}", b));
+        out.push_str(&format!("{b:02x}"));
     }
     out.push('$');
     for &b in &hash {
-        out.push_str(&format!("{:02x}", b));
+        out.push_str(&format!("{b:02x}"));
     }
     out
 }
@@ -30067,9 +30313,9 @@ fn populate_ext2_files(
     // Standard Unix root filesystem layout.
     let passwd_content =
         "root:x:0:0:root:/root:/bin/ion\nuser:x:1000:1000:user:/home/user:/bin/ion\n";
-    // Phase 66 Track E.1 — pre-provisioned `/etc/shadow` hashes are now
-    // generated through the same canonical helper the in-guest passwd
-    // binary uses (`$sha256i$10000$<hex_salt>$<hex_hash>`), so the
+    // Pre-provisioned `/etc/shadow` hashes are generated through the same
+    // canonical helper the in-guest passwd/login binaries use — Phase 110
+    // Track C: `$argon2id$v=19$m=…,t=…,p=…$<hex_salt>$<hex_hash>` — so the
     // bootstrap format cannot drift from runtime updates. Salts are
     // fixed-bytes so the rebuilt disk image is byte-identical run to
     // run — the salt is not a secret, only the password is.
@@ -35776,18 +36022,19 @@ fn security_floor_steps() -> Vec<SmokeStep> {
         label: "guest/auth: prompt after id",
     });
 
-    // 2. Verify shadow file contains a salted SHA-256-family password hash
-    //    (not plaintext, not locked). Pre-seeded images use $sha256$ while
-    //    first-boot or passwd updates produce $sha256i$ hashes with a fresh
-    //    getrandom()-backed salt.
+    // 2. Verify the shadow file contains a memory-hard argon2id password hash
+    //    (not plaintext, not locked). Phase 110 Track C — pre-seeded images and
+    //    passwd/login writes all emit `$argon2id$…`; the `$sha256i$`/`$sha256$`
+    //    verify arms remain only as a fallback read path for pre-migration
+    //    entries (which a successful login transparently re-hashes to argon2id).
     steps.push(SmokeStep::Send {
         input: "/bin/grep root /etc/shadow\n",
         label: "guest/auth: inspect shadow hash format",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "$sha256",
+        pattern: "$argon2id$",
         timeout_secs: 10,
-        label: "guest/auth: shadow contains SHA-256-family hash",
+        label: "guest/auth: shadow contains argon2id hash",
     });
     steps.push(SmokeStep::Wait {
         pattern: "# ",

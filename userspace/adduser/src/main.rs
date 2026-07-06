@@ -1,12 +1,27 @@
 //! m3OS adduser — create a new user account (Phase 27, root only).
 #![no_std]
 #![no_main]
+#![feature(alloc_error_handler)]
 
+extern crate alloc;
+
+use core::alloc::Layout;
 use shadow::{ShadowError, shadow_write_atomic};
+use syscall_lib::argon2::{DEFAULT_PARAMS, build_shadow_field};
+use syscall_lib::heap::BrkAllocator;
 use syscall_lib::{
     O_RDONLY, STDOUT_FILENO, chown, close, exit, fsync, geteuid, getrandom, open, read, write,
     write_str, write_u64,
 };
+
+#[global_allocator]
+static ALLOCATOR: BrkAllocator = BrkAllocator::new();
+
+#[alloc_error_handler]
+fn alloc_error(_layout: Layout) -> ! {
+    write_str(STDOUT_FILENO, "adduser: alloc error\n");
+    exit(1)
+}
 
 const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
 const SHADOW_PATH: &[u8] = b"/etc/shadow\0";
@@ -90,18 +105,21 @@ fn adduser_main() -> ! {
     };
     let new_gid = new_uid; // GID = UID
 
-    // Hash the password with random salt and iterated SHA-256.
+    // Hash the password with a random salt using argon2id (Phase 110).
     let mut salt = [0u8; 16];
     if getrandom(&mut salt) != 16 {
         write_str(STDOUT_FILENO, "adduser: failed to generate random salt\n");
         exit(1);
     }
-    let hash =
-        syscall_lib::sha256::hash_password_iterated(&pw_input[..plen], &salt, passwd::HASH_ROUNDS);
-    let mut salt_hex = [0u8; 64];
-    let salt_hex_len = syscall_lib::sha256::to_hex(&salt, &mut salt_hex);
-    let mut hash_hex = [0u8; 64];
-    let hash_hex_len = syscall_lib::sha256::to_hex(&hash, &mut hash_hex);
+    let mut hash_field = [0u8; 200];
+    let hash_field_len =
+        match build_shadow_field(&pw_input[..plen], &salt, &DEFAULT_PARAMS, &mut hash_field) {
+            Some(len) => len,
+            None => {
+                write_str(STDOUT_FILENO, "adduser: failed to hash password\n");
+                exit(1);
+            }
+        };
 
     // Append to /etc/passwd (single write).
     {
@@ -173,10 +191,7 @@ fn adduser_main() -> ! {
                 && !append_checked(&mut new_shadow, &mut pos, b"\n"))
             || !append_checked(&mut new_shadow, &mut pos, username)
             || !append_checked(&mut new_shadow, &mut pos, b":")
-            || !append_checked(&mut new_shadow, &mut pos, passwd::HASH_FORMAT_PREFIX)
-            || !append_checked(&mut new_shadow, &mut pos, &salt_hex[..salt_hex_len])
-            || !append_checked(&mut new_shadow, &mut pos, b"$")
-            || !append_checked(&mut new_shadow, &mut pos, &hash_hex[..hash_hex_len])
+            || !append_checked(&mut new_shadow, &mut pos, &hash_field[..hash_field_len])
             || !append_checked(&mut new_shadow, &mut pos, b"::::::\n")
         {
             write_str(

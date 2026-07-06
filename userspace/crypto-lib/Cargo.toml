@@ -11,7 +11,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aes_force_soft)'] }
 
 [features]
 default = []
-alloc = []
+# Phase 110 Track C — the argon2id re-export needs syscall-lib's argon2 module
+# (which pulls the `alloc` crate; `argon2` implies syscall-lib's `alloc`).
+alloc = ["syscall-lib/argon2"]
 
 [dependencies]
 sha2 = { workspace = true }

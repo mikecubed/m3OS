@@ -10,14 +10,14 @@ fatfs = "0.3.6"
 gpt = "3.1.0"
 serde_json = "1.0.149"
 tempfile = "3.25.0"
-# Phase 66 Track E.1 — regenerate the pre-seeded `/etc/shadow` hashes via the
-# canonical `$sha256i$10000$` format the in-guest passwd helper uses.
 sha2 = { workspace = true, default-features = false }
-passwd = { path = "../userspace/passwd", default-features = false }
 # Phase 85a — host packer for the content-addressed .m3pkg store (default
 # features bring in the std pack/unpack surface).
 pkg-format = { path = "../pkg-format" }
 # Phase 107 Track C — ed25519 signing for `cargo xtask repo-index` (the same
 # crate whose verify half runs on-device; sign-on-host / verify-on-device
 # agree by construction).
-crypto-lib = { path = "../userspace/crypto-lib" }
+# Phase 110 Track C — `alloc` also pulls in `crypto_lib::argon2`, used by
+# `generate_seeded_shadow_line` so the pre-seeded `/etc/shadow` argon2id hashes
+# are produced by the exact same code path as the in-guest passwd helper.
+crypto-lib = { path = "../userspace/crypto-lib", features = ["alloc"] }

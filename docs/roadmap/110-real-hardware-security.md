@@ -1,6 +1,6 @@
 # Phase 110 - Real-Hardware Security Hardening
 
-**Status:** Planned
+**Status:** In progress — **Track C (argon2id) landed + green** (RFC 9106 argon2id + BLAKE2b host-tested, passwd/adduser/login write argon2id, `verify_password` fallback + login re-hash, seeded images argon2id, `argon2-smoke` PASS). Tracks A (KPTI), B (ASLR/canaries/CET), D (Secure Boot) planned — the KPTI/CET/Secure-Boot arms are bare-metal-validation-gated.
 **Source Ref:** phase-110
 **Depends on:** Phase 84 (KPTI scaffolding + Spectre mitigations) ✅, Phase 48 (security foundation) ✅, Phase 10 (Secure Boot) ✅
 **Builds on:** Activates the Phase 84 Track A KPTI CR3-trampoline (designed + host-tested as a PML4-pair model, with `KPTI_WIRED = false` so it has **never** actually switched CR3 on a kernel/user transition), hardens the Phase 27/48 password path, and validates the Phase 10 Secure Boot chain on real silicon — retiring the long-stale Phase 59 Track J item.

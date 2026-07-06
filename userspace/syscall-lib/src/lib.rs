@@ -15,6 +15,11 @@ use core::arch::asm;
 #[cfg(feature = "alloc")]
 pub mod heap;
 
+pub mod blake2b;
+
+#[cfg(feature = "argon2")]
+pub mod argon2;
+
 pub mod sha256;
 
 pub mod start;

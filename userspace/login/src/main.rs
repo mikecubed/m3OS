@@ -1,12 +1,27 @@
 //! m3OS login — prompts for username/password and spawns user shell (Phase 27).
 #![no_std]
 #![no_main]
+#![feature(alloc_error_handler)]
 
-use passwd::{build_hash_field, rewrite_shadow_file};
+extern crate alloc;
+
+use core::alloc::Layout;
+use passwd::rewrite_shadow_file;
+use syscall_lib::argon2::{DEFAULT_PARAMS, build_shadow_field};
+use syscall_lib::heap::BrkAllocator;
 use syscall_lib::{
     O_RDONLY, O_TRUNC, O_WRONLY, STDOUT_FILENO, close, execve, exit, fsync, getrandom, nanosleep,
     open, read, setgid, setuid, write, write_str, write_u64,
 };
+
+#[global_allocator]
+static ALLOCATOR: BrkAllocator = BrkAllocator::new();
+
+#[alloc_error_handler]
+fn alloc_error(_layout: Layout) -> ! {
+    write_str(STDOUT_FILENO, "login: alloc error\n");
+    exit(1)
+}
 
 const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
 const SHADOW_PATH: &[u8] = b"/etc/shadow\0";
@@ -115,6 +130,8 @@ fn login_once() {
             write_str(STDOUT_FILENO, "Login incorrect\n");
             return;
         }
+        // Phase 110 — upgrade a legacy hash to argon2id now, while still root.
+        maybe_rehash_to_argon2id(&shadow_buf[..shadow_len], username, &pw_input[..plen]);
     }
 
     // Authentication succeeded.
@@ -304,48 +321,35 @@ fn is_locked_account(shadow: &[u8], username: &[u8]) -> bool {
     false
 }
 
-/// Set a new password for a locked account by rewriting /etc/shadow.
-fn set_initial_password(username: &[u8], password: &[u8]) -> bool {
-    // Generate random salt and hash the password.
+/// Hash `password` with a fresh random salt into a `$argon2id$…` shadow field.
+/// Returns the field length, or `None` on getrandom/hash failure.
+fn build_argon2_field(password: &[u8], out: &mut [u8]) -> Option<usize> {
     let mut salt = [0u8; 16];
     if getrandom(&mut salt) != 16 {
-        return false;
+        return None;
     }
-    let hash = syscall_lib::sha256::hash_password_iterated(password, &salt, 10000);
-    let mut salt_hex = [0u8; 64];
-    let salt_hex_len = syscall_lib::sha256::to_hex(&salt, &mut salt_hex);
-    let mut hash_hex = [0u8; 64];
-    let hash_hex_len = syscall_lib::sha256::to_hex(&hash, &mut hash_hex);
-    let mut hash_field = [0u8; 128];
-    let hash_field_len = match build_hash_field(
-        &salt_hex[..salt_hex_len],
-        &hash_hex[..hash_hex_len],
-        &mut hash_field,
-    ) {
-        Some(len) => len,
-        None => return false,
-    };
+    build_shadow_field(password, &salt, &DEFAULT_PARAMS, out)
+}
 
-    // Read current shadow file.
+/// Rewrite `username`'s hash field in /etc/shadow to `hash_field`, preserving
+/// the metadata suffix. Non-atomic (matches the pre-existing login write path);
+/// callers treat failure as best-effort.
+fn write_shadow_field(username: &[u8], hash_field: &[u8]) -> bool {
     let mut shadow_buf = [0u8; 2048];
     let shadow_len = read_file(SHADOW_PATH, &mut shadow_buf);
     if shadow_len == 0 {
         return false;
     }
-
-    // Reuse the shared shadow rewrite helper so the existing metadata suffix is preserved.
     let mut new_shadow = [0u8; 2048];
     let out_pos = match rewrite_shadow_file(
         &shadow_buf[..shadow_len],
         username,
-        &hash_field[..hash_field_len],
+        hash_field,
         &mut new_shadow,
     ) {
         Ok(len) => len,
         Err(_) => return false,
     };
-
-    // Write the new shadow file.
     let fd = open(SHADOW_PATH, O_WRONLY | O_TRUNC, 0);
     if fd < 0 {
         return false;
@@ -363,25 +367,61 @@ fn set_initial_password(username: &[u8], password: &[u8]) -> bool {
     true
 }
 
-/// Verify password against /etc/shadow.
-fn verify_shadow(shadow: &[u8], username: &[u8], password: &[u8]) -> bool {
+/// Set a new password for a locked account by rewriting /etc/shadow (argon2id).
+fn set_initial_password(username: &[u8], password: &[u8]) -> bool {
+    let mut hash_field = [0u8; 200];
+    let n = match build_argon2_field(password, &mut hash_field) {
+        Some(n) => n,
+        None => return false,
+    };
+    write_shadow_field(username, &hash_field[..n])
+}
+
+/// Return `username`'s `/etc/shadow` hash field (the second colon-field).
+fn user_hash_field<'a>(shadow: &'a [u8], username: &[u8]) -> Option<&'a [u8]> {
     for line in shadow.split(|&b| b == b'\n') {
         if line.is_empty() {
             continue;
         }
-        // Format: username:hash:...
-        if let Some(colon) = line.iter().position(|&b| b == b':') {
-            let name = &line[..colon];
-            if name == username {
-                let rest = &line[colon + 1..];
-                // Find the next colon to isolate the hash field.
-                let hash_end = rest.iter().position(|&b| b == b':').unwrap_or(rest.len());
-                let hash_field = &rest[..hash_end];
-                return syscall_lib::sha256::verify_password(password, hash_field);
-            }
+        if let Some(colon) = line.iter().position(|&b| b == b':')
+            && &line[..colon] == username
+        {
+            let rest = &line[colon + 1..];
+            let hash_end = rest.iter().position(|&b| b == b':').unwrap_or(rest.len());
+            return Some(&rest[..hash_end]);
         }
     }
-    false
+    None
+}
+
+/// Phase 110 — after a successful login against a legacy `$sha256i$`/`$sha256$`
+/// entry, transparently re-hash the password to argon2id in place. Best-effort:
+/// a failure just leaves the legacy entry (still valid) for next time. MUST run
+/// while still root (before the setuid), since it writes /etc/shadow.
+fn maybe_rehash_to_argon2id(shadow: &[u8], username: &[u8], password: &[u8]) {
+    let Some(field) = user_hash_field(shadow, username) else {
+        return;
+    };
+    if field.starts_with(syscall_lib::argon2::SHADOW_PREFIX) {
+        return; // already argon2id
+    }
+    let mut hash_field = [0u8; 200];
+    if let Some(n) = build_argon2_field(password, &mut hash_field)
+        && write_shadow_field(username, &hash_field[..n])
+    {
+        write_str(
+            STDOUT_FILENO,
+            "[security] rehashed login password to argon2id\n",
+        );
+    }
+}
+
+/// Verify password against /etc/shadow.
+fn verify_shadow(shadow: &[u8], username: &[u8], password: &[u8]) -> bool {
+    match user_hash_field(shadow, username) {
+        Some(field) => syscall_lib::sha256::verify_password(password, field),
+        None => false,
+    }
 }
 
 /// Build an environment string like "KEY=value\0".
