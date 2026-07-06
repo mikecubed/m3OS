@@ -441,6 +441,8 @@ fi
 if [ "${M3OS_PTRACE_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask ptrace-smoke..."
     cargo xtask ptrace-smoke --timeout 240
+    echo "pre-push: running cargo xtask ptrace-gdbserver-smoke..."
+    cargo xtask ptrace-gdbserver-smoke --timeout 300
 fi
 
 # Phase 107 — networked + signed package distribution. Gated behind

@@ -14,6 +14,9 @@ members = [
     "userspace/stack-smash",
     # Phase 111 Track D — ptrace tracer/tracee smoke binary
     "userspace/ptrace-test",
+    # Phase 111 Track D.3 — native gdbserver + its debuggee
+    "userspace/m3gdbserver",
+    "userspace/ptrace-tracee",
     "userspace/fork-test",
     "userspace/echo-args",
     # Phase 20 userspace init and shell

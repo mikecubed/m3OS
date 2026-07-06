@@ -5739,6 +5739,40 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             crate::smp::set_current_core_kernel_stack(kstack_top);
             set_per_core_syscall_stack_top(kstack_top);
         }
+        // Phase 111 Track D — exec-stop. If this process is traced, stop-and-
+        // notify the tracer with SIGTRAP *before* the new image's first
+        // instruction runs (Linux `PTRACE_EVENT_EXEC`/exec-stop), so the tracer
+        // (m3gdbserver) can set breakpoints first. We are in a normal blockable
+        // syscall context with the new CR3/UserReturnState already published, so
+        // we snapshot the new program's initial registers (entry RIP, ABI RSP,
+        // zeroed GPRs — matching Linux exec register clearing) and park, then
+        // resume to the entry with any SETREGS edits. Diverges (never falls
+        // through to `enter_userspace`).
+        #[cfg(feature = "ptrace")]
+        {
+            let traced = crate::process::PROCESS_TABLE
+                .lock()
+                .find(pid)
+                .map(|p| p.ptrace.traced)
+                .unwrap_or(false);
+            if traced {
+                let regs = crate::signal::SavedUserRegs {
+                    rip: loaded.entry,
+                    rsp: user_rsp,
+                    rflags: 0x202,
+                    ..Default::default()
+                };
+                {
+                    let mut table = crate::process::PROCESS_TABLE.lock();
+                    if let Some(proc) = table.find_mut(pid) {
+                        proc.ptrace.regs = regs;
+                        proc.ptrace.stop_sig = crate::process::ptrace::SIGTRAP;
+                        proc.ptrace.resume = crate::process::ptrace::PtraceResume::None;
+                    }
+                }
+                ptrace_park_and_resume();
+            }
+        }
         crate::arch::x86_64::enter_userspace(loaded.entry, user_rsp)
     }
 }
@@ -20105,14 +20139,24 @@ pub extern "C" fn ptrace_stop_trampoline() -> ! {
     // IRET restored the (cleared) IF from the redirected frame; re-enable so the
     // park loop is scheduled against, mirroring `fault_kill_trampoline`.
     x86_64::instructions::interrupts::enable();
+    ptrace_park_and_resume()
+}
+
+/// Park the current (traced) tracee until the tracer resumes it, then re-enter
+/// userspace with the resulting registers (or terminate on `KILL`). Shared by
+/// the `#BP`/`#DB` stop trampoline and the `execve` exec-stop — both call this
+/// from a normal, blockable ring-0 context (interrupts already enabled). Never
+/// returns.
+#[cfg(feature = "ptrace")]
+pub fn ptrace_park_and_resume() -> ! {
     match crate::process::ptrace::enter_stop_and_wait() {
         crate::process::ptrace::ResumeAction::Kill => {
             let pid = crate::process::current_pid();
             terminate_thread_group_and_exit(pid, -(crate::process::ptrace::SIGTRAP as i32));
         }
         crate::process::ptrace::ResumeAction::Resume(regs) => {
-            // SAFETY: `regs` holds valid userspace RIP/RSP captured at the trap
-            // (or set via SETREGS); resume the tracee to ring 3.
+            // SAFETY: `regs` holds valid userspace RIP/RSP (captured at the trap
+            // / the new image's entry, or set via SETREGS); resume to ring 3.
             unsafe { restore_and_enter_userspace(&regs) }
         }
     }

@@ -1271,6 +1271,15 @@ fn main() {
                 });
             cmd_ptrace_smoke(&smoke_args);
         }
+        Some("ptrace-gdbserver-smoke") => {
+            let smoke_args = parse_smoke_boot_args("ptrace-gdbserver-smoke", &args[2..])
+                .unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_ptrace_gdbserver_smoke(&smoke_args);
+        }
         Some("session-recover-smoke") => {
             let smoke_args = parse_smoke_boot_args("session-recover-smoke", &args[2..])
                 .unwrap_or_else(|err| {
@@ -1961,7 +1970,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|debug [--fresh] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|argon2-smoke [--timeout <secs>] [--display]|aslr-smoke [--timeout <secs>] [--display]|stack-smash-smoke [--timeout <secs>] [--display]|debug-substrate-smoke [--timeout <secs>] [--display]|kgdb-smoke [--timeout <secs>] [--display]|ptrace-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|debug [--fresh] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|argon2-smoke [--timeout <secs>] [--display]|aslr-smoke [--timeout <secs>] [--display]|stack-smash-smoke [--timeout <secs>] [--display]|debug-substrate-smoke [--timeout <secs>] [--display]|kgdb-smoke [--timeout <secs>] [--display]|ptrace-smoke [--timeout <secs>] [--display]|ptrace-gdbserver-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm.\n\
      USB passthrough: --usb-passthrough <vid:pid> (e.g. `--usb-passthrough 0bda:8156`) passes a physical USB device into the guest's emulated xHCI (qemu-xhci,id=xhci_pt). The QEMU process must have access to the USB device node — add a udev rule granting the user/group read-write on the device, or run with sudo. The device is claimed from the host kernel while QEMU runs and is released on exit."
@@ -2066,6 +2075,9 @@ fn build_userspace_bins() {
         ("stack-smash", "stack-smash", false),
         // Phase 111 Track D — ptrace tracer/tracee smoke.
         ("ptrace-test", "ptrace-test", false),
+        // Phase 111 Track D.3 — native gdbserver (links kernel-core → alloc) + debuggee.
+        ("m3gdbserver", "m3gdbserver", true),
+        ("ptrace-tracee", "ptrace-tracee", false),
         ("fork-test", "fork-test", false),
         ("echo-args", "echo-args", false),
         ("ping", "ping", false),
@@ -18002,6 +18014,253 @@ fn cmd_ptrace_smoke(args: &SmokeBootArgs) {
             eprintln!("ptrace-smoke: FAILED\n{msg}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Phase 111 Track D.3 — `ptrace-gdbserver-smoke` gate
+/// (`M3OS_PTRACE_REGRESSION=1`, the same env as `ptrace-smoke`). Builds the
+/// kernel with the `ptrace` feature, boots it, logs in, and launches
+/// `m3gdbserver 1234 /bin/ptrace-tracee` over serial — a native gdbserver that
+/// forks+`TRACEME`+`execve`s the tracee (which **exec-stops** before its first
+/// instruction). A **raw GDB-RSP client on the host** (no host `gdb`; a real
+/// `gdb target remote` follows the identical wire path) connects over a SLIRP
+/// `hostfwd` (host port → guest `1234`) and drives a full session: `qSupported`,
+/// `?` → the exec-stop, `g` (read RIP/RSP), `Z0` at the entry + `c` → the
+/// breakpoint hit (RIP advanced past the planted `int3`), `z0` + `P` (rewind
+/// RIP), an `M`/`m` memory round-trip, and `c` → the tracee runs to exit with
+/// `W07`. Exercises the whole Track D.3 stack: exec-stop, the RSP↔ptrace
+/// translation over TCP, and cross-address-space peek/poke — end to end.
+fn cmd_ptrace_gdbserver_smoke(args: &SmokeBootArgs) {
+    // Build with the `ptrace` feature (merge any pre-set features).
+    // SAFETY: xtask is single-threaded here; the child build reads the env.
+    let merged = match std::env::var("M3OS_KERNEL_FEATURES") {
+        Ok(existing) if !existing.trim().is_empty() => format!("{},ptrace", existing.trim()),
+        _ => "ptrace".to_string(),
+    };
+    unsafe {
+        std::env::set_var("M3OS_KERNEL_FEATURES", merged);
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let ovmf = find_ovmf();
+    // Keep SLIRP networking and forward a fresh host port to the guest's
+    // gdbserver port (1234). `session_smoke_qemu_args` strips the default
+    // hostfwd to `user,id=net0`; we replace it to add our rule (the guestfwd
+    // idiom), so the guest still gets its static 10.0.2.15 + inbound forward.
+    let host_port = kgdb_pick_free_port();
+    let mut qemu_args = session_smoke_qemu_args(&uefi_image, &ovmf, args.display);
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0") {
+            *arg = format!("user,id=net0,hostfwd=tcp:127.0.0.1:{host_port}-:1234");
+        }
+    }
+
+    println!(
+        "ptrace-gdbserver-smoke: launching QEMU (hostfwd 127.0.0.1:{host_port}→guest:1234, \
+         timeout {}s)",
+        args.timeout_secs
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+
+    // Boot, log in, and launch the gdbserver; wait until it is listening.
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Send {
+        input: "m3gdbserver 1234 /bin/ptrace-tracee\n",
+        label: "launch m3gdbserver on the tracee",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "M3GDBSERVER:listening on 1234",
+        timeout_secs: 30,
+        label: "gdbserver bound + listening",
+    });
+    if let Err(msg) = run_smoke_steps_with_capture(
+        &mut child,
+        &steps,
+        global_timeout,
+        &rx,
+        &mut serial_buf,
+        global_start,
+    ) {
+        let _ = child.kill();
+        let _ = child.wait();
+        eprintln!("ptrace-gdbserver-smoke: FAILED (gdbserver never listened)\n{msg}");
+        std::process::exit(1);
+    }
+
+    // Connect the raw-RSP client over the hostfwd and drive the session.
+    let connect_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut stream = loop {
+        match std::net::TcpStream::connect(("127.0.0.1", host_port)) {
+            Ok(s) => break s,
+            Err(_) if std::time::Instant::now() < connect_deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!("ptrace-gdbserver-smoke: FAILED — could not connect to gdbserver: {e}");
+                std::process::exit(1);
+            }
+        }
+    };
+
+    let result = ptrace_gdbserver_rsp_session(&mut stream);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    match result {
+        Ok(()) => {
+            let elapsed = global_start.elapsed().as_secs();
+            println!(
+                "ptrace-gdbserver-smoke: PASSED ({elapsed}s) — RSP-over-TCP attach, exec-stop, \
+                 breakpoint hit + rewind, M/m memory, and continue-to-exit (W07) all verified \
+                 through m3gdbserver → sys_ptrace"
+            );
+        }
+        Err(reason) => {
+            eprintln!("ptrace-gdbserver-smoke: FAILED — {reason}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Drive a full RSP session against `m3gdbserver` (reusing the kgdb RSP wire
+/// helpers). Returns Ok on a clean exec-stop → breakpoint → exit cycle.
+fn ptrace_gdbserver_rsp_session(stream: &mut std::net::TcpStream) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+        .map_err(|e| format!("set_read_timeout: {e}"))?;
+
+    // 1. qSupported.
+    kgdb_rsp_send(stream, b"qSupported").map_err(|e| format!("send qSupported: {e}"))?;
+    let sup = kgdb_rsp_recv(stream).map_err(|e| format!("recv qSupported: {e}"))?;
+    if !sup.windows(11).any(|w| w == b"PacketSize=") {
+        return Err(format!(
+            "qSupported missing PacketSize: {:?}",
+            String::from_utf8_lossy(&sup)
+        ));
+    }
+
+    // 2. ? → exec-stop (S05).
+    kgdb_rsp_send(stream, b"?").map_err(|e| format!("send ?: {e}"))?;
+    let stop = kgdb_rsp_recv(stream).map_err(|e| format!("recv ?: {e}"))?;
+    if stop.first() != Some(&b'S') {
+        return Err(format!(
+            "exec-stop reply not S..: {:?}",
+            String::from_utf8_lossy(&stop)
+        ));
+    }
+
+    // 3. g → the entry RIP (hex chars 256..272) and RSP (112..128).
+    let regs = gdbserver_read_g(stream)?;
+    let entry_rip = kgdb_le_u64(&regs[256..272]).ok_or("parse RIP")?;
+    let rsp = kgdb_le_u64(&regs[112..128]).ok_or("parse RSP")?;
+
+    // 4. Z0 at the entry, then continue → the planted int3 fires immediately.
+    let z0 = format!("Z0,{entry_rip:x},1");
+    kgdb_rsp_send(stream, z0.as_bytes()).map_err(|e| format!("send Z0: {e}"))?;
+    expect_ok(stream, "Z0")?;
+    kgdb_rsp_send(stream, b"c").map_err(|e| format!("send c: {e}"))?;
+    let hit = kgdb_rsp_recv(stream).map_err(|e| format!("recv stop after c: {e}"))?;
+    if hit.first() != Some(&b'S') {
+        return Err(format!(
+            "breakpoint stop not S..: {:?}",
+            String::from_utf8_lossy(&hit)
+        ));
+    }
+
+    // 5. g → RIP must be entry+1 (past the planted 0xCC).
+    let regs2 = gdbserver_read_g(stream)?;
+    let hit_rip = kgdb_le_u64(&regs2[256..272]).ok_or("parse RIP after bp")?;
+    if hit_rip != entry_rip + 1 {
+        return Err(format!(
+            "breakpoint RIP {hit_rip:#x} != entry+1 {:#x}",
+            entry_rip + 1
+        ));
+    }
+
+    // 6. Remove the breakpoint and rewind RIP to the entry via P (reg 0x10 = rip).
+    let z0d = format!("z0,{entry_rip:x},1");
+    kgdb_rsp_send(stream, z0d.as_bytes()).map_err(|e| format!("send z0: {e}"))?;
+    expect_ok(stream, "z0")?;
+    let mut prip = String::from("P10=");
+    for b in entry_rip.to_le_bytes() {
+        prip.push_str(&format!("{b:02x}"));
+    }
+    kgdb_rsp_send(stream, prip.as_bytes()).map_err(|e| format!("send P: {e}"))?;
+    expect_ok(stream, "P(rip)")?;
+
+    // 7. M/m round-trip through the tracee's stack scratch.
+    const MAGIC: u64 = 0xDEAD_BEEF_1234_5678;
+    let scratch = rsp.wrapping_sub(16);
+    let mut mcmd = format!("M{scratch:x},8:");
+    for b in MAGIC.to_le_bytes() {
+        mcmd.push_str(&format!("{b:02x}"));
+    }
+    kgdb_rsp_send(stream, mcmd.as_bytes()).map_err(|e| format!("send M: {e}"))?;
+    expect_ok(stream, "M")?;
+    let mrd = format!("m{scratch:x},8");
+    kgdb_rsp_send(stream, mrd.as_bytes()).map_err(|e| format!("send m: {e}"))?;
+    let mem = kgdb_rsp_recv(stream).map_err(|e| format!("recv m: {e}"))?;
+    let got = kgdb_le_u64(&mem).ok_or("parse m reply")?;
+    if got != MAGIC {
+        return Err(format!("m read {got:#x} != M-written {MAGIC:#x}"));
+    }
+
+    // 8. Continue to exit — the tracee runs to exit(7) → W07.
+    kgdb_rsp_send(stream, b"c").map_err(|e| format!("send final c: {e}"))?;
+    let exit = kgdb_rsp_recv(stream).map_err(|e| format!("recv exit: {e}"))?;
+    if exit != b"W07" {
+        return Err(format!(
+            "exit reply {:?} != W07",
+            String::from_utf8_lossy(&exit)
+        ));
+    }
+    Ok(())
+}
+
+fn gdbserver_read_g(stream: &mut std::net::TcpStream) -> Result<Vec<u8>, String> {
+    kgdb_rsp_send(stream, b"g").map_err(|e| format!("send g: {e}"))?;
+    let regs = kgdb_rsp_recv(stream).map_err(|e| format!("recv g: {e}"))?;
+    if regs.len() < 272 {
+        return Err(format!("g reply too short: {} chars", regs.len()));
+    }
+    Ok(regs)
+}
+
+fn expect_ok(stream: &mut std::net::TcpStream, what: &str) -> Result<(), String> {
+    let r = kgdb_rsp_recv(stream).map_err(|e| format!("recv {what}: {e}"))?;
+    if r == b"OK" {
+        Ok(())
+    } else {
+        Err(format!("{what} not OK: {:?}", String::from_utf8_lossy(&r)))
     }
 }
 

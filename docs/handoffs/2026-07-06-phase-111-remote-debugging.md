@@ -11,10 +11,12 @@
   (PR #314; full-GPR `#BP`/`#DB` naked entry, polled COM2, RSP command loop, SMP
   all-stop + panic hook, `kgdb` feature + `kgdb-smoke` gate PASS). Details below
   ("What's landed"); the old blueprint is preserved under "Implementation notes".
-- **Track D.1 + D.2 (ptrace substrate + `sys_ptrace`)** ✅ **landed on
-  `feat/phase-111-ptrace`** (traced-process stop/notify, `SIGTRAP` on ring-3
-  `int3`, cross-address-space peek/poke, `ptrace-smoke` PASS). See "Track D" below.
-- **Track D.3 + D.4 (`m3gdbserver` + symbol retention)** — NOT started.
+- **Track D.1 + D.2 + D.3 (ptrace substrate + `sys_ptrace` + `m3gdbserver`)** ✅
+  **landed on `feat/phase-111-ptrace`** (traced-process stop/notify, `SIGTRAP` on
+  ring-3 `int3`, cross-address-space peek/poke, `execve` exec-stop, and a native
+  gdbserver translating RSP ↔ ptrace over TCP; `ptrace-smoke` +
+  `ptrace-gdbserver-smoke` PASS). See "Track D" below.
+- **Track D.4 (host-side DWARF/symbol retention)** — the one open follow-on.
 
 **Charter:** `docs/roadmap/111-remote-debugging.md`
 **Tasks:** `docs/roadmap/tasks/111-remote-debugging-tasks.md`
@@ -213,9 +215,10 @@ registered.
 
 ## Track D — ptrace + m3gdbserver
 
-**D.1 + D.2 landed on `feat/phase-111-ptrace`** (stacked on the Track C branch —
-it reuses the Track C full-GPR `DebugTrapFrame` naked entry for the ring-3 path).
-`ptrace-smoke` PASSES. D.3 (`m3gdbserver`) + D.4 (symbol retention) remain.
+**D.1 + D.2 + D.3 landed on `feat/phase-111-ptrace`** (stacked on the Track C
+branch — it reuses the Track C full-GPR `DebugTrapFrame` naked entry for the
+ring-3 path). `ptrace-smoke` + `ptrace-gdbserver-smoke` PASS. Only D.4 (host-side
+DWARF/symbol retention for real `gdb` source stepping) remains.
 
 ### As-built (D.1 + D.2)
 
@@ -250,22 +253,47 @@ it reuses the Track C full-GPR `DebugTrapFrame` naked entry for the ring-3 path)
   Validates stop/notify + GETREGS/SETREGS + PEEK/POKETEXT + CONT with **no**
   m3gdbserver — a `SETREGS`'d `rbx` flows into the tracee's exit code.
 
-### D.3 / D.4 remaining
+### As-built (D.3)
 
-- `userspace/m3gdbserver` (native, four-place wiring per the codebase map —
-  sshd template + `kernel-core` for `gdb_rsp`): fork+TRACEME+`execve` a tracee,
-  translate GDB RSP ↔ `sys_ptrace` over TCP/AF_UNIX (kernel is alive → ordinary
-  IRQ-driven transport, no polled link). The `gdb_rsp` codec is `no_std`, so it
-  links from userspace. Register-order marshalling matches the `g`/`G` amd64
-  layout the kgdb stub already implements.
-- **exec-stop**: for the `execve` model, `execve` of a `TRACEME`'d child should
-  emit a SIGTRAP ptrace-stop so the tracer gains control before the new program
-  runs (Linux). Not yet wired — the native D.1/D.2 test hits `int3` in the same
-  binary (no exec), so this is a D.3 prerequisite.
+- **exec-stop** (`syscall/mod.rs` `sys_execve` tail, before `enter_userspace`):
+  a traced `execve` snapshots the new image's initial registers
+  (`SavedUserRegs { rip: loaded.entry, rsp: user_rsp, rflags: 0x202, ..zeroed }`)
+  into `ptrace.regs`, then calls the shared `ptrace_park_and_resume()` (extracted
+  from `ptrace_stop_trampoline` — the park/resume tail: `enter_stop_and_wait` →
+  `restore_and_enter_userspace`). No frame redirect: `sys_execve` is already a
+  blockable syscall context with the new CR3 + `UserReturnState` published, so it
+  parks inline and resumes to the new image's entry. **Do not** try to hook this
+  into `check_pending_signals` — a successful `execve` diverges through
+  `enter_userspace` and never returns to the syscall-return path, and
+  `read_saved_user_regs` there would read the pre-exec caller's registers.
+- **`userspace/m3gdbserver`** (native, `kernel-core` for `gdb_rsp`): `m3gdbserver
+  <port> <program>` → socket/bind/listen, accept one GDB connection,
+  fork+`TRACEME`+`execve` the program (exec-stops), then translate RSP ↔
+  `sys_ptrace`. Commands: `?`, `qSupported`/`q*`, `g`/`G`/`P`, `m`/`M`, `Z0`/`z0`
+  (int3 patch via a `POKETEXT` read-modify-write; a breakpoint table holds the
+  saved bytes), `c`/`s` (resume then `waitpid` → `S`/`W`/`X` stop reply),
+  `k`/`D`. Register marshalling: `SavedUserRegs`'s first 17 `u64` ARE the GDB
+  amd64 `g` order (rax..rip), then eflags (low 32 of rflags) + 6 segment
+  selectors (cs=0x33, ss=0x2b, rest 0).
+- **`userspace/ptrace-tracee`** — the debuggee (does a little work, `exit(7)`).
+- **Gate** `ptrace-gdbserver-smoke` (`cmd_ptrace_gdbserver_smoke`, same
+  `M3OS_PTRACE_REGRESSION` env): boots, logs in, `Send`s
+  `m3gdbserver 1234 /bin/ptrace-tracee`, waits for `M3GDBSERVER:listening`, then a
+  **host** raw-RSP client connects over a SLIRP `hostfwd` (fresh host port → guest
+  1234) and drives the full session. Uses `run_smoke_steps_with_capture` (which
+  takes an externally-owned serial `rx`) so the login steps and the TCP work
+  interleave. **Networking note:** `session_smoke_qemu_args` strips the default
+  hostfwd; the gate replaces `user,id=net0` to add its rule (the guestfwd idiom).
+  The guest's static `10.0.2.15` + virtio-net baseline carry inbound TCP.
 - **`ATTACH` / `GETSIGINFO`** deferred (the fork+TRACEME model needs neither).
-- D.4: retain unstripped userspace ELFs host-side for DWARF; the current
-  `ptrace-smoke` is the native-tracer variant, the `m3gdbserver` RSP variant
-  rides D.3.
+
+### D.4 remaining
+
+- Retain unstripped userspace ELFs host-side (or a `-g` variant) for DWARF, so a
+  **real** host `gdb` (not just a raw-RSP client) gets source-level stepping
+  against `m3gdbserver`. The current gates use native binaries whose symbols the
+  raw-RSP clients don't need, so this is the one open item — it matters only once
+  a real `gdb target remote` with source lines is in the loop.
 
 ---
 
@@ -306,13 +334,12 @@ Landed alongside the Phase 111 work (context, not this phase):
 
 ## Next actions (suggested order)
 
-1. **Track D.3** (`m3gdbserver`) + **D.4** (userspace symbol retention) per the
-   "Track D" section above — the last Phase 111 increment, fully QEMU-testable
-   (kernel is alive → ordinary TCP/AF_UNIX transport, no polled link). Reuse the
-   `gdb_rsp` codec (it is `no_std`, so it links from userspace too). First wire
-   the `execve`→SIGTRAP-stop so a fork+TRACEME+exec tracee stops before the new
-   program runs.
-2. Phase 110 A/B.3/D + the Phase 111 Track C/D on-metal arms — operator-owned.
+1. **Track D.4** (host-side DWARF/symbol retention) per the "Track D" section
+   above — retain unstripped userspace ELFs host-side so a **real** host `gdb`
+   (not just a raw-RSP client) gets source-level stepping against `m3gdbserver`.
+   The only open Phase 111 item; low-stakes (build-plumbing, not kernel).
+2. The Track C async-break follow-on below (optional polish).
+3. Phase 110 A/B.3/D + the Phase 111 Track C/D on-metal arms — operator-owned.
 
 ### Async-break (Track C.4) — ✅ landed
 

@@ -1,0 +1,15 @@
+[package]
+name = "m3gdbserver"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "m3gdbserver"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib", features = ["alloc"] }
+# The GDB Remote Serial Protocol wire codec (framing/checksum/hex) is the same
+# host-tested kernel_core::gdb_rsp the in-kernel kgdb stub uses — it is no_std,
+# so it links into this userspace tracer too.
+kernel-core = { path = "../../kernel-core", default-features = false }
