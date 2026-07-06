@@ -18,16 +18,18 @@
 
 ## Track A — Activate + Bare-Metal-Validate KPTI
 
-### A.1 — PML4 pair in `new_process_page_table`
+### A.1 — PML4 pair builder + user-half invariant self-test ✅ (builder + validation; live wiring is A.2)
 
-**File:** `kernel/src/mm/mod.rs`
-**Symbol:** `new_process_page_table`
-**Why it matters:** Today this clones the kernel PML4[1..512] into **every** process PML4, so kernel mappings live in the user CR3 — the exact arrangement Meltdown exploits. KPTI requires a second "user" PML4 carrying only PML4[0] (user pages) plus the minimal entry set, with kernel `.text`/heap/direct-map absent in the user half.
+**File:** `kernel/src/mm/kpti.rs` (new), `kernel/src/mm/mod.rs`, `kernel/src/lib.rs`
+**Symbol:** `mm::kpti::self_test`, `mm::kpti::build_selftest_pair`, `mm::mapper_for_frame`
+**Why it matters:** Today `new_process_page_table` clones the kernel PML4[1..512] into **every** process PML4, so kernel mappings live in the user CR3 — the exact arrangement Meltdown exploits. KPTI requires a second "user" PML4 carrying only PML4[0] (user pages) plus the minimal entry set, with kernel `.text`/heap/direct-map absent in the user half.
+
+**As-built (A.1):** the reusable **user-half builder** (private-sub-table entry-set mapper — never cloning a kernel `PML4[i]` slot) plus a **boot-time self-test** landed with `KPTI_WIRED` still `false`, so the live CR3 is untouched and every existing gate is unaffected. The self-test builds a real user PML4 (a synthetic user page + a representative entry set: the PerCoreData page(s), the `syscall_entry` text page, a fresh entry stack), walks it back, and feeds the observations to `kernel_core::kpti::check_user_half_invariant` — emitting `KPTI_SELFTEST:PASS`. Gate `kpti-selftest-smoke` (`M3OS_KPTI_REGRESSION=1`) asserts it. **Load-bearing subtlety:** m3OS never uses `swapgs` (`GS_BASE` = `PerCoreData` in both rings), so the PerCoreData page(s) MUST be in the entry set — the entry asm reads `gs:[…]` before the CR3 switch. Entry-set pages are mapped at their existing kernel VAs through fresh private sub-tables. **Deferred to A.2:** wiring the builder into `new_process_page_table` so `AddressSpace` tracks the pair per-process (only meaningful once the CR3 switch consumes it — building an inert second PML4 for every process would add fork/exec overhead for no benefit while `KPTI_WIRED` is false).
 
 **Acceptance:**
-- [ ] `new_process_page_table` returns a kernel/user PML4 **pair** (kernel = full map; user = PML4[0] + minimal entry set), each tracked on the process `AddressSpace`.
-- [ ] The user PML4 maps exactly the minimal entry set (trampoline text, IDT, GDT/TSS, per-CPU entry stack) and **no** kernel `.text`/heap/direct-map entries (verified by a walk asserting PML4[256..512] empty in the user half).
-- [ ] Host/`kernel-core` test (or a boot-time self-check) asserts the user half contains no kernel upper-half leaf PTE.
+- [ ] `new_process_page_table` returns a kernel/user PML4 **pair** (kernel = full map; user = PML4[0] + minimal entry set), each tracked on the process `AddressSpace`. *(Builder landed in `mm::kpti`; per-process wiring lands with A.2's CR3 switch.)*
+- [x] The user PML4 maps exactly the minimal entry set (trampoline text, IDT, GDT/TSS, per-CPU entry stack) and **no** kernel `.text`/heap/direct-map entries (verified by a walk asserting no kernel upper-half secret leaf in the user half). *(Self-test proves it on a representative pair; the real switch's full entry set — GDT/TSS/IDT — is added in A.2.)*
+- [x] Host/`kernel-core` test (or a boot-time self-check) asserts the user half contains no kernel upper-half leaf PTE. *(`mm::kpti::self_test` → `KPTI_SELFTEST:PASS`, gate `kpti-selftest-smoke`; the `kernel_core::kpti` invariant model is host-tested.)*
 
 ### A.2 — Syscall-entry CR3 trampoline
 

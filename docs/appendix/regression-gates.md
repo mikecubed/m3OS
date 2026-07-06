@@ -226,6 +226,12 @@ Phase 87: the **reboot-persistence** proof — a two-boot gate against the SAME 
 
 Phase 84: boots + asserts the `[sec] mitigations=… global_kernel_ptes=0` boot-policy log and the `m3ctl mitigations status` reporter output — per-vuln Meltdown line + compiled-in retpoline line + UNADDRESSED enumeration; KPTI-independent default boot
 
+## kpti-selftest-smoke
+
+**Env var:** `M3OS_KPTI_REGRESSION=1`
+
+Phase 110 Track A.1: boots the **stock** kernel (no special feature) and asserts the boot-time KPTI user-half self-test passes (`KPTI_SELFTEST:PASS`, and no `FAIL`/`SKIP`). The self-test (`kernel/src/mm/kpti.rs`, run unconditionally in `mitigations::init_bsp`) builds a real **user PML4** — a synthetic user page at `USER_VADDR_MIN` plus the minimal **entry set** mapped through *fresh private sub-tables* at their existing kernel VAs (never cloning a kernel `PML4[i]` slot, which would re-expose the direct map and silently defeat KPTI): the `PerCoreData` page(s) — load-bearing because m3OS is `swapgs`-free, so `GS_BASE` = `PerCoreData` in **both** rings and the KPTI entry asm reads `gs:[…]` before the CR3 switch — the `syscall_entry` text page, and a fresh entry stack. It then walks the built table back and feeds every present leaf's `(role, present)` to the host-tested `kernel_core::kpti::check_user_half_invariant`, proving on QEMU — which cannot exercise Meltdown itself — that **no** kernel image / heap / kstack / direct-map leaf is reachable from the user CR3. The throwaway pair is freed leak-free (a recording allocator tracks exactly the private page-table frames created; real kernel pages the entry set points at are never freed). This is the A.1 **builder + validation** only: `KPTI_WIRED` is still `false`, so the live CR3 is untouched — the syscall/IRQ CR3 trampoline that consumes the pair is A.2–A.4. Set on branches touching `kernel/src/mm/kpti.rs`, `new_process_page_table`, the minimal entry set, or `kernel_core::kpti`.
+
 ## kgdb-smoke
 
 **Env var:** `M3OS_KGDB_REGRESSION=1`

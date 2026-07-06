@@ -6,6 +6,7 @@ pub mod dma;
 pub mod elf;
 pub mod frame_allocator;
 pub mod heap;
+pub mod kpti;
 pub mod memory_map;
 pub mod paging;
 pub mod pkey;

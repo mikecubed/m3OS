@@ -1253,6 +1253,15 @@ fn main() {
                 });
             cmd_debug_substrate_smoke(&smoke_args);
         }
+        Some("kpti-selftest-smoke") => {
+            let smoke_args = parse_smoke_boot_args("kpti-selftest-smoke", &args[2..])
+                .unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_kpti_selftest_smoke(&smoke_args);
+        }
         Some("kgdb-smoke") => {
             let smoke_args =
                 parse_smoke_boot_args("kgdb-smoke", &args[2..]).unwrap_or_else(|err| {
@@ -1970,7 +1979,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|debug [--fresh] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|argon2-smoke [--timeout <secs>] [--display]|aslr-smoke [--timeout <secs>] [--display]|stack-smash-smoke [--timeout <secs>] [--display]|debug-substrate-smoke [--timeout <secs>] [--display]|kgdb-smoke [--timeout <secs>] [--display]|ptrace-smoke [--timeout <secs>] [--display]|ptrace-gdbserver-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|debug [--fresh] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|argon2-smoke [--timeout <secs>] [--display]|aslr-smoke [--timeout <secs>] [--display]|stack-smash-smoke [--timeout <secs>] [--display]|debug-substrate-smoke [--timeout <secs>] [--display]|kpti-selftest-smoke [--timeout <secs>] [--display]|kgdb-smoke [--timeout <secs>] [--display]|ptrace-smoke [--timeout <secs>] [--display]|ptrace-gdbserver-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm.\n\
      USB passthrough: --usb-passthrough <vid:pid> (e.g. `--usb-passthrough 0bda:8156`) passes a physical USB device into the guest's emulated xHCI (qemu-xhci,id=xhci_pt). The QEMU process must have access to the USB device node — add a udev rule granting the user/group read-write on the device, or run with sudo. The device is claimed from the host kernel while QEMU runs and is released on exit."
@@ -17421,6 +17430,92 @@ fn cmd_debug_substrate_smoke(args: &SmokeBootArgs) {
     println!(
         "debug-substrate-smoke: PASSED ({elapsed}s) — #BP RIP-fixup, RFLAGS.TF \
          single-step (1 #DB), and DR7 arm/disarm all verified in kernel context"
+    );
+}
+
+/// Phase 110 Track A.1 — `kpti-selftest-smoke`: boot the **stock** kernel and
+/// assert the KPTI user-half self-test passes. The self-test (in
+/// `kernel/src/mm/kpti.rs`, run unconditionally in `init_bsp`) builds a real
+/// user PML4 — a synthetic user page + the minimal entry set (PerCoreData, the
+/// `syscall_entry` text page, an entry stack) — walks it, and feeds the result
+/// to `kernel_core::kpti::check_user_half_invariant`, emitting `KPTI_SELFTEST:`.
+/// The gate asserts `PASS` (and no `FAIL`), proving on QEMU — which cannot
+/// exercise Meltdown itself — that the pair builder maps only the user lower
+/// half + entry set, with no kernel image / heap / kstack / direct-map leaf
+/// reachable from the user CR3. No special kernel feature: the sentinel prints
+/// on every boot (KPTI is not yet live; `KPTI_WIRED` is `false`).
+fn cmd_kpti_selftest_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let ovmf = find_ovmf();
+    let qemu_args = session_smoke_qemu_args(&uefi_image, &ovmf, args.display);
+    println!(
+        "kpti-selftest-smoke: launching QEMU (timeout {}s)",
+        args.timeout_secs
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut buf = String::new();
+    let mut hist = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let step = std::time::Duration::from_secs(args.timeout_secs.min(180));
+
+    // The sentinel prints early in boot (right after the `[sec] mitigations`
+    // line). Wait for a `KPTI_SELFTEST:` line, then assert on history.
+    let result = wait_for_serial_pattern(
+        &rx,
+        &mut buf,
+        &mut hist,
+        "KPTI_SELFTEST:",
+        step,
+        global_start,
+        global_timeout,
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let clean = strip_ansi(&hist);
+    if let Err(msg) = result {
+        eprintln!("kpti-selftest-smoke: FAILED (self-test never ran)\n{msg}");
+        std::process::exit(1);
+    }
+    if clean.contains("KPTI_SELFTEST:FAIL") || clean.contains("KPTI_SELFTEST:SKIP") {
+        for l in clean.lines().filter(|l| l.contains("KPTI_SELFTEST:")) {
+            eprintln!("  {l}");
+        }
+        eprintln!("kpti-selftest-smoke: FAILED — self-test did not PASS");
+        std::process::exit(1);
+    }
+    if !clean.contains("KPTI_SELFTEST:PASS") {
+        eprintln!("kpti-selftest-smoke: FAILED — missing KPTI_SELFTEST:PASS sentinel");
+        std::process::exit(1);
+    }
+    let elapsed = global_start.elapsed().as_secs();
+    println!(
+        "kpti-selftest-smoke: PASSED ({elapsed}s) — KPTI user-half pair builder maps \
+         only the user lower half + entry set; no kernel-secret leaf reachable from user CR3"
     );
 }
 

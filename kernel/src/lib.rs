@@ -531,6 +531,12 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     // (see the `mitigations` module — m3OS has no kernel boot cmdline).
     x86_64::instructions::interrupts::without_interrupts(|| {
         crate::mitigations::init_bsp();
+        // Phase 110 Track A.1 — prove the KPTI user-half PML4 builder maps only
+        // the user lower half + minimal entry set, and no kernel-secret leaf, on
+        // real hardware page tables (QEMU cannot exercise Meltdown itself). A
+        // throwaway pair, built + walked + freed; emits a `KPTI_SELFTEST:`
+        // sentinel. Inert w.r.t. the live CR3 (KPTI_WIRED is still false).
+        crate::mm::kpti::self_test();
     });
 
     // Phase 103 Track E: probe HWP and opt in on the BSP (IA32_PM_ENABLE is

@@ -417,6 +417,18 @@ if [ "${M3OS_DEBUG_SUBSTRATE_REGRESSION:-0}" = "1" ]; then
     cargo xtask debug-substrate-smoke --timeout 240
 fi
 
+# Phase 110 Track A.1 — KPTI user-half self-test gate. Gated behind
+# M3OS_KPTI_REGRESSION=1. Boots the stock kernel and asserts the boot-time KPTI
+# self-test PASSES: it builds a real user PML4 (synthetic user page + the
+# minimal entry set), walks it, and proves via kernel_core::kpti that no kernel
+# image / heap / kstack / direct-map leaf is reachable from the user CR3 — the
+# Meltdown-isolation invariant QEMU cannot exercise directly. Set on branches
+# touching kernel/src/mm/kpti.rs, new_process_page_table, or the KPTI entry set.
+if [ "${M3OS_KPTI_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask kpti-selftest-smoke..."
+    cargo xtask kpti-selftest-smoke --timeout 240
+fi
+
 # Phase 111 Track C — in-kernel GDB stub (kgdb) gate. Gated behind
 # M3OS_KGDB_REGRESSION=1 because it builds the kernel with the `kgdb` feature
 # and boots it frozen at a wait-for-debugger int3, then drives a raw GDB-RSP
