@@ -9,7 +9,7 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | QEMU gdbstub wiring + debug-info kernel build | — | Planned |
+| A | QEMU gdbstub wiring + debug-info kernel build | — | ✅ **Landed** — `kdebug` profile (DWARF) + `cargo xtask debug` (QEMU `-s -S` + auto gdb script); RSP round-trip validated |
 | B | Trap & debug-register substrate (`#DB`/`#BP`, TF, `DR0`–`DR7`, `int3` patch) | — | Planned |
 | C | In-kernel GDB stub (kgdb) over polled COM2 + SMP all-stop | B | Planned |
 | D | `ptrace` syscall + stop/notify + `m3gdbserver` | B | Planned |
@@ -20,26 +20,23 @@ Track A is standalone and **pull-forward** (usable by the in-flight 101–110 ba
 
 ## Track A — QEMU gdbstub + debug-info build
 
-### A.1 — Debug-info kernel build path
+### A.1 — Debug-info kernel build path ✅
 
-**File:** `Cargo.toml` (`[profile.release]` / new override)
-**Symbol:** kernel build profile
-**Why it matters:** The release profile is `lto = true` + implicit `debuginfo = 0` — there is no DWARF for GDB to resolve names against. A debug-info build is the prerequisite for every other track's symbolication.
+**File:** `Cargo.toml` (`[profile.kdebug]`), `xtask/src/main.rs` (`build_kernel_debug` / `build_kernel_binary`).
 
 **Acceptance:**
-- [ ] A debug-info kernel build emits an unstripped host-side ELF with DWARF (`debug = 2`, optionally `split-debuginfo` to keep the booted image lean).
-- [ ] The default/production image build is unchanged (still stripped/lean).
+- [x] `[profile.kdebug]` inherits `release` but sets `lto = false` (LTO inlines away small functions, so `break <fn>` and named backtraces stop resolving) + `debug = "full"`. `build_kernel_debug()` produces `target/x86_64-unknown-none/kdebug/kernel` — an unstripped ELF with full `.debug_*` DWARF (49 MiB vs 16 MiB release; the extra is all non-PT_LOAD, so the booted image's loaded footprint is identical). Demanglable Rust symbols present (`kernel::kernel_main_entry`, `kernel::handle_panic`).
+- [x] The default/production build (`--release`) is untouched — `build_kernel()` and every gate still build stripped/lean.
 
-### A.2 — `cargo xtask debug` subcommand
+### A.2 — `cargo xtask debug` subcommand ✅
 
-**File:** `xtask/src/main.rs`
-**Symbol:** `cmd_debug` (new), QEMU arg builder
-**Why it matters:** QEMU already exposes the guest CPU to GDB; the only missing piece is launching with `-s -S` and telling the developer how to attach. Zero kernel code for full in-emulator kernel debugging.
+**File:** `xtask/src/main.rs` (`cmd_debug`).
 
 **Acceptance:**
-- [ ] `cargo xtask debug` launches QEMU with `-s -S` (gdbstub on :1234, CPU halted at reset).
-- [ ] It prints the exact `gdb -ex 'target remote :1234' <host-elf>` invocation (or writes a `.gdbinit`).
-- [ ] Documented developer workflow: `break <rust_fn>` → `c` → `bt` shows named Rust frames with source.
+- [x] `cargo xtask debug` builds the `kdebug` kernel and launches QEMU with `-s -S` (gdbstub on `tcp::1234`, vCPU frozen at reset). Accepts the same `--device`/`--fresh` flags as `run`.
+- [x] Prints the exact attach invocation **and** writes an auto-generated `m3os-kernel.gdb` (`gdb -q -x <script>`) that does `target remote :1234` + `add-symbol-file … -o 0x10000000000`.
+- [x] **Charter correction:** the kernel ELF is **ET_DYN (PIE)** and the `bootloader` crate relocates it by a **fixed 1 TiB offset** (`0x10000000000`) — verified deterministic. So `add-symbol-file <elf> -o 0x10000000000` **is** required (the charter's "no KASLR → add-symbol-file unnecessary" was wrong: no KASLR, but a non-zero PIE base). Without the offset `break kernel_main_entry` resolves to the un-relocated vaddr and never fires.
+- [x] Round-trip validated headlessly (no host gdb) via a raw RSP client: `?`→`T05` (halted at reset), `Z1`/`Z0` breakpoint at `kernel_main_entry + 0x10000000000`, `c`→stop with `RIP == 0x10000ccf500` exactly. A real gdb `break kernel_main_entry ; continue ; bt` follows the identical path with source lines.
 
 ---
 

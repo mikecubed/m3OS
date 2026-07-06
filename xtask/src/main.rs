@@ -838,6 +838,17 @@ fn main() {
             let no_audio = remaining.iter().any(|a| a == "--no-audio");
             cmd_run(fresh, devices, !no_audio);
         }
+        Some("debug") => {
+            // Phase 111 Track A — halted QEMU + gdbstub for source-level kernel
+            // debugging. Accepts the same `--device`/`--fresh` flags as `run`.
+            let (devices, remaining) = extract_device_flags(&args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            let fresh = remaining.iter().any(|a| a == "--fresh");
+            cmd_debug(fresh, devices);
+        }
         Some("run-gui") => {
             let (devices, remaining) = extract_device_flags(&args[2..]).unwrap_or_else(|err| {
                 eprintln!("Error: {err}");
@@ -1923,7 +1934,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|argon2-smoke [--timeout <secs>] [--display]|aslr-smoke [--timeout <secs>] [--display]|stack-smash-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|debug [--fresh] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|argon2-smoke [--timeout <secs>] [--display]|aslr-smoke [--timeout <secs>] [--display]|stack-smash-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm.\n\
      USB passthrough: --usb-passthrough <vid:pid> (e.g. `--usb-passthrough 0bda:8156`) passes a physical USB device into the guest's emulated xHCI (qemu-xhci,id=xhci_pt). The QEMU process must have access to the USB device node — add a udev rule granting the user/group read-write on the device, or run with sudo. The device is claimed from the host kernel while QEMU runs and is released on exit."
@@ -5026,7 +5037,24 @@ fn human_size(bytes: u64) -> String {
 }
 
 fn build_kernel() -> PathBuf {
-    let root = workspace_root();
+    build_kernel_artifacts_prelude();
+    build_kernel_binary(false)
+}
+
+/// Phase 111 Track A.1 — build the kernel with the `kdebug` profile (DWARF, no
+/// LTO) for source-level debugging under `cargo xtask debug`. Same userspace /
+/// ramdisk staging as [`build_kernel`]; only the kernel crate's own build
+/// profile differs, so the produced ELF carries symbols while every other
+/// build path stays on `--release`.
+fn build_kernel_debug() -> PathBuf {
+    build_kernel_artifacts_prelude();
+    build_kernel_binary(true)
+}
+
+/// Stage every userspace binary, dynamic-linker artifact, musl program, and
+/// port the kernel `include_bytes!`s into its ramdisk. Shared by the release
+/// and debug kernel builds.
+fn build_kernel_artifacts_prelude() {
     build_userspace_bins();
     // Phase 76 — build ld.so before the musl binaries; the
     // `dynlink_smoke` musl binary's PT_INTERP refers to
@@ -5071,10 +5099,22 @@ fn build_kernel() -> PathBuf {
     fetch_port_sources();
     // Phase 47: cross-compile DOOM.
     build_doom();
+}
+
+/// Compile the kernel crate itself. `debug_info=true` selects the Phase 111
+/// `kdebug` profile (DWARF, no LTO) and returns the ELF under `.../kdebug/`;
+/// otherwise the normal `--release` build under `.../release/`.
+fn build_kernel_binary(debug_info: bool) -> PathBuf {
+    let root = workspace_root();
+    let (profile_flag, profile_dir) = if debug_info {
+        ("--profile=kdebug", "kdebug")
+    } else {
+        ("--release", "release")
+    };
     let mut cmd = Command::new(env!("CARGO"));
     cmd.current_dir(&root).args([
         "build",
-        "--release",
+        profile_flag,
         "--package",
         "kernel",
         "--target",
@@ -5100,7 +5140,7 @@ fn build_kernel() -> PathBuf {
         std::process::exit(1);
     }
 
-    root.join("target/x86_64-unknown-none/release/kernel")
+    root.join(format!("target/x86_64-unknown-none/{profile_dir}/kernel"))
 }
 
 fn create_uefi_image(kernel_binary: &Path) -> PathBuf {
@@ -34620,6 +34660,92 @@ fn cmd_run(fresh: bool, devices: DeviceSet, with_audio: bool) {
         with_audio,
         "serial",
     );
+}
+
+/// Phase 111 Track A.2 — `cargo xtask debug`: build a DWARF-bearing kernel
+/// (the `kdebug` profile) and launch QEMU **halted** with its gdbstub on
+/// `tcp::1234`, then print the exact host `gdb` invocation to attach. No kernel
+/// code is involved — QEMU exposes the guest CPU directly, and symbolication
+/// lives entirely in the host GDB against the `kdebug` ELF (there is no KASLR,
+/// so kernel addresses are fixed and no `add-symbol-file` fixup is needed).
+fn cmd_debug(fresh: bool, devices: DeviceSet) {
+    let kernel_binary = build_kernel_debug();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    if fresh {
+        let disk = uefi_image.parent().unwrap().join("disk.img");
+        if disk.exists() {
+            fs::remove_file(&disk).expect("failed to remove disk.img");
+            println!("Removed {} (--fresh)", disk.display());
+        }
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // serial autologin path, like `run`
+    );
+    let ovmf = find_ovmf();
+    let mut args =
+        qemu_run_args_with_devices(&uefi_image, &ovmf, QemuDisplayMode::Headless, devices);
+    // Boot like `cargo xtask run` (serial autologin).
+    args.push("-fw_cfg".to_string());
+    args.push("name=opt/m3os/boot-mode,string=serial".to_string());
+    // `-s` = gdbstub on tcp::1234; `-S` = freeze the vCPU at reset until GDB
+    // issues `continue`, so a breakpoint set before boot is guaranteed to arm.
+    args.push("-s".to_string());
+    args.push("-S".to_string());
+
+    // The kernel ELF is ET_DYN (PIE); the `bootloader` crate relocates it by a
+    // fixed 1 TiB offset (verified deterministic — the runtime RIP always lands
+    // at `elf_vaddr + this`). GDB must load the kernel symbols at that offset or
+    // `break <fn>` resolves to the un-relocated vaddr and never fires. (This
+    // corrects the Phase 111 charter's "no KASLR → no add-symbol-file" note: the
+    // kernel is not KASLR'd, but it *is* a PIE loaded at a non-zero base.)
+    const KERNEL_PIE_LOAD_OFFSET: u64 = 0x10000000000;
+    let gdb_elf = kernel_binary.display().to_string();
+    let gdb_script = kernel_binary.parent().unwrap().join("m3os-kernel.gdb");
+    let script_body = format!(
+        "# Auto-generated by `cargo xtask debug` (Phase 111 Track A).\n\
+         set confirm off\n\
+         set pagination off\n\
+         set architecture i386:x86-64\n\
+         target remote :1234\n\
+         # PIE kernel loaded at +{off:#x}; relocate every section so names resolve.\n\
+         add-symbol-file {elf} -o {off:#x}\n\
+         echo \\n[m3os] kernel symbols loaded at +{off:#x}. Try: break kernel_main_entry ; continue ; bt\\n\\n\n",
+        off = KERNEL_PIE_LOAD_OFFSET,
+        elf = gdb_elf,
+    );
+    let script_ok = std::fs::write(&gdb_script, script_body).is_ok();
+
+    println!("\n=== m3OS kernel debug session (Phase 111 Track A) ===");
+    println!("QEMU is starting HALTED with a gdbstub on tcp::1234.");
+    println!("In another terminal, attach host gdb:\n");
+    if script_ok {
+        println!("    gdb -q -x {}\n", gdb_script.display());
+        println!(
+            "  (the script connects + loads symbols at the +{KERNEL_PIE_LOAD_OFFSET:#x} PIE base)"
+        );
+        println!("  or manually:");
+    }
+    println!("    gdb -q \\");
+    println!("        -ex 'target remote :1234' \\");
+    println!("        -ex 'add-symbol-file {gdb_elf} -o {KERNEL_PIE_LOAD_OFFSET:#x}'\n");
+    println!("Then e.g.:  break kernel_main_entry  |  continue  |  bt  |  info registers  |  si");
+    println!(
+        "(Ctrl-C inside gdb breaks into a running guest; `continue` resumes. Quit gdb,\n \
+         then Ctrl-C this QEMU to stop it.)\n"
+    );
+
+    let status = Command::new("qemu-system-x86_64")
+        .args(&args)
+        .status()
+        .expect("failed to launch QEMU");
+    std::process::exit(normalize_run_qemu_exit(status.code()));
 }
 
 fn cmd_run_gui(fresh: bool, devices: DeviceSet, with_audio: bool, skip_login: bool) {

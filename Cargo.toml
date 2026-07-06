@@ -273,6 +273,18 @@ panic = "abort"
 [profile.dev]
 panic = "abort"
 
+# Phase 111 Track A.1 — DWARF-bearing kernel build for `cargo xtask debug`.
+# Inherits release but disables LTO (which inlines away most small functions,
+# so `break <rust_fn>` and named backtraces stop resolving) and emits full
+# debug info. The DWARF sits in non-PT_LOAD sections, so the booted image's
+# loaded footprint is identical to release — only the host-side ELF grows,
+# and GDB reads its symbols from that ELF. The default/production build
+# (`--release`) is untouched. Artifacts land in `target/<triple>/kdebug/`.
+[profile.kdebug]
+inherits = "release"
+lto = false
+debug = "full"
+
 # Phase 42: RustCrypto workspace dependencies
 [workspace.package]
 version = "0.99.0"
