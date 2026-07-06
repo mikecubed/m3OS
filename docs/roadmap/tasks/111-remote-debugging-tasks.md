@@ -12,7 +12,7 @@
 | A | QEMU gdbstub wiring + debug-info kernel build | — | ✅ **Landed** — `kdebug` profile (DWARF) + `cargo xtask debug` (QEMU `-s -S` + auto gdb script); RSP round-trip validated |
 | B | Trap & debug-register substrate (`#DB`/`#BP`, TF, `DR0`–`DR7`, `int3` patch) | — | ✅ **Landed** — `#DB` registered + `#BP` dispatcher (RIP-fixup), `RFLAGS.TF` single-step, `DebugRegs` (`DR0`–`DR7`), `int3` patch; `kernel_core::debug_regs` host-tested + `debug-substrate-smoke` PASS |
 | C | In-kernel GDB stub (kgdb) over polled COM2 + SMP all-stop | B | ✅ **Landed** — C.1 RSP codec (`kernel_core::gdb_rsp`, host-tested) + C.2–C.5 (full-GPR `#BP`/`#DB` naked entry, polled COM2, RSP command loop, SMP all-stop + panic hook, `kgdb` feature + `kgdb-smoke` gate) |
-| D | `ptrace` syscall + stop/notify + `m3gdbserver` | B | ✅ **Landed** — D.1 (stop/notify + SIGTRAP + ring-3 `int3`), D.2 (`sys_ptrace`), D.3 (`m3gdbserver` + exec-stop, RSP↔ptrace over TCP), D.4 CI (`ptrace-smoke` + `ptrace-gdbserver-smoke` PASS). Host-side DWARF retention deferred |
+| D | `ptrace` syscall + stop/notify + `m3gdbserver` | B | ✅ **Landed** — D.1 (stop/notify + SIGTRAP + ring-3 `int3`), D.2 (`sys_ptrace`), D.3 (`m3gdbserver` + exec-stop, RSP↔ptrace over TCP incl. single-step), D.4 (symbol-retaining host ELFs + `ptrace-smoke` / `ptrace-gdbserver-smoke` PASS). Source-level DWARF build is an operator follow-on (no host `gdb`) |
 
 Track A is standalone and **pull-forward** (usable by the in-flight 101–110 bare-metal arc). C and D both consume B and are otherwise independent; either may be split into its own sub-phase (111a/111b) if scoped separately during implementation.
 
@@ -188,10 +188,10 @@ Track A is standalone and **pull-forward** (usable by the in-flight 101–110 ba
 **Landed as:** `userspace/m3gdbserver` (native) + the kernel **exec-stop** (`sys_execve` tail) + `userspace/ptrace-tracee` (debuggee) + `ptrace-gdbserver-smoke` gate. ✅
 
 **Acceptance:**
-- [x] A ring-3 program launched under `m3gdbserver` is debuggable from a **host GDB-RSP client over TCP** (the dev machine has no host `gdb`; a real `gdb target remote :<port>` follows the identical wire path). `m3gdbserver <port> <program>` forks + `PTRACE_TRACEME` + `execve`s the program, which **exec-stops** before its first instruction (new kernel exec-stop: a traced `execve` snapshots the new image's entry registers and parks the tracee, notifying the tracer), then translates RSP (`kernel_core::gdb_rsp` codec — the same the kgdb stub uses) ↔ `sys_ptrace`. Commands: `?`, `qSupported`, `g`/`G`/`P`, `m`/`M`, `Z0`/`z0` (int3 patch via POKETEXT), `c`/`s`, `k`/`D`. Proven by `ptrace-gdbserver-smoke`: attach over a SLIRP `hostfwd`, exec-stop, `Z0` at the entry + `c` → breakpoint hit (RIP = entry+1), rewind (`z0`+`P`), `M`/`m` memory round-trip, `c` → the tracee runs to exit with `W07`.
+- [x] A ring-3 program launched under `m3gdbserver` is debuggable from a **host GDB-RSP client over TCP** (the dev machine has no host `gdb`; a real `gdb target remote :<port>` follows the identical wire path). `m3gdbserver <port> <program>` forks + `PTRACE_TRACEME` + `execve`s the program, which **exec-stops** before its first instruction (new kernel exec-stop: a traced `execve` snapshots the new image's entry registers and parks the tracee, notifying the tracer), then translates RSP (`kernel_core::gdb_rsp` codec — the same the kgdb stub uses) ↔ `sys_ptrace`. Commands: `?`, `qSupported`, `g`/`G`/`P`, `m`/`M`, `Z0`/`z0` (int3 patch via POKETEXT), `c`/`s`, `k`/`D`. Proven by `ptrace-gdbserver-smoke`: attach over a SLIRP `hostfwd`, exec-stop, `s` single-step (RIP advances one instruction — the only path that exercises the ring-3 `#DB` / `on_user_debug` consumer), `Z0` + `c` → breakpoint hit (RIP = stepped+1), rewind (`z0`+`P`), `M`/`m` memory round-trip, `c` → the tracee runs to exit with `W07`.
 - [x] Native, wired through all four userspace-binary registration points (workspace member, xtask `bins`, ramdisk `BIN_ENTRIES`; no daemon `.conf` — the gate launches it over serial). Links `kernel-core` (`default-features = false`) for `gdb_rsp`.
 
-### D.4 — Userspace symbol retention + CI smoke
+### D.4 — Userspace symbol retention + CI smoke ✅
 
 **Files:**
 - `xtask/src/port_build.rs` (Phase 85a strip step)
@@ -201,8 +201,8 @@ Track A is standalone and **pull-forward** (usable by the in-flight 101–110 ba
 **Why it matters:** Ports strip ELFs (Phase 85a relocation contract), leaving no DWARF; GDB needs symbols, retained host-side.
 
 **Acceptance:**
-- [ ] Unstripped host-side copies (or a `-g` variant) retained for debuggable targets; the on-device/stripped artifacts are unchanged. (Deferred — the current gates use native binaries whose symbols the raw-RSP clients don't need; DWARF retention matters once a real host `gdb` with source-level stepping is wired.)
-- [x] CI smokes assert userspace ptrace stops behind `M3OS_PTRACE_REGRESSION=1`: **`ptrace-smoke`** (`cmd_ptrace_smoke`, a native fork+`TRACEME` tracer/tracee) validates the substrate directly, and **`ptrace-gdbserver-smoke`** (`cmd_ptrace_gdbserver_smoke`) drives `m3gdbserver` with a **host GDB-RSP client over TCP** (SLIRP hostfwd) — the closest analog to a real `gdb target remote` session.
+- [x] Unstripped host-side copies retained for debuggable targets; the on-device artifacts are unchanged. The native userspace binaries build `--release` with **no `strip`** in `[profile.release]`, so the host-side ELF under `target/x86_64-m3os/release/<bin>` keeps its `.symtab` with function symbols (verified: `ptrace-tracee` retains `_start` + `tracee_main`) — enough for **symbol-level** `gdb` against `m3gdbserver` today (`break <fn>`, named backtraces). The on-device ramdisk copy is the same ELF. **Source-level** (DWARF `.debug_*`) needs a `-g`/`debug = "full"` build variant (the userspace analog of the Track A `kdebug` kernel profile) — a small operator follow-on, and only meaningful with a real host `gdb` (the dev machine has none; every arm here is validated with raw-RSP clients).
+- [x] CI smokes assert userspace ptrace stops behind `M3OS_PTRACE_REGRESSION=1`: **`ptrace-smoke`** (`cmd_ptrace_smoke`, a native fork+`TRACEME` tracer/tracee) validates the substrate directly, and **`ptrace-gdbserver-smoke`** (`cmd_ptrace_gdbserver_smoke`) drives `m3gdbserver` with a **host GDB-RSP client over TCP** (SLIRP hostfwd) — the closest analog to a real `gdb target remote` session (exec-stop, single-step, breakpoint hit + rewind, memory, continue-to-exit).
 
 ---
 

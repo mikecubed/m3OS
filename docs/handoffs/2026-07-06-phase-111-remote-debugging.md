@@ -11,12 +11,13 @@
   (PR #314; full-GPR `#BP`/`#DB` naked entry, polled COM2, RSP command loop, SMP
   all-stop + panic hook, `kgdb` feature + `kgdb-smoke` gate PASS). Details below
   ("What's landed"); the old blueprint is preserved under "Implementation notes".
-- **Track D.1 + D.2 + D.3 (ptrace substrate + `sys_ptrace` + `m3gdbserver`)** ✅
-  **landed on `feat/phase-111-ptrace`** (traced-process stop/notify, `SIGTRAP` on
-  ring-3 `int3`, cross-address-space peek/poke, `execve` exec-stop, and a native
-  gdbserver translating RSP ↔ ptrace over TCP; `ptrace-smoke` +
-  `ptrace-gdbserver-smoke` PASS). See "Track D" below.
-- **Track D.4 (host-side DWARF/symbol retention)** — the one open follow-on.
+- **Track D (ptrace substrate + `sys_ptrace` + `m3gdbserver` + exec-stop +
+  single-step)** ✅ **landed on `feat/phase-111-ptrace`** (traced-process
+  stop/notify, `SIGTRAP` on ring-3 `int3`, cross-address-space peek/poke, `execve`
+  exec-stop, a native gdbserver translating RSP ↔ ptrace over TCP, and D.4 symbol
+  retention; `ptrace-smoke` + `ptrace-gdbserver-smoke` (incl. single-step) PASS).
+  See "Track D" below. **Phase 111 is functionally complete** — the only remaining
+  item is a source-level DWARF userspace build for a *real* host `gdb`.
 
 **Charter:** `docs/roadmap/111-remote-debugging.md`
 **Tasks:** `docs/roadmap/tasks/111-remote-debugging-tasks.md`
@@ -287,13 +288,21 @@ DWARF/symbol retention for real `gdb` source stepping) remains.
   The guest's static `10.0.2.15` + virtio-net baseline carry inbound TCP.
 - **`ATTACH` / `GETSIGINFO`** deferred (the fork+TRACEME model needs neither).
 
-### D.4 remaining
+### D.4 (symbol retention) — done; source-level DWARF is the operator arm
 
-- Retain unstripped userspace ELFs host-side (or a `-g` variant) for DWARF, so a
-  **real** host `gdb` (not just a raw-RSP client) gets source-level stepping
-  against `m3gdbserver`. The current gates use native binaries whose symbols the
-  raw-RSP clients don't need, so this is the one open item — it matters only once
-  a real `gdb target remote` with source lines is in the loop.
+- The native userspace binaries build `--release` with **no `strip`** in
+  `[profile.release]`, so the host-side ELF (`target/x86_64-m3os/release/<bin>`)
+  keeps its `.symtab` — verified: `ptrace-tracee` retains `_start` +
+  `tracee_main`. That's enough for **symbol-level** `gdb` against `m3gdbserver`
+  today (`break <fn>`, named `bt`). The on-device ramdisk copy is the same ELF.
+- **Source-level** (`list`/`step` with source lines) needs a DWARF (`debug =
+  "full"`) userspace build variant — the analog of the Track A `kdebug` kernel
+  profile — plus a real host `gdb` to consume it. The dev machine has no `gdb`
+  (every arm this phase is validated with raw-RSP clients), so this last slice is
+  operator-owned, like the on-metal arms. Workflow is documented in the charter.
+- **Single-step is now covered:** `ptrace-gdbserver-smoke` sends `s` and asserts
+  RIP advances one instruction — the only path that exercises the ring-3 `#DB` /
+  `on_user_debug` consumer (`PTRACE_SINGLESTEP` → `RFLAGS.TF` → `#DB`).
 
 ---
 
@@ -334,10 +343,13 @@ Landed alongside the Phase 111 work (context, not this phase):
 
 ## Next actions (suggested order)
 
-1. **Track D.4** (host-side DWARF/symbol retention) per the "Track D" section
-   above — retain unstripped userspace ELFs host-side so a **real** host `gdb`
-   (not just a raw-RSP client) gets source-level stepping against `m3gdbserver`.
-   The only open Phase 111 item; low-stakes (build-plumbing, not kernel).
+Phase 111 is functionally complete (A–D, all QEMU-validatable gates PASS). The
+remaining items are polish / operator-owned:
+
+1. **Source-level DWARF userspace build** — a `debug = "full"` userspace variant
+   (analog of the Track A `kdebug` kernel profile) so a *real* host `gdb` gets
+   source lines against `m3gdbserver`. Build-plumbing, not kernel; only meaningful
+   with a host `gdb` (the dev machine has none).
 2. The Track C async-break follow-on below (optional polish).
 3. Phase 110 A/B.3/D + the Phase 111 Track C/D on-metal arms — operator-owned.
 

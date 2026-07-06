@@ -18140,8 +18140,8 @@ fn cmd_ptrace_gdbserver_smoke(args: &SmokeBootArgs) {
             let elapsed = global_start.elapsed().as_secs();
             println!(
                 "ptrace-gdbserver-smoke: PASSED ({elapsed}s) — RSP-over-TCP attach, exec-stop, \
-                 breakpoint hit + rewind, M/m memory, and continue-to-exit (W07) all verified \
-                 through m3gdbserver → sys_ptrace"
+                 single-step (#DB), breakpoint hit + rewind, M/m memory, and continue-to-exit \
+                 (W07) all verified through m3gdbserver → sys_ptrace"
             );
         }
         Err(reason) => {
@@ -18178,13 +18178,33 @@ fn ptrace_gdbserver_rsp_session(stream: &mut std::net::TcpStream) -> Result<(), 
         ));
     }
 
-    // 3. g → the entry RIP (hex chars 256..272) and RSP (112..128).
+    // 3. g → the entry RIP (hex chars 256..272).
     let regs = gdbserver_read_g(stream)?;
     let entry_rip = kgdb_le_u64(&regs[256..272]).ok_or("parse RIP")?;
-    let rsp = kgdb_le_u64(&regs[112..128]).ok_or("parse RSP")?;
 
-    // 4. Z0 at the entry, then continue → the planted int3 fires immediately.
-    let z0 = format!("Z0,{entry_rip:x},1");
+    // 4. Single-step one instruction (`s` → PTRACE_SINGLESTEP → RFLAGS.TF → #DB →
+    //    the ring-3 on_user_debug consumer). RIP must advance by exactly one
+    //    instruction (1..=15 bytes) — this is the only path that exercises the
+    //    single-step trap.
+    kgdb_rsp_send(stream, b"s").map_err(|e| format!("send s: {e}"))?;
+    let step_stop = kgdb_rsp_recv(stream).map_err(|e| format!("recv stop after s: {e}"))?;
+    if step_stop.first() != Some(&b'S') {
+        return Err(format!(
+            "single-step stop not S..: {:?}",
+            String::from_utf8_lossy(&step_stop)
+        ));
+    }
+    let sregs = gdbserver_read_g(stream)?;
+    let step_rip = kgdb_le_u64(&sregs[256..272]).ok_or("parse RIP after step")?;
+    let rsp = kgdb_le_u64(&sregs[112..128]).ok_or("parse RSP after step")?;
+    if !(step_rip > entry_rip && step_rip <= entry_rip + 15) {
+        return Err(format!(
+            "single-step RIP {step_rip:#x} did not advance one instruction from entry {entry_rip:#x}"
+        ));
+    }
+
+    // 5. Z0 at the current RIP, then continue → the planted int3 fires immediately.
+    let z0 = format!("Z0,{step_rip:x},1");
     kgdb_rsp_send(stream, z0.as_bytes()).map_err(|e| format!("send Z0: {e}"))?;
     expect_ok(stream, "Z0")?;
     kgdb_rsp_send(stream, b"c").map_err(|e| format!("send c: {e}"))?;
@@ -18196,28 +18216,28 @@ fn ptrace_gdbserver_rsp_session(stream: &mut std::net::TcpStream) -> Result<(), 
         ));
     }
 
-    // 5. g → RIP must be entry+1 (past the planted 0xCC).
+    // 6. g → RIP must be step_rip+1 (past the planted 0xCC).
     let regs2 = gdbserver_read_g(stream)?;
     let hit_rip = kgdb_le_u64(&regs2[256..272]).ok_or("parse RIP after bp")?;
-    if hit_rip != entry_rip + 1 {
+    if hit_rip != step_rip + 1 {
         return Err(format!(
-            "breakpoint RIP {hit_rip:#x} != entry+1 {:#x}",
-            entry_rip + 1
+            "breakpoint RIP {hit_rip:#x} != step_rip+1 {:#x}",
+            step_rip + 1
         ));
     }
 
-    // 6. Remove the breakpoint and rewind RIP to the entry via P (reg 0x10 = rip).
-    let z0d = format!("z0,{entry_rip:x},1");
+    // 7. Remove the breakpoint and rewind RIP via P (reg 0x10 = rip).
+    let z0d = format!("z0,{step_rip:x},1");
     kgdb_rsp_send(stream, z0d.as_bytes()).map_err(|e| format!("send z0: {e}"))?;
     expect_ok(stream, "z0")?;
     let mut prip = String::from("P10=");
-    for b in entry_rip.to_le_bytes() {
+    for b in step_rip.to_le_bytes() {
         prip.push_str(&format!("{b:02x}"));
     }
     kgdb_rsp_send(stream, prip.as_bytes()).map_err(|e| format!("send P: {e}"))?;
     expect_ok(stream, "P(rip)")?;
 
-    // 7. M/m round-trip through the tracee's stack scratch.
+    // 8. M/m round-trip through the tracee's stack scratch.
     const MAGIC: u64 = 0xDEAD_BEEF_1234_5678;
     let scratch = rsp.wrapping_sub(16);
     let mut mcmd = format!("M{scratch:x},8:");
@@ -18234,7 +18254,7 @@ fn ptrace_gdbserver_rsp_session(stream: &mut std::net::TcpStream) -> Result<(), 
         return Err(format!("m read {got:#x} != M-written {MAGIC:#x}"));
     }
 
-    // 8. Continue to exit — the tracee runs to exit(7) → W07.
+    // 9. Continue to exit — the tracee runs to exit(7) → W07.
     kgdb_rsp_send(stream, b"c").map_err(|e| format!("send final c: {e}"))?;
     let exit = kgdb_rsp_recv(stream).map_err(|e| format!("recv exit: {e}"))?;
     if exit != b"W07" {
