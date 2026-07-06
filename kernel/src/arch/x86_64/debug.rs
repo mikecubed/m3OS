@@ -349,9 +349,15 @@ pub fn on_breakpoint(bp_addr: u64, frame: &mut DebugTrapFrame, from_user: bool) 
     }
 
     // Track C consumer: ring-0 traps enter the kgdb stub when it is live.
-    // (Track D's ptrace stop is the future ring-3 consumer.)
     #[cfg(feature = "kgdb")]
     if !from_user && crate::debug::gdbstub::on_breakpoint(bp_addr, frame) {
+        return;
+    }
+
+    // Track D consumer: a ring-3 `int3` in a traced process stops-and-notifies
+    // its tracer (the exact inverse routing of the kgdb `!from_user` case).
+    #[cfg(feature = "ptrace")]
+    if from_user && crate::process::ptrace::on_user_breakpoint(bp_addr, frame) {
         return;
     }
 
@@ -379,6 +385,13 @@ pub fn on_debug_exception(
     // kgdb stub when it is live.
     #[cfg(feature = "kgdb")]
     if !from_user && crate::debug::gdbstub::on_debug_exception(&status, rip, frame) {
+        return;
+    }
+
+    // Track D consumer: a ring-3 single-step completion in a traced process
+    // stops-and-notifies its tracer.
+    #[cfg(feature = "ptrace")]
+    if from_user && crate::process::ptrace::on_user_debug(frame) {
         return;
     }
 

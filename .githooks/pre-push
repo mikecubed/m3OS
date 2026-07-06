@@ -430,6 +430,21 @@ if [ "${M3OS_KGDB_REGRESSION:-0}" = "1" ]; then
     cargo xtask kgdb-smoke --timeout 240
 fi
 
+# Phase 111 Track D — ptrace userspace-debugging gate. Gated behind
+# M3OS_PTRACE_REGRESSION=1 because it builds the kernel with the `ptrace` feature
+# and boots it, then runs /bin/ptrace-test: a forked tracee calls PTRACE_TRACEME
+# + int3 and stops-and-notifies its tracer, which reads the stop
+# (WIFSTOPPED/SIGTRAP), GETREGS/SETREGS, PEEKTEXT/POKETEXT, and CONTs it — the
+# SETREGS'd register is observed in the tracee's exit code. Set on branches
+# touching kernel/src/process/ptrace.rs, the #BP/#DB ring-3 seam, sys_ptrace, or
+# the waitpid stop reporting.
+if [ "${M3OS_PTRACE_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask ptrace-smoke..."
+    cargo xtask ptrace-smoke --timeout 240
+    echo "pre-push: running cargo xtask ptrace-gdbserver-smoke..."
+    cargo xtask ptrace-gdbserver-smoke --timeout 300
+fi
+
 # Phase 107 — networked + signed package distribution. Gated behind
 # M3OS_PKG_NET_REGRESSION=1 because it boots QEMU against a host-served
 # SLIRP HTTP repo and asserts the full trust pipeline: ed25519 index

@@ -1335,6 +1335,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "m3gdbserver"
+version = "0.99.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "m3ui"
 version = "0.99.0"
 dependencies = [
@@ -1719,6 +1727,20 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
+]
+
+[[package]]
+name = "ptrace-test"
+version = "0.99.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
+name = "ptrace-tracee"
+version = "0.99.0"
+dependencies = [
+ "syscall-lib",
 ]
 
 [[package]]

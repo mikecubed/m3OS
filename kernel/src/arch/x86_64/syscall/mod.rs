@@ -2572,6 +2572,12 @@ pub extern "C" fn syscall_handler(
         // -- Track C.1 panic-quiesce demo (feature `panic-test`; absent → ENOSYS) --
         #[cfg(feature = "panic-test")]
         SYS_PANIC_TEST => sys_panic_test(),
+        // -- Track D ptrace (feature `ptrace`; absent → ENOSYS) --
+        #[cfg(feature = "ptrace")]
+        SYS_PTRACE => {
+            let arg3 = per_core_syscall_arg3();
+            sys_ptrace(arg0, arg1, arg2, arg3)
+        }
         _ => {
             // Rate-limit to ONCE per syscall number per boot. A real userspace
             // runtime (Node) probes unsupported syscalls (capget=125,
@@ -5733,6 +5739,40 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             crate::smp::set_current_core_kernel_stack(kstack_top);
             set_per_core_syscall_stack_top(kstack_top);
         }
+        // Phase 111 Track D — exec-stop. If this process is traced, stop-and-
+        // notify the tracer with SIGTRAP *before* the new image's first
+        // instruction runs (Linux `PTRACE_EVENT_EXEC`/exec-stop), so the tracer
+        // (m3gdbserver) can set breakpoints first. We are in a normal blockable
+        // syscall context with the new CR3/UserReturnState already published, so
+        // we snapshot the new program's initial registers (entry RIP, ABI RSP,
+        // zeroed GPRs — matching Linux exec register clearing) and park, then
+        // resume to the entry with any SETREGS edits. Diverges (never falls
+        // through to `enter_userspace`).
+        #[cfg(feature = "ptrace")]
+        {
+            let traced = crate::process::PROCESS_TABLE
+                .lock()
+                .find(pid)
+                .map(|p| p.ptrace.traced)
+                .unwrap_or(false);
+            if traced {
+                let regs = crate::signal::SavedUserRegs {
+                    rip: loaded.entry,
+                    rsp: user_rsp,
+                    rflags: 0x202,
+                    ..Default::default()
+                };
+                {
+                    let mut table = crate::process::PROCESS_TABLE.lock();
+                    if let Some(proc) = table.find_mut(pid) {
+                        proc.ptrace.regs = regs;
+                        proc.ptrace.stop_sig = crate::process::ptrace::SIGTRAP;
+                        proc.ptrace.resume = crate::process::ptrace::PtraceResume::None;
+                    }
+                }
+                ptrace_park_and_resume();
+            }
+        }
         crate::arch::x86_64::enter_userspace(loaded.entry, user_rsp)
     }
 }
@@ -5816,6 +5856,20 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
                     found_code = proc.exit_code;
                     break;
                 }
+                // Phase 111 Track D — a ptrace-stopped tracee is reported to its
+                // tracer as WIFSTOPPED unconditionally (ptrace implies WUNTRACED),
+                // one-shot per stop, carrying the trap signal (SIGTRAP).
+                #[cfg(feature = "ptrace")]
+                if proc.ptrace.traced
+                    && proc.ptrace.tracer_pid == calling_pid
+                    && proc.ptrace.stopped
+                    && !proc.ptrace.stop_reported
+                {
+                    found_pid = Some(proc.pid);
+                    found_stopped = true;
+                    found_code = Some(proc.ptrace.stop_sig as i32);
+                    break;
+                }
                 if report_stopped
                     && proc.state == crate::process::ProcessState::Stopped
                     && !proc.stop_reported
@@ -5839,6 +5893,10 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
                     // Mark as reported so subsequent waitpid calls don't re-report.
                     if let Some(p) = table.find_mut(pid) {
                         p.stop_reported = true;
+                        #[cfg(feature = "ptrace")]
+                        {
+                            p.ptrace.stop_reported = true;
+                        }
                     }
                     Some((pid, found_code, true)) // stopped
                 } else {
@@ -19432,6 +19490,10 @@ fn sys_clone_thread(
                 .map(|p| p.comm)
                 .unwrap_or([0u8; 16])
         },
+        // A fork child starts untraced (Linux: tracing is not inherited by
+        // default); the child sets it via PTRACE_TRACEME after fork.
+        #[cfg(feature = "ptrace")]
+        ptrace: crate::process::ptrace::Ptrace::default(),
     };
 
     PROCESS_TABLE.lock().insert(child_proc);
@@ -20051,6 +20113,130 @@ pub(super) fn sys_panic_test() -> u64 {
         "PANICTEST_SENTINEL deliberate Track-C.1 panic from pid {}",
         crate::process::current_pid()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Track D — sys_ptrace (0x1152) + the ptrace-stop trampoline
+// ---------------------------------------------------------------------------
+//
+// Feature-gated (`ptrace`); absent in production (the number falls through to
+// `NEG_ENOSYS`, and the #BP DPL-3 gate + trap consumers are all `cfg`-off). The
+// tracer (`m3gdbserver`) drives a traced tracee via this syscall; a tracee's
+// ring-3 debug trap redirects into `ptrace_stop_trampoline` below.
+
+/// m3OS reuses the Linux `ptrace` request numbers for the practical subset.
+#[cfg(feature = "ptrace")]
+pub const SYS_PTRACE: u64 = 0x1152;
+
+/// Phase 111 Track D — ptrace-stop continuation. A traced tracee's `#BP`/`#DB`
+/// handler redirects its `iretq` here (the `fault_kill_trampoline` technique)
+/// so the stop-and-wait runs in a normal, blockable ring-0 context instead of
+/// inside the exception handler. Notifies the tracer, parks the tracee until it
+/// issues `CONT`/`SINGLESTEP`/`DETACH`/`KILL`, then re-enters userspace with the
+/// (possibly `SETREGS`-modified) registers. Never returns.
+#[cfg(feature = "ptrace")]
+pub extern "C" fn ptrace_stop_trampoline() -> ! {
+    // IRET restored the (cleared) IF from the redirected frame; re-enable so the
+    // park loop is scheduled against, mirroring `fault_kill_trampoline`.
+    x86_64::instructions::interrupts::enable();
+    ptrace_park_and_resume()
+}
+
+/// Park the current (traced) tracee until the tracer resumes it, then re-enter
+/// userspace with the resulting registers (or terminate on `KILL`). Shared by
+/// the `#BP`/`#DB` stop trampoline and the `execve` exec-stop — both call this
+/// from a normal, blockable ring-0 context (interrupts already enabled). Never
+/// returns.
+#[cfg(feature = "ptrace")]
+pub fn ptrace_park_and_resume() -> ! {
+    match crate::process::ptrace::enter_stop_and_wait() {
+        crate::process::ptrace::ResumeAction::Kill => {
+            let pid = crate::process::current_pid();
+            terminate_thread_group_and_exit(pid, -(crate::process::ptrace::SIGTRAP as i32));
+        }
+        crate::process::ptrace::ResumeAction::Resume(regs) => {
+            // SAFETY: `regs` holds valid userspace RIP/RSP (captured at the trap
+            // / the new image's entry, or set via SETREGS); resume to ring 3.
+            unsafe { restore_and_enter_userspace(&regs) }
+        }
+    }
+}
+
+/// View a `SavedUserRegs` as its raw `#[repr(C)]` bytes (18 × u64 = 144 bytes)
+/// for the GETREGS/SETREGS userspace copy.
+#[cfg(feature = "ptrace")]
+fn saved_regs_bytes(regs: &crate::signal::SavedUserRegs) -> &[u8] {
+    // SAFETY: `SavedUserRegs` is `#[repr(C)]` plain `u64`s with no padding.
+    unsafe {
+        core::slice::from_raw_parts(
+            regs as *const _ as *const u8,
+            core::mem::size_of::<crate::signal::SavedUserRegs>(),
+        )
+    }
+}
+
+/// `sys_ptrace(request, pid, addr, data)` — the practical ptrace subset
+/// (`TRACEME`, `PEEK/POKE TEXT/DATA`, `CONT`, `KILL`, `SINGLESTEP`,
+/// `GETREGS`/`SETREGS`, `DETACH`). Linux request numbers.
+#[cfg(feature = "ptrace")]
+pub(super) fn sys_ptrace(request: u64, pid: u64, addr: u64, data: u64) -> u64 {
+    use crate::process::ptrace::{self, PtraceResume};
+
+    // Linux PTRACE_* request constants (the subset we implement).
+    const TRACEME: u64 = 0;
+    const PEEKTEXT: u64 = 1;
+    const PEEKDATA: u64 = 2;
+    const POKETEXT: u64 = 4;
+    const POKEDATA: u64 = 5;
+    const CONT: u64 = 7;
+    const KILL: u64 = 8;
+    const SINGLESTEP: u64 = 9;
+    const GETREGS: u64 = 12;
+    const SETREGS: u64 = 13;
+    const DETACH: u64 = 17;
+
+    let caller = crate::process::current_pid();
+    let tracee = pid as u32;
+
+    match request {
+        TRACEME => ptrace::traceme() as u64,
+        PEEKTEXT | PEEKDATA => match ptrace::peek(caller, tracee, addr) {
+            Some(word) => word,
+            None => NEG_EFAULT,
+        },
+        POKETEXT | POKEDATA => ptrace::poke(caller, tracee, addr, data) as u64,
+        CONT => ptrace::resume(caller, tracee, PtraceResume::Cont) as u64,
+        KILL => ptrace::resume(caller, tracee, PtraceResume::Kill) as u64,
+        SINGLESTEP => ptrace::resume(caller, tracee, PtraceResume::Step) as u64,
+        DETACH => ptrace::resume(caller, tracee, PtraceResume::Detach) as u64,
+        GETREGS => match ptrace::getregs(caller, tracee) {
+            Some(regs) => {
+                let bytes = saved_regs_bytes(&regs);
+                match UserSliceWo::new(data, bytes.len()) {
+                    Ok(s) if s.copy_from_kernel(bytes).is_ok() => 0,
+                    _ => NEG_EFAULT,
+                }
+            }
+            None => NEG_ESRCH,
+        },
+        SETREGS => {
+            let mut buf = [0u8; core::mem::size_of::<crate::signal::SavedUserRegs>()];
+            match UserSliceRo::new(data, buf.len()) {
+                Ok(s) if s.copy_to_kernel(&mut buf).is_ok() => {
+                    // SAFETY: `SavedUserRegs` is `#[repr(C)]` plain `u64`s; any
+                    // 144-byte pattern is a valid value.
+                    let regs = unsafe {
+                        core::ptr::read_unaligned(
+                            buf.as_ptr() as *const crate::signal::SavedUserRegs
+                        )
+                    };
+                    ptrace::setregs(caller, tracee, regs) as u64
+                }
+                _ => NEG_EFAULT,
+            }
+        }
+        _ => NEG_ENOSYS,
+    }
 }
 
 // ---------------------------------------------------------------------------

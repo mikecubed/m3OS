@@ -21,6 +21,10 @@
 #![allow(dead_code)]
 
 pub mod futex;
+/// Phase 111 Track D — ptrace-backed userspace debugging. Feature-gated: the
+/// syscall is arbitrary cross-process peek/poke, OFF in production.
+#[cfg(feature = "ptrace")]
+pub mod ptrace;
 
 extern crate alloc;
 
@@ -957,6 +961,12 @@ pub struct Process {
     /// 15 visible bytes + trailing NUL; defaults to all-zeros and is
     /// populated by `prctl(PR_SET_NAME)` and by `execve` (basename).
     pub comm: [u8; 16],
+    /// Phase 111 Track D — ptrace tracing state (traced flag, tracer PID,
+    /// stop bookkeeping, register snapshot). Feature-gated; absent in
+    /// production. A fork child starts untraced (`Default`); `PTRACE_TRACEME`
+    /// sets it.
+    #[cfg(feature = "ptrace")]
+    pub ptrace: ptrace::Ptrace,
 }
 
 // `MemoryMapping` is now defined in `kernel_core::mm` and re-exported above.
@@ -1020,6 +1030,8 @@ impl Process {
             shared_fd_table: None,
             shared_signal_actions: None,
             comm: [0u8; 16],
+            #[cfg(feature = "ptrace")]
+            ptrace: ptrace::Ptrace::default(),
         }
     }
 
@@ -1450,6 +1462,8 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         shared_fd_table: None,
         shared_signal_actions: None,
         comm: [0u8; 16],
+        #[cfg(feature = "ptrace")]
+        ptrace: ptrace::Ptrace::default(),
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -1513,6 +1527,8 @@ pub fn spawn_process_with_cr3(
         shared_fd_table: None,
         shared_signal_actions: None,
         comm: [0u8; 16],
+        #[cfg(feature = "ptrace")]
+        ptrace: ptrace::Ptrace::default(),
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -1580,6 +1596,8 @@ pub fn spawn_process_with_cr3_and_fds(
         shared_fd_table: None,
         shared_signal_actions: None,
         comm: [0u8; 16],
+        #[cfg(feature = "ptrace")]
+        ptrace: ptrace::Ptrace::default(),
     };
     PROCESS_TABLE.lock().insert(proc);
     pid

@@ -30,7 +30,7 @@ use crate::mm::user_mem::{UserSliceRo, UserSliceWo};
 ///
 /// **Must be `#[repr(C)]`** — the `restore_and_enter_userspace` asm stub
 /// in `syscall.rs` accesses fields by fixed byte offsets.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
 pub struct SavedUserRegs {
     pub rax: u64,

@@ -1161,8 +1161,17 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     // (iretq-frame-only) cannot see. Track B registered #DB — long absent —
     // so single-step and hardware breakpoints are possible.
     unsafe {
-        idt.breakpoint
+        let bp_opts = idt
+            .breakpoint
             .set_handler_addr(VirtAddr::new(bp_entry as *const () as u64));
+        // Phase 111 Track D — with `ptrace` on, raise the #BP gate to DPL 3 so a
+        // ring-3 `int3` (a debugger's software breakpoint) delivers #BP instead
+        // of #GP (the software-interrupt privilege check requires CPL ≤ gate
+        // DPL). Off by default: production keeps DPL 0, so a stray userspace
+        // `int3` still faults to #GP → kill, unchanged.
+        #[cfg(feature = "ptrace")]
+        bp_opts.set_privilege_level(x86_64::PrivilegeLevel::Ring3);
+        let _ = bp_opts;
         idt.debug
             .set_handler_addr(VirtAddr::new(db_entry as *const () as u64));
     }
