@@ -417,6 +417,19 @@ if [ "${M3OS_DEBUG_SUBSTRATE_REGRESSION:-0}" = "1" ]; then
     cargo xtask debug-substrate-smoke --timeout 240
 fi
 
+# Phase 111 Track C — in-kernel GDB stub (kgdb) gate. Gated behind
+# M3OS_KGDB_REGRESSION=1 because it builds the kernel with the `kgdb` feature
+# and boots it frozen at a wait-for-debugger int3, then drives a raw GDB-RSP
+# session over COM2->TCP: attach, set a software breakpoint at kgdb_probe_target
+# (nm vaddr + the 1 TiB PIE base), continue, assert the hit with RIP at that
+# address, and read back a known u64 over `m`. Also confirms the SMP all-stop
+# sentinel (no sibling core advances while stopped). Set on branches touching
+# kernel/src/debug/, the #BP/#DB entry stubs, or the smp kgdb quiesce.
+if [ "${M3OS_KGDB_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask kgdb-smoke..."
+    cargo xtask kgdb-smoke --timeout 240
+fi
+
 # Phase 107 — networked + signed package distribution. Gated behind
 # M3OS_PKG_NET_REGRESSION=1 because it boots QEMU against a host-served
 # SLIRP HTTP repo and asserts the full trust pipeline: ed25519 index

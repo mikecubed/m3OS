@@ -11,7 +11,7 @@
 |---|---|---|---|
 | A | QEMU gdbstub wiring + debug-info kernel build | — | ✅ **Landed** — `kdebug` profile (DWARF) + `cargo xtask debug` (QEMU `-s -S` + auto gdb script); RSP round-trip validated |
 | B | Trap & debug-register substrate (`#DB`/`#BP`, TF, `DR0`–`DR7`, `int3` patch) | — | ✅ **Landed** — `#DB` registered + `#BP` dispatcher (RIP-fixup), `RFLAGS.TF` single-step, `DebugRegs` (`DR0`–`DR7`), `int3` patch; `kernel_core::debug_regs` host-tested + `debug-substrate-smoke` PASS |
-| C | In-kernel GDB stub (kgdb) over polled COM2 + SMP all-stop | B | 🟡 **C.1 (RSP codec) landed** (`kernel_core::gdb_rsp`, host-tested); C.2–C.5 (stub loop + COM2 + all-stop + gate) next |
+| C | In-kernel GDB stub (kgdb) over polled COM2 + SMP all-stop | B | ✅ **Landed** — C.1 RSP codec (`kernel_core::gdb_rsp`, host-tested) + C.2–C.5 (full-GPR `#BP`/`#DB` naked entry, polled COM2, RSP command loop, SMP all-stop + panic hook, `kgdb` feature + `kgdb-smoke` gate) |
 | D | `ptrace` syscall + stop/notify + `m3gdbserver` | B | Planned |
 
 Track A is standalone and **pull-forward** (usable by the in-flight 101–110 bare-metal arc). C and D both consume B and are otherwise independent; either may be split into its own sub-phase (111a/111b) if scoped separately during implementation.
@@ -88,57 +88,61 @@ Track A is standalone and **pull-forward** (usable by the in-flight 101–110 ba
 
 > **Note (Track C sub-phasing):** C.1 landed as the standalone, host-tested wire-format foundation. C.2–C.5 (the stub command loop + naked-entry register frame, the polled COM2 transport, the SMP all-stop + panic hook, and the `kgdb` feature + gate) are interdependent — COM2 has no consumer without the stub, and the stub needs a naked-asm exception entry to capture the full GPR set for `g`/`G` — so they land together as the next Track C increment.
 
-### C.2 — Stub command dispatch + register mapping
+### C.2 — Stub command dispatch + register mapping ✅
 
 **File:** `kernel/src/debug/gdbstub.rs`
-**Symbol:** stub command loop
+**Symbol:** stub command loop (`session` / `dispatch`)
 **Why it matters:** The command set (`?`, `g`/`G`, `m`/`M`, `c`/`s`, `Z0/z0`, `Z1/z1`, `qSupported`, `D`, `k`) plus the x86_64 GDB register ordering is what turns raw traps into an interactive session.
 
-**Acceptance:**
-- [ ] Reads/writes all GPRs + RIP/RFLAGS in GDB's x86_64 order, mapped onto the kernel trap frame.
-- [ ] `m`/`M` read/write kernel memory; `Z0/z0` use B.3; `Z1/z1` use B.2 debug registers.
-- [ ] `c`/`s` resume/single-step; `D`/`k` detach/halt cleanly.
+**Landed as:** `kernel/src/debug/gdbstub.rs` — the all-stop RSP loop, driven by the host-tested `kernel_core::gdb_rsp` codec over polled COM2.
 
-### C.3 — Polled COM2 transport
+**Acceptance:**
+- [x] Reads/writes all GPRs + RIP/EFLAGS + segment selectors in GDB's amd64 order, mapped onto the naked-entry `DebugTrapFrame` (full-GPR capture — an `extern "x86-interrupt"` handler could not see the GPRs, so `#BP`/`#DB` moved to `bp_entry`/`db_entry` naked stubs). FPU/XSAVE deferred per charter.
+- [x] `m`/`M` read/write kernel memory (canonical-address guarded; `M` writes with `CR0.WP` cleared so kernel text patches); `Z0/z0` use B.3 `insert/remove_sw_breakpoint` with a planted-breakpoint table (RIP rewound to the bp address on a planted hit, left past a compiled-in `int3`); `Z1/z1` use B.2 `DebugRegs`.
+- [x] `c`/`s` resume/single-step (`s` sets `RFLAGS.TF`); `D`/`k` remove planted breakpoints and resume; unsolicited stop reply sent after a `c`/`s` re-stop, `?`-driven on the initial attach.
+
+### C.3 — Polled COM2 transport ✅
 
 **Files:**
-- `kernel/src/serial.rs` (or a new `kernel/src/debug/com2.rs`)
+- `kernel/src/debug/com2.rs` (new)
 - `xtask/src/main.rs` (QEMU args)
 
-**Symbol:** `Com2Polled`
+**Symbol:** `com2::{init, try_read_byte, write_byte, write_all}`
 **Why it matters:** At a breakpoint the kernel is frozen, so the IRQ-driven COM1 feeder and the IRQ-driven TCP stack are both dead; the stub must **poll** a dedicated UART. COM2 (`0x2F8`) is unused today in both kernel and QEMU args.
 
 **Acceptance:**
-- [ ] Polled RX/TX on COM2 via LSR (`0x2FD`) — no interrupts, no allocation.
-- [ ] COM1 remains the live console (`-serial stdio`); COM2 added and routed to a host TCP port.
-- [ ] Host `gdb` attaches over `target remote` to the COM2 TCP port.
+- [x] Polled RX/TX on COM2 via LSR (`0x2FD`, bit 0 RX-ready / bit 5 THR-empty) — IER=0, no interrupts, no allocation.
+- [x] COM1 remains the live console (`-serial stdio`); COM2 is a **second** `-serial tcp:127.0.0.1:<port>,server,nowait` (order: first serial = COM1, second = COM2), routed to a host TCP port the gate connects to.
+- [x] A raw GDB-RSP client attaches over the COM2 TCP port (a real `gdb` `target remote` follows the identical wire path; the dev machine has no host `gdb`, so the gate is a raw-RSP driver).
 
-### C.4 — SMP all-stop quiesce + panic→stub hook
+### C.4 — SMP all-stop quiesce + panic→stub hook ✅
 
 **Files:**
-- `kernel/src/arch/x86_64/interrupts.rs` (NMI-IPI path)
-- `kernel/src/lib.rs` (`handle_panic`)
+- `kernel/src/smp/mod.rs` (`kgdb_stop_all_aps` / `kgdb_release_aps` / `kgdb_ack_and_wait`)
+- `kernel/src/arch/x86_64/interrupts.rs` (`nmi_handler` kgdb branch, `total_timer_ticks` sentinel)
+- `kernel/src/lib.rs` (`handle_panic` → `enter_from_panic`)
 
 **Symbol:** stub-entry quiesce, panic hook
 **Why it matters:** A correct all-stop debugger must freeze every other core (reusing the TLB-shootdown NMI-IPI), and a panic that drops into the stub turns a dead bare-metal machine into an interactive post-mortem.
 
 **Acceptance:**
-- [ ] On stub entry, other APs park in an NMI spin-wait; released on continue. At `-smp 8`, a sentinel confirms no other core advances while stopped.
-- [ ] The panic handler optionally enters the stub before halting (feature-gated).
-- [ ] Asynchronous break: GDB `0x03` (Ctrl-C) on the polled link interrupts a running guest into the stub.
+- [x] On stub entry the other APs park in the NMI handler (spin until released — a **releasable** variant of the panic-quiesce path, reusing `send_nmi_to_core`), and `kgdb_release_aps` frees them on `c`/`s`/`D`/`k`. The stub logs a `KGDB:release … ticks_before=X ticks_after=Y` sentinel; the gate asserts `X == Y` (no core advanced while stopped, since every AP's LAPIC timer is frozen in the park loop).
+- [x] The panic handler enters the stub before halting (feature-gated) via `enter_from_panic` (a fresh `int3` so the stub gets a real `DebugTrapFrame`); the panic AP-quiesce has already parked the siblings, so the stub's own all-stop finds none online.
+- [x] Asynchronous break (GDB `0x03`/Ctrl-C into a *running* guest): the BSP timer tick (`timer_handler_user`/`_kernel` → `kgdb_poll_async_break_*`) polls COM2 for a lone `0x03` and, when present, builds a `DebugTrapFrame` from the interrupted preempt frame and breaks into the stub at the interrupted RIP (register edits copied back so the naked stub's `iretq` applies them). Only the BSP polls (single COM2 reader), and only under the `kgdb` feature (a per-tick LSR read guarded by `async_break_pending()`; production timers are untouched). Proven by `kgdb-smoke`: after the breakpoint test it `z0`+`c`-runs the guest free, sends a bare `0x03`, and asserts the unsolicited stop reply + a valid RIP.
 
-### C.5 — `kgdb` feature gate + CI smoke
+### C.5 — `kgdb` feature gate + CI smoke ✅
 
 **Files:**
 - `kernel/Cargo.toml` (feature)
-- `xtask/src/main.rs` (`kgdb-smoke` step)
+- `xtask/src/main.rs` (`cmd_kgdb_smoke`)
+- `.githooks/pre-push` (`M3OS_KGDB_REGRESSION` gate)
 
 **Symbol:** `kgdb` cargo feature
 **Why it matters:** Arbitrary kernel memory peek/poke defeats W^X/PKU/capabilities; the stub must be build-time opt-in and off in production, like `panic-test`/`trace`/telnet.
 
 **Acceptance:**
-- [ ] `kgdb` feature off by default; production image excludes the stub.
-- [ ] A serial/QMP-driven smoke scripts a minimal GDB session and asserts a known kernel breakpoint hit, behind `M3OS_KGDB_REGRESSION=1`.
+- [x] `kgdb` feature off by default; production image excludes the stub (the whole `kernel/src/debug/` module and the `on_breakpoint`/`on_debug_exception` stub routing are `#[cfg(feature = "kgdb")]`).
+- [x] `kgdb-smoke` (`M3OS_KGDB_REGRESSION=1`): boots with `kgdb`, waits for the `KGDB:waiting` breadcrumb on COM1, connects a raw-RSP client to COM2, sets `Z0` at `kgdb_probe_target` (`nm` vaddr + `0x10000000000`), continues, asserts the stop with `RIP` at that address, reads back `KGDB_PROBE_MAGIC` over `m`, then `z0`+`c`-runs the guest free and sends a bare `0x03` to assert the **async-break** stop. Also asserts the all-stop sentinel.
 
 ---
 

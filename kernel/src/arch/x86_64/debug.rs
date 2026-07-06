@@ -22,12 +22,87 @@
 //! `debug-substrate-test` feature adds a boot-time self-test that proves the
 //! `int3` fixup and single-step end to end.
 
+use core::mem::offset_of;
+
 use kernel_core::debug_regs::{self, DR6_STATUS_MASK, SlotConfig};
-use x86_64::registers::rflags::RFlags;
-use x86_64::structures::idt::InterruptStackFrame;
 
 /// `RFLAGS.TF` — the single-step trap-enable bit (bit 8).
-const RFLAGS_TF: u64 = 1 << 8;
+pub const RFLAGS_TF: u64 = 1 << 8;
+
+// ---------------------------------------------------------------------------
+// Full-GPR debug trap frame (Phase 111 Track C.2 prerequisite)
+// ---------------------------------------------------------------------------
+
+/// On-stack trap frame captured by the naked-asm `#BP`/`#DB` entry stubs
+/// (`bp_entry`/`db_entry` in `interrupts.rs`), giving a debugger consumer all
+/// 15 GPRs — which the previous `extern "x86-interrupt"` handlers could not
+/// see — plus the CPU-pushed iretq frame. GDB's `g`/`G` packets need the full
+/// set.
+///
+/// Layout (low → high address):
+/// 1. `gprs[0..14]` — 15 × u64 GPR save area pushed by the asm stub, same
+///    order as [`crate::arch::x86_64::preempt_trap_frame`]:
+///    `[rax, rbx, rcx, rdx, rsi, rdi, rbp, r8, r9, r10, r11, r12, r13, r14, r15]`
+/// 2. CPU-pushed 5-field iretq frame: `rip`, `cs`, `rflags`, `rsp`, `ss`.
+///
+/// **One layout for both rings.** In 64-bit mode the CPU pushes `SS:RSP`
+/// unconditionally on every interrupt/exception — with or without a privilege
+/// change (Intel SDM Vol 3A §6.14.2, AMD APM Vol 2 §8.9.3) — and `iretq`
+/// always pops all five fields. So unlike the ring-split preempt frames there
+/// is no 3-field kernel variant to model; `cs & 3` distinguishes the rings.
+///
+/// Mutations to this frame (GPRs, `rip`, `rflags`, …) are live: the asm stub
+/// pops the GPR block back into the registers and `iretq` consumes the CPU
+/// fields, so a `G`/`s` register write-back takes effect on resume.
+#[repr(C)]
+pub struct DebugTrapFrame {
+    /// GPR block pushed by the asm stub (index 0 = lowest address).
+    /// Order: `[rax, rbx, rcx, rdx, rsi, rdi, rbp, r8, r9, r10, r11, r12, r13, r14, r15]`
+    pub gprs: [u64; 15],
+    // CPU-pushed iretq frame (always 5 fields in 64-bit mode).
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+
+impl DebugTrapFrame {
+    /// True if the trap came from ring 3.
+    #[inline]
+    pub fn from_user(&self) -> bool {
+        (self.cs & 3) == 3
+    }
+}
+
+const _: () = assert!(
+    offset_of!(DebugTrapFrame, gprs) == 0,
+    "DebugTrapFrame: gprs must be at offset 0"
+);
+const _: () = assert!(
+    offset_of!(DebugTrapFrame, rip) == 15 * 8,
+    "DebugTrapFrame: rip must be at offset 120 (after 15 GPRs)"
+);
+const _: () = assert!(
+    offset_of!(DebugTrapFrame, cs) == 16 * 8,
+    "DebugTrapFrame: cs must be at offset 128"
+);
+const _: () = assert!(
+    offset_of!(DebugTrapFrame, rflags) == 17 * 8,
+    "DebugTrapFrame: rflags must be at offset 136"
+);
+const _: () = assert!(
+    offset_of!(DebugTrapFrame, rsp) == 18 * 8,
+    "DebugTrapFrame: rsp must be at offset 144"
+);
+const _: () = assert!(
+    offset_of!(DebugTrapFrame, ss) == 19 * 8,
+    "DebugTrapFrame: ss must be at offset 152"
+);
+const _: () = assert!(
+    core::mem::size_of::<DebugTrapFrame>() == 20 * 8,
+    "DebugTrapFrame must be 160 bytes (15 GPRs + 5 CPU fields)"
+);
 
 // ---------------------------------------------------------------------------
 // Hardware debug register access (DR0–DR7)
@@ -140,24 +215,13 @@ fn slot_clear_mask(slot: usize) -> u64 {
 
 /// Set `RFLAGS.TF` on `frame` so exactly one instruction executes after the
 /// return before a `#DB` fires.
-pub fn set_single_step(frame: &mut InterruptStackFrame) {
-    // SAFETY: we only flip the TF bit of the saved RFLAGS image; the CPU
-    // reloads it on `iretq`.
-    unsafe {
-        frame.as_mut().update(|f| {
-            f.cpu_flags |= RFlags::from_bits_truncate(RFLAGS_TF);
-        });
-    }
+pub fn set_single_step(frame: &mut DebugTrapFrame) {
+    frame.rflags |= RFLAGS_TF;
 }
 
 /// Clear `RFLAGS.TF` on `frame` (stop single-stepping).
-pub fn clear_single_step(frame: &mut InterruptStackFrame) {
-    // SAFETY: as above — clear the TF bit of the saved RFLAGS image.
-    unsafe {
-        frame.as_mut().update(|f| {
-            f.cpu_flags &= !RFlags::from_bits_truncate(RFLAGS_TF);
-        });
-    }
+pub fn clear_single_step(frame: &mut DebugTrapFrame) {
+    frame.rflags &= !RFLAGS_TF;
 }
 
 // ---------------------------------------------------------------------------
@@ -179,7 +243,7 @@ pub unsafe fn insert_sw_breakpoint(addr: u64) -> u8 {
     // SAFETY: caller guarantees `addr` is a mapped, writable kernel byte.
     unsafe {
         let orig = core::ptr::read_volatile(p);
-        core::ptr::write_volatile(p, INT3);
+        with_wp_disabled(|| core::ptr::write_volatile(p, INT3));
         flush_icache(addr);
         orig
     }
@@ -194,9 +258,69 @@ pub unsafe fn remove_sw_breakpoint(addr: u64, orig: u8) {
     let p = addr as *mut u8;
     // SAFETY: caller guarantees `addr` is the mapped, writable byte it patched.
     unsafe {
-        core::ptr::write_volatile(p, orig);
+        with_wp_disabled(|| core::ptr::write_volatile(p, orig));
         flush_icache(addr);
     }
+}
+
+/// Run `f` with `CR0.WP` cleared so a ring-0 store to a read-only page (kernel
+/// text is mapped R-X per its ELF flags) succeeds — the classic kprobes/kgdb
+/// text-patch technique. Interrupt-safety: callers run either at boot (Track B
+/// self-test) or inside the frozen all-stop stub (Track C), so no other code
+/// observes the WP-off window on this core; other cores' CR0 is unaffected.
+///
+/// # Safety
+/// Caller must ensure nothing else on this core can run during `f` (IRQs
+/// disabled or single-threaded boot) — WP-off suspends kernel write protection.
+unsafe fn with_wp_disabled<R>(f: impl FnOnce() -> R) -> R {
+    use x86_64::registers::control::{Cr0, Cr0Flags};
+    let wp_was_set = Cr0::read().contains(Cr0Flags::WRITE_PROTECT);
+    if wp_was_set {
+        // SAFETY: clearing WP only widens ring-0 write permission; restored below.
+        unsafe { Cr0::update(|f| f.remove(Cr0Flags::WRITE_PROTECT)) };
+    }
+    let r = f();
+    if wp_was_set {
+        // SAFETY: restoring the original CR0.WP state.
+        unsafe { Cr0::update(|f| f.insert(Cr0Flags::WRITE_PROTECT)) };
+    }
+    r
+}
+
+/// Read `out.len()` bytes starting at kernel virtual address `addr` (the GDB
+/// `m` command). Plain volatile byte reads — the caller (the all-stop stub)
+/// has already validated the address is canonical.
+///
+/// # Safety
+/// `addr..addr+out.len()` must be a mapped, readable kernel range; an unmapped
+/// address faults.
+pub unsafe fn read_kernel_bytes(addr: u64, out: &mut [u8]) {
+    // SAFETY: caller guarantees the range is mapped + readable.
+    unsafe {
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = core::ptr::read_volatile((addr + i as u64) as *const u8);
+        }
+    }
+}
+
+/// Write `data` starting at kernel virtual address `addr` (the GDB `M`
+/// command), with `CR0.WP` cleared so a write to read-only kernel text
+/// succeeds. Serializes the icache after.
+///
+/// # Safety
+/// `addr..addr+data.len()` must be a mapped kernel range, and nothing else on
+/// this core may run during the write (the frozen all-stop stub guarantees
+/// this — see [`with_wp_disabled`]).
+pub unsafe fn write_kernel_bytes(addr: u64, data: &[u8]) {
+    // SAFETY: caller guarantees the range is mapped; WP-off is restored.
+    unsafe {
+        with_wp_disabled(|| {
+            for (i, &b) in data.iter().enumerate() {
+                core::ptr::write_volatile((addr + i as u64) as *mut u8, b);
+            }
+        });
+    }
+    flush_icache(addr);
 }
 
 /// Serialize after a code patch so the CPU refetches the modified byte. On
@@ -216,16 +340,21 @@ fn flush_icache(_addr: u64) {
 /// Handle a `#BP` (vector 3). `bp_addr` is the breakpoint address (RIP already
 /// decremented past the `0xCC` by the caller). `from_user` distinguishes a
 /// ring-3 `int3` (→ future `ptrace` stop path, Track D) from a ring-0 one (→
-/// future in-kernel stub, Track C). Until those land, the self-test records the
-/// event and a production trap is logged once and resumed.
-pub fn on_breakpoint(bp_addr: u64, frame: &mut InterruptStackFrame, from_user: bool) {
+/// the in-kernel `kgdb` stub, Track C). With no consumer active, the self-test
+/// records the event and a production trap is logged once and resumed.
+pub fn on_breakpoint(bp_addr: u64, frame: &mut DebugTrapFrame, from_user: bool) {
     #[cfg(feature = "debug-substrate-test")]
     if selftest::on_breakpoint(bp_addr, frame) {
         return;
     }
 
-    // Track B seam: a registered consumer (C: ring-0 kernel stub / D: ring-3
-    // ptrace stop) would take the trap here. None registered yet.
+    // Track C consumer: ring-0 traps enter the kgdb stub when it is live.
+    // (Track D's ptrace stop is the future ring-3 consumer.)
+    #[cfg(feature = "kgdb")]
+    if !from_user && crate::debug::gdbstub::on_breakpoint(bp_addr, frame) {
+        return;
+    }
+
     let _ = (from_user, frame);
     log::warn!(
         "[debug] unexpected int3 breakpoint at {:#x} (no debugger attached) — resuming",
@@ -238,11 +367,18 @@ pub fn on_breakpoint(bp_addr: u64, frame: &mut InterruptStackFrame, from_user: b
 pub fn on_debug_exception(
     status: debug_regs::Dr6Status,
     rip: u64,
-    frame: &mut InterruptStackFrame,
+    frame: &mut DebugTrapFrame,
     from_user: bool,
 ) {
     #[cfg(feature = "debug-substrate-test")]
     if selftest::on_debug_exception(status, rip, frame) {
+        return;
+    }
+
+    // Track C consumer: ring-0 single-step / hw-breakpoint hits re-enter the
+    // kgdb stub when it is live.
+    #[cfg(feature = "kgdb")]
+    if !from_user && crate::debug::gdbstub::on_debug_exception(&status, rip, frame) {
         return;
     }
 
@@ -284,7 +420,7 @@ mod selftest {
 
     /// Called from [`super::on_breakpoint`]; returns `true` if the self-test
     /// consumed the event.
-    pub(super) fn on_breakpoint(bp_addr: u64, frame: &mut InterruptStackFrame) -> bool {
+    pub(super) fn on_breakpoint(bp_addr: u64, frame: &mut DebugTrapFrame) -> bool {
         if !ACTIVE.load(Ordering::Acquire) {
             return false;
         }
@@ -303,7 +439,7 @@ mod selftest {
     pub(super) fn on_debug_exception(
         status: debug_regs::Dr6Status,
         _rip: u64,
-        frame: &mut InterruptStackFrame,
+        frame: &mut DebugTrapFrame,
     ) -> bool {
         if !ACTIVE.load(Ordering::Acquire) || !EXPECT_STEP.load(Ordering::Acquire) {
             return false;
