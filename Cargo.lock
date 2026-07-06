@@ -1722,6 +1722,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ptrace-test"
+version = "0.99.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
 name = "pty-test"
 version = "0.99.0"
 dependencies = [

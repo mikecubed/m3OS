@@ -65,6 +65,14 @@ debug-substrate-test = []
 # of halting. Driven by `kgdb-smoke` (M3OS_KGDB_REGRESSION). Run with:
 #   M3OS_KERNEL_FEATURES=kgdb cargo xtask run
 kgdb = []
+# Phase 111 Track D — ptrace-backed userspace debugging. OFF by default and
+# excluded from production images: sys_ptrace is arbitrary cross-process
+# register/memory peek/poke (defeats process isolation), same posture as
+# `kgdb`/`panic-test`/`trace`. When enabled, adds the `sys_ptrace` syscall
+# (0x1152), sets the #BP IDT gate to DPL 3 so a ring-3 `int3` traps (not #GP),
+# and routes a traced tracee's debug traps into a stop-and-notify path for its
+# tracer (`m3gdbserver`). Driven by `ptrace-smoke` (M3OS_PTRACE_REGRESSION).
+ptrace = []
 # Track D (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md):
 # debug-only deliberate kernel-stack-overflow probe. Adds the `SYS_KSTACK_OVERFLOW_TEST`
 # (0x1150) syscall, which recurses until the calling task overflows its per-task

@@ -84,6 +84,8 @@ static EXIT0_ELF: &[u8] = generated_initrd_asset!("exit0");
 // Phase 110 Track B — ASLR + stack-canary probes.
 static ASLR_PROBE_ELF: &[u8] = generated_initrd_asset!("aslr-probe");
 static STACK_SMASH_ELF: &[u8] = generated_initrd_asset!("stack-smash");
+// Phase 111 Track D — ptrace tracer/tracee smoke.
+static PTRACE_TEST_ELF: &[u8] = generated_initrd_asset!("ptrace-test");
 static FORK_TEST_ELF: &[u8] = generated_initrd_asset!("fork-test");
 static ECHO_ARGS_ELF: &[u8] = generated_initrd_asset!("echo-args");
 static HELLO_ELF: &[u8] = generated_initrd_asset!("hello");
@@ -544,6 +546,12 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "stack-smash",
         RamdiskNode::File {
             content: STACK_SMASH_ELF,
+        },
+    ),
+    (
+        "ptrace-test",
+        RamdiskNode::File {
+            content: PTRACE_TEST_ELF,
         },
     ),
     (

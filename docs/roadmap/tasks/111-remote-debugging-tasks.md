@@ -12,7 +12,7 @@
 | A | QEMU gdbstub wiring + debug-info kernel build | — | ✅ **Landed** — `kdebug` profile (DWARF) + `cargo xtask debug` (QEMU `-s -S` + auto gdb script); RSP round-trip validated |
 | B | Trap & debug-register substrate (`#DB`/`#BP`, TF, `DR0`–`DR7`, `int3` patch) | — | ✅ **Landed** — `#DB` registered + `#BP` dispatcher (RIP-fixup), `RFLAGS.TF` single-step, `DebugRegs` (`DR0`–`DR7`), `int3` patch; `kernel_core::debug_regs` host-tested + `debug-substrate-smoke` PASS |
 | C | In-kernel GDB stub (kgdb) over polled COM2 + SMP all-stop | B | ✅ **Landed** — C.1 RSP codec (`kernel_core::gdb_rsp`, host-tested) + C.2–C.5 (full-GPR `#BP`/`#DB` naked entry, polled COM2, RSP command loop, SMP all-stop + panic hook, `kgdb` feature + `kgdb-smoke` gate) |
-| D | `ptrace` syscall + stop/notify + `m3gdbserver` | B | Planned |
+| D | `ptrace` syscall + stop/notify + `m3gdbserver` | B | 🟡 **D.1 + D.2 landed** (traced-process stop/notify + SIGTRAP + ring-3 `int3`, `sys_ptrace`, `ptrace-smoke` PASS); D.3 (`m3gdbserver`) + D.4 (symbol retention) next |
 
 Track A is standalone and **pull-forward** (usable by the in-flight 101–110 bare-metal arc). C and D both consume B and are otherwise independent; either may be split into its own sub-phase (111a/111b) if scoped separately during implementation.
 
@@ -148,30 +148,33 @@ Track A is standalone and **pull-forward** (usable by the in-flight 101–110 ba
 
 ## Track D — `ptrace` + userspace gdbserver
 
-### D.1 — Traced-process state + stop/notify
+### D.1 — Traced-process state + stop/notify ✅
 
 **Files:**
-- `kernel/src/arch/x86_64/interrupts.rs` (`fault_kill_trampoline` path)
-- `kernel/src/process/mod.rs` (process state, `SIGTRAP`)
+- `kernel/src/process/ptrace.rs` (new — the `Ptrace` state, trap consumers, stop/wait, peek/poke)
+- `kernel/src/arch/x86_64/debug.rs` (`on_breakpoint`/`on_debug_exception` `from_user` ptrace branches)
+- `kernel/src/arch/x86_64/syscall/mod.rs` (`ptrace_stop_trampoline`, `waitpid` stop reporting)
+- `kernel/src/arch/x86_64/interrupts.rs` (#BP IDT gate → DPL 3 under `ptrace`)
+- `kernel/src/process/mod.rs` (`Process.ptrace` field), `kernel/src/signal.rs` (`SavedUserRegs: Default`)
 
 **Symbol:** traced-stop conversion
 **Why it matters:** Today a ring-3 trap/fault → `fault_kill_trampoline` → SIGSEGV kill (exit `-11`); `SIGTRAP` (5) is defined but never generated. A debugger needs the trap to **stop and notify**, not kill.
 
 **Acceptance:**
-- [ ] `SIGTRAP` is generated on ring-3 `int3` and on single-step completion, delivered to the **tracer**.
-- [ ] A traced tracee that hits a debug trap (or, opt-in, a fatal signal) stops instead of being torn down.
-- [ ] The tracer learns of the stop via `wait`/`waitpid` with a ptrace-stop status encoding.
+- [x] `SIGTRAP` (`process::ptrace::SIGTRAP = 5`) is generated on ring-3 `int3` (with the #BP gate raised to DPL 3 under the `ptrace` feature so a userspace `int3` traps to `#BP` instead of `#GP`) and on single-step completion, reported to the **tracer**. RIP is left **past** the `int3` (Linux semantics — the tracer rewinds it for planted breakpoints).
+- [x] A traced tracee that hits a debug trap **stops**: its `#BP`/`#DB` handler snapshots the `DebugTrapFrame` into `Process.ptrace.regs` and redirects the `iretq` into `ptrace_stop_trampoline` (the `fault_kill_trampoline` technique — a blockable ring-0 continuation), which parks it until the tracer resumes it. An untraced userspace `int3` resumes past the byte (feature build only; production keeps DPL 0 → `#GP` kill, unchanged).
+- [x] The tracer learns of the stop via `waitpid` — the scan reports a ptrace-stopped child as `WIFSTOPPED` with `SIGTRAP` (one-shot per stop), regardless of `WUNTRACED`. Proven by `ptrace-smoke` (`PTRACE_SMOKE:stop-sigtrap ok`).
 
-### D.2 — `sys_ptrace` syscall surface
+### D.2 — `sys_ptrace` syscall surface ✅
 
-**File:** `kernel/src/arch/x86_64/syscall/mod.rs`
+**Files:** `kernel/src/arch/x86_64/syscall/mod.rs` (`sys_ptrace`, `SYS_PTRACE = 0x1152`, dispatch arm), `kernel/src/process/ptrace.rs` (request handlers)
 **Symbol:** `sys_ptrace`
 **Why it matters:** The attach/inspect/resume primitives a gdbserver maps RSP onto; peek/poke must cross into the tracee's address space, which the tracer does not share.
 
 **Acceptance:**
-- [ ] `TRACEME`/`ATTACH`/`DETACH`, `CONT`, `SINGLESTEP` implemented.
-- [ ] `PEEKTEXT`/`POKETEXT` read/write tracee memory via its VMA tree (`find_vma`) + page tables.
-- [ ] `GETREGS`/`SETREGS` marshal the tracee's `SavedUserRegs` + trap frame; `GETSIGINFO` returns the stop reason.
+- [x] `TRACEME`, `CONT`, `SINGLESTEP`, `DETACH`, `KILL` implemented (feature-gated `sys_ptrace`; `ATTACH`/`GETSIGINFO` deferred — the fork+`TRACEME` model `m3gdbserver` uses does not need `ATTACH`).
+- [x] `PEEKTEXT`/`PEEKDATA` and `POKETEXT`/`POKEDATA` read/write tracee memory via the tracee's own page tables (`mm::mapper_for_frame` over its CR3, no CR3 switch) → physmap; `POKE` writes through the physmap alias so it can plant an `int3` in read-only code text. Proven by `ptrace-smoke` (`peek-int3`, `poke-roundtrip`).
+- [x] `GETREGS`/`SETREGS` marshal the tracee's `SavedUserRegs` (18 × u64) to/from the tracer's userspace buffer; the register snapshot is applied to the tracee on resume via `restore_and_enter_userspace`. Proven end-to-end by `ptrace-smoke` (`getregs-rbx`, `setregs`, `setregs-effect`: a `SETREGS`'d `rbx` flows into the resumed tracee's exit code). `GETSIGINFO` deferred.
 
 ### D.3 — `m3gdbserver` (native or ported)
 
@@ -197,7 +200,7 @@ Track A is standalone and **pull-forward** (usable by the in-flight 101–110 ba
 
 **Acceptance:**
 - [ ] Unstripped host-side copies (or a `-g` variant) retained for debuggable targets; the on-device/stripped artifacts are unchanged.
-- [ ] A smoke scripts a gdb/`m3gdbserver` session over the in-kernel TCP stack asserting a known userspace stop, behind `M3OS_PTRACE_REGRESSION=1`.
+- [x] A CI smoke asserts a known userspace ptrace stop behind `M3OS_PTRACE_REGRESSION=1`. **Landed** as `ptrace-smoke` (`cmd_ptrace_smoke`) — a **native tracer/tracee** (`/bin/ptrace-test`, fork+`TRACEME`) that exercises the full substrate (stop/notify, GETREGS/SETREGS, PEEKTEXT/POKETEXT, CONT) without needing `m3gdbserver` or a host GDB. The `m3gdbserver`-driven RSP-over-TCP variant rides D.3.
 
 ---
 

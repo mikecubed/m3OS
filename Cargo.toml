@@ -12,6 +12,8 @@ members = [
     # Phase 110 Track B — ASLR + stack-canary probe binaries
     "userspace/aslr-probe",
     "userspace/stack-smash",
+    # Phase 111 Track D — ptrace tracer/tracee smoke binary
+    "userspace/ptrace-test",
     "userspace/fork-test",
     "userspace/echo-args",
     # Phase 20 userspace init and shell
