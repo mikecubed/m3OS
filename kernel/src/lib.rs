@@ -509,6 +509,12 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
         arch::x86_64::smap_test::run_boot_self_test();
     });
 
+    // Phase 111 Track B (debug-only): prove the #BP RIP-fixup + RFLAGS.TF
+    // single-step substrate works end to end (int3 from kernel context, one
+    // #DB per step). Feature-gated; absent in production builds.
+    #[cfg(feature = "debug-substrate-test")]
+    arch::x86_64::debug::run_boot_self_test();
+
     // Phase 77 Track E: apply microcode on the BSP first (before APs are
     // woken). A no-op clean skip on QEMU / non-AMD CPUs (no MSR write unless a
     // strictly-newer matching patch is found in the embedded blob).

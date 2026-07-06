@@ -3,6 +3,9 @@ use core::arch::global_asm;
 pub mod apic;
 pub mod cpufreq;
 pub mod cpuid;
+// Phase 111 Track B — trap & debug-register substrate (#DB/#BP dispatch,
+// DR0–DR7 wrapper, single-step, sw-breakpoint patch).
+pub mod debug;
 pub mod gdt;
 pub mod interrupts;
 pub mod microcode;

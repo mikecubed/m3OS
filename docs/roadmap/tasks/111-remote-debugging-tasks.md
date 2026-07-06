@@ -10,7 +10,7 @@
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
 | A | QEMU gdbstub wiring + debug-info kernel build | — | ✅ **Landed** — `kdebug` profile (DWARF) + `cargo xtask debug` (QEMU `-s -S` + auto gdb script); RSP round-trip validated |
-| B | Trap & debug-register substrate (`#DB`/`#BP`, TF, `DR0`–`DR7`, `int3` patch) | — | Planned |
+| B | Trap & debug-register substrate (`#DB`/`#BP`, TF, `DR0`–`DR7`, `int3` patch) | — | ✅ **Landed** — `#DB` registered + `#BP` dispatcher (RIP-fixup), `RFLAGS.TF` single-step, `DebugRegs` (`DR0`–`DR7`), `int3` patch; `kernel_core::debug_regs` host-tested + `debug-substrate-smoke` PASS |
 | C | In-kernel GDB stub (kgdb) over polled COM2 + SMP all-stop | B | Planned |
 | D | `ptrace` syscall + stop/notify + `m3gdbserver` | B | Planned |
 
@@ -44,35 +44,29 @@ Track A is standalone and **pull-forward** (usable by the in-flight 101–110 ba
 
 ### B.1 — Register the `#DB` handler and upgrade `#BP`
 
-**File:** `kernel/src/arch/x86_64/interrupts.rs`
-**Symbol:** IDT init (vector 1), `breakpoint_handler` (vector 3)
-**Why it matters:** Vector 1 is currently **unregistered** and `breakpoint_handler` only prints-and-returns — so single-step, hardware breakpoints, and real `int3` breakpoints are all impossible today.
+**File:** `kernel/src/arch/x86_64/interrupts.rs` (IDT + handlers), `kernel/src/arch/x86_64/debug.rs` (dispatch).
 
 **Acceptance:**
-- [ ] `#DB` (vector 1) has a handler that decodes `DR6` (single-step BS vs hw-breakpoint B0–B3) and dispatches to the active consumer.
-- [ ] `#BP` (vector 3) dispatches instead of returning; for a software breakpoint it presents RIP at the breakpoint address (decrement past the 0xCC).
-- [ ] A ring-0 trap routes to the kernel stub; a traced ring-3 trap routes to the `ptrace` stop path (seam in place even before C/D land).
+- [x] `#DB` (vector 1) is registered — `debug_exception_handler` reads + clears `DR6` and decodes it (single-step BS vs hw-breakpoint B0–B3) via `kernel_core::debug_regs`, then dispatches (`debug::on_debug_exception`).
+- [x] `#BP` (vector 3) dispatches instead of print-and-return — the handler computes the breakpoint address as `RIP-1` (past the `0xCC`) and calls `debug::on_breakpoint`. Proven by the self-test: `DEBUG_SELFTEST:bp-rip ok addr=…` (the recorded address equals the `int3` instruction's address).
+- [x] Ring-0 vs ring-3 routing **seam** in place (`from_user` branch in `on_breakpoint`/`on_debug_exception`); with no consumer registered the safe default logs + resumes (past `int3`, clearing any stray `TF`), so production is undisturbed.
 
-### B.2 — Single-step and `DR0`–`DR7` wrapper
+### B.2 — Single-step and `DR0`–`DR7` wrapper ✅
 
-**File:** `kernel/src/arch/x86_64/` (new `debug_regs.rs`), `kernel/src/arch/x86_64/preempt_trap_frame.rs`
-**Symbol:** `set_single_step` / `DebugRegs`
-**Why it matters:** `RFLAGS.TF` and `DR0`–`DR7` are never touched anywhere in the tree; they are the hardware basis for stepping and watchpoints.
+**Files:** new `kernel-core/src/debug_regs.rs` (pure logic, host-tested), `kernel/src/arch/x86_64/debug.rs` (HW wrapper + single-step). *(Deviation: the pure-logic codec lives in `kernel-core` — host-testable — with the HW `mov %dr` access in the arch module, rather than a single `arch/debug_regs.rs`.)*
 
 **Acceptance:**
-- [ ] Set/clear `RFLAGS.TF` on a given trap frame; exactly one `#DB` results per step.
-- [ ] `DebugRegs` encodes/decodes `DR7` (enable + len + rw) and `DR6` (sticky hit, cleared after read) for 4 slots; ring-3 access still `#GP`s.
-- [ ] Host tests in `kernel-core` cover the `DR6`/`DR7` bit encoding.
+- [x] `set_single_step`/`clear_single_step` flip `RFLAGS.TF` on a trap frame; the self-test proves **exactly one** `#DB` per step (`DEBUG_SELFTEST:single-step ok count=1`).
+- [x] `DebugRegs` arms/disarms `DR0`–`DR3` + `DR7` via `dr7_slot_bits`, and `read_and_clear_dr6` decodes + clears the sticky status; ring-3 `mov %dr` still `#GP`s (unchanged). `DEBUG_SELFTEST:dr7 ok arm+disarm`.
+- [x] Host tests in `kernel-core::debug_regs` cover the `DR7` enable/R-W/LEN encoding and `DR6` BS/B0–B3/BD/BT decode (7 tests, in `cargo xtask check`).
 
-### B.3 — Software-breakpoint patch primitive
+### B.3 — Software-breakpoint patch primitive ✅
 
-**File:** `kernel/src/arch/x86_64/` (debug module)
-**Symbol:** `insert_sw_breakpoint` / `remove_sw_breakpoint`
-**Why it matters:** GDB `Z0`/`z0` breakpoints are implemented by writing `0xCC` and restoring the saved byte; the RIP-fixup contract must be exact or the debugged program corrupts.
+**File:** `kernel/src/arch/x86_64/debug.rs` (`insert_sw_breakpoint` / `remove_sw_breakpoint`).
 
 **Acceptance:**
-- [ ] Save original byte, write `0xCC`, restore on removal; idempotent and safe across the same address twice.
-- [ ] Works against both a kernel address (Track C) and a tracee address via its page tables (Track D).
+- [x] `insert_sw_breakpoint(addr) -> u8` saves the original byte, writes `0xCC`, and `mfence`s so the patching core refetches; `remove_sw_breakpoint(addr, orig)` restores it. `# Safety` docs the caller-owned save/restore lifecycle (double-insert would save `0xCC` as the "original").
+- [x] Works against a kernel virtual address (Track C). The tracee-address variant (via the tracee's page tables) lands with Track D's `POKETEXT`.
 
 ---
 
