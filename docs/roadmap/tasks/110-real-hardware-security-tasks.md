@@ -10,7 +10,7 @@
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
 | A | Activate + bare-metal-validate KPTI (PML4 pair, CR3 trampoline, `KPTI_WIRED`, PCID, Meltdown PoC) | Phase 84 ✅, Phase 99 ✅ | Planned |
-| B | Userspace ASLR + stack canaries + CET shadow stacks | Phase 86a ✅, A (shares the mm/exec path) | Planned |
+| B | Userspace ASLR + stack canaries + CET shadow stacks | Phase 86a ✅, A (shares the mm/exec path) | 🟢 **B.1 (ASLR) + B.2 (canaries) landed + green** (`aslr-smoke` + `stack-smash-smoke`); B.3 (CET) bare-metal-gated (planned) |
 | C | argon2id password hashing migration (fallback read path + re-hash) | Phase 48 ✅ | ✅ **Landed** — RFC 9106 argon2id (+ BLAKE2b) host-tested; passwd/adduser/login write argon2id; verify_password fallback + login re-hash; seeded images argon2id; `argon2-smoke` PASS |
 | D | Secure Boot on-metal validation + Phase 59 Track J / Phase 10 C.3 closeout | Phase 10 ✅, A (validated boot platform) | Planned |
 
@@ -91,32 +91,23 @@
 
 ## Track B — Userspace ASLR + Stack Canaries + CET Shadow Stacks
 
-### B.1 — ASLR: randomize PIE base / mmap base / stack top
+### B.1 — ASLR: randomize PIE base / mmap base / stack top ✅
 
-**File:** `kernel/src/mm/elf.rs`
-**Symbol:** `map_segment` / `load_bias`, `INTERP_LOAD_BASE_HINT`, `ELF_STACK_TOP`, the mmap base allocator
-**Why it matters:** Every PIE loads at the fixed `INTERP_LOAD_BASE_HINT = 0x4000_0000` bias and the stack at the fixed `ELF_STACK_TOP` today, so addresses are fully predictable. ASLR draws a per-`execve` random bias from `kernel_core::csprng::global_fill` (Phase 86a).
-
-**Acceptance:**
-- [ ] PIE/`ET_DYN` load bias, mmap base, and stack top are each offset by a CSPRNG-drawn, page-aligned random value within a bounded budget.
-- [ ] Randomized mappings stay inside the canonical user range, never overlap, and the Phase 75 W^X reject in `map_segment` is unchanged.
-- [ ] `aslr-smoke` (new, CI-able under QEMU) boots the same PIE twice and asserts the observed load base / stack top differ across runs.
-- [ ] When the CSPRNG is not yet `global_ready()`, load falls back to the fixed bias (boot never blocks on entropy).
-
-### B.2 — Stack canaries (`-Z stack-protector` + runtime symbols)
-
-**Files:**
-- `x86_64-m3os.json`
-- `xtask/src/main.rs` (`build_userspace` flags)
-- new: `userspace/syscall-lib/src/stack_protector.rs` (`__stack_chk_guard`, `__stack_chk_fail`)
-
-**Symbol:** `__stack_chk_guard`, `__stack_chk_fail`
-**Why it matters:** The userspace target compiles with no stack protector, so a stack overwrite returns into corrupted control flow undetected. Canaries are compiler-emitted CFI; m3OS must supply the guard symbol (seeded from the CSPRNG at process start) and a `__stack_chk_fail` that aborts.
+**File:** `kernel/src/mm/elf.rs` (`aslr_offset_bytes`, `map_user_stack`, the `ET_DYN` `load_bias`), `kernel/src/arch/x86_64/syscall/mod.rs` (mmap base at exec).
+**Why it matters:** Every stack sat at the fixed `ELF_STACK_TOP`, mmaps at the fixed `ANON_MMAP_BASE`, and PIEs at a fixed bias — fully predictable.
 
 **Acceptance:**
-- [ ] `-Z stack-protector=strong` (or `all`) is set for the userspace build; `objdump -d` of a representative binary shows canary load/compare prologue+epilogue sequences.
-- [ ] `__stack_chk_guard` is seeded from `getrandom`/CSPRNG at process start; `__stack_chk_fail` terminates the process (no return into corrupted state).
-- [ ] `stack-smash-smoke` (new, CI-able under QEMU): a binary that deliberately overwrites its canary is killed via `__stack_chk_fail` rather than completing.
+- [x] Per-`execve` page-aligned CSPRNG offsets jitter the **stack top** (≤ 1 MiB, within the eager stack mapping — the mapped extent, guard page, and demand-page window are unchanged; only the initial RSP moves), the **`ET_DYN` load bias** (≤ 2 MiB above `USER_VADDR_MIN` — the interpreter + PIE binaries), and the **anonymous mmap base** (≤ 16 MiB, seeded into `mmap_next` at exec). Native `ET_EXEC` binaries keep fixed link addresses (the target links non-PIE), so only their stack + mmap are randomized. Bounds keep every anchor inside the canonical range; the Phase 75 W^X reject is untouched.
+- [x] `aslr-smoke` (CI-able, `M3OS_ASLR_REGRESSION=1`): execs `/bin/aslr-probe` 5× and asserts the printed stack address is **not all identical** (observed 5/5 distinct). Uses `global_fill`, falling back to `global_fill_insecure` when the DRBG lacks credited bits (QEMU TCG has no RDRAND) — still per-exec-varying; credited-random on real hardware. Never blocks on entropy (the DRBG is seeded at boot before any exec).
+
+### B.2 — Stack canaries (`-Z stack-protector` + runtime symbols) ✅
+
+**Files:** `.cargo/config.toml` (`[target.x86_64-m3os]` rustflag), new `userspace/syscall-lib/src/stack_protector.rs` (`__stack_chk_guard`, `__stack_chk_fail`, `seed_guard`), `userspace/syscall-lib/src/start.rs` (seed call).
+
+**Acceptance:**
+- [x] `-Z stack-protector=strong` set for the userspace target (in `.cargo/config.toml`, not the JSON — scoped so the ring-0 kernel never carries canaries). Confirmed via `objdump`: protected functions load the global `__stack_chk_guard` (RIP-relative, **not** `%fs:0x28`) and `call __stack_chk_fail`.
+- [x] `__stack_chk_guard` is a fixed non-zero sentinel (canaries functional from the first instruction), **re-seeded per process from the CSPRNG** by `seed_guard`, called from the divergent `start::run_main*` trampoline before `main` (so the reseed can't trip its own caller's epilogue check). `__stack_chk_fail` prints `*** stack smashing detected` and `exit(134)`.
+- [x] `stack-smash-smoke` (CI-able, `M3OS_ASLR_REGRESSION=1`): `/bin/stack-smash` overflows a 16-byte buffer past its canary and is aborted via `__stack_chk_fail` (the `STACK_SMASH:after-NOT-CAUGHT` line never prints). **PASS.**
 
 ### B.3 — CET shadow stacks
 

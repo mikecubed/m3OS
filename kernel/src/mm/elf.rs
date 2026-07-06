@@ -83,6 +83,57 @@ pub const STACK_PAGES: u64 = 1024;
 /// Additional pages above this are demand-paged by the page fault handler
 /// when musl's TLS/TCB allocation writes above the initial RSP.
 const ABOVE_STACK_PAGES: u64 = 16;
+// ---------------------------------------------------------------------------
+// Phase 110 Track B.1 — userspace ASLR
+// ---------------------------------------------------------------------------
+//
+// Per-`execve` random, page-aligned offsets drawn from the Phase 86a kernel
+// CSPRNG (`kernel_core::csprng`) perturb three layout anchors: the user stack
+// top (so the initial RSP and every stack address is unpredictable), the PIE
+// (`ET_DYN`) load bias (the interpreter + any position-independent binary land
+// at a different base each run), and the anonymous mmap base (set at exec — see
+// `sys_execve`). Native `ET_EXEC` binaries keep their fixed link addresses (the
+// `x86_64-m3os` target links non-PIE), so their code is not randomized, but the
+// stack and heap-mmap regions are — the addresses an attacker most often needs.
+//
+// Budgets are deliberately modest so randomized anchors stay well inside the
+// canonical user range and clear of each other, and so the stack top stays
+// inside the eagerly-mapped stack region (the mapped extent and the
+// fault-handler demand-page/guard window are unchanged — only *where within it*
+// the ABI stack begins moves). All draws fall back to 0 (the fixed pre-ASLR
+// layout) until the CSPRNG is seeded, so early boot never blocks on entropy.
+
+/// Stack-top jitter: up to 256 pages (1 MiB) **below** [`ELF_STACK_TOP`], well
+/// inside the 4 MiB eager stack mapping.
+const STACK_ASLR_PAGES: u64 = 256;
+/// PIE (`ET_DYN`) load-base jitter: up to 512 pages (2 MiB) **above**
+/// `USER_VADDR_MIN`.
+const PIE_ASLR_PAGES: u64 = 512;
+/// Anonymous mmap-base jitter: up to 4096 pages (16 MiB) above the fixed base.
+pub const MMAP_ASLR_PAGES: u64 = 4096;
+
+/// Draw a page-aligned random offset in `[0, max_pages) · 4096` from the kernel
+/// CSPRNG.
+///
+/// Prefers credited entropy (`global_fill`); when the DRBG has not accrued
+/// enough credited bits — e.g. QEMU TCG with no RDRAND/RDSEED — it falls back
+/// to `global_fill_insecure`, which still advances the (seed-mixed) DRBG so the
+/// offset varies per `execve`. ASLR does not require cryptographic-grade
+/// entropy, only per-exec variation; on real hardware RDRAND makes
+/// `global_fill` succeed, so the offset is credited-random there. The DRBG is
+/// seeded during boot (`seed_csprng_early`) before any userspace exec, so this
+/// never observes an uninitialized generator.
+pub fn aslr_offset_bytes(max_pages: u64) -> u64 {
+    if max_pages == 0 {
+        return 0;
+    }
+    let mut buf = [0u8; 8];
+    if kernel_core::csprng::global_fill(&mut buf).is_err() {
+        kernel_core::csprng::global_fill_insecure(&mut buf);
+    }
+    (u64::from_le_bytes(buf) % max_pages) * 4096
+}
+
 /// Lower bound for valid userspace virtual addresses (2 MiB). Lowered from 4 MiB
 /// in Phase 85d: LLD defaults its x86_64 `ET_EXEC` image base to **0x200000**
 /// (2 MiB), so the LLD-linked static `clang`/`lld` toolchain places its first
@@ -579,7 +630,14 @@ unsafe fn map_user_stack(mapper: &mut OffsetPageTable<'_>) -> Result<u64, ElfErr
         // Guard page = ELF_STACK_TOP - (STACK_PAGES + 1) * 4096 — intentionally
         // left unmapped; a stack overflow causes a page fault here.
 
-        Ok(ELF_STACK_TOP)
+        // Phase 110 B.1 — return a randomized top *within* the just-mapped
+        // region. The ABI stack (and therefore the initial RSP and every stack
+        // address) starts here, so it is unpredictable across execs; the mapped
+        // extent, the unmapped guard page below it, and the fault-handler
+        // demand-page window above ELF_STACK_TOP are all unchanged. The jitter
+        // (≤ 1 MiB) is far smaller than the 4 MiB mapping, leaving ≥ 3 MiB of
+        // usable stack below the randomized top.
+        Ok(ELF_STACK_TOP - aslr_offset_bytes(STACK_ASLR_PAGES))
     }
 }
 
@@ -914,12 +972,13 @@ pub unsafe fn load_elf_into_with_interp(
         }
 
         // For PIE (ET_DYN) binaries the segments are linked at vaddr 0.
-        // Compute a load bias so they land at USER_VADDR_MIN (2 MiB).
+        // Compute a load bias so they land at USER_VADDR_MIN (2 MiB), plus a
+        // per-exec ASLR jitter (Phase 110 B.1) so the base differs each run.
         let load_bias = if ehdr.e_type == ET_DYN {
             if min_vaddr == u64::MAX {
                 0 // no LOAD segments — bias has no effect
             } else {
-                USER_VADDR_MIN.saturating_sub(min_vaddr)
+                (USER_VADDR_MIN + aslr_offset_bytes(PIE_ASLR_PAGES)).saturating_sub(min_vaddr)
             }
         } else if ehdr.e_type == ET_EXEC {
             0

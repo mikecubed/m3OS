@@ -119,6 +119,7 @@ This sets `core.hooksPath` to `.githooks/`. **pre-commit** runs `cargo xtask che
 | `ahci-smoke` + `ahci-root-smoke` + `ahci-rw-smoke` + `ahci-persist-smoke` | `M3OS_AHCI_REGRESSION=1` | AHCI ring-3 suite: IDENTIFY/RW/flush, ext2 root mount, write round-trip, reboot-persistence. |
 | `mitigations-status-smoke` | `M3OS_MITIGATIONS_REGRESSION=1` | `m3ctl mitigations status` reports correct Spectre-v2/retpoline/KPTI posture at boot. |
 | `argon2-smoke` | `M3OS_ARGON2_REGRESSION=1` | argon2id password hashing end-to-end: argon2id-seeded root login, `$sha256i$` fallback verify, and transparent legacy→argon2id re-hash on login (RFC 9106 vector is an always-on `crypto-lib` host test). |
+| `aslr-smoke` + `stack-smash-smoke` | `M3OS_ASLR_REGRESSION=1` | Userspace ASLR (`aslr-probe`'s stack address differs across execs — CSPRNG-jittered stack top) and stack canaries (`stack-smash` overflow is caught by `-Z stack-protector` → `__stack_chk_fail`, not returned into). |
 | `pkgcache-hit-check` | `M3OS_PKGCACHE_REGRESSION=1` | Second port build hits `.m3pkg` cache with zero compiler invocations. |
 | `pkg-smoke` | `M3OS_PKG_REGRESSION=1` | In-OS `pkg` manager install/list/verify/upgrade/remove + transitive dependency solver works. |
 | `git-local-smoke` | `M3OS_GIT_REGRESSION=1` | Static git + pkg solver runs local init/commit/branch/merge workflow in-OS. |

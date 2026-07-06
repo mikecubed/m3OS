@@ -22,6 +22,8 @@ pub mod argon2;
 
 pub mod sha256;
 
+pub mod stack_protector;
+
 pub mod start;
 
 // ===========================================================================
