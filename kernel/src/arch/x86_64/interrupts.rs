@@ -2499,6 +2499,18 @@ fn bump_timer_ticks_for_current_core() {
     }
 }
 
+/// Sum of every core's timer-tick counter. The kgdb all-stop sentinel
+/// (Phase 111 Track C.4) samples this before and after a stop: while the stub
+/// owns the machine, every other core is parked in its NMI handler with its
+/// LAPIC timer frozen, so the sum must not advance across the stopped window.
+#[cfg(feature = "kgdb")]
+pub fn total_timer_ticks() -> u64 {
+    TIMER_TICKS_PER_CORE
+        .iter()
+        .map(|c| c.load(Ordering::Relaxed))
+        .sum()
+}
+
 // ---------------------------------------------------------------------------
 // Phase 57d Track G — voluntary preemption IRQ-return helpers
 // ---------------------------------------------------------------------------
@@ -3226,6 +3238,24 @@ extern "x86-interrupt" fn tlb_shootdown_ipi_handler(stack_frame: InterruptStackF
 /// NMI does **not** require `lapic_eoi()` — NMI is delivered out of
 /// band of the LAPIC ISR/IRR machinery.
 extern "x86-interrupt" fn nmi_handler(_stack_frame: InterruptStackFrame) {
+    // Phase 111 (Track C.4) — kgdb all-stop. When the in-kernel GDB stub owns
+    // the machine, every OTHER core parks here (spins until released) so the
+    // developer inspects a frozen system, then resumes exactly where it was.
+    // Checked before the panic/shootdown logic; unlike panic-park this RETURNS
+    // (the stub clears the flag on continue). The owner core never parks.
+    #[cfg(feature = "kgdb")]
+    if crate::smp::kgdb_stop_requested() {
+        let my_core = crate::smp::try_per_core()
+            .map(|pc| pc.core_id)
+            .unwrap_or(0xFF);
+        if !crate::smp::kgdb_is_owner(my_core) {
+            crate::smp::kgdb_ack_and_wait();
+            // Resume the interrupted context; skip shootdown service this pass
+            // (the machine was frozen, so nothing accrued).
+            return;
+        }
+    }
+
     // Phase 99 (Track C.1) — panic AP-quiesce. When a sibling core has begun a
     // panic, every other core parks HERE (on the clean per-core NMI IST stack)
     // so the panic owner prints the banner + crash dump on a quiet COM1 instead

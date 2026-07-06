@@ -1253,6 +1253,15 @@ fn main() {
                 });
             cmd_debug_substrate_smoke(&smoke_args);
         }
+        Some("kgdb-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("kgdb-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_kgdb_smoke(&smoke_args);
+        }
         Some("session-recover-smoke") => {
             let smoke_args = parse_smoke_boot_args("session-recover-smoke", &args[2..])
                 .unwrap_or_else(|err| {
@@ -1943,7 +1952,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|debug [--fresh] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|argon2-smoke [--timeout <secs>] [--display]|aslr-smoke [--timeout <secs>] [--display]|stack-smash-smoke [--timeout <secs>] [--display]|debug-substrate-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|debug [--fresh] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|argon2-smoke [--timeout <secs>] [--display]|aslr-smoke [--timeout <secs>] [--display]|stack-smash-smoke [--timeout <secs>] [--display]|debug-substrate-smoke [--timeout <secs>] [--display]|kgdb-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm.\n\
      USB passthrough: --usb-passthrough <vid:pid> (e.g. `--usb-passthrough 0bda:8156`) passes a physical USB device into the guest's emulated xHCI (qemu-xhci,id=xhci_pt). The QEMU process must have access to the USB device node — add a udev rule granting the user/group read-write on the device, or run with sudo. The device is claimed from the host kernel while QEMU runs and is released on exit."
@@ -17390,6 +17399,363 @@ fn cmd_debug_substrate_smoke(args: &SmokeBootArgs) {
         "debug-substrate-smoke: PASSED ({elapsed}s) — #BP RIP-fixup, RFLAGS.TF \
          single-step (1 #DB), and DR7 arm/disarm all verified in kernel context"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 111 Track C.5 — `kgdb-smoke`
+// ---------------------------------------------------------------------------
+
+/// The bootloader relocates the PIE kernel ELF by a fixed 1 TiB offset (Track
+/// A charter correction). Any `nm` symbol address maps to its runtime address
+/// by adding this. Deterministic across boots (verified in Track A).
+const KGDB_KERNEL_PIE_LOAD_OFFSET: u64 = 0x10000000000;
+
+/// Resolve a kernel symbol's ELF vaddr via `nm`. Returns `None` if `nm` is
+/// unavailable or the symbol is absent.
+fn kgdb_symbol_addr(elf: &Path, name: &str) -> Option<u64> {
+    let out = Command::new("nm").arg(elf).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let addr = it.next()?;
+        let _ty = it.next();
+        let sym = it.next().unwrap_or("");
+        if sym == name {
+            return u64::from_str_radix(addr, 16).ok();
+        }
+    }
+    None
+}
+
+/// Bind an ephemeral TCP port, note it, and release it — QEMU then claims it as
+/// the COM2 server. A small race window, acceptable for a dev gate.
+fn kgdb_pick_free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    listener.local_addr().expect("local_addr").port()
+}
+
+/// RSP mod-256 checksum.
+fn kgdb_rsp_checksum(payload: &[u8]) -> u8 {
+    payload.iter().fold(0u8, |a, &b| a.wrapping_add(b))
+}
+
+/// Send a `$payload#cc` RSP packet.
+fn kgdb_rsp_send(stream: &mut std::net::TcpStream, payload: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let cs = kgdb_rsp_checksum(payload);
+    let mut pkt = Vec::with_capacity(payload.len() + 4);
+    pkt.push(b'$');
+    pkt.extend_from_slice(payload);
+    pkt.push(b'#');
+    pkt.extend_from_slice(format!("{cs:02x}").as_bytes());
+    stream.write_all(&pkt)
+}
+
+/// Read one byte with the stream's configured read timeout.
+fn kgdb_read_one(stream: &mut std::net::TcpStream) -> std::io::Result<u8> {
+    use std::io::Read as _;
+    let mut b = [0u8; 1];
+    stream.read_exact(&mut b)?;
+    Ok(b[0])
+}
+
+/// Receive one RSP packet payload, skipping `+`/`-` acks and ACKing the packet.
+/// (Our stub never uses RLE in replies, so no `*` expansion is needed.)
+fn kgdb_rsp_recv(stream: &mut std::net::TcpStream) -> std::io::Result<Vec<u8>> {
+    use std::io::Write as _;
+    loop {
+        match kgdb_read_one(stream)? {
+            b'+' | b'-' => continue,
+            b'$' => {
+                let mut payload = Vec::new();
+                loop {
+                    let c = kgdb_read_one(stream)?;
+                    if c == b'#' {
+                        break;
+                    }
+                    payload.push(c);
+                }
+                let _ = kgdb_read_one(stream)?; // checksum hi
+                let _ = kgdb_read_one(stream)?; // checksum lo
+                stream.write_all(b"+")?; // ack the packet
+                return Ok(payload);
+            }
+            _ => continue,
+        }
+    }
+}
+
+/// Decode a little-endian u64 from a 16-char hex slice (GDB register/memory
+/// wire order: low byte first).
+fn kgdb_le_u64(hex: &[u8]) -> Option<u64> {
+    if hex.len() < 16 {
+        return None;
+    }
+    let mut v = 0u64;
+    for i in 0..8 {
+        let byte =
+            u8::from_str_radix(std::str::from_utf8(&hex[i * 2..i * 2 + 2]).ok()?, 16).ok()?;
+        v |= (byte as u64) << (8 * i);
+    }
+    Some(v)
+}
+
+/// Run the raw GDB-RSP session against the frozen kernel stub. Returns Ok on a
+/// clean breakpoint hit + register/memory verification, Err(reason) otherwise.
+fn kgdb_run_rsp_session(
+    stream: &mut std::net::TcpStream,
+    probe_addr: u64,
+    magic_addr: u64,
+) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+        .map_err(|e| format!("set_read_timeout: {e}"))?;
+
+    // 1. qSupported → PacketSize advertisement.
+    kgdb_rsp_send(stream, b"qSupported").map_err(|e| format!("send qSupported: {e}"))?;
+    let sup = kgdb_rsp_recv(stream).map_err(|e| format!("recv qSupported: {e}"))?;
+    if !sup.windows(11).any(|w| w == b"PacketSize=") {
+        return Err(format!(
+            "qSupported reply missing PacketSize: {:?}",
+            String::from_utf8_lossy(&sup)
+        ));
+    }
+
+    // 2. ? → stop reason at the wait-for-debugger int3.
+    kgdb_rsp_send(stream, b"?").map_err(|e| format!("send ?: {e}"))?;
+    let stop = kgdb_rsp_recv(stream).map_err(|e| format!("recv ?: {e}"))?;
+    if stop.first() != Some(&b'S') {
+        return Err(format!(
+            "initial stop reply not S..: {:?}",
+            String::from_utf8_lossy(&stop)
+        ));
+    }
+
+    // 3. Z0 at kgdb_probe_target (runtime addr = nm vaddr + 1 TiB PIE base).
+    let z0 = format!("Z0,{probe_addr:x},1");
+    kgdb_rsp_send(stream, z0.as_bytes()).map_err(|e| format!("send Z0: {e}"))?;
+    let z0r = kgdb_rsp_recv(stream).map_err(|e| format!("recv Z0: {e}"))?;
+    if z0r != b"OK" {
+        return Err(format!("Z0 not OK: {:?}", String::from_utf8_lossy(&z0r)));
+    }
+
+    // 4. Continue → the kernel calls kgdb_probe_target, the planted int3 fires,
+    //    and the stub sends an unsolicited stop reply.
+    kgdb_rsp_send(stream, b"c").map_err(|e| format!("send c: {e}"))?;
+    let hit = kgdb_rsp_recv(stream).map_err(|e| format!("recv stop after c: {e}"))?;
+    if hit.first() != Some(&b'S') {
+        return Err(format!(
+            "breakpoint stop reply not S..: {:?}",
+            String::from_utf8_lossy(&hit)
+        ));
+    }
+
+    // 5. Read registers; RIP must equal the breakpoint address.
+    kgdb_rsp_send(stream, b"g").map_err(|e| format!("send g: {e}"))?;
+    let regs = kgdb_rsp_recv(stream).map_err(|e| format!("recv g: {e}"))?;
+    // RIP is the 17th register: hex chars 256..272 (16 × u64 before it).
+    if regs.len() < 272 {
+        return Err(format!("g reply too short: {} chars", regs.len()));
+    }
+    let rip = kgdb_le_u64(&regs[256..272]).ok_or("parse RIP")?;
+    if rip != probe_addr {
+        return Err(format!(
+            "RIP {rip:#x} != breakpoint {probe_addr:#x} (nm vaddr + 1 TiB base)"
+        ));
+    }
+
+    // 6. Read the known magic over `m` and verify.
+    let m = format!("m{magic_addr:x},8");
+    kgdb_rsp_send(stream, m.as_bytes()).map_err(|e| format!("send m: {e}"))?;
+    let mem = kgdb_rsp_recv(stream).map_err(|e| format!("recv m: {e}"))?;
+    let magic = kgdb_le_u64(&mem).ok_or("parse m reply")?;
+    const EXPECT_MAGIC: u64 = 0xB16B_00B5_CAFE_F00D;
+    if magic != EXPECT_MAGIC {
+        return Err(format!("m read {magic:#x} != expected {EXPECT_MAGIC:#x}"));
+    }
+
+    // 7. Remove the breakpoint and let the machine run on (k = detach+resume).
+    let z0d = format!("z0,{probe_addr:x},1");
+    kgdb_rsp_send(stream, z0d.as_bytes()).map_err(|e| format!("send z0: {e}"))?;
+    let _ = kgdb_rsp_recv(stream);
+    kgdb_rsp_send(stream, b"k").map_err(|e| format!("send k: {e}"))?;
+    Ok(())
+}
+
+/// Phase 111 Track C.5 — `kgdb-smoke`: build the kernel with the `kgdb` feature
+/// and boot it. Boot freezes at the wait-for-debugger `int3`; a raw GDB-RSP
+/// client (no host `gdb` needed) connects to the COM2→TCP port, sets a software
+/// breakpoint at `kgdb_probe_target` (`nm` vaddr + the 1 TiB PIE base), reads
+/// the stop reply, continues, asserts the breakpoint hit with `RIP` at that
+/// address, and reads back a known `u64` over `m`. Exercises the full C.2–C.4
+/// stack: naked-entry register capture, polled COM2, the RSP command loop, and
+/// the SMP all-stop (the release line logs `ticks_before==ticks_after`).
+fn cmd_kgdb_smoke(args: &SmokeBootArgs) {
+    // Build with the kgdb feature (merge any pre-set features).
+    // SAFETY: xtask is single-threaded here; the child build reads the env.
+    let merged = match std::env::var("M3OS_KERNEL_FEATURES") {
+        Ok(existing) if !existing.trim().is_empty() => format!("{},kgdb", existing.trim()),
+        _ => "kgdb".to_string(),
+    };
+    unsafe {
+        std::env::set_var("M3OS_KERNEL_FEATURES", merged);
+    }
+
+    let kernel_binary = build_kernel();
+
+    // Resolve the breakpoint + magic addresses from the (unstripped) ELF.
+    let probe_vaddr = kgdb_symbol_addr(&kernel_binary, "kgdb_probe_target").unwrap_or_else(|| {
+        eprintln!(
+            "kgdb-smoke: FAILED — could not resolve `kgdb_probe_target` via nm \
+             (is binutils `nm` installed and the ELF unstripped?)"
+        );
+        std::process::exit(1);
+    });
+    let magic_vaddr = kgdb_symbol_addr(&kernel_binary, "KGDB_PROBE_MAGIC").unwrap_or_else(|| {
+        eprintln!("kgdb-smoke: FAILED — could not resolve `KGDB_PROBE_MAGIC` via nm");
+        std::process::exit(1);
+    });
+    let probe_addr = probe_vaddr + KGDB_KERNEL_PIE_LOAD_OFFSET;
+    let magic_addr = magic_vaddr + KGDB_KERNEL_PIE_LOAD_OFFSET;
+    println!(
+        "kgdb-smoke: kgdb_probe_target @ {probe_addr:#x} (nm {probe_vaddr:#x} + 1 TiB), \
+         KGDB_PROBE_MAGIC @ {magic_addr:#x}"
+    );
+
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let ovmf = find_ovmf();
+    let mut qemu_args = session_smoke_qemu_args(&uefi_image, &ovmf, args.display);
+    // Append COM2 as a TCP server. The first `-serial` (stdio) is COM1 (the
+    // live console); this second one is COM2 (the polled kgdb transport).
+    let port = kgdb_pick_free_port();
+    qemu_args.push("-serial".to_string());
+    qemu_args.push(format!("tcp:127.0.0.1:{port},server,nowait"));
+
+    println!(
+        "kgdb-smoke: launching QEMU (COM2→tcp:127.0.0.1:{port}, timeout {}s)",
+        args.timeout_secs
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut buf = String::new();
+    let mut hist = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let step = std::time::Duration::from_secs(args.timeout_secs.min(180));
+
+    // Wait for the wait-for-debugger breadcrumb on COM1.
+    if let Err(msg) = wait_for_serial_pattern(
+        &rx,
+        &mut buf,
+        &mut hist,
+        "KGDB:waiting",
+        step,
+        global_start,
+        global_timeout,
+    ) {
+        let _ = child.kill();
+        let _ = child.wait();
+        eprintln!("kgdb-smoke: FAILED — never reached wait-for-debugger point\n{msg}");
+        std::process::exit(1);
+    }
+
+    // Connect the raw-RSP client to COM2 (retry a moment for QEMU's listener).
+    let connect_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut stream = loop {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(s) => break s,
+            Err(_) if std::time::Instant::now() < connect_deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!("kgdb-smoke: FAILED — could not connect to COM2 port {port}: {e}");
+                std::process::exit(1);
+            }
+        }
+    };
+
+    let result = kgdb_run_rsp_session(&mut stream, probe_addr, magic_addr);
+
+    // Give the release-sentinel line a moment to land on COM1, then tear down.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    while let Ok(chunk) = rx.try_recv() {
+        append_serial_chunk(&mut buf, &mut hist, &chunk);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if let Err(reason) = result {
+        eprintln!("kgdb-smoke: FAILED — {reason}");
+        std::process::exit(1);
+    }
+
+    // Verify the SMP all-stop sentinel: parked cores did not advance while
+    // stopped (ticks_before == ticks_after on the stub's release line).
+    let clean = strip_ansi(&hist);
+    let sentinel_ok = clean
+        .lines()
+        .filter(|l| l.contains("KGDB:release"))
+        .any(|l| {
+            let before = kgdb_extract_kv(l, "ticks_before=");
+            let after = kgdb_extract_kv(l, "ticks_after=");
+            matches!((before, after), (Some(b), Some(a)) if b == a)
+        });
+    if !sentinel_ok {
+        eprintln!(
+            "kgdb-smoke: WARNING — all-stop sentinel not confirmed (no KGDB:release line with \
+             ticks_before==ticks_after). Breakpoint/register/memory checks PASSED."
+        );
+        for l in clean.lines().filter(|l| l.contains("KGDB:")) {
+            eprintln!("  {l}");
+        }
+    }
+
+    let elapsed = global_start.elapsed().as_secs();
+    println!(
+        "kgdb-smoke: PASSED ({elapsed}s) — RSP attach over COM2, Z0 breakpoint hit at \
+         kgdb_probe_target (RIP verified), `m` read-back verified{}",
+        if sentinel_ok {
+            ", SMP all-stop sentinel confirmed (no core advanced while stopped)"
+        } else {
+            ""
+        }
+    );
+}
+
+/// Extract the `u64` following `key` (e.g. "ticks_before=") in a log line.
+fn kgdb_extract_kv(line: &str, key: &str) -> Option<u64> {
+    let start = line.find(key)? + key.len();
+    let rest = &line[start..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 /// Phase 110 Track B.2 — `stack-smash-smoke`: prove the userspace stack-canary

@@ -1,14 +1,17 @@
 # Handoff — Phase 111: Remote Debugging (Source-Level Kernel + Userspace)
 
 **Date:** 2026-07-06 (living doc — update on every session working this phase)
-**Branch:** none — all landed work is merged to `main`. No active feature branch.
+**Branch:** `feat/phase-111-kgdb-stub` (Track C.2–C.5) — open PR to `main`.
 **State:** IN PROGRESS.
 - **Track A (QEMU gdbstub + debug-info build)** ✅ merged — PR #311 (`1c2645d3`).
 - **Track B (trap & debug-register substrate)** ✅ merged — PR #312 (`f34d7fc9`).
 - **Track C.1 (RSP wire codec)** ✅ merged — PR #313 (`0edfa7a2`).
-- **Track C.2–C.5 (in-kernel stub core)** — NOT started. The meaty remainder;
-  a detailed blueprint is below ("Next increment").
-- **Track D (ptrace + m3gdbserver)** — NOT started.
+- **Track C.2–C.5 (in-kernel stub core)** ✅ **landed on `feat/phase-111-kgdb-stub`**
+  (full-GPR `#BP`/`#DB` naked entry, polled COM2, RSP command loop, SMP all-stop
+  + panic hook, `kgdb` feature + `kgdb-smoke` gate PASS). Details below
+  ("What's landed"); the old blueprint is preserved under "Implementation notes".
+- **Track D (ptrace + m3gdbserver)** — NOT started. The remaining increment;
+  sketch below.
 
 **Charter:** `docs/roadmap/111-remote-debugging.md`
 **Tasks:** `docs/roadmap/tasks/111-remote-debugging-tasks.md`
@@ -81,13 +84,49 @@ The seam C.2 plugs into. All in `kernel/src/arch/x86_64/debug.rs` +
 - Hex helpers: `hex_encode` / `hex_decode` / `parse_hex_prefix` (big-endian, for
   `m addr,len` / `g` / `M`).
 
+### Track C.2–C.5 — in-kernel `kgdb` stub (`feat/phase-111-kgdb-stub`)
+
+The interactive stub, all behind the `kgdb` cargo feature (off by default;
+production excludes it — same posture as `panic-test`/`trace`/telnet).
+
+- **Full-GPR `#BP`/`#DB` naked entry** (`interrupts.rs` `bp_entry`/`db_entry`
+  + `debug.rs` `DebugTrapFrame`): the old `extern "x86-interrupt"` handlers
+  could not see the interrupted GPRs, which `g`/`G` need. The stubs push all 15
+  GPRs (r15→rax, so rax=`gprs[0]`) then reuse the CPU's 5-field iretq frame —
+  **one layout for both rings** (64-bit mode pushes `SS:RSP` unconditionally),
+  `cs&3` splits ring in Rust. `offset_of` asserts pin it. `debug-substrate-smoke`
+  still PASSES (naked entry validated).
+- **Polled COM2** (`debug/com2.rs`): `0x2F8`, 115200 8N1, IER=0. `try_read_byte`
+  polls LSR bit 0, `write_byte` spins on bit 5. No IRQ, no alloc — the machine
+  is frozen when the stub runs. QEMU wires COM2 as a **second** `-serial
+  tcp:…,server,nowait` (first=COM1 stdio, second=COM2).
+- **Stub command loop** (`debug/gdbstub.rs`): all-stop RSP loop over the
+  `gdb_rsp` codec. `?`, `qSupported` (`PacketSize=400`), `g`/`G` (amd64 order,
+  LE hex, FPU deferred), `m`/`M` (canonical-guarded; `M` clears `CR0.WP` to
+  patch kernel text), `Z0/z0` (planted-bp table; RIP rewound to the bp on a
+  planted hit, left past a compiled-in `int3`), `Z1/z1` (DR0), `c`/`s`/`D`/`k`,
+  `H`/`q*` stubs. Unsolicited stop reply after `c`/`s`; `?`-driven on attach.
+- **SMP all-stop** (`smp/mod.rs` `kgdb_stop_all_aps`/`kgdb_release_aps`/
+  `kgdb_ack_and_wait` + `nmi_handler` branch): a **releasable** clone of the
+  panic-quiesce NMI path — parked APs spin in the NMI handler until the owner
+  clears `KGDB_STOP`, then `iretq` back (panic-stop parks forever; this
+  returns). Sentinel: `interrupts::total_timer_ticks()` sampled before/after,
+  logged on `KGDB:release … ticks_before=X ticks_after=Y` (equal = no advance).
+- **Panic hook** (`lib.rs handle_panic` → `gdbstub::enter_from_panic`, a fresh
+  `int3` so the stub gets a real frame): a bare-metal panic drops into the stub
+  after the banner/dump instead of a dead halt.
+- **Entry + gate**: `kgdb_break()` (wait-for-debugger `int3` early in boot after
+  `boot_aps`) + `kgdb_probe_target()` (`#[inline(never)]`, `#[no_mangle]` —
+  the deterministic breakpoint symbol) + `KGDB_PROBE_MAGIC` (`#[used]` static
+  the `m` read verifies). `cargo xtask kgdb-smoke` (`M3OS_KGDB_REGRESSION=1`) is
+  the raw-RSP driver: `nm kgdb_probe_target + 0x10000000000` → `Z0` → `c` →
+  assert stop + RIP + `m` magic + all-stop sentinel. **PASSES (~7 s).**
+
 ---
 
-## Next increment — Track C.2–C.5 (the in-kernel stub core)
+## Implementation notes — Track C.2–C.5 blueprint (as-built, kept for reference)
 
-These are **interdependent** — land them together in one PR. COM2 has no
-consumer without the stub; the stub needs the naked entry for `g`/`G`. Suggested
-build order + blueprint:
+The plan below is what was implemented above; retained for the design rationale.
 
 ### 1. Full-GPR exception entry (prerequisite for `g`/`G`)
 
@@ -225,7 +264,16 @@ Landed alongside the Phase 111 work (context, not this phase):
 
 ## Next actions (suggested order)
 
-1. **Track C.2–C.5** (the stub core) per the blueprint above — the natural next
-   Phase 111 increment, fully QEMU-testable via a raw-RSP gate.
-2. **Track D** (ptrace + m3gdbserver) — also QEMU-testable.
-3. Phase 110 A/B.3/D + the Phase 111 Track C/D on-metal arms — operator-owned.
+1. **Track D** (ptrace + m3gdbserver) per the sketch above — the last Phase 111
+   increment, fully QEMU-testable (kernel is alive → ordinary TCP/AF_UNIX
+   transport, no polled link). Reuse the `gdb_rsp` codec (it is `no_std`, so it
+   links from userspace too).
+2. Phase 110 A/B.3/D + the Phase 111 Track C/D on-metal arms — operator-owned.
+
+### Async-break follow-on (Track C.4, deferred)
+
+The one Track C acceptance item not yet wired: GDB `0x03` (Ctrl-C) breaking a
+*running* guest into the stub. The `gdb_rsp` reader already surfaces
+`RspEvent::Interrupt`; what's missing is a poll of COM2 for `0x03` from the
+idle/timer path (the stub is only ever entered from a trap today). Low risk,
+additive — a good warm-up before Track D.

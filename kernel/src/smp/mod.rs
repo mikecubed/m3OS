@@ -615,6 +615,122 @@ pub fn panic_stop_ack_and_park() -> ! {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 111 Track C.4 — kgdb all-stop quiesce (releasable, unlike panic-stop)
+// ---------------------------------------------------------------------------
+//
+// When the in-kernel GDB stub takes a trap it must freeze every OTHER core so
+// the developer inspects a still machine, then release them on continue. This
+// reuses the panic-quiesce NMI mechanism but is *releasable*: a parked core
+// spins inside its NMI handler until the stub owner clears `KGDB_STOP` and then
+// `iretq`s back to exactly where it was — whereas panic-stop parks forever.
+// Only compiled under the `kgdb` feature.
+
+/// Set while the stub owns the machine; read by the NMI handler to decide
+/// whether to park (and by the owner to release).
+#[cfg(feature = "kgdb")]
+static KGDB_STOP: AtomicBool = AtomicBool::new(false);
+
+/// Logical core id of the stub owner (must not park itself).
+#[cfg(feature = "kgdb")]
+static KGDB_OWNER_CORE: AtomicU8 = AtomicU8::new(PANIC_OWNER_NONE);
+
+/// Bit `i` set while core `i` is parked in the kgdb NMI wait loop.
+#[cfg(feature = "kgdb")]
+static KGDB_STOP_ACK: AtomicU64 = AtomicU64::new(0);
+
+/// True while the stub has the machine all-stopped.
+#[cfg(feature = "kgdb")]
+#[inline]
+pub fn kgdb_stop_requested() -> bool {
+    KGDB_STOP.load(Ordering::Acquire)
+}
+
+/// True if `my_core` is the stub owner (it must not self-park on a stray NMI).
+#[cfg(feature = "kgdb")]
+#[inline]
+pub fn kgdb_is_owner(my_core: u8) -> bool {
+    KGDB_OWNER_CORE.load(Ordering::Acquire) == my_core
+}
+
+/// Freeze every other online core into the kgdb NMI wait loop and wait (bounded)
+/// for them to park. Called by the stub on entry, before it serves any packet.
+/// Returns the mask of cores parked (for the release symmetry / sentinel).
+/// Pre-SMP boot (no siblings) is a no-op returning 0.
+#[cfg(feature = "kgdb")]
+pub fn kgdb_stop_all_aps() -> u64 {
+    let my_core = match try_per_core() {
+        Some(pc) => pc.core_id,
+        None => {
+            // Pre-SMP: stamp an owner anyway so `kgdb_is_owner` is meaningful.
+            KGDB_OWNER_CORE.store(0, Ordering::Release);
+            KGDB_STOP.store(true, Ordering::Release);
+            return 0;
+        }
+    };
+    KGDB_STOP_ACK.store(0, Ordering::Release);
+    KGDB_OWNER_CORE.store(my_core, Ordering::Release);
+    KGDB_STOP.store(true, Ordering::Release);
+
+    let n = core_count();
+    let mut target_mask: u64 = 0;
+    for core_id in 0..n {
+        if core_id == my_core {
+            continue;
+        }
+        if let Some(data) = get_core_data(core_id)
+            && data.is_online.load(Ordering::Acquire)
+        {
+            target_mask |= 1u64 << core_id;
+            ipi::send_nmi_to_core(core_id);
+        }
+    }
+    if target_mask == 0 {
+        return 0;
+    }
+    // Bounded wait for every target to park — a wedged core must not hang the
+    // debugger. ~200M pause iterations (~hundreds of ms) is generous; the stub
+    // proceeds anyway on timeout (a non-parked core is a diagnosable anomaly,
+    // not a reason to deadlock the operator's session).
+    const SPIN_BUDGET: u64 = 200_000_000;
+    let mut spun: u64 = 0;
+    while (KGDB_STOP_ACK.load(Ordering::Acquire) & target_mask) != target_mask {
+        core::hint::spin_loop();
+        spun += 1;
+        if spun >= SPIN_BUDGET {
+            break;
+        }
+    }
+    target_mask
+}
+
+/// Release the cores frozen by [`kgdb_stop_all_aps`]. Called by the stub on
+/// `c`/`s`/`D`/`k`. Each parked core observes `KGDB_STOP == false`, exits its
+/// NMI wait loop, and `iretq`s back to its interrupted context.
+#[cfg(feature = "kgdb")]
+pub fn kgdb_release_aps() {
+    KGDB_OWNER_CORE.store(PANIC_OWNER_NONE, Ordering::Release);
+    KGDB_STOP.store(false, Ordering::Release);
+}
+
+/// Acknowledge the kgdb-stop NMI and spin until the stub owner releases us, then
+/// return so the NMI handler `iretq`s back to the interrupted context. Called
+/// from the NMI handler on a non-owner core while a kgdb stop is in progress.
+/// Unlike [`panic_stop_ack_and_park`] this RETURNS — the core resumes on release.
+#[cfg(feature = "kgdb")]
+pub fn kgdb_ack_and_wait() {
+    let my_core = try_per_core().map(|pc| pc.core_id).unwrap_or(0xFF);
+    if my_core != 0xFF {
+        KGDB_STOP_ACK.fetch_or(1u64 << my_core, Ordering::Release);
+    }
+    while KGDB_STOP.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    if my_core != 0xFF {
+        KGDB_STOP_ACK.fetch_and(!(1u64 << my_core), Ordering::Release);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-core access via gs_base (T004)
 // ---------------------------------------------------------------------------
 

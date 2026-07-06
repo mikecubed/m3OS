@@ -32,6 +32,10 @@ extern crate alloc;
 pub mod acpi;
 pub mod arch;
 pub mod blk;
+/// Phase 111 Track C — in-kernel GDB stub (kgdb). Feature-gated: the stub is
+/// arbitrary kernel peek/poke, OFF in production.
+#[cfg(feature = "kgdb")]
+pub mod debug;
 pub mod epoll;
 pub mod eventfd;
 pub mod fb;
@@ -582,6 +586,17 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
         smp::boot::boot_aps();
     }
     post_marker(14); // SMP boot_aps done — all APs online (AP rendezvous survived)
+
+    // Phase 111 Track C — wait-for-debugger entry (kgdb feature only). Freezes
+    // here (all-stop) until a host GDB-RSP client attaches on COM2 and
+    // continues; then a planted breakpoint at `kgdb_probe_target` demonstrates
+    // the full hit/inspect cycle. Absent in production. Placed after SMP boot
+    // so the all-stop quiesce has real sibling cores to freeze.
+    #[cfg(feature = "kgdb")]
+    {
+        debug::gdbstub::kgdb_break();
+        debug::gdbstub::kgdb_probe_target();
+    }
 
     task::spawn(init_task, "init");
     task::spawn_idle(idle_task);
@@ -1323,6 +1338,13 @@ pub fn handle_panic(info: &core::panic::PanicInfo) -> ! {
         serial::_panic_print(format_args!("  {}\n", info.message()));
         panic_diag::dump_crash_context();
         trace::dump_trace_rings();
+        // Phase 111 Track C.4 — a bare-metal panic drops into the in-kernel GDB
+        // stub (kgdb feature) for live post-mortem instead of a dead halt. The
+        // banner + crash dump have already printed on the (now quiesced) COM1;
+        // the stub then owns COM2 until the operator detaches, after which we
+        // fall through to the halt below.
+        #[cfg(feature = "kgdb")]
+        debug::gdbstub::enter_from_panic();
         hlt_loop();
     }
 }
