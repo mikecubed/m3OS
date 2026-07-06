@@ -1,23 +1,22 @@
 # Handoff — Phase 111: Remote Debugging (Source-Level Kernel + Userspace)
 
-**Date:** 2026-07-06 (living doc — update on every session working this phase)
-**Branch:** `feat/phase-111-ptrace` (Track D.1–D.2), stacked on
-`feat/phase-111-kgdb-stub` (Track C.2–C.5, PR #314 open) — both open PRs to `main`.
-**State:** IN PROGRESS.
-- **Track A (QEMU gdbstub + debug-info build)** ✅ merged — PR #311 (`1c2645d3`).
-- **Track B (trap & debug-register substrate)** ✅ merged — PR #312 (`f34d7fc9`).
-- **Track C.1 (RSP wire codec)** ✅ merged — PR #313 (`0edfa7a2`).
-- **Track C.2–C.5 (in-kernel stub core)** ✅ **landed on `feat/phase-111-kgdb-stub`**
-  (PR #314; full-GPR `#BP`/`#DB` naked entry, polled COM2, RSP command loop, SMP
-  all-stop + panic hook, `kgdb` feature + `kgdb-smoke` gate PASS). Details below
-  ("What's landed"); the old blueprint is preserved under "Implementation notes".
-- **Track D (ptrace substrate + `sys_ptrace` + `m3gdbserver` + exec-stop +
-  single-step)** ✅ **landed on `feat/phase-111-ptrace`** (traced-process
-  stop/notify, `SIGTRAP` on ring-3 `int3`, cross-address-space peek/poke, `execve`
-  exec-stop, a native gdbserver translating RSP ↔ ptrace over TCP, and D.4 symbol
-  retention; `ptrace-smoke` + `ptrace-gdbserver-smoke` (incl. single-step) PASS).
-  See "Track D" below. **Phase 111 is functionally complete** — the only remaining
-  item is a source-level DWARF userspace build for a *real* host `gdb`.
+**Date:** 2026-07-06 (living doc)
+**Branch:** none — **all Phase 111 work is merged to `main`.**
+**State:** ✅ **COMPLETE (merged).** Tracks A–D all landed and merged; every
+QEMU-validatable gate passes. Residuals are operator/hardware-owned (see
+"What's next" at the bottom). **New session: start from "What's next," not here.**
+- **Track A (QEMU gdbstub + debug-info build)** ✅ PR #311 (`1c2645d3`).
+- **Track B (trap & debug-register substrate)** ✅ PR #312 (`f34d7fc9`).
+- **Track C.1 (RSP wire codec)** ✅ PR #313 (`0edfa7a2`).
+- **Track C.2–C.5 + async-break (in-kernel kgdb stub)** ✅ PR #314 (`5b5bfa51`) —
+  full-GPR `#BP`/`#DB` naked entry, polled COM2, RSP command loop, SMP all-stop +
+  panic hook, GDB-Ctrl-C async break (BSP timer poll), `kgdb` feature +
+  `kgdb-smoke` gate PASS.
+- **Track D (ptrace + `sys_ptrace` + `m3gdbserver` + exec-stop + single-step)** ✅
+  PR #315 (`3ef04af9`) — traced-process stop/notify, `SIGTRAP` on ring-3 `int3`,
+  cross-address-space peek/poke, `execve` exec-stop, a native gdbserver
+  translating RSP ↔ ptrace over TCP; `ptrace-smoke` + `ptrace-gdbserver-smoke`
+  (incl. single-step) PASS.
 
 **Charter:** `docs/roadmap/111-remote-debugging.md`
 **Tasks:** `docs/roadmap/tasks/111-remote-debugging-tasks.md`
@@ -341,17 +340,46 @@ Landed alongside the Phase 111 work (context, not this phase):
   **bare-metal-validation-gated** (QEMU models no speculation/CET/Secure-Boot),
   so they need the Dell. See `docs/handoffs/next-dell-session.md`.
 
-## Next actions (suggested order)
+## What's next
 
-Phase 111 is functionally complete (A–D, all QEMU-validatable gates PASS). The
-remaining items are polish / operator-owned:
+**Phase 111 itself is done** (A–D merged; `debug-substrate-smoke`, `kgdb-smoke`,
+`ptrace-smoke`, `ptrace-gdbserver-smoke` all green). What remains for this phase
+is only operator/hardware-owned:
 
-1. **Source-level DWARF userspace build** — a `debug = "full"` userspace variant
-   (analog of the Track A `kdebug` kernel profile) so a *real* host `gdb` gets
-   source lines against `m3gdbserver`. Build-plumbing, not kernel; only meaningful
-   with a host `gdb` (the dev machine has none).
-2. The Track C async-break follow-on below (optional polish).
-3. Phase 110 A/B.3/D + the Phase 111 Track C/D on-metal arms — operator-owned.
+- **Source-level DWARF userspace build** — a `debug = "full"` userspace variant
+  (analog of the Track A `kdebug` kernel profile) so a *real* host `gdb` gets
+  source lines against `m3gdbserver`. Build-plumbing, not kernel; only meaningful
+  with a host `gdb` (the dev machine has none — every arm this phase was validated
+  with raw-RSP clients). The release ELFs already keep their `.symtab`
+  (symbol-level `gdb` works today).
+- **On-metal arms** — kgdb over a physical COM2, ptrace/`m3gdbserver` on the Dell.
+  Added to [`next-dell-session.md`](./next-dell-session.md) § Phase 111.
+
+### The actual next work (beyond Phase 111)
+
+The QEMU-validatable frontier of the 99–111 arc is largely closed; most open
+items need real hardware. In rough priority:
+
+1. **Phase 106 Track C/D — USB→NVMe installer + first-user** (the one big
+   *QEMU-testable* item left in the arc). `/sbin/installer` + the `0x117x` raw
+   block syscalls landed, but the two-boot `nvme-install-smoke` gate is WIP —
+   **blocked on USB-storage 256-sector raw-read stability**; then C.4/C.5
+   (partition-aware GPT/ESP + on-device `mkfs.ext2`) + first-user account setup.
+   Start here for a QEMU session. See [Phase 106](../roadmap/106-usb-installer-nvme.md).
+2. **Bare-metal validation on the Dell** (batched — see
+   [`next-dell-session.md`](./next-dell-session.md)): Phase 101 ACPI DSDT capture +
+   HW arms, Phase 103 power (GPE re-arm, S0ix, live battery/backlight/HWP), Phase
+   110 KPTI/CET/Secure-Boot (QEMU models none), Phase 100 GUI arms, + the Phase 111
+   on-metal arms above.
+3. **New hardware phases** (need the laptop/OmniBook): Phase 102 (I2C-HID
+   touchpad), 104 (Wi-Fi AX201 + supplicant), 108 (AMD Strix / MT7925), 109
+   (bare-metal audio — determine HDA-vs-SoundWire first).
+4. **Operator-owned:** Phase 107 — create the public `m3os-pkgs` repo + signing
+   secret, then the opt-in live-HTTPS `pkg` arm.
+
+*(The older pre-1.0 backlog — Phases 59/62 closeouts, the 466-line "Capability
+Expansion" and "Pre-1.0" tables — predates this arc; consult the roadmap README
+before pulling one forward.)*
 
 ### Async-break (Track C.4) — ✅ landed
 
