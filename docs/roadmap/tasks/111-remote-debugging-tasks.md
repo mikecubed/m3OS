@@ -11,7 +11,7 @@
 |---|---|---|---|
 | A | QEMU gdbstub wiring + debug-info kernel build | — | ✅ **Landed** — `kdebug` profile (DWARF) + `cargo xtask debug` (QEMU `-s -S` + auto gdb script); RSP round-trip validated |
 | B | Trap & debug-register substrate (`#DB`/`#BP`, TF, `DR0`–`DR7`, `int3` patch) | — | ✅ **Landed** — `#DB` registered + `#BP` dispatcher (RIP-fixup), `RFLAGS.TF` single-step, `DebugRegs` (`DR0`–`DR7`), `int3` patch; `kernel_core::debug_regs` host-tested + `debug-substrate-smoke` PASS |
-| C | In-kernel GDB stub (kgdb) over polled COM2 + SMP all-stop | B | Planned |
+| C | In-kernel GDB stub (kgdb) over polled COM2 + SMP all-stop | B | 🟡 **C.1 (RSP codec) landed** (`kernel_core::gdb_rsp`, host-tested); C.2–C.5 (stub loop + COM2 + all-stop + gate) next |
 | D | `ptrace` syscall + stop/notify + `m3gdbserver` | B | Planned |
 
 Track A is standalone and **pull-forward** (usable by the in-flight 101–110 bare-metal arc). C and D both consume B and are otherwise independent; either may be split into its own sub-phase (111a/111b) if scoped separately during implementation.
@@ -78,12 +78,15 @@ Track A is standalone and **pull-forward** (usable by the in-flight 101–110 ba
 - `kernel-core/src/` (new `gdb_rsp.rs` — host-testable)
 - `kernel/src/debug/gdbstub.rs` (new)
 
-**Symbol:** `RspPacket` encode/decode
-**Why it matters:** The Remote Serial Protocol framing (`$...#cc`, checksum, ack/nak) is the wire format every GDB client speaks; isolating it in `kernel-core` makes it host-testable without QEMU.
+**Symbol:** `checksum` / `encode_packet` / `PacketReader` (`kernel_core::gdb_rsp`)
+**Landed as:** `kernel-core/src/gdb_rsp.rs` — host-tested (**11 tests**). ✅
 
 **Acceptance:**
-- [ ] Encode/decode `$payload#checksum` with correct mod-256 checksum and ack/nak handling.
-- [ ] Host tests in `kernel-core` cover framing, escaping, and checksum round-trips.
+- [x] `encode_packet` frames `$payload#cc` with the correct mod-256 checksum; `PacketReader` decodes incrementally, surfacing `Packet`/`BadChecksum`/`Ack`/`Nak`/`Interrupt` events. **The RSP checksum covers the raw on-wire body** (incl. `*`+RLE count), not the expanded payload — a subtlety the tests pin.
+- [x] Handles `+`/`-` ack/nak, the `0x03` async-interrupt byte, and run-length `*` expansion on decode; plus the hex helpers (`hex_encode`/`hex_decode`/`parse_hex_prefix`) the `g`/`m`/`M` commands use.
+- [x] Host tests in `kernel-core` cover framing, checksum round-trips (incl. GDB's `?`→`3f` / `OK`→`9a` examples), RLE, and the hex codecs.
+
+> **Note (Track C sub-phasing):** C.1 landed as the standalone, host-tested wire-format foundation. C.2–C.5 (the stub command loop + naked-entry register frame, the polled COM2 transport, the SMP all-stop + panic hook, and the `kgdb` feature + gate) are interdependent — COM2 has no consumer without the stub, and the stub needs a naked-asm exception entry to capture the full GPR set for `g`/`G` — so they land together as the next Track C increment.
 
 ### C.2 — Stub command dispatch + register mapping
 
