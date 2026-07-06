@@ -21,6 +21,7 @@ pub mod eventfd;
 pub mod fb;
 pub mod font;
 pub mod fs;
+pub mod gdb_rsp;
 pub mod hda;
 pub mod init;
 pub mod input;
