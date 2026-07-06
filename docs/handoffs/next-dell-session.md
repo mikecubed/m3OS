@@ -41,6 +41,31 @@ handoff](./2026-06-30-phase-100-bare-metal-gui-hw-validation.md) §6.
       `acpid` GPE/fixed dispatch to log it (D.3/D.4 HW arm; charter's
       lid `Validated-on-HW` item). Power button press is the fallback arm.
 
+## Phase 111 — Remote Debugging (kgdb / ptrace on metal)
+
+The whole phase is merged and QEMU-green; these arms prove the *bare-metal* value
+prop (QEMU's own gdbstub is blind on real silicon, which is why the in-kernel
+kgdb stub exists). All are `#[cfg]`-gated features — build with
+`M3OS_KERNEL_FEATURES=kgdb` (or `ptrace`) for the debug image.
+
+- [ ] **kgdb over a physical COM2** — the Dell has no DE-9; use a USB-serial
+      adapter wired to COM2 (`0x2F8`), or expose COM2 another way. Boot the `kgdb`
+      image (freezes at `KGDB:waiting`), attach a raw-RSP client (or real `gdb`)
+      over the serial link, set a breakpoint at a kernel fn (`nm` addr +
+      `0x10000000000`), continue, confirm the hit + register/memory read-back.
+      This is the arm QEMU cannot substitute for.
+- [ ] **kgdb async break on metal** — with the guest running, send Ctrl-C
+      (`0x03`) on the serial link; confirm it breaks into the stub at the
+      interrupted RIP (the BSP timer-tick poll works the same on real silicon).
+- [ ] **kgdb panic hook** — trigger a real panic on the `kgdb` image; confirm it
+      drops into the stub (`KGDB:panic`) instead of a dead halt — the highest-value
+      bare-metal use (live post-mortem of a driver/IRQ/SMP crash).
+- [ ] **ptrace / m3gdbserver on metal** — mostly hardware-agnostic (worked in
+      QEMU), but run one real session: `m3gdbserver <port> <prog>` on the Dell,
+      attach a host RSP client over the (Phase 104) Wi-Fi or a USB-Ethernet dongle,
+      breakpoint + step + continue-to-exit. Optional: a `-g` (DWARF) userspace
+      build + real `gdb` for source-level stepping (the D.4 follow-on).
+
 ## Phase 106 — USB Installer (when the combined image lands)
 
 - [ ] **M1 rung** — boot the combined GPT(ESP+ext2) image from USB and confirm a
