@@ -405,6 +405,18 @@ if [ "${M3OS_ASLR_REGRESSION:-0}" = "1" ]; then
     cargo xtask stack-smash-smoke --timeout 240
 fi
 
+# Phase 111 Track B — trap & debug-register substrate gate. Gated behind
+# M3OS_DEBUG_SUBSTRATE_REGRESSION=1 because it builds the kernel with the
+# `debug-substrate-test` feature and boots it: the boot-time self-test proves
+# the #BP RIP-fixup, the RFLAGS.TF single-step (exactly one #DB), and the DR7
+# arm/disarm round-trip. Set on branches touching arch/x86_64/debug.rs, the
+# #DB/#BP IDT handlers, or kernel_core::debug_regs. (The DR6/DR7 codec is an
+# always-on kernel-core host test in `cargo xtask check`.)
+if [ "${M3OS_DEBUG_SUBSTRATE_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask debug-substrate-smoke..."
+    cargo xtask debug-substrate-smoke --timeout 240
+fi
+
 # Phase 107 — networked + signed package distribution. Gated behind
 # M3OS_PKG_NET_REGRESSION=1 because it boots QEMU against a host-served
 # SLIRP HTTP repo and asserts the full trust pipeline: ed25519 index

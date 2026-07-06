@@ -9,6 +9,7 @@ pub mod buddy;
 pub mod cred;
 pub mod cross_cpu_free;
 pub mod csprng;
+pub mod debug_regs;
 pub mod device_host;
 pub mod display;
 pub mod driver_ipc;

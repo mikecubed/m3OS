@@ -1146,6 +1146,9 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
 
     // CPU exceptions
     idt.breakpoint.set_handler_fn(breakpoint_handler);
+    // Phase 111 Track B — register the long-absent #DB (debug exception, vector
+    // 1) handler so single-step and hardware breakpoints are possible.
+    idt.debug.set_handler_fn(debug_exception_handler);
     idt.page_fault.set_handler_fn(page_fault_handler);
     idt.general_protection_fault
         .set_handler_fn(general_protection_fault_handler);
@@ -1535,10 +1538,31 @@ unsafe extern "C" {
 // Exception handlers
 // ---------------------------------------------------------------------------
 
-extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
-    // Use _panic_print to avoid deadlocking on the serial mutex if the exception
-    // fires while normal code holds the lock.
-    _panic_print(format_args!("[int] breakpoint: {:?}\n", stack_frame));
+/// `#BP` (vector 3) — Phase 111 Track B upgraded this from a print-and-return
+/// stub to a dispatcher. `int3` (0xCC) is a trap: the CPU pushes RIP pointing
+/// *after* the byte, so the breakpoint address a debugger expects is RIP-1. The
+/// dispatch (`debug::on_breakpoint`) routes to a debugger consumer (Track C/D)
+/// or, with none attached, logs and resumes past the `int3`.
+extern "x86-interrupt" fn breakpoint_handler(mut stack_frame: InterruptStackFrame) {
+    clac_on_irq_entry();
+    let after = stack_frame.instruction_pointer.as_u64();
+    let bp_addr = after.wrapping_sub(1);
+    let from_user = (stack_frame.code_segment.0 & 3) == 3;
+    crate::arch::x86_64::debug::on_breakpoint(bp_addr, &mut stack_frame, from_user);
+    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+}
+
+/// `#DB` (vector 1) — Phase 111 Track B. Fires on a single-step (`RFLAGS.TF`),
+/// a hardware breakpoint/watchpoint (`DR0`–`DR3`), or a debug-register-access
+/// trap. Reads + clears `DR6` (so its sticky status does not persist into the
+/// next `#DB`) and dispatches; with no debugger attached the default clears any
+/// stray single-step and resumes.
+extern "x86-interrupt" fn debug_exception_handler(mut stack_frame: InterruptStackFrame) {
+    clac_on_irq_entry();
+    let status = crate::arch::x86_64::debug::read_and_clear_dr6();
+    let rip = stack_frame.instruction_pointer.as_u64();
+    let from_user = (stack_frame.code_segment.0 & 3) == 3;
+    crate::arch::x86_64::debug::on_debug_exception(status, rip, &mut stack_frame, from_user);
     assert_preempt_count_zero_on_return_to_user(&stack_frame);
 }
 

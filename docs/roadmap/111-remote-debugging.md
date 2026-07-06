@@ -1,6 +1,6 @@
 # Phase 111 - Remote Debugging (Source-Level Kernel + Userspace)
 
-**Status:** In progress — **Track A (QEMU gdbstub + debug-info build) landed** (`cargo xtask debug`; RSP round-trip validated). Tracks B/C/D (in-kernel stub + ptrace) planned.
+**Status:** In progress — **Track A (QEMU gdbstub) + Track B (trap/debug-register substrate) landed** (`cargo xtask debug`; `#DB`/`#BP` dispatch + single-step + `DR0`–`DR7` + `int3` patch, `debug-substrate-smoke` PASS). Tracks C (in-kernel kgdb stub) / D (ptrace + m3gdbserver) planned.
 **Source Ref:** phase-111
 **Depends on:** Phase 3 (Interrupts/IDT) ✅, Phase 19 (Signal Handlers) ✅, Phase 25/35 (SMP + NMI-IPI) ✅, Phase 16/23 (TCP + Socket API) ✅, Phase 45 (Ports System) ✅
 **Builds on:** Reuses the existing IDT/exception substrate (`kernel/src/arch/x86_64/interrupts.rs`), the user/kernel trap frames (`kernel/src/arch/x86_64/preempt_trap_frame.rs`), the signal-frame machinery (`kernel/src/signal.rs`), the NMI-IPI quiesce path used for TLB shootdown, and the host-side `addr2line` symbolication convention from the Phase 43a crash diagnostics. Turns the long-deferred "gdb stub" item (`docs/44-rust-cross-compilation.md`, `docs/95-native-rust-toolchain.md`) into real, source-level debugging for both ring 0 and ring 3.

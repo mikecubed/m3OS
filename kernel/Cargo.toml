@@ -50,6 +50,12 @@ legacy-bootstrap-allocator = []
 # in the page-fault handler. Zero-cost/absent in production. Run with:
 #   cargo xtask run --features smep-smap-test  (or via M3OS_KERNEL_FEATURES)
 smep-smap-test = []
+# Phase 111 Track B — debug-substrate self-test. Adds a boot-time self-test
+# that proves the #BP RIP-fixup and RFLAGS.TF single-step end to end
+# (DEBUG_SELFTEST: sentinels). Zero-cost/absent in production. Driven by
+# `debug-substrate-smoke` (M3OS_ASLR_REGRESSION-adjacent gate). Run with:
+#   cargo xtask run --features debug-substrate-test  (or via M3OS_KERNEL_FEATURES)
+debug-substrate-test = []
 # Track D (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md):
 # debug-only deliberate kernel-stack-overflow probe. Adds the `SYS_KSTACK_OVERFLOW_TEST`
 # (0x1150) syscall, which recurses until the calling task overflows its per-task
