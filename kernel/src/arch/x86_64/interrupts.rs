@@ -94,15 +94,22 @@ pub static USING_APIC: AtomicBool = AtomicBool::new(false);
 /// builds compile out the entire body via `cfg(debug_assertions)`.
 #[inline]
 fn assert_preempt_count_zero_on_return_to_user(stack_frame: &InterruptStackFrame) {
+    assert_preempt_count_zero_on_return_to_user_cs(stack_frame.code_segment.0 as u64);
+}
+
+/// Raw-CS variant for the naked-entry paths (#BP/#DB), whose frames carry the
+/// selector as a plain `u64` rather than an `InterruptStackFrame`.
+#[inline]
+fn assert_preempt_count_zero_on_return_to_user_cs(cs: u64) {
     // Phase 57e Bug #9 — clamp preempt_count to 0 at user-return in release
     // builds, panic on non-zero in debug builds.  Helper handles both modes;
     // gate ring-3 only.
-    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+    if (cs & 3) == 3 {
         crate::task::scheduler::assert_preempt_count_zero_at_user_return();
     }
     // Phase 57d E.3: consume deferred reschedule at IRQ-return to user mode.
     #[cfg(feature = "preempt-voluntary")]
-    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3
+    if (cs & 3) == 3
         && let Some(pc) = crate::smp::try_per_core()
         && pc
             .preempt_resched_pending
@@ -1144,11 +1151,21 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
 
-    // CPU exceptions
-    idt.breakpoint.set_handler_fn(breakpoint_handler);
-    // Phase 111 Track B — register the long-absent #DB (debug exception, vector
-    // 1) handler so single-step and hardware breakpoints are possible.
-    idt.debug.set_handler_fn(debug_exception_handler);
+    // CPU exceptions.
+    //
+    // Phase 111 Track C.2 — #BP (vector 3) and #DB (vector 1) use naked-asm
+    // entry stubs (`bp_entry`/`db_entry`, modelled on the preempt stubs below)
+    // that capture ALL 15 GPRs into a `DebugTrapFrame` before any Rust
+    // prologue can clobber them: the in-kernel GDB stub's `g`/`G` packets need
+    // the full register file, which an `extern "x86-interrupt"` handler
+    // (iretq-frame-only) cannot see. Track B registered #DB — long absent —
+    // so single-step and hardware breakpoints are possible.
+    unsafe {
+        idt.breakpoint
+            .set_handler_addr(VirtAddr::new(bp_entry as *const () as u64));
+        idt.debug
+            .set_handler_addr(VirtAddr::new(db_entry as *const () as u64));
+    }
     idt.page_fault.set_handler_fn(page_fault_handler);
     idt.general_protection_fault
         .set_handler_fn(general_protection_fault_handler);
@@ -1538,32 +1555,122 @@ unsafe extern "C" {
 // Exception handlers
 // ---------------------------------------------------------------------------
 
-/// `#BP` (vector 3) — Phase 111 Track B upgraded this from a print-and-return
-/// stub to a dispatcher. `int3` (0xCC) is a trap: the CPU pushes RIP pointing
-/// *after* the byte, so the breakpoint address a debugger expects is RIP-1. The
-/// dispatch (`debug::on_breakpoint`) routes to a debugger consumer (Track C/D)
-/// or, with none attached, logs and resumes past the `int3`.
-extern "x86-interrupt" fn breakpoint_handler(mut stack_frame: InterruptStackFrame) {
-    clac_on_irq_entry();
-    let after = stack_frame.instruction_pointer.as_u64();
-    let bp_addr = after.wrapping_sub(1);
-    let from_user = (stack_frame.code_segment.0 & 3) == 3;
-    crate::arch::x86_64::debug::on_breakpoint(bp_addr, &mut stack_frame, from_user);
-    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+// ---------------------------------------------------------------------------
+// Phase 111 Track C.2 — full-GPR #BP / #DB entry stubs
+// ---------------------------------------------------------------------------
+//
+// Same shape as the preempt stubs above (save all 15 GPRs before any Rust
+// prologue runs, r15 first → rax last so rax lands at `gprs[0]`), but with NO
+// user/kernel asm split: in 64-bit mode the CPU pushes the full 5-field iretq
+// frame (`rip/cs/rflags/rsp/ss`) unconditionally — SS:RSP is pushed even
+// without a privilege change (Intel SDM Vol 3A §6.14.2) — so one
+// `DebugTrapFrame` layout serves both rings and the ring test happens in Rust
+// (`frame.cs & 3`).
+//
+// Alignment: an error-code-less exception leaves rsp ≡ 8 (mod 16) at entry
+// (CPU aligns to 16 then pushes 40 bytes); 15 GPR pushes keep that parity, so
+// we re-align with the same r12 trick as the preempt kernel path (`pop r12`
+// after the call restores the interrupted r12 from the frame slot).
+//
+// Distinct macro names from the preempt block: each `global_asm!` invocation
+// is its own assembly unit, but keeping the names unique avoids any doubt.
+
+global_asm!(
+    ".macro dbg_save_gprs",
+    "push r15",
+    "push r14",
+    "push r13",
+    "push r12",
+    "push r11",
+    "push r10",
+    "push r9",
+    "push r8",
+    "push rbp",
+    "push rdi",
+    "push rsi",
+    "push rdx",
+    "push rcx",
+    "push rbx",
+    "push rax",
+    ".endm",
+    "",
+    ".macro dbg_restore_gprs",
+    "pop rax",
+    "pop rbx",
+    "pop rcx",
+    "pop rdx",
+    "pop rsi",
+    "pop rdi",
+    "pop rbp",
+    "pop r8",
+    "pop r9",
+    "pop r10",
+    "pop r11",
+    "pop r12",
+    "pop r13",
+    "pop r14",
+    "pop r15",
+    ".endm",
+    "",
+    ".global bp_entry",
+    "bp_entry:",
+    "dbg_save_gprs",
+    "cld",
+    "mov rdi, rsp", // arg1: &mut DebugTrapFrame
+    "mov r12, rsp", // save pre-alignment rsp (callee-saved across the call)
+    "and rsp, -16",
+    "call bp_trap_handler",
+    "mov rsp, r12",
+    "dbg_restore_gprs",
+    "iretq",
+    "",
+    ".global db_entry",
+    "db_entry:",
+    "dbg_save_gprs",
+    "cld",
+    "mov rdi, rsp",
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call db_trap_handler",
+    "mov rsp, r12",
+    "dbg_restore_gprs",
+    "iretq",
+);
+
+unsafe extern "C" {
+    fn bp_entry();
+    fn db_entry();
 }
 
-/// `#DB` (vector 1) — Phase 111 Track B. Fires on a single-step (`RFLAGS.TF`),
-/// a hardware breakpoint/watchpoint (`DR0`–`DR3`), or a debug-register-access
-/// trap. Reads + clears `DR6` (so its sticky status does not persist into the
-/// next `#DB`) and dispatches; with no debugger attached the default clears any
-/// stray single-step and resumes.
-extern "x86-interrupt" fn debug_exception_handler(mut stack_frame: InterruptStackFrame) {
+/// `#BP` (vector 3) — Phase 111 Track B upgraded this from a print-and-return
+/// stub to a dispatcher; Track C.2 moved it onto the full-GPR naked entry.
+/// `int3` (0xCC) is a trap: the CPU pushes RIP pointing *after* the byte, so
+/// the breakpoint address a debugger expects is RIP-1. The dispatch
+/// (`debug::on_breakpoint`) routes to a debugger consumer (Track C/D) or, with
+/// none attached, logs and resumes past the `int3`.
+#[unsafe(no_mangle)]
+extern "C" fn bp_trap_handler(frame: &mut crate::arch::x86_64::debug::DebugTrapFrame) {
+    clac_on_irq_entry();
+    let bp_addr = frame.rip.wrapping_sub(1);
+    let from_user = frame.from_user();
+    crate::arch::x86_64::debug::on_breakpoint(bp_addr, frame, from_user);
+    assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
+}
+
+/// `#DB` (vector 1) — Phase 111 Track B; Track C.2 moved it onto the full-GPR
+/// naked entry. Fires on a single-step (`RFLAGS.TF`), a hardware
+/// breakpoint/watchpoint (`DR0`–`DR3`), or a debug-register-access trap.
+/// Reads and clears `DR6` (so its sticky status does not persist into the
+/// next `#DB`) and dispatches; with no debugger attached the default clears
+/// any stray single-step and resumes.
+#[unsafe(no_mangle)]
+extern "C" fn db_trap_handler(frame: &mut crate::arch::x86_64::debug::DebugTrapFrame) {
     clac_on_irq_entry();
     let status = crate::arch::x86_64::debug::read_and_clear_dr6();
-    let rip = stack_frame.instruction_pointer.as_u64();
-    let from_user = (stack_frame.code_segment.0 & 3) == 3;
-    crate::arch::x86_64::debug::on_debug_exception(status, rip, &mut stack_frame, from_user);
-    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+    let rip = frame.rip;
+    let from_user = frame.from_user();
+    crate::arch::x86_64::debug::on_debug_exception(status, rip, frame, from_user);
+    assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
 }
 
 /// Clear `EFLAGS.AC` on entry to an interrupt/exception handler that may have

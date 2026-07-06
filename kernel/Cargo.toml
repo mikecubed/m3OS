@@ -56,6 +56,15 @@ smep-smap-test = []
 # `debug-substrate-smoke` (M3OS_ASLR_REGRESSION-adjacent gate). Run with:
 #   cargo xtask run --features debug-substrate-test  (or via M3OS_KERNEL_FEATURES)
 debug-substrate-test = []
+# Phase 111 Track C — in-kernel GDB stub (kgdb) over polled COM2. OFF by
+# default and excluded from production images: the stub is arbitrary kernel
+# memory peek/poke (defeats W^X/PKU/capability gating), same posture as
+# `panic-test`/`trace`/telnet. When enabled, boot freezes at a
+# wait-for-debugger `int3` ("KGDB:waiting" on COM1) until a GDB-RSP client
+# attaches on COM2 and continues; a kernel panic drops into the stub instead
+# of halting. Driven by `kgdb-smoke` (M3OS_KGDB_REGRESSION). Run with:
+#   M3OS_KERNEL_FEATURES=kgdb cargo xtask run
+kgdb = []
 # Track D (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md):
 # debug-only deliberate kernel-stack-overflow probe. Adds the `SYS_KSTACK_OVERFLOW_TEST`
 # (0x1150) syscall, which recurses until the calling task overflows its per-task
