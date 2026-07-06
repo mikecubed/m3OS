@@ -128,7 +128,7 @@ Track A is standalone and **pull-forward** (usable by the in-flight 101–110 ba
 **Acceptance:**
 - [x] On stub entry the other APs park in the NMI handler (spin until released — a **releasable** variant of the panic-quiesce path, reusing `send_nmi_to_core`), and `kgdb_release_aps` frees them on `c`/`s`/`D`/`k`. The stub logs a `KGDB:release … ticks_before=X ticks_after=Y` sentinel; the gate asserts `X == Y` (no core advanced while stopped, since every AP's LAPIC timer is frozen in the park loop).
 - [x] The panic handler enters the stub before halting (feature-gated) via `enter_from_panic` (a fresh `int3` so the stub gets a real `DebugTrapFrame`); the panic AP-quiesce has already parked the siblings, so the stub's own all-stop finds none online.
-- [ ] Asynchronous break (GDB `0x03`/Ctrl-C into a *running* guest) — deferred: the codec surfaces `RspEvent::Interrupt`, but polling COM2 from the idle/timer path to break a running kernel is a follow-on (the wait-for-debugger + breakpoint + panic entries cover the acceptance-critical paths).
+- [x] Asynchronous break (GDB `0x03`/Ctrl-C into a *running* guest): the BSP timer tick (`timer_handler_user`/`_kernel` → `kgdb_poll_async_break_*`) polls COM2 for a lone `0x03` and, when present, builds a `DebugTrapFrame` from the interrupted preempt frame and breaks into the stub at the interrupted RIP (register edits copied back so the naked stub's `iretq` applies them). Only the BSP polls (single COM2 reader), and only under the `kgdb` feature (a per-tick LSR read guarded by `async_break_pending()`; production timers are untouched). Proven by `kgdb-smoke`: after the breakpoint test it `z0`+`c`-runs the guest free, sends a bare `0x03`, and asserts the unsolicited stop reply + a valid RIP.
 
 ### C.5 — `kgdb` feature gate + CI smoke ✅
 
@@ -142,7 +142,7 @@ Track A is standalone and **pull-forward** (usable by the in-flight 101–110 ba
 
 **Acceptance:**
 - [x] `kgdb` feature off by default; production image excludes the stub (the whole `kernel/src/debug/` module and the `on_breakpoint`/`on_debug_exception` stub routing are `#[cfg(feature = "kgdb")]`).
-- [x] `kgdb-smoke` (`M3OS_KGDB_REGRESSION=1`): boots with `kgdb`, waits for the `KGDB:waiting` breadcrumb on COM1, connects a raw-RSP client to COM2, sets `Z0` at `kgdb_probe_target` (`nm` vaddr + `0x10000000000`), continues, asserts the stop with `RIP` at that address, and reads back `KGDB_PROBE_MAGIC` over `m`. Also asserts the all-stop sentinel.
+- [x] `kgdb-smoke` (`M3OS_KGDB_REGRESSION=1`): boots with `kgdb`, waits for the `KGDB:waiting` breadcrumb on COM1, connects a raw-RSP client to COM2, sets `Z0` at `kgdb_probe_target` (`nm` vaddr + `0x10000000000`), continues, asserts the stop with `RIP` at that address, reads back `KGDB_PROBE_MAGIC` over `m`, then `z0`+`c`-runs the guest free and sends a bare `0x03` to assert the **async-break** stop. Also asserts the all-stop sentinel.
 
 ---
 

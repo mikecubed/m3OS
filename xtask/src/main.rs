@@ -17577,10 +17577,45 @@ fn kgdb_run_rsp_session(
         return Err(format!("m read {magic:#x} != expected {EXPECT_MAGIC:#x}"));
     }
 
-    // 7. Remove the breakpoint and let the machine run on (k = detach+resume).
+    // 7. Remove the breakpoint and continue the guest freely (no reply yet).
     let z0d = format!("z0,{probe_addr:x},1");
     kgdb_rsp_send(stream, z0d.as_bytes()).map_err(|e| format!("send z0: {e}"))?;
     let _ = kgdb_rsp_recv(stream);
+    kgdb_rsp_send(stream, b"c").map_err(|e| format!("send c (run free): {e}"))?;
+
+    // 8. Async break (Track C.4): with the guest running, send a bare Ctrl-C
+    //    (`0x03`, not a framed packet). The kernel's timer tick polls COM2, sees
+    //    it, and breaks into the stub at the interrupted RIP — assert the
+    //    unsolicited stop reply and that `g` reports a valid (non-zero) RIP.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    {
+        use std::io::Write as _;
+        stream
+            .write_all(&[0x03])
+            .map_err(|e| format!("send async 0x03: {e}"))?;
+    }
+    let abrk = kgdb_rsp_recv(stream).map_err(|e| format!("recv async-break stop: {e}"))?;
+    if abrk.first() != Some(&b'S') {
+        return Err(format!(
+            "async-break stop reply not S..: {:?}",
+            String::from_utf8_lossy(&abrk)
+        ));
+    }
+    kgdb_rsp_send(stream, b"g").map_err(|e| format!("send g (async): {e}"))?;
+    let aregs = kgdb_rsp_recv(stream).map_err(|e| format!("recv g (async): {e}"))?;
+    if aregs.len() < 272 {
+        return Err(format!(
+            "async-break g reply too short: {} chars",
+            aregs.len()
+        ));
+    }
+    let abrk_rip = kgdb_le_u64(&aregs[256..272]).ok_or("parse async-break RIP")?;
+    if abrk_rip == 0 {
+        return Err("async-break RIP is zero (invalid stop)".to_string());
+    }
+    println!("kgdb-smoke: async break stopped the running guest at RIP {abrk_rip:#x}");
+
+    // 9. Kill / detach.
     kgdb_rsp_send(stream, b"k").map_err(|e| format!("send k: {e}"))?;
     Ok(())
 }
@@ -17739,7 +17774,8 @@ fn cmd_kgdb_smoke(args: &SmokeBootArgs) {
     let elapsed = global_start.elapsed().as_secs();
     println!(
         "kgdb-smoke: PASSED ({elapsed}s) — RSP attach over COM2, Z0 breakpoint hit at \
-         kgdb_probe_target (RIP verified), `m` read-back verified{}",
+         kgdb_probe_target (RIP verified), `m` read-back verified, async-break (Ctrl-C) into a \
+         running guest verified{}",
         if sentinel_ok {
             ", SMP all-stop sentinel confirmed (no core advanced while stopped)"
         } else {

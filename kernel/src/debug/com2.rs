@@ -67,6 +67,13 @@ pub fn try_read_byte() -> Option<u8> {
     }
 }
 
+/// True if a byte is waiting in the RX FIFO (does not consume it). Used by the
+/// async-break poll as a cheap per-tick guard before doing any real work.
+#[inline]
+pub fn rx_pending() -> bool {
+    inb(LSR) & LSR_RX_READY != 0
+}
+
 /// Blocking write: spin until the transmit holding register is empty, then
 /// send. The spin is HW-bounded (one UART character time at 115200 ≈ 87 µs).
 #[inline]

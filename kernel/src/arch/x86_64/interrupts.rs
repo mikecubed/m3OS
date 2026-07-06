@@ -2618,6 +2618,11 @@ pub unsafe extern "C" fn timer_handler_user(frame: &mut PreemptTrapFrameUser) {
     // AC so SMAP enforces while this handler runs the scheduler/IPC. See M1.
     clac_on_irq_entry();
     bump_timer_ticks_for_current_core();
+    // Phase 111 Track C.4 — async break: GDB Ctrl-C (0x03 on COM2) breaks a
+    // running guest into the kgdb stub. Only the BSP polls (single COM2 reader);
+    // absent unless the `kgdb` feature is built.
+    #[cfg(feature = "kgdb")]
+    kgdb_poll_async_break_user(frame);
     // COM1 RX backstop on EVERY core (independent of IRQ4 routing): under heavy
     // SMP serial-TX load the IRQ4-target core can be IF-masked busy-waiting on
     // the slow UART TX, so this drains pending serial input from whichever core's
@@ -2700,6 +2705,9 @@ pub unsafe extern "C" fn timer_handler_kernel(
     bump_timer_ticks_for_current_core();
     // COM1 RX backstop on every core — see the note in `timer_handler_user`.
     crate::serial::serial_rx_backstop();
+    // Phase 111 Track C.4 — async break (kgdb Ctrl-C into a running kernel).
+    #[cfg(feature = "kgdb")]
+    kgdb_poll_async_break_kernel(frame, captured_kernel_rsp);
     if !USING_APIC.load(Ordering::Relaxed) || crate::smp::is_bsp() {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
         crate::time::on_timer_tick_isr();
@@ -2759,6 +2767,57 @@ pub unsafe extern "C" fn timer_handler_kernel(
     // quantum (e.g. 100 ms) if a future workload introduces a hog.
     let _ = frame;
     let _ = captured_kernel_rsp;
+}
+
+/// Phase 111 Track C.4 — poll COM2 for a GDB async-break (`0x03`) from the
+/// ring-3 timer tick and, if present, break into the kgdb stub at the
+/// interrupted user context. Only the BSP polls (single COM2 reader). Any stub
+/// register edits (`G`) are copied back to the live `PreemptTrapFrameUser` so
+/// the naked stub's `iretq` applies them.
+#[cfg(feature = "kgdb")]
+fn kgdb_poll_async_break_user(frame: &mut PreemptTrapFrameUser) {
+    if !(crate::smp::is_bsp() && crate::debug::gdbstub::async_break_pending()) {
+        return;
+    }
+    let mut d = crate::arch::x86_64::debug::DebugTrapFrame {
+        gprs: frame.gprs,
+        rip: frame.rip,
+        cs: frame.cs,
+        rflags: frame.rflags,
+        rsp: frame.rsp,
+        ss: frame.ss,
+    };
+    if crate::debug::gdbstub::poll_async_break(&mut d) {
+        frame.gprs = d.gprs;
+        frame.rip = d.rip;
+        frame.cs = d.cs;
+        frame.rflags = d.rflags;
+        frame.rsp = d.rsp;
+        frame.ss = d.ss;
+    }
+}
+
+/// Ring-0 variant of [`kgdb_poll_async_break_user`]. The kernel iretq frame is
+/// 3-field (no `rsp`/`ss`), so `rsp` comes from the captured kernel RSP and only
+/// `gprs`/`rip`/`rflags` are copied back.
+#[cfg(feature = "kgdb")]
+fn kgdb_poll_async_break_kernel(frame: &mut PreemptTrapFrameKernel, captured_kernel_rsp: u64) {
+    if !(crate::smp::is_bsp() && crate::debug::gdbstub::async_break_pending()) {
+        return;
+    }
+    let mut d = crate::arch::x86_64::debug::DebugTrapFrame {
+        gprs: frame.gprs,
+        rip: frame.rip,
+        cs: frame.cs,
+        rflags: frame.rflags,
+        rsp: captured_kernel_rsp,
+        ss: u64::from(gdt::kernel_data_selector().0),
+    };
+    if crate::debug::gdbstub::poll_async_break(&mut d) {
+        frame.gprs = d.gprs;
+        frame.rip = d.rip;
+        frame.rflags = d.rflags;
+    }
 }
 
 // ---------------------------------------------------------------------------

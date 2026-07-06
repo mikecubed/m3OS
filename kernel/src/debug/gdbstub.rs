@@ -170,6 +170,38 @@ pub fn enter_from_panic() {
     unsafe { core::arch::asm!("int3", options(nostack)) };
 }
 
+/// True if an async break is pending on COM2: the stub has been attached
+/// (`init` ran) and a byte is waiting. The timer poll uses this as a cheap
+/// per-tick guard so it only builds a trap frame when there is actually
+/// something to service.
+pub fn async_break_pending() -> bool {
+    INITIALIZED.load(Ordering::Acquire) && super::com2::rx_pending()
+}
+
+/// Async-break entry (Track C.4): GDB `Ctrl-C` sends a lone `0x03` on the link
+/// while the guest is *running*. Called from the timer tick (the only reliable
+/// poll point for a busy guest) with the interrupted context as `frame`. If the
+/// pending byte is the `0x03` interrupt, break into the stub at the interrupted
+/// RIP — send the stop reply GDB is waiting for, then serve the session and
+/// resume on continue. Any other stray byte is consumed and ignored.
+///
+/// Returns `true` if it entered the stub (so the caller writes the possibly
+/// register-modified `frame` back to the interrupted context).
+pub fn poll_async_break(frame: &mut DebugTrapFrame) -> bool {
+    if !INITIALIZED.load(Ordering::Acquire) {
+        return false;
+    }
+    match super::com2::try_read_byte() {
+        Some(b) if b == gdb_rsp::INTERRUPT => {
+            // GDB sent 0x03 and is waiting for a stop reply.
+            AWAITING_STOP_REPLY.store(true, Ordering::Release);
+            session(StopReason::Trap, frame);
+            true
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum StopReason {
     SwBreak,

@@ -270,10 +270,25 @@ Landed alongside the Phase 111 work (context, not this phase):
    links from userspace too).
 2. Phase 110 A/B.3/D + the Phase 111 Track C/D on-metal arms — operator-owned.
 
-### Async-break follow-on (Track C.4, deferred)
+### Async-break (Track C.4) — ✅ landed
 
-The one Track C acceptance item not yet wired: GDB `0x03` (Ctrl-C) breaking a
-*running* guest into the stub. The `gdb_rsp` reader already surfaces
-`RspEvent::Interrupt`; what's missing is a poll of COM2 for `0x03` from the
-idle/timer path (the stub is only ever entered from a trap today). Low risk,
-additive — a good warm-up before Track D.
+GDB `0x03` (Ctrl-C) now breaks a *running* guest into the stub. The **BSP timer
+tick** (`timer_handler_user`/`_kernel` → `kgdb_poll_async_break_*` in
+`interrupts.rs`) polls COM2 (`com2::rx_pending()` guard → `try_read_byte`); on a
+lone `0x03` it builds a `DebugTrapFrame` from the interrupted preempt frame and
+calls `gdbstub::poll_async_break`, which sends the stop reply GDB is waiting for
+and serves the session at the interrupted RIP. Register edits (`G`) are copied
+back into the live preempt frame so the naked stub's `iretq` applies them.
+Only the BSP polls (single COM2 reader); the per-tick cost (one LSR read) is
+`#[cfg(feature = "kgdb")]` so production timers are untouched. Proven by
+`kgdb-smoke` (after the breakpoint test: `z0` + `c`-run-free + bare `0x03` →
+assert the async stop + a valid RIP).
+
+**Gotcha (cost me a link error):** when inserting the two `#[cfg(kgdb)]` helper
+`fn`s just above `timer_handler_user`, the `#[unsafe(no_mangle)]` that belonged
+to `timer_handler_user` re-attached to the first helper — so the default build
+linked (helpers `cfg`-out, `no_mangle` falls back onto `timer_handler_user`) but
+the `kgdb` build failed with `undefined symbol: timer_handler_user` (the naked
+`timer_entry` asm calls it by that raw name). Clippy doesn't link, so it passed;
+always do a full `--bin kernel` link build with the feature. Fix: the helpers
+live *below* the timer handlers now.
