@@ -1327,40 +1327,13 @@ pub fn init() {
 // Called from the scheduler dispatch loop (D.3) with IRQs disabled.
 // Never returns.
 
+// Phase 110 A.3b part 3 — `preempt_resume_to_user` moved into the page-aligned,
+// user-mapped `.text.kpti_exit` section (bottom of this file) so it can flip to
+// the user CR3 in the instruction before its `iretq`. `dispatch_preempted_and_resume`
+// stays here in plain `.text`: it builds the `switch_context` frame on the
+// scheduler stack and `jmp`s to `preempt_resume_to_user`, but never touches the
+// user CR3 itself.
 core::arch::global_asm!(
-    ".global preempt_resume_to_user",
-    "preempt_resume_to_user:",
-    // Build the iretq frame on the current (scheduler) stack.
-    // iretq pops: rip, cs, rflags, rsp, ss — push in reverse (ss first).
-    "mov rax, [rdi + 152]", // ss
-    "push rax",
-    "mov rax, [rdi + 144]", // rsp (user-mode stack pointer)
-    "push rax",
-    "mov rax, [rdi + 136]", // rflags
-    "push rax",
-    "mov rax, [rdi + 128]", // cs
-    "push rax",
-    "mov rax, [rdi + 120]", // rip
-    "push rax",
-    // Restore GPRs — all except rax and rdi (rdi is still our frame pointer).
-    "mov rbx, [rdi + 8]",
-    "mov rcx, [rdi + 16]",
-    "mov rdx, [rdi + 24]",
-    "mov rsi, [rdi + 32]",
-    "mov rbp, [rdi + 48]",
-    "mov r8,  [rdi + 56]",
-    "mov r9,  [rdi + 64]",
-    "mov r10, [rdi + 72]",
-    "mov r11, [rdi + 80]",
-    "mov r12, [rdi + 88]",
-    "mov r13, [rdi + 96]",
-    "mov r14, [rdi + 104]",
-    "mov r15, [rdi + 112]",
-    // Restore rax, then rdi last (pointer becomes invalid after this).
-    "mov rax, [rdi + 0]",
-    "mov rdi, [rdi + 40]",
-    "iretq",
-    //
     // ---------------------------------------------------------------------------
     // Phase 57d D.3 (fix) — dispatch_preempted_and_resume
     //
@@ -3883,5 +3856,110 @@ pub fn kpti_irq_entry_range() -> (u64, u64) {
     (
         kpti_irq_entry_start as *const () as u64,
         kpti_irq_entry_end as *const () as u64,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Phase 110 Track A.3b part 3 — KPTI ring0→ring3 exit trampolines
+// ---------------------------------------------------------------------------
+//
+// The page-aligned, user-mapped `.text.kpti_exit` section (mapped r-x into every
+// user half by `mm::kpti::collect_entry_pages`). A ring0→ring3 `iretq` must load
+// the user CR3 in the instruction before `iretq`, and after that flip only the
+// user half is mapped — so both the `iretq` frame AND the `mov cr3 … iretq`
+// instructions must be user-mapped. Each trampoline therefore:
+//   1. `mov rsp, gs:[STACK_TOP]` — reset to this task's kstack **top page**, the
+//      one page `build_user_half` maps into the user half. Safe: the trampolines
+//      are `-> !` and build a fresh frame (for the preempt path the scheduler RSP
+//      was already saved by `dispatch_preempted_and_resume` before its `jmp`).
+//   2. build the 5-field `iretq` frame there + restore GPRs from the kernel-
+//      mapped reg source (done BEFORE the flip — the source is gone afterwards).
+//   3. flip CR3 via the scratch slot (no-op while `kpti_user_cr3 == 0`).
+//   4. `iretq`.
+//
+// Part 3a lands `preempt_resume_to_user` (the preemption-resume path) as the
+// proof of pattern; `fork_enter_userspace`, `enter_userspace`, and
+// `restore_and_enter_userspace` follow the same recipe in later sub-commits.
+core::arch::global_asm!(
+    ".equ EXIT_OFF_USER_CR3,  {exit_off_user_cr3}",
+    ".equ EXIT_OFF_SCRATCH,   {exit_off_scratch}",
+    ".equ EXIT_OFF_STACK_TOP, {exit_off_stack_top}",
+    ".section .text.kpti_exit, \"ax\"",
+    ".balign 4096",
+    ".global kpti_exit_start",
+    "kpti_exit_start:",
+    "",
+    // preempt_resume_to_user(rdi = *const PreemptFrame) -> !
+    // PreemptFrame offsets: rax=0 rbx=8 rcx=16 rdx=24 rsi=32 rdi=40 rbp=48
+    //   r8=56 r9=64 r10=72 r11=80 r12=88 r13=96 r14=104 r15=112
+    //   rip=120 cs=128 rflags=136 rsp=144 ss=152
+    ".global preempt_resume_to_user",
+    "preempt_resume_to_user:",
+    // Reset rsp to this (resumed) task's kstack top page — the dispatch prep
+    // block published it to gs:[STACK_TOP] before the jmp here, and it is the
+    // one kstack page the user half maps. The scheduler stack we abandon was
+    // already saved by dispatch_preempted_and_resume.
+    "mov rsp, gs:[EXIT_OFF_STACK_TOP]",
+    // Build the 5-field iretq frame on the top page (push in reverse: ss first).
+    "mov rax, [rdi + 152]", // ss
+    "push rax",
+    "mov rax, [rdi + 144]", // user rsp
+    "push rax",
+    "mov rax, [rdi + 136]", // rflags
+    "push rax",
+    "mov rax, [rdi + 128]", // cs
+    "push rax",
+    "mov rax, [rdi + 120]", // rip
+    "push rax",
+    // Restore GPRs (all except rax/rdi) from the PreemptFrame — BEFORE the CR3
+    // flip, since the frame lives in the kernel map and vanishes after it.
+    "mov rbx, [rdi + 8]",
+    "mov rcx, [rdi + 16]",
+    "mov rdx, [rdi + 24]",
+    "mov rsi, [rdi + 32]",
+    "mov rbp, [rdi + 48]",
+    "mov r8,  [rdi + 56]",
+    "mov r9,  [rdi + 64]",
+    "mov r10, [rdi + 72]",
+    "mov r11, [rdi + 80]",
+    "mov r12, [rdi + 88]",
+    "mov r13, [rdi + 96]",
+    "mov r14, [rdi + 104]",
+    "mov r15, [rdi + 112]",
+    "mov rax, [rdi + 0]",
+    "mov rdi, [rdi + 40]", // rdi last (pointer becomes invalid)
+    // KPTI exit: flip to the user CR3 (rax holds a user value → spill via
+    // gs:[scratch], which is mapped on both halves). No-op while inactive.
+    "mov gs:[EXIT_OFF_SCRATCH], rax",
+    "mov rax, gs:[EXIT_OFF_USER_CR3]",
+    "test rax, rax",
+    "jz 1f",
+    "mov cr3, rax",
+    "1:",
+    "mov rax, gs:[EXIT_OFF_SCRATCH]",
+    "iretq",
+    "",
+    ".balign 4096",
+    ".global kpti_exit_end",
+    "kpti_exit_end:",
+    ".text",
+    exit_off_user_cr3  = const crate::smp::offsets::KPTI_USER_CR3,
+    exit_off_scratch   = const crate::smp::offsets::KPTI_SCRATCH,
+    exit_off_stack_top = const crate::smp::offsets::SYSCALL_STACK_TOP,
+);
+
+unsafe extern "C" {
+    /// Bounds of the page-aligned `.text.kpti_exit` section — mapped r-x into
+    /// every user PML4 by `mm::kpti::collect_entry_pages`.
+    fn kpti_exit_start();
+    fn kpti_exit_end();
+}
+
+/// `[start, end)` VA range of the `.text.kpti_exit` section (the ring0→ring3
+/// exit trampolines the user PML4 maps r-x). Both bounds are page-aligned.
+pub fn kpti_exit_range() -> (u64, u64) {
+    (
+        kpti_exit_start as *const () as u64,
+        kpti_exit_end as *const () as u64,
     )
 }

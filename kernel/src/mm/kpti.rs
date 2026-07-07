@@ -371,6 +371,13 @@ fn collect_entry_pages() -> Option<Vec<(u64, u64, PageTableFlags)>> {
     let (irq_start, irq_end) = crate::arch::x86_64::interrupts::kpti_irq_entry_range();
     push_kernel_range(&kmapper, &mut out, irq_start, irq_end, RX)?;
 
+    // Phase 110 A.3b part 3 — the ring0→ring3 exit trampolines
+    // (`.text.kpti_exit`): the instructions from each trampoline's `mov cr3`
+    // (→ user CR3) through its `iretq` execute on the user half, so they must be
+    // user-mapped (r-x).
+    let (exit_start, exit_end) = crate::arch::x86_64::interrupts::kpti_exit_range();
+    push_kernel_range(&kmapper, &mut out, exit_start, exit_end, RX)?;
+
     let idtr = x86_64::instructions::tables::sidt();
     let idt_base = idtr.base.as_u64();
     push_kernel_range(
@@ -657,6 +664,17 @@ pub fn self_test() {
     if irq_start % 0x1000 != 0 || irq_end % 0x1000 != 0 || irq_start >= irq_end {
         log::error!(
             "KPTI_SELFTEST:FAIL reason=irq-entry-layout start={irq_start:#x} end={irq_end:#x}"
+        );
+        return;
+    }
+
+    // A.3b part 3: the ring0→ring3 exit-trampoline section must likewise be
+    // page-aligned and non-empty (a linker regression would #PF-loop the first
+    // preempt-resume once A.4 activates).
+    let (exit_start, exit_end) = crate::arch::x86_64::interrupts::kpti_exit_range();
+    if exit_start % 0x1000 != 0 || exit_end % 0x1000 != 0 || exit_start >= exit_end {
+        log::error!(
+            "KPTI_SELFTEST:FAIL reason=exit-layout start={exit_start:#x} end={exit_end:#x}"
         );
         return;
     }
