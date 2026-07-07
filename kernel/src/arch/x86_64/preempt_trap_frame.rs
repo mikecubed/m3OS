@@ -95,6 +95,60 @@ const _: () = assert!(
 );
 
 // ---------------------------------------------------------------------------
+// Phase 110 Track A.3b — full-GPR error-code trap frame (#PF, #GP)
+// ---------------------------------------------------------------------------
+
+/// On-stack trap frame captured by the KPTI-aware naked stubs for the two
+/// error-code exceptions this kernel handles from ring 3 (`#PF`, `#GP`).
+///
+/// Identical to [`TrapFrame`] except the CPU pushes a hardware **error code**
+/// between the GPR block and the iretq frame (it sits just above `gprs` because
+/// the asm stub pushes the GPRs *after* the CPU has already pushed the error
+/// code + iretq frame). The stub therefore discards the error code with
+/// `add rsp, 8` before `iretq` (which does not pop it).
+///
+/// Layout (low → high): `gprs[0..14]`, `error_code`, then `rip/cs/rflags/rsp/ss`.
+#[repr(C)]
+pub struct TrapFrameErr {
+    /// GPR block — same order as [`PreemptTrapFrameUser`].
+    pub gprs: [u64; 15],
+    /// CPU-pushed hardware error code (`#PF` fault flags / `#GP` selector).
+    pub error_code: u64,
+    // CPU-pushed iretq frame (always 5 fields in 64-bit mode).
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+
+const _: () = assert!(
+    offset_of!(TrapFrameErr, gprs) == 0
+        && offset_of!(TrapFrameErr, error_code) == 15 * 8
+        && offset_of!(TrapFrameErr, rip) == 16 * 8,
+    "TrapFrameErr: gprs at 0, error_code at 120, rip at 128"
+);
+const _: () = assert!(
+    offset_of!(TrapFrameErr, cs) == 17 * 8
+        && offset_of!(TrapFrameErr, rflags) == 18 * 8
+        && offset_of!(TrapFrameErr, rsp) == 19 * 8
+        && offset_of!(TrapFrameErr, ss) == 20 * 8,
+    "TrapFrameErr: CPU frame fields must follow the error code contiguously"
+);
+const _: () = assert!(
+    core::mem::size_of::<TrapFrameErr>() == 21 * 8,
+    "TrapFrameErr must be 168 bytes (15 GPRs + error code + 5 CPU fields)"
+);
+
+impl TrapFrameErr {
+    /// True if the trap came from ring 3.
+    #[inline]
+    pub fn from_user(&self) -> bool {
+        (self.cs & 3) == 3
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Ring-0 on-stack trap frame
 // ---------------------------------------------------------------------------
 

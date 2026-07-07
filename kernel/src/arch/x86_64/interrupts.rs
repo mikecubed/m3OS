@@ -54,7 +54,9 @@ use crate::panic_diag;
 use crate::serial::_panic_print;
 
 use super::gdt;
-use super::preempt_trap_frame::{PreemptTrapFrameKernel, PreemptTrapFrameUser, TrapFrame};
+use super::preempt_trap_frame::{
+    PreemptTrapFrameKernel, PreemptTrapFrameUser, TrapFrame, TrapFrameErr,
+};
 
 // ---------------------------------------------------------------------------
 // APIC / PIC mode flag
@@ -69,35 +71,21 @@ pub static USING_APIC: AtomicBool = AtomicBool::new(false);
 // Phase 57b D.3 — IRQ-return-to-ring-3 preempt_count assertion
 // ---------------------------------------------------------------------------
 
-/// Phase 57b D.3 — IRQ-return-to-ring-3 wrapper around
-/// [`crate::task::scheduler::assert_preempt_count_zero_at_user_return`].
+/// Phase 57b D.3 — IRQ-return-to-ring-3 preempt_count assertion, keyed off the
+/// raw code-segment selector the naked entry stubs carry in their frame
+/// (`frame.cs`). Phase 110 A.3b converted every ring-3-reachable handler to a
+/// naked stub, so this raw-CS form is now the only variant.
 ///
-/// Called at the end of every `extern "x86-interrupt"` handler that may
-/// have interrupted ring 3 — the body returns via `iretq` to user mode
-/// when this branch is taken, and we want the same `preempt_count == 0`
-/// invariant the syscall-return path enforces.
+/// Called at the end of every handler that may have interrupted ring 3 — the
+/// body returns via `iretq` to user mode when this branch is taken, and we want
+/// the same `preempt_count == 0` invariant the syscall-return path enforces.
 ///
-/// The assertion is gated on `stack_frame.code_segment.rpl() ==
-/// PrivilegeLevel::Ring3` because under Phase 57d kernel-mode will hold
-/// `preempt_count > 0` while inside spinlock-protected critical
-/// sections — an IPI / IRQ that interrupted such a section would
-/// (correctly) see a non-zero count and must not panic.  The "return to
-/// ring 3" check distinguishes the two cases.
-///
-/// In Phase 57b nothing raises `preempt_count` yet (Tracks F and G are
-/// future waves), so even unconditionally checking would pass — the
-/// gate is in place from day one to keep the assertion future-correct
-/// once F.1 wires `IrqSafeMutex::lock` into `preempt_disable`.
-///
-/// The check itself is a `debug_assert!` inside the helper; release
-/// builds compile out the entire body via `cfg(debug_assertions)`.
-#[inline]
-fn assert_preempt_count_zero_on_return_to_user(stack_frame: &InterruptStackFrame) {
-    assert_preempt_count_zero_on_return_to_user_cs(stack_frame.code_segment.0 as u64);
-}
-
-/// Raw-CS variant for the naked-entry paths (#BP/#DB), whose frames carry the
-/// selector as a plain `u64` rather than an `InterruptStackFrame`.
+/// The assertion is gated on `(cs & 3) == 3` because kernel-mode may hold
+/// `preempt_count > 0` inside a spinlock-protected critical section — an IPI /
+/// IRQ that interrupted such a section would (correctly) see a non-zero count
+/// and must not panic. The "return to ring 3" check distinguishes the two cases.
+/// The check itself is a `debug_assert!` inside the callee; release builds
+/// compile out the body via `cfg(debug_assertions)`.
 #[inline]
 fn assert_preempt_count_zero_on_return_to_user_cs(cs: u64) {
     // Phase 57e Bug #9 — clamp preempt_count to 0 at user-return in release
@@ -217,7 +205,7 @@ fn fault_recovery_stack_top(core_id: usize) -> u64 {
 ///
 /// Mirrors the ring-3 fault-kill redirect, but points RSP at the per-core
 /// recovery stack rather than the current (exhausted) kernel stack.
-fn try_recover_kstack_overflow(stack_frame: &mut InterruptStackFrame) -> bool {
+fn try_recover_kstack_overflow(frame: &mut TrapFrameErr) -> bool {
     if !crate::smp::is_per_core_ready() {
         return false;
     }
@@ -240,19 +228,17 @@ fn try_recover_kstack_overflow(stack_frame: &mut InterruptStackFrame) -> bool {
         pid, core,
     ));
     let recovery_top = fault_recovery_stack_top(core);
-    // SAFETY: rewrite the interrupt return frame while interrupts are disabled
-    // (exception entry cleared IF). IRETQ will load RSP = recovery stack so the
-    // kill trampoline runs on a clean stack, not the overflowed one. Same shape
-    // as the ring-3 redirect in `page_fault_handler`.
-    unsafe {
-        stack_frame.as_mut().update(|f| {
-            f.instruction_pointer = VirtAddr::new(fault_kill_trampoline as *const () as u64);
-            f.code_segment = gdt::kernel_code_selector();
-            f.cpu_flags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG;
-            f.stack_pointer = VirtAddr::new(recovery_top);
-            f.stack_segment = gdt::kernel_data_selector();
-        });
-    }
+    // Rewrite the on-stack iretq frame while interrupts are disabled (exception
+    // entry cleared IF). IRETQ will load RSP = recovery stack so the kill
+    // trampoline runs on a clean stack, not the overflowed one. Redirecting to a
+    // ring-0 CS means the naked stub's exit switch keeps the kernel CR3 (no
+    // user-CR3 flip on a kernel-target return). Same shape as the ring-3 redirect
+    // in `page_fault_body`.
+    frame.rip = fault_kill_trampoline as *const () as u64;
+    frame.cs = u64::from(gdt::kernel_code_selector().0);
+    frame.rflags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG.bits();
+    frame.rsp = recovery_top;
+    frame.ss = u64::from(gdt::kernel_data_selector().0);
     true
 }
 
@@ -1174,9 +1160,18 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
         idt.debug
             .set_handler_addr(VirtAddr::new(db_entry as *const () as u64));
     }
-    idt.page_fault.set_handler_fn(page_fault_handler);
-    idt.general_protection_fault
-        .set_handler_fn(general_protection_fault_handler);
+    // Phase 110 A.3b — #PF and #GP use naked KPTI-aware entry stubs (they run
+    // demand paging / diagnostics that need the full kernel map, so they must
+    // switch to the kernel CR3 on entry and, if returning to ring 3, back to the
+    // user CR3 before `iretq`). The bodies are `page_fault_body` /
+    // `general_protection_fault_body`, taking `&mut TrapFrameErr`.
+    unsafe {
+        idt.page_fault
+            .set_handler_addr(VirtAddr::new(page_fault_entry as *const () as u64));
+        idt.general_protection_fault.set_handler_addr(VirtAddr::new(
+            general_protection_fault_entry as *const () as u64,
+        ));
+    }
     unsafe {
         idt.double_fault
             .set_handler_fn(double_fault_handler)
@@ -1552,15 +1547,20 @@ fn clac_on_irq_entry() {
     unsafe { crate::arch::x86_64::cpuid::clear_ac_for_smap() };
 }
 
-extern "x86-interrupt" fn page_fault_handler(
-    mut stack_frame: InterruptStackFrame,
-    err: PageFaultErrorCode,
-) {
+/// `#PF` body — Phase 110 A.3b moved this onto the KPTI-aware naked
+/// `page_fault_entry` stub, so it takes the full-GPR [`TrapFrameErr`] the stub
+/// captured (the CPU error code is `frame.error_code`) instead of an
+/// `InterruptStackFrame`. Redirects (the ring-3 fault-kill and the kstack-overflow
+/// recovery) rewrite `frame` in place; the stub's exit switch re-reads
+/// `frame.cs`, so a redirect to a ring-0 trampoline returns on the kernel CR3.
+#[unsafe(no_mangle)]
+extern "C" fn page_fault_body(frame: &mut TrapFrameErr) {
     clac_on_irq_entry();
+    let err = PageFaultErrorCode::from_bits_truncate(frame.error_code);
     let addr = x86_64::registers::control::Cr2::read();
 
     // Check if the fault came from ring 3 (user mode).
-    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+    if frame.from_user() {
         // P17-T031: detect CoW faults — a write to a present, non-writable
         // page marked with BIT_9 (the CoW marker set by cow_clone_user_pages).
         let is_write = err.contains(PageFaultErrorCode::CAUSED_BY_WRITE);
@@ -1580,7 +1580,7 @@ extern "x86-interrupt" fn page_fault_handler(
                 // require the disk-backed mmap path which is not yet
                 // wired; the major counter stays at 0 in practice today.
                 crate::task::scheduler::current_task_record_page_fault(false);
-                assert_preempt_count_zero_on_return_to_user(&stack_frame);
+                assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
                 return;
             }
             // OOM or no-longer-CoW mapping — fall through to other handlers / kill.
@@ -1605,7 +1605,7 @@ extern "x86-interrupt" fn page_fault_handler(
                 && demand_map_user_page(fault_addr_u64, 0x3)
             // PROT_READ|PROT_WRITE
             {
-                assert_preempt_count_zero_on_return_to_user(&stack_frame);
+                assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
                 return;
             }
         }
@@ -1615,7 +1615,7 @@ extern "x86-interrupt" fn page_fault_handler(
         if !is_present && let Ok(fault_vaddr) = addr {
             let fault_addr_u64 = fault_vaddr.as_u64();
             if demand_map_vma_page(fault_addr_u64, is_write) {
-                assert_preempt_count_zero_on_return_to_user(&stack_frame);
+                assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
                 return;
             }
         }
@@ -1678,12 +1678,12 @@ extern "x86-interrupt" fn page_fault_handler(
                             crate::process::current_pid(),
                             key,
                             fault_vaddr.as_u64(),
-                            stack_frame.instruction_pointer.as_u64(),
+                            frame.rip,
                             n,
                         ));
                     }
                     crate::task::scheduler::current_task_record_page_fault(false);
-                    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+                    assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
                     return;
                 }
             }
@@ -1743,13 +1743,13 @@ extern "x86-interrupt" fn page_fault_handler(
                         "[pf] spurious write-fault recovered: pid={} addr={:#x} rip={:#x} (#{}) ",
                         crate::process::current_pid(),
                         fault_vaddr.as_u64(),
-                        stack_frame.instruction_pointer.as_u64(),
+                        frame.rip,
                         n + 1,
                     );
                 }
                 x86_64::instructions::tlb::flush(VirtAddr::new(fault_vaddr.as_u64()));
                 crate::task::scheduler::current_task_record_page_fault(false);
-                assert_preempt_count_zero_on_return_to_user(&stack_frame);
+                assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
                 return;
             } else if leaf_writable && leaf_user {
                 // Leaf grants write+user but an intermediate does not — the
@@ -1762,7 +1762,7 @@ extern "x86-interrupt" fn page_fault_handler(
                         "[pf] non-writable intermediate (would loop): pid={} addr={:#x} rip={:#x} p4={:#x} p3={:#x} p2={:#x} p1={:#x}\n",
                         crate::process::current_pid(),
                         fault_vaddr.as_u64(),
-                        stack_frame.instruction_pointer.as_u64(),
+                        frame.rip,
                         levels[0],
                         levels[1],
                         levels[2],
@@ -1776,15 +1776,9 @@ extern "x86-interrupt" fn page_fault_handler(
         let pid = crate::process::current_pid();
         _panic_print(format_args!(
             "[int] userspace page fault: pid={} addr={:?} err={:?} rip={:#x} — process killed\n",
-            pid,
-            addr,
-            err,
-            stack_frame.instruction_pointer.as_u64()
+            pid, addr, err, frame.rip
         ));
-        _panic_print(format_args!(
-            "[int] RSP={:#x}\n",
-            stack_frame.stack_pointer.as_u64()
-        ));
+        _panic_print(format_args!("[int] RSP={:#x}\n", frame.rsp));
         // Phase 57e diag: not-present userspace faults on what should be a
         // mapped code/data page are the same shape as the kernel slab UAF;
         // dump the PTE walk to localise the missing-PTE level.
@@ -1812,26 +1806,21 @@ extern "x86-interrupt" fn page_fault_handler(
         // Store the PID for the trampoline. Safe: interrupts are disabled
         // during exception handling on a single CPU.
         FAULT_KILL_PID.store(pid, Ordering::Relaxed);
-        // Redirect the interrupted context to fault_kill_trampoline, which
-        // runs in ring 0 outside interrupt context where locking is safe.
-        // SAFETY: we modify the interrupt return frame while interrupts are
-        // disabled. The trampoline is a valid kernel function pointer.
-        // We must also set RSP to the current kernel stack (not the user RSP
-        // that was saved in the frame), otherwise IRET would pop the user RSP
-        // and the trampoline would run with an unmapped stack → GPF.
+        // Redirect the interrupted context to fault_kill_trampoline, which runs
+        // in ring 0 outside interrupt context where locking is safe. Set RSP to
+        // the current kernel stack (not the user RSP saved in the frame),
+        // otherwise IRETQ would pop the user RSP and the trampoline would run on
+        // an unmapped stack → GPF. Redirecting to a ring-0 CS also makes the
+        // naked stub's exit switch keep the kernel CR3 (no user-CR3 flip).
         let kernel_rsp: u64;
         unsafe {
             core::arch::asm!("mov {}, rsp", out(reg) kernel_rsp);
         }
-        unsafe {
-            stack_frame.as_mut().update(|f| {
-                f.instruction_pointer = VirtAddr::new(fault_kill_trampoline as *const () as u64);
-                f.code_segment = gdt::kernel_code_selector();
-                f.cpu_flags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG;
-                f.stack_pointer = VirtAddr::new(kernel_rsp);
-                f.stack_segment = gdt::kernel_data_selector();
-            });
-        }
+        frame.rip = fault_kill_trampoline as *const () as u64;
+        frame.cs = u64::from(gdt::kernel_code_selector().0);
+        frame.rflags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG.bits();
+        frame.rsp = kernel_rsp;
+        frame.ss = u64::from(gdt::kernel_data_selector().0);
         return;
     }
 
@@ -1841,11 +1830,7 @@ extern "x86-interrupt" fn page_fault_handler(
     // from production builds (feature-gated).
     #[cfg(feature = "smep-smap-test")]
     if let Some(recovery_rip) = crate::arch::x86_64::smap_test::take_expected_fault_recovery() {
-        unsafe {
-            stack_frame.as_mut().update(|f| {
-                f.instruction_pointer = VirtAddr::new(recovery_rip);
-            });
-        }
+        frame.rip = recovery_rip;
         return;
     }
 
@@ -1864,10 +1849,7 @@ extern "x86-interrupt" fn page_fault_handler(
     {
         _panic_print(format_args!(
             "[int] RECURSIVE KERNEL PAGE FAULT on core {} — cascade halted (cr2={:?} rip={:#x} err={:?})\n",
-            core_idx,
-            addr,
-            stack_frame.instruction_pointer.as_u64(),
-            err,
+            core_idx, addr, frame.rip, err,
         ));
         crate::hlt_loop();
     }
@@ -1882,10 +1864,10 @@ extern "x86-interrupt" fn page_fault_handler(
     // dumps below cascade. (`#PF` so it greps distinctly from the verbose line.)
     _panic_print(format_args!(
         "[int] KERNEL #PF rip={:#x} cr2={:#x} err={:#x} rsp={:#x}\n",
-        stack_frame.instruction_pointer.as_u64(),
+        frame.rip,
         addr.as_ref().map_or(u64::MAX, |v| v.as_u64()),
         err.bits(),
-        stack_frame.stack_pointer.as_u64(),
+        frame.rsp,
     ));
 
     // Kernel-stack overflow: the fault address is inside a kstack guard page.
@@ -1903,17 +1885,17 @@ extern "x86-interrupt" fn page_fault_handler(
             "[int] KERNEL STACK OVERFLOW: kstack slot {} guard page hit at {:#x} (rip={:#x})\n",
             slot,
             fault_va.as_u64(),
-            stack_frame.instruction_pointer.as_u64(),
+            frame.rip,
         ));
         // Phase 95 diag: stash slot + faulting RSP so the recovery trampoline can
         // print the recursion backtrace on its CLEAN stack (dumping here would
         // re-overflow). One compact store each — no risk of re-crossing the guard.
         KSTACK_OVF_SLOT.store(slot, Ordering::Relaxed);
-        KSTACK_OVF_RSP.store(stack_frame.stack_pointer.as_u64(), Ordering::Relaxed);
+        KSTACK_OVF_RSP.store(frame.rsp, Ordering::Relaxed);
         // Track D: if attributable to a userspace task, redirect to the kill
         // trampoline on the per-core recovery stack and return (IRETQ). The core
         // survives and keeps scheduling other tasks.
-        if try_recover_kstack_overflow(&mut stack_frame) {
+        if try_recover_kstack_overflow(frame) {
             return;
         }
         // Genuine kernel/idle-context overflow — a real kernel bug. Halt this
@@ -1923,8 +1905,8 @@ extern "x86-interrupt" fn page_fault_handler(
     }
 
     _panic_print(format_args!(
-        "[int] kernel page fault: addr={:?} err={:?}\n{:?}\n",
-        addr, err, stack_frame
+        "[int] kernel page fault: addr={:?} err={:?} rip={:#x} cs={:#x} rflags={:#x} rsp={:#x}\n",
+        addr, err, frame.rip, frame.cs, frame.rflags, frame.rsp,
     ));
     let (cr3_frame, _) = x86_64::registers::control::Cr3::read_raw();
     _panic_print(format_args!(
@@ -1983,54 +1965,31 @@ fn maybe_redirect_group_exit_trampoline_user(frame: &mut PreemptTrapFrameUser) {
     frame.ss = u64::from(gdt::kernel_data_selector().0);
 }
 
-extern "x86-interrupt" fn general_protection_fault_handler(
-    mut stack_frame: InterruptStackFrame,
-    _err: u64,
-) {
-    // Capture the user's callee-saved GPRs IMMEDIATELY, before any Rust
-    // code can clobber them. With the `x86-interrupt` calling convention,
-    // these still hold the user's values at the first instruction of the
-    // handler body (caller-saved regs are spilled by the entry stub but
-    // callee-saved are preserved across the Rust call boundary).
-    // `panic_diag::capture_registers` runs deeper in the call chain, so
-    // r12-r15 there reflect kernel state, not the user's view.
-    let user_r12: u64;
-    let user_r13: u64;
-    let user_r14: u64;
-    let user_r15: u64;
-    let user_rbx: u64;
-    let user_rbp: u64;
-    unsafe {
-        core::arch::asm!(
-            "mov {0}, rbx",
-            "mov {1}, rbp",
-            "mov {2}, r12",
-            "mov {3}, r13",
-            "mov {4}, r14",
-            "mov {5}, r15",
-            out(reg) user_rbx,
-            out(reg) user_rbp,
-            out(reg) user_r12,
-            out(reg) user_r13,
-            out(reg) user_r14,
-            out(reg) user_r15,
-            options(nostack, preserves_flags),
-        );
-    }
-    // Clear AC AFTER the user-GPR capture above (a `call` would preserve the
-    // callee-saved regs being snapshotted, but keep the snapshot asm strictly
-    // first to be safe), so SMAP enforces for the rest of the handler. See M1.
+/// `#GP` body — Phase 110 A.3b moved this onto the KPTI-aware naked
+/// `general_protection_fault_entry` stub. The stub's `kpti_save_gprs` already
+/// captured the user's GPRs into `frame.gprs` before any Rust prologue ran, so
+/// the old inline-asm callee-saved snapshot is gone (`frame.gprs[i]` order:
+/// `[rax, rbx, rcx, rdx, rsi, rdi, rbp, r8, r9, r10, r11, r12, r13, r14, r15]`).
+/// The error code is `frame.error_code`.
+#[unsafe(no_mangle)]
+extern "C" fn general_protection_fault_body(frame: &mut TrapFrameErr) {
     clac_on_irq_entry();
+    let err = frame.error_code;
     // Check if the fault came from ring 3.
-    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+    if frame.from_user() {
         let pid = crate::process::current_pid();
         _panic_print(format_args!(
-            "[int] userspace GPF: pid={} — process killed\n{:?}\n",
-            pid, stack_frame
+            "[int] userspace GPF: pid={} rip={:#x} cs={:#x} rflags={:#x} rsp={:#x} — process killed\n",
+            pid, frame.rip, frame.cs, frame.rflags, frame.rsp,
         ));
         _panic_print(format_args!(
             "[int] user GPRs at fault: rbx={:#018x} rbp={:#018x} r12={:#018x} r13={:#018x} r14={:#018x} r15={:#018x}\n",
-            user_rbx, user_rbp, user_r12, user_r13, user_r14, user_r15
+            frame.gprs[1],
+            frame.gprs[6],
+            frame.gprs[11],
+            frame.gprs[12],
+            frame.gprs[13],
+            frame.gprs[14],
         ));
         if crate::smp::is_per_core_ready() {
             let task_idx = crate::smp::per_core()
@@ -2046,41 +2005,42 @@ extern "x86-interrupt" fn general_protection_fault_handler(
                 ));
             }
         }
-        let selector_idx = _err >> 3;
-        let table = (_err >> 1) & 3;
-        let external = _err & 1;
+        let selector_idx = err >> 3;
+        let table = (err >> 1) & 3;
+        let external = err & 1;
         _panic_print(format_args!(
             "[int] GPF error_code={:#x} (selector_idx={}, table={}, external={})\n",
-            _err, selector_idx, table, external
+            err, selector_idx, table, external
         ));
         panic_diag::dump_crash_context();
         crate::trace::dump_trace_rings();
         // Store the PID and redirect to the kill trampoline (same pattern as
-        // page_fault_handler — no blocking allowed inside an ISR).
+        // page_fault_body — no blocking allowed inside an ISR).
         FAULT_KILL_PID.store(pid, Ordering::Relaxed);
-        // SAFETY: same as page_fault_handler above.
+        // Run the kill trampoline on the current kernel stack, NOT the user RSP
+        // saved in the frame. Redirecting to a ring-0 CS means the stub's exit
+        // switch keeps the kernel CR3 (no user-CR3 flip on a kernel return).
         let kernel_rsp: u64;
         unsafe {
             core::arch::asm!("mov {}, rsp", out(reg) kernel_rsp);
         }
-        unsafe {
-            stack_frame.as_mut().update(|f| {
-                f.instruction_pointer = VirtAddr::new(fault_kill_trampoline as *const () as u64);
-                f.code_segment = gdt::kernel_code_selector();
-                f.cpu_flags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG;
-                f.stack_pointer = VirtAddr::new(kernel_rsp);
-                f.stack_segment = gdt::kernel_data_selector();
-            });
-        }
+        frame.rip = fault_kill_trampoline as *const () as u64;
+        frame.cs = u64::from(gdt::kernel_code_selector().0);
+        frame.rflags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG.bits();
+        frame.rsp = kernel_rsp;
+        frame.ss = u64::from(gdt::kernel_data_selector().0);
         return;
     }
-    _panic_print(format_args!("[int] GPF: {:?}\n", stack_frame));
-    let selector_idx = _err >> 3;
-    let table = (_err >> 1) & 3;
-    let external = _err & 1;
+    _panic_print(format_args!(
+        "[int] GPF (ring 0): rip={:#x} cs={:#x} rflags={:#x} rsp={:#x}\n",
+        frame.rip, frame.cs, frame.rflags, frame.rsp,
+    ));
+    let selector_idx = err >> 3;
+    let table = (err >> 1) & 3;
+    let external = err & 1;
     _panic_print(format_args!(
         "[int] GPF error_code={:#x} (selector_idx={}, table={}, external={})\n",
-        _err, selector_idx, table, external
+        err, selector_idx, table, external
     ));
     panic_diag::dump_crash_context();
     crate::trace::dump_trace_rings();
@@ -3591,6 +3551,30 @@ core::arch::global_asm!(
     "3:",
     ".endm",
     "",
+    // Error-code variants (#PF/#GP): the CPU pushed an 8-byte error code below
+    // the iretq frame, so after kpti_save_gprs cs sits at [rsp+136], not
+    // [rsp+128].
+    ".macro kpti_entry_switch_err",
+    "test qword ptr [rsp + 136], 3",
+    "jz 4f",
+    "mov rax, gs:[IRQ_OFF_USER_CR3]",
+    "test rax, rax",
+    "jz 4f",
+    "mov rax, gs:[IRQ_OFF_KERNEL_CR3]",
+    "mov cr3, rax",
+    "4:",
+    ".endm",
+    "",
+    ".macro kpti_exit_switch_err",
+    "test qword ptr [rsp + 136], 3",
+    "jz 5f",
+    "mov rax, gs:[IRQ_OFF_USER_CR3]",
+    "test rax, rax",
+    "jz 5f",
+    "mov cr3, rax",
+    "5:",
+    ".endm",
+    "",
     // A no-error-code vector whose body is `extern "C" fn(&mut TrapFrame)`.
     r".macro kpti_simple_stub name, body",
     r".global \name",
@@ -3714,6 +3698,40 @@ core::arch::global_asm!(
     "kpti_restore_gprs",
     "iretq",
     "",
+    // --- #PF / #GP (error-code exceptions; body is `fn(&mut TrapFrameErr)`) ----
+    // The body may rewrite the frame's cs to a ring-0 fault-kill trampoline; the
+    // exit switch re-tests cs, so such a redirect returns on the kernel CR3.
+    // `add rsp, 8` discards the CPU error code (iretq does not pop it).
+    ".global page_fault_entry",
+    "page_fault_entry:",
+    "kpti_save_gprs",
+    "kpti_entry_switch_err",
+    "cld",
+    "mov rdi, rsp", // &mut TrapFrameErr
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call page_fault_body",
+    "mov rsp, r12",
+    "kpti_exit_switch_err",
+    "kpti_restore_gprs",
+    "add rsp, 8", // discard error code
+    "iretq",
+    "",
+    ".global general_protection_fault_entry",
+    "general_protection_fault_entry:",
+    "kpti_save_gprs",
+    "kpti_entry_switch_err",
+    "cld",
+    "mov rdi, rsp",
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call general_protection_fault_body",
+    "mov rsp, r12",
+    "kpti_exit_switch_err",
+    "kpti_restore_gprs",
+    "add rsp, 8",
+    "iretq",
+    "",
     "kpti_simple_stub keyboard_entry, keyboard_body",
     "kpti_simple_stub serial_entry, serial_body",
     "kpti_simple_stub mouse_entry, mouse_body",
@@ -3749,6 +3767,8 @@ core::arch::global_asm!(
 );
 
 unsafe extern "C" {
+    fn page_fault_entry();
+    fn general_protection_fault_entry();
     fn keyboard_entry();
     fn serial_entry();
     fn mouse_entry();
