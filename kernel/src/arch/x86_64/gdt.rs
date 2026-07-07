@@ -178,6 +178,21 @@ pub fn tss_extent() -> (u64, u64) {
     (base, core::mem::size_of::<TaskStateSegment>() as u64)
 }
 
+/// Phase 110 Track A.3b (KPTI) — the BSP TSS's NMI and #DF IST stack tops
+/// (`interrupt_stack_table[NMI_IST_INDEX]`, `[DOUBLE_FAULT_IST_INDEX]`).
+///
+/// The paranoid NMI/#DF naked stubs run on these IST stacks; when KPTI is active
+/// and one fires while ring 3 is on the user CR3, the CPU switches RSP to the IST
+/// top and pushes the trap frame there *before* the stub can switch CR3 — so the
+/// user-half entry set must map each IST stack's top page. AP IST tops live in
+/// their own `PerCoreData.tss_ptr` TSS and are read there.
+pub fn bsp_ist_tops() -> [u64; 2] {
+    [
+        TSS.interrupt_stack_table[NMI_IST_INDEX as usize].as_u64(),
+        TSS.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize].as_u64(),
+    ]
+}
+
 /// Update TSS.RSP0 (privilege stack 0) at runtime.
 ///
 /// Called when a new kernel stack should be used for ring-3 → ring-0

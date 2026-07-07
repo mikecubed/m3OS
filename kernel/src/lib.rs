@@ -9,7 +9,10 @@
 //! reach scheduler / SMP / pipe internals.
 
 #![no_std]
-#![feature(abi_x86_interrupt)]
+// Phase 110 A.3b — the `abi_x86_interrupt` feature was dropped once every
+// interrupt/exception vector became a naked-asm entry stub (KPTI needs to own
+// the `iretq` for the CR3 exit switch), so no `extern "x86-interrupt"` fn
+// remains in the kernel.
 #![cfg_attr(test, feature(custom_test_frameworks))]
 #![cfg_attr(test, test_runner(crate::testing::test_runner))]
 #![cfg_attr(test, reexport_test_harness_main = "test_main")]

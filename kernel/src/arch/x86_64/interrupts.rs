@@ -48,7 +48,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use kernel_core::input::{ScancodeRouter, ScancodeSink};
 use spin::{Lazy, Mutex};
 use x86_64::VirtAddr;
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::structures::idt::{InterruptDescriptorTable, PageFaultErrorCode};
 
 use crate::panic_diag;
 use crate::serial::_panic_print;
@@ -1172,9 +1172,13 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
             general_protection_fault_entry as *const () as u64,
         ));
     }
+    // Phase 110 A.3b — #DF uses the paranoid KPTI naked stub (`double_fault_entry`
+    // → `double_fault_body`). It runs on the DF IST stack, whose top page is
+    // user-mapped by `mm::kpti` so a #DF that escalates while ring 3 is on the
+    // user CR3 can still push its frame.
     unsafe {
         idt.double_fault
-            .set_handler_fn(double_fault_handler)
+            .set_handler_addr(VirtAddr::new(double_fault_entry as *const () as u64))
             .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
     }
     // NMI (vector 2) — used as the cross-core TLB shootdown delivery
@@ -1196,9 +1200,11 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     // (`invlpg`/CR3-reload + atomic decrement — fault-free), so it never
     // re-enables NMI mid-handler and cannot nest on the shared IST stack. See
     // `docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md`.
+    // Phase 110 A.3b — NMI uses the paranoid KPTI naked stub (`nmi_entry` →
+    // `nmi_body`) on its own IST stack (top page user-mapped by `mm::kpti`).
     unsafe {
         idt.non_maskable_interrupt
-            .set_handler_fn(nmi_handler)
+            .set_handler_addr(VirtAddr::new(nmi_entry as *const () as u64))
             .set_stack_index(gdt::NMI_IST_INDEX);
     }
 
@@ -2060,10 +2066,10 @@ extern "C" fn general_protection_fault_body(frame: &mut TrapFrameErr) {
 /// kstack/heap data pointers are GiBs away and filtered out. Boyer–Moore
 /// majority voting finds the most-repeated address in O(1) space; the printed
 /// `delta` (addr − anchor) resolves offline via
-/// `addr2line -e kernel $((<elf vaddr of double_fault_handler> + delta))`.
+/// `addr2line -e kernel $((<elf vaddr of double_fault_body> + delta))`.
 fn dump_kstack_overflow_backtrace(slot: usize, faulting_rsp: u64) {
     let (usable_base, top) = crate::task::kstack::slot_usable_bounds(slot);
-    let anchor = double_fault_handler as *const () as u64;
+    let anchor = double_fault_body as *const () as u64;
     const WINDOW: u64 = 16 * 1024 * 1024;
     let is_text = |v: u64| -> bool {
         let d = v.wrapping_sub(anchor) as i64;
@@ -2175,7 +2181,13 @@ fn dump_kstack_overflow_backtrace(slot: usize, faulting_rsp: u64) {
     }
 }
 
-extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame, _err: u64) -> ! {
+/// `#DF` body — Phase 110 A.3b moved this onto the KPTI-aware **paranoid** naked
+/// `double_fault_entry` stub (IST stack; can interrupt either ring, so the stub
+/// saves/restores the entry CR3 rather than ring-testing). Takes the full-GPR
+/// [`TrapFrameErr`] (the CPU pushes a 0 error code for #DF). `-> !`: never
+/// returns to the stub (halts or hands off to `fault_kill_trampoline`).
+#[unsafe(no_mangle)]
+extern "C" fn double_fault_body(frame: &mut TrapFrameErr) -> ! {
     // Track D: a #DF whose faulting context's RSP sits in a kstack guard page is
     // a kernel-stack overflow that *escalated* — the guard-page #PF couldn't push
     // its frame onto the exhausted stack, so it double-faulted. We are now on the
@@ -2183,7 +2195,7 @@ extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame,
     // we can run the kill path directly (no stack switch needed) and reschedule,
     // converting a previously-fatal #DF into a SIGSEGV of the offending process.
     // See docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md.
-    let faulting_rsp = stack_frame.stack_pointer.as_u64();
+    let faulting_rsp = frame.rsp;
     if let Some(slot) = crate::task::kstack::classify_guard_page_fault(faulting_rsp)
         && crate::smp::is_per_core_ready()
     {
@@ -2205,11 +2217,11 @@ extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame,
         }
     }
 
-    _panic_print(format_args!("[int] DOUBLE FAULT: {:?}\n", stack_frame));
     _panic_print(format_args!(
-        "[int] IST RSP={:#x}\n",
-        stack_frame.stack_pointer.as_u64()
+        "[int] DOUBLE FAULT: rip={:#x} cs={:#x} rflags={:#x} rsp={:#x}\n",
+        frame.rip, frame.cs, frame.rflags, frame.rsp,
     ));
+    _panic_print(format_args!("[int] IST RSP={:#x}\n", frame.rsp));
     panic_diag::dump_crash_context();
     crate::trace::dump_trace_rings();
     crate::hlt_loop();
@@ -3120,7 +3132,14 @@ extern "C" fn tlb_shootdown_ipi_body(frame: &mut TrapFrame) {
 ///
 /// NMI does **not** require `lapic_eoi()` — NMI is delivered out of
 /// band of the LAPIC ISR/IRR machinery.
-extern "x86-interrupt" fn nmi_handler(_stack_frame: InterruptStackFrame) {
+/// `NMI` body — Phase 110 A.3b moved this onto the KPTI-aware **paranoid** naked
+/// `nmi_entry` stub. NMI is the cross-core TLB-shootdown receiver and fires
+/// regardless of ring or CR3 (including inside another stub's brief user-CR3
+/// window), so the stub cannot ring-test: it saves the entry CR3, switches to
+/// the kernel CR3, and restores the saved CR3 on exit (Linux `paranoid_entry`).
+/// `frame` is unused today (kept for parity / future register inspection).
+#[unsafe(no_mangle)]
+extern "C" fn nmi_body(_frame: &mut TrapFrame) {
     // Phase 111 (Track C.4) — kgdb all-stop. When the in-kernel GDB stub owns
     // the machine, every OTHER core parks here (spins until released) so the
     // developer inspects a frozen system, then resumes exactly where it was.
@@ -3575,6 +3594,30 @@ core::arch::global_asm!(
     "5:",
     ".endm",
     "",
+    // Paranoid entry/exit for NMI + #DF (IST stacks). They can interrupt EITHER
+    // ring — including ring-0 code already on the user CR3 inside another stub's
+    // switch window — so a `cs`-based ring test is wrong. Instead save the entry
+    // CR3 in r15 (callee-saved across the body call; the interrupted r15 lives in
+    // the frame and is restored by kpti_restore_gprs) and unconditionally load
+    // the kernel CR3 when KPTI is active; the exit restores the saved CR3. When
+    // KPTI is inactive (`kpti_kernel_cr3 == 0`) neither touches CR3.
+    ".macro kpti_paranoid_entry",
+    "mov r15, cr3",
+    "mov rax, gs:[IRQ_OFF_KERNEL_CR3]",
+    "test rax, rax",
+    "jz 6f",
+    "mov cr3, rax",
+    "6:",
+    ".endm",
+    "",
+    ".macro kpti_paranoid_exit",
+    "mov rax, gs:[IRQ_OFF_KERNEL_CR3]",
+    "test rax, rax",
+    "jz 7f",
+    "mov cr3, r15",
+    "7:",
+    ".endm",
+    "",
     // A no-error-code vector whose body is `extern "C" fn(&mut TrapFrame)`.
     r".macro kpti_simple_stub name, body",
     r".global \name",
@@ -3732,6 +3775,39 @@ core::arch::global_asm!(
     "add rsp, 8",
     "iretq",
     "",
+    // --- NMI (paranoid; IST stack; no error code) -----------------------------
+    ".global nmi_entry",
+    "nmi_entry:",
+    "kpti_save_gprs",
+    "kpti_paranoid_entry",
+    "cld",
+    "mov rdi, rsp", // &mut TrapFrame
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call nmi_body",
+    "mov rsp, r12",
+    "kpti_paranoid_exit",
+    "kpti_restore_gprs",
+    "iretq",
+    "",
+    // --- #DF (paranoid; IST stack; CPU pushes a 0 error code; body is `-> !`) --
+    ".global double_fault_entry",
+    "double_fault_entry:",
+    "kpti_save_gprs",
+    "kpti_paranoid_entry",
+    "cld",
+    "mov rdi, rsp", // &mut TrapFrameErr
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call double_fault_body",
+    // double_fault_body is `-> !`; the tail below is unreachable but kept
+    // well-formed so the stub is a valid function.
+    "mov rsp, r12",
+    "kpti_paranoid_exit",
+    "kpti_restore_gprs",
+    "add rsp, 8",
+    "iretq",
+    "",
     "kpti_simple_stub keyboard_entry, keyboard_body",
     "kpti_simple_stub serial_entry, serial_body",
     "kpti_simple_stub mouse_entry, mouse_body",
@@ -3769,6 +3845,8 @@ core::arch::global_asm!(
 unsafe extern "C" {
     fn page_fault_entry();
     fn general_protection_fault_entry();
+    fn nmi_entry();
+    fn double_fault_entry();
     fn keyboard_entry();
     fn serial_entry();
     fn mouse_entry();

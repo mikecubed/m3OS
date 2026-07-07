@@ -454,6 +454,27 @@ impl PerCoreData {
         };
         [pcd, gdt, tss]
     }
+
+    /// Phase 110 Track A.3b (KPTI) — this core's NMI and #DF IST stack tops
+    /// (`interrupt_stack_table[NMI_IST_INDEX]`, `[DOUBLE_FAULT_IST_INDEX]`).
+    ///
+    /// The paranoid NMI/#DF stubs run on these IST stacks; the CPU switches RSP
+    /// to the IST top and pushes the trap frame there on the *active* (user) CR3
+    /// before the stub can switch, so the user-half entry set must map each
+    /// stack's top page. BSP (`tss_ptr` null) falls back to the global TSS.
+    pub fn ist_top_pages(&self) -> [u64; 2] {
+        if self.tss_ptr.is_null() {
+            crate::arch::x86_64::gdt::bsp_ist_tops()
+        } else {
+            // SAFETY: `tss_ptr` points at this core's live TSS (set at AP init);
+            // we only read the IST table entries (VirtAddr values).
+            let tss = unsafe { &*self.tss_ptr };
+            [
+                tss.interrupt_stack_table[NMI_IST_INDEX as usize].as_u64(),
+                tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize].as_u64(),
+            ]
+        }
+    }
 }
 
 /// Global array of per-core data pointers. Indexed by logical core_id (0 = BSP).

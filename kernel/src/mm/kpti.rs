@@ -34,11 +34,14 @@
 //! of physical memory; see [`kernel_core::kpti::may_clone_slot_into_user_half`]).
 //!
 //! The entry set ([`collect_entry_pages`]) is, per **online core** (a process
-//! may run on any core): its `PerCoreData`, GDT, and TSS; plus the shared
-//! page-aligned `.text.kpti_entry` section (both SYSCALL stubs + body + tail,
-//! A.2) and the IDT. The CPU reads GDT/IDT/TSS through the *active* paging when
-//! delivering a ring-3 → ring-0 interrupt, so all must be user-mapped or
-//! delivery itself triple-faults. [`build_user_half`] adds the two per-process
+//! may run on any core): its `PerCoreData`, GDT, TSS, and the top page of each
+//! of its NMI + `#DF` IST stacks; plus the shared page-aligned `.text.kpti_entry`
+//! section (both SYSCALL stubs + body + tail, A.2), the `.text.kpti_irq_entry`
+//! section (A.3b: the naked IRQ/exception entry stubs — the CPU begins executing
+//! them on the user CR3 when an interrupt fires while ring 3 runs), and the IDT.
+//! The CPU reads GDT/IDT/TSS and switches to the IST top through the *active*
+//! paging when delivering a ring-3 → ring-0 interrupt, so all must be user-mapped
+//! or delivery itself triple-faults. [`build_user_half`] adds the two per-process
 //! bits: the shared user lower half (`PML4[0]`, the same frame the kernel half
 //! points at, so mmap/brk/stack stay in sync) and this process's **kstack top
 //! page** — where the CPU pushes the interrupt frame on the user CR3 before the
@@ -388,6 +391,17 @@ fn collect_entry_pages() -> Option<Vec<(u64, u64, PageTableFlags)>> {
         }
         for (base, size) in pcd.entry_struct_extents() {
             push_kernel_range(&kmapper, &mut out, base, base + size, RW)?;
+        }
+        // A.3b — the NMI + #DF IST stack top pages. The paranoid stubs run on
+        // these; the CPU pushes the trap frame onto the IST top on the user CR3
+        // before the stub can switch, so each top page must be user-mapped (the
+        // rest of the IST stack reappears once the stub is on the kernel CR3).
+        for ist_top in pcd.ist_top_pages() {
+            if ist_top == 0 {
+                continue;
+            }
+            let top_page = (ist_top - 1) & !0xFFF;
+            push_kernel_range(&kmapper, &mut out, top_page, top_page + 0x1000, RW)?;
         }
     }
 
