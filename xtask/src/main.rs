@@ -23459,9 +23459,27 @@ fn smp_smoke_steps(fast_iter: bool) -> Vec<SmokeStep> {
     // a wrongful spurious-fault kill) fail fast too. Kept ~150 chars (the working
     // node-smoke `node -e` length — longer command bursts can outrun the COM1 RX
     // feeder). `'SMP'+'_STRESS_OK'` so the Wait keys on real output, not the echo.
+    //
+    // `--jitless` is REQUIRED and load-bearing here (not a perf tweak): the 256×
+    // pbkdf2 loop is hot enough that V8 tiers it up and JIT-compiles it, and the
+    // JIT then requests `mprotect(addr, len, PROT_READ|WRITE|EXEC)` for its code
+    // space. m3OS enforces W^X — on the no-PKU TCG lane (W^X v1, no pkey-guarded
+    // W+X) that mprotect is correctly REJECTED with EINVAL, but V8's
+    // `OS::SetPermissions` asserts `CHECK_EQ(ENOMEM, errno)` and hard-aborts
+    // (`int3`) on any non-ENOMEM failure → the process is killed and the SMP test
+    // never completes. This is a deterministic W^X-vs-JIT conflict, NOT an SMP
+    // scheduler bug (it was misfiled as a "lost-wakeup / errno race" — the actual
+    // signature is `[int] userspace GPF ... process killed` right after a
+    // `mprotect ... prot=0x7 -> errno 22`). Running Ignition-only with `--jitless`
+    // emits zero W+X mappings, so the gate exercises the libuv-threadpool ↔
+    // event-loop futex handshakes (its real purpose) without the JIT crash. The
+    // base node port is jitless-intended anyway (JIT is the separate
+    // `node-jit-smoke` gate, KVM+PKU); pinning `--jitless` on the command also
+    // makes this gate deterministic regardless of V8's tier-up heuristics or which
+    // node `.m3pkg` variant is installed.
     steps.push(SmokeStep::Send {
-        input: "node -e \"const c=require('crypto');let d=0;for(let i=0;i!==256;i++)c.pbkdf2('p','s',2000,32,'sha256',()=>++d===256&&console.log('SMP'+'_STRESS_OK '+d))\"\n",
-        label: "smp-smoke: futex-heavy threadpool stress (256 async pbkdf2 ops)",
+        input: "node --jitless -e \"const c=require('crypto');let d=0;for(let i=0;i!==256;i++)c.pbkdf2('p','s',2000,32,'sha256',()=>++d===256&&console.log('SMP'+'_STRESS_OK '+d))\"\n",
+        label: "smp-smoke: futex-heavy threadpool stress (256 async pbkdf2 ops, jitless)",
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "SMP_STRESS_OK 256",
