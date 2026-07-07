@@ -43,7 +43,6 @@
 //! 3 is the rule that class of bug violated. Every handler below
 //! relies on at least one of the three lock disciplines it enumerates.
 
-use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use kernel_core::input::{ScancodeRouter, ScancodeSink};
@@ -1304,112 +1303,12 @@ pub fn init() {
 // loads the interrupted task's r12 from the frame slot — the scratch value
 // in the live register is overwritten by the pop, which is correct.
 
-global_asm!(
-    // -----------------------------------------------------------------------
-    // Shared macros: GPR save / restore used by both stubs.
-    // -----------------------------------------------------------------------
-    ".macro save_gprs_all",
-    "push r15",
-    "push r14",
-    "push r13",
-    "push r12",
-    "push r11",
-    "push r10",
-    "push r9",
-    "push r8",
-    "push rbp",
-    "push rdi",
-    "push rsi",
-    "push rdx",
-    "push rcx",
-    "push rbx",
-    "push rax",
-    ".endm",
-    "",
-    ".macro restore_gprs_all",
-    "pop rax",
-    "pop rbx",
-    "pop rcx",
-    "pop rdx",
-    "pop rsi",
-    "pop rdi",
-    "pop rbp",
-    "pop r8",
-    "pop r9",
-    "pop r10",
-    "pop r11",
-    "pop r12",
-    "pop r13",
-    "pop r14",
-    "pop r15",
-    ".endm",
-    "",
-    // -----------------------------------------------------------------------
-    // timer_entry
-    // -----------------------------------------------------------------------
-    ".global timer_entry",
-    "timer_entry:",
-    // CS is at [rsp+8] on both ring-0 (3-field frame: rip/cs/rflags) and
-    // ring-3 (5-field frame: rip/cs/rflags/rsp/ss) IRQ entries.
-    "test QWORD PTR [rsp+8], 3",
-    "jnz .Ltimer_user",
-    "",
-    // --- Kernel path --------------------------------------------------------
-    ".Ltimer_kernel:",
-    "save_gprs_all",
-    // After 15 pushes, rsp = &gprs[0].
-    // interrupted RSP = rsp + 15*8 + 3*8 = rsp + 144.
-    "lea rsi, [rsp + 144]", // arg2: captured_kernel_rsp
-    "cld",
-    "mov rdi, rsp", // arg1: &PreemptTrapFrameKernel
-    "mov r12, rsp", // save pre-alignment rsp (r12 is callee-saved)
-    "and rsp, -16", // align to 16 bytes for SysV call ABI
-    "call timer_handler_kernel",
-    "mov rsp, r12", // restore (pop r12 below loads original r12 from frame)
-    "restore_gprs_all",
-    "iretq",
-    "",
-    // --- User path ----------------------------------------------------------
-    ".Ltimer_user:",
-    "save_gprs_all",
-    // After 15 GPR pushes + 5 CPU-pushed fields = 160 bytes.
-    // If TSS.RSP0 is 16-aligned, 160 ≡ 0 (mod 16) → already aligned.
-    "cld",
-    "mov rdi, rsp", // arg1: &mut PreemptTrapFrameUser
-    "call timer_handler_user",
-    "restore_gprs_all",
-    "iretq",
-    "",
-    // -----------------------------------------------------------------------
-    // reschedule_ipi_entry
-    // -----------------------------------------------------------------------
-    ".global reschedule_ipi_entry",
-    "reschedule_ipi_entry:",
-    "test QWORD PTR [rsp+8], 3",
-    "jnz .Lrescheduleipi_user",
-    "",
-    // --- Kernel path --------------------------------------------------------
-    ".Lrescheduleipi_kernel:",
-    "save_gprs_all",
-    "lea rsi, [rsp + 144]",
-    "cld",
-    "mov rdi, rsp",
-    "mov r12, rsp",
-    "and rsp, -16",
-    "call reschedule_ipi_handler_kernel",
-    "mov rsp, r12",
-    "restore_gprs_all",
-    "iretq",
-    "",
-    // --- User path ----------------------------------------------------------
-    ".Lrescheduleipi_user:",
-    "save_gprs_all",
-    "cld",
-    "mov rdi, rsp",
-    "call reschedule_ipi_handler_user",
-    "restore_gprs_all",
-    "iretq",
-);
+// Phase 110 Track A.3b — `timer_entry` and `reschedule_ipi_entry` moved into the
+// page-aligned `.text.kpti_irq_entry` section (bottom of this file) so they are
+// user-mapped and gain the KPTI entry/exit CR3 discipline. They keep their
+// ring-aware two-path shape (user path → `*_handler_user`, kernel path →
+// `*_handler_kernel` with the captured kernel RSP); the CR3 switch is applied
+// only on the user path (a ring-0 interruption is already on the kernel CR3).
 
 // ---------------------------------------------------------------------------
 // Phase 57d C.2 — preempt_resume_to_user
@@ -1587,83 +1486,15 @@ unsafe extern "C" {
 // Phase 111 Track C.2 — full-GPR #BP / #DB entry stubs
 // ---------------------------------------------------------------------------
 //
-// Same shape as the preempt stubs above (save all 15 GPRs before any Rust
-// prologue runs, r15 first → rax last so rax lands at `gprs[0]`), but with NO
-// user/kernel asm split: in 64-bit mode the CPU pushes the full 5-field iretq
-// frame (`rip/cs/rflags/rsp/ss`) unconditionally — SS:RSP is pushed even
-// without a privilege change (Intel SDM Vol 3A §6.14.2) — so one
-// `DebugTrapFrame` layout serves both rings and the ring test happens in Rust
-// (`frame.cs & 3`).
-//
-// Alignment: an error-code-less exception leaves rsp ≡ 8 (mod 16) at entry
-// (CPU aligns to 16 then pushes 40 bytes); 15 GPR pushes keep that parity, so
-// we re-align with the same r12 trick as the preempt kernel path (`pop r12`
-// after the call restores the interrupted r12 from the frame slot).
-//
-// Distinct macro names from the preempt block: each `global_asm!` invocation
-// is its own assembly unit, but keeping the names unique avoids any doubt.
-
-global_asm!(
-    ".macro dbg_save_gprs",
-    "push r15",
-    "push r14",
-    "push r13",
-    "push r12",
-    "push r11",
-    "push r10",
-    "push r9",
-    "push r8",
-    "push rbp",
-    "push rdi",
-    "push rsi",
-    "push rdx",
-    "push rcx",
-    "push rbx",
-    "push rax",
-    ".endm",
-    "",
-    ".macro dbg_restore_gprs",
-    "pop rax",
-    "pop rbx",
-    "pop rcx",
-    "pop rdx",
-    "pop rsi",
-    "pop rdi",
-    "pop rbp",
-    "pop r8",
-    "pop r9",
-    "pop r10",
-    "pop r11",
-    "pop r12",
-    "pop r13",
-    "pop r14",
-    "pop r15",
-    ".endm",
-    "",
-    ".global bp_entry",
-    "bp_entry:",
-    "dbg_save_gprs",
-    "cld",
-    "mov rdi, rsp", // arg1: &mut DebugTrapFrame
-    "mov r12, rsp", // save pre-alignment rsp (callee-saved across the call)
-    "and rsp, -16",
-    "call bp_trap_handler",
-    "mov rsp, r12",
-    "dbg_restore_gprs",
-    "iretq",
-    "",
-    ".global db_entry",
-    "db_entry:",
-    "dbg_save_gprs",
-    "cld",
-    "mov rdi, rsp",
-    "mov r12, rsp",
-    "and rsp, -16",
-    "call db_trap_handler",
-    "mov rsp, r12",
-    "dbg_restore_gprs",
-    "iretq",
-);
+// Phase 110 A.3b moved `bp_entry` / `db_entry` into the page-aligned
+// `.text.kpti_irq_entry` section (bottom of this file) so they are user-mapped
+// and gain the KPTI entry/exit CR3 discipline — a ring-3 `int3` (ptrace) or
+// single-step (`RFLAGS.TF`) enters on the user CR3 like any other ring-3 trap.
+// They keep the Track C.2 shape: save all 15 GPRs before any Rust prologue runs
+// (r15 first → rax last so rax lands at `gprs[0]`), NO user/kernel asm split
+// (the CPU pushes the full 5-field iretq frame unconditionally in long mode, so
+// one `DebugTrapFrame`/`TrapFrame` layout serves both rings and the ring test
+// happens in Rust via `frame.cs & 3`), and the r12 re-align trick.
 
 unsafe extern "C" {
     fn bp_entry();
@@ -3799,6 +3630,89 @@ core::arch::global_asm!(
     ".balign 4096",
     ".global kpti_irq_entry_start",
     "kpti_irq_entry_start:",
+    "",
+    // --- timer_entry (Phase 57d Track B; two-path, CR3 on the user path) ------
+    // CS is at [rsp+8] before any push on both the ring-0 (3-field) and ring-3
+    // (5-field) IRQ frames.
+    ".global timer_entry",
+    "timer_entry:",
+    "test qword ptr [rsp+8], 3",
+    "jz .Ltimer_kernel",
+    // User path (ring 3): switch to kernel CR3 on entry, back to user on exit.
+    "kpti_save_gprs",
+    "kpti_entry_switch",
+    "cld",
+    "mov rdi, rsp", // &mut PreemptTrapFrameUser
+    "call timer_handler_user",
+    "kpti_exit_switch", // re-tests cs — group-exit redirect may have rewritten it
+    "kpti_restore_gprs",
+    "iretq",
+    // Kernel path (ring 0): already on the kernel CR3, no switch.
+    ".Ltimer_kernel:",
+    "kpti_save_gprs",
+    "lea rsi, [rsp + 144]", // captured_kernel_rsp = rsp + 15*8 + 3*8
+    "cld",
+    "mov rdi, rsp", // &mut PreemptTrapFrameKernel
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call timer_handler_kernel",
+    "mov rsp, r12",
+    "kpti_restore_gprs",
+    "iretq",
+    "",
+    // --- reschedule_ipi_entry -------------------------------------------------
+    ".global reschedule_ipi_entry",
+    "reschedule_ipi_entry:",
+    "test qword ptr [rsp+8], 3",
+    "jz .Lrescheduleipi_kernel",
+    "kpti_save_gprs",
+    "kpti_entry_switch",
+    "cld",
+    "mov rdi, rsp",
+    "call reschedule_ipi_handler_user",
+    "kpti_exit_switch",
+    "kpti_restore_gprs",
+    "iretq",
+    ".Lrescheduleipi_kernel:",
+    "kpti_save_gprs",
+    "lea rsi, [rsp + 144]",
+    "cld",
+    "mov rdi, rsp",
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call reschedule_ipi_handler_kernel",
+    "mov rsp, r12",
+    "kpti_restore_gprs",
+    "iretq",
+    "",
+    // --- #BP / #DB (Phase 111 Track C.2; single layout, ring test in Rust) ----
+    ".global bp_entry",
+    "bp_entry:",
+    "kpti_save_gprs",
+    "kpti_entry_switch",
+    "cld",
+    "mov rdi, rsp", // &mut DebugTrapFrame
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call bp_trap_handler",
+    "mov rsp, r12",
+    "kpti_exit_switch",
+    "kpti_restore_gprs",
+    "iretq",
+    "",
+    ".global db_entry",
+    "db_entry:",
+    "kpti_save_gprs",
+    "kpti_entry_switch",
+    "cld",
+    "mov rdi, rsp",
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call db_trap_handler",
+    "mov rsp, r12",
+    "kpti_exit_switch",
+    "kpti_restore_gprs",
+    "iretq",
     "",
     "kpti_simple_stub keyboard_entry, keyboard_body",
     "kpti_simple_stub serial_entry, serial_body",
