@@ -45,6 +45,12 @@ use x86_64::{
 /// still pins the holder against 57d/57e voluntary or full preemption.
 pub struct AddressSpace {
     pml4_phys: PhysAddr,
+    /// Phase 110 A.3b part 5 — the KPTI **user-half** PML4 for this address
+    /// space (0 = none built). Built by [`AddressSpace::build_kpti_user_half`]
+    /// at process creation / execve when KPTI is active; A.4's dispatch prep
+    /// publishes it to `gs:[kpti_user_cr3]` for the entry/exit stubs to load
+    /// as the ring-3 CR3. Freed by `Drop` via [`kpti::free_user_half`].
+    kpti_user_pml4: AtomicU64,
     generation: AtomicU64,
     active_on_cores: AtomicU64,
     page_table_lock: spin::Mutex<()>,
@@ -81,6 +87,7 @@ impl AddressSpace {
     pub fn new(pml4_phys: PhysAddr) -> Self {
         Self {
             pml4_phys,
+            kpti_user_pml4: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             active_on_cores: AtomicU64::new(0),
             page_table_lock: spin::Mutex::new(()),
@@ -89,6 +96,72 @@ impl AddressSpace {
 
     pub fn pml4_phys(&self) -> PhysAddr {
         self.pml4_phys
+    }
+
+    /// Phase 110 A.3b part 5 — build + attach the KPTI user-half PML4 for this
+    /// address space. `kstack_top` is the owning task's kernel-stack top (the
+    /// value published to `gs:[SYSCALL_STACK_TOP]` / TSS.RSP0 at dispatch; its
+    /// top page is the one kstack page the user half maps).
+    ///
+    /// No-op (returning `true`) while KPTI is inactive — the inert
+    /// `KPTI_WIRED=false` production path adds zero per-process overhead.
+    /// Returns `false` on allocation failure (logged); A.4 treats a missing
+    /// user half at dispatch as fatal for the process rather than silently
+    /// running it unisolated.
+    pub fn build_kpti_user_half(&self, kstack_top: u64) -> bool {
+        if !crate::mitigations::state().is_some_and(|s| s.kpti_active) {
+            return true;
+        }
+        // SAFETY: `pml4_phys` is this process's live kernel PML4 and
+        // `kstack_top` a mapped kernel-stack top, per the constructor contracts
+        // of every call site (spawn/fork/execve).
+        match unsafe { kpti::build_user_half(self.pml4_phys.as_u64(), kstack_top) } {
+            Some(user) => {
+                self.kpti_user_pml4.store(user, Ordering::Release);
+                true
+            }
+            None => {
+                log::error!(
+                    "kpti: build_user_half failed for pml4={:#x} (out of frames?)",
+                    self.pml4_phys.as_u64()
+                );
+                false
+            }
+        }
+    }
+
+    /// The KPTI user-half PML4 physical address (0 = none built). A.4's
+    /// dispatch prep publishes this to `gs:[kpti_user_cr3]`.
+    pub fn kpti_user_pml4(&self) -> u64 {
+        self.kpti_user_pml4.load(Ordering::Acquire)
+    }
+
+    /// Phase 110 A.3b part 5 — map an additional thread's kernel-stack **top
+    /// page** into this address space's user half (`CLONE_VM` path): the CPU
+    /// pushes that thread's ring-3 interrupt frames onto *its own* kstack top
+    /// on the user CR3, so every thread's top page must be user-mapped, not
+    /// just the creating task's.
+    ///
+    /// No-op (returning `true`) when no user half exists (KPTI inactive).
+    /// Serialized against other mappers via the page-table lock.
+    pub fn kpti_map_thread_kstack(&self, kstack_top: u64) -> bool {
+        let user = self.kpti_user_pml4.load(Ordering::Acquire);
+        if user == 0 {
+            return true;
+        }
+        let _guard = self.lock_page_tables();
+        // SAFETY: `user` was built by `build_user_half` for this address
+        // space; `kstack_top` is a freshly-allocated mapped kstack top; the
+        // page-table lock serializes concurrent mappers.
+        let ok = unsafe { kpti::map_kstack_top_into_user_half(user, kstack_top) }.is_some();
+        if !ok {
+            log::error!(
+                "kpti: mapping thread kstack top {:#x} into user half {:#x} failed",
+                kstack_top,
+                user
+            );
+        }
+        ok
     }
 
     pub fn activate_on_core(&self, core_id: u8) {
@@ -129,6 +202,26 @@ impl AddressSpace {
         PageTableGuard {
             _guard: guard,
             _preempt: PageTablePreemptRestore,
+        }
+    }
+}
+
+/// Phase 110 A.3b part 5 — the KPTI user half is freed with the
+/// `AddressSpace`, not with the kernel PML4: `free_process_page_table` (called
+/// manually at the teardown sites) only knows the kernel half, while the last
+/// `Arc<AddressSpace>` drop is the natural end-of-life for the pair.
+/// [`kpti::free_user_half`] frees only the private entry-set sub-tables and
+/// the user PML4 frame itself — never `PML4[0]` (shared with the kernel half)
+/// nor any leaf page — so the ordering relative to
+/// `free_process_page_table(kernel_pml4)` is immaterial.
+impl Drop for AddressSpace {
+    fn drop(&mut self) {
+        let user = *self.kpti_user_pml4.get_mut();
+        if user != 0 {
+            // SAFETY: the last Arc reference is gone, so no core can have this
+            // user half loaded as its CR3 (execve/exit switch away before
+            // dropping the process's Arc).
+            unsafe { kpti::free_user_half(user) };
         }
     }
 }

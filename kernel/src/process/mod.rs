@@ -1485,6 +1485,10 @@ pub fn spawn_process_with_cr3(
 ) -> Pid {
     let kstack_top = alloc_kernel_stack();
     let pid = alloc_pid();
+    // Phase 110 A.3b part 5 — build the KPTI user half alongside the address
+    // space (no-op while KPTI is inactive).
+    let addr_space = Arc::new(AddressSpace::new(cr3));
+    addr_space.build_kpti_user_half(kstack_top);
     let proc = Process {
         pid,
         tid: pid,
@@ -1492,7 +1496,7 @@ pub fn spawn_process_with_cr3(
         clear_child_tid: 0,
         ppid,
         state: ProcessState::Ready,
-        addr_space: Some(Arc::new(AddressSpace::new(cr3))),
+        addr_space: Some(addr_space),
         kernel_stack_top: kstack_top,
         entry_point,
         user_stack_top,
@@ -1554,6 +1558,10 @@ pub fn spawn_process_with_cr3_and_fds(
     let kstack_top = alloc_kernel_stack();
     let pid = alloc_pid();
     let pgid = if inherit_pgid != 0 { inherit_pgid } else { pid };
+    // Phase 110 A.3b part 5 — build the KPTI user half alongside the address
+    // space (no-op while KPTI is inactive).
+    let addr_space = Arc::new(AddressSpace::new(cr3));
+    addr_space.build_kpti_user_half(kstack_top);
     let proc = Process {
         pid,
         tid: pid,
@@ -1561,7 +1569,7 @@ pub fn spawn_process_with_cr3_and_fds(
         clear_child_tid: 0,
         ppid,
         state: ProcessState::Ready,
-        addr_space: Some(Arc::new(AddressSpace::new(cr3))),
+        addr_space: Some(addr_space),
         kernel_stack_top: kstack_top,
         entry_point,
         user_stack_top,

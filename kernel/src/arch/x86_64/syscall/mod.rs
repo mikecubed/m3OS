@@ -5673,9 +5673,13 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // Keep the old AddressSpace alive across the CR3 switch. The process table
     // replacement below drops its Arc, but this core still runs on the old CR3
     // until `Cr3::write(new_cr3)` completes.
-    let _old_addr_space = {
+    let (_old_addr_space, proc_kstack_top) = {
         let table = crate::process::PROCESS_TABLE.lock();
-        table.find(pid).and_then(|p| p.addr_space.as_ref().cloned())
+        let entry = table.find(pid);
+        (
+            entry.and_then(|p| p.addr_space.as_ref().cloned()),
+            entry.map(|p| p.kernel_stack_top).unwrap_or(0),
+        )
     };
     let old_as_ptr = _old_addr_space
         .as_ref()
@@ -5684,6 +5688,10 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let new_addr_space = alloc::sync::Arc::new(crate::mm::AddressSpace::new(
         x86_64::PhysAddr::new(new_cr3.start_address().as_u64()),
     ));
+    // Phase 110 A.3b part 5 — execve replaces the kernel PML4, so the KPTI
+    // user half is rebuilt against it (the process keeps its kstack). No-op
+    // while KPTI is inactive; the old half dies with the old Arc's Drop.
+    new_addr_space.build_kpti_user_half(proc_kstack_top);
     let new_as_ptr = alloc::sync::Arc::as_ptr(&new_addr_space);
 
     // Update the process entry with the new CR3 and entry point.
@@ -19513,6 +19521,12 @@ fn sys_clone_thread(
 
     // Allocate a NEW kernel stack for the child thread.
     let kstack_top = alloc_kernel_stack_pub();
+
+    // Phase 110 A.3b part 5 — the shared user half maps only the creating
+    // task's kstack top page; this thread's ring-3 interrupt frames push onto
+    // ITS kstack top on the user CR3, so map that page too (no-op while KPTI
+    // is inactive).
+    parent_addr_space.kpti_map_thread_kstack(kstack_top);
 
     // Determine TLS: if CLONE_SETTLS, use the provided tls value.
     let child_fs_base = if flags & CLONE_SETTLS != 0 {

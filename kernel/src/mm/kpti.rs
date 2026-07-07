@@ -539,6 +539,52 @@ pub unsafe fn free_user_half(user_pml4_phys: u64) {
     frame_allocator::free_frame(user_pml4_phys);
 }
 
+/// Phase 110 A.3b part 5 — map one additional kernel-stack **top page** into
+/// an existing user half (a `CLONE_VM` thread's own kstack): the CPU pushes
+/// that thread's ring-3 interrupt frames onto *its* kstack top on the user
+/// CR3, so every thread's top page must be present, not just the page
+/// [`build_user_half`] mapped for the creating task.
+///
+/// Sub-tables created here are freed by [`free_user_half`]'s generic
+/// `PML4[1..512]` walk. The mapping only makes absent entries present, so it
+/// is safe while the half is live as a sibling thread's CR3 on another core
+/// (no shootdown needed); the *caller* must serialize concurrent mappers
+/// (`AddressSpace::kpti_map_thread_kstack` holds the page-table lock).
+///
+/// # Safety
+/// `user_pml4_phys` must be a user half built by [`build_user_half`] over this
+/// process's kernel PML4, and `kstack_top_va` a mapped kernel-stack top.
+pub unsafe fn map_kstack_top_into_user_half(user_pml4_phys: u64, kstack_top_va: u64) -> Option<()> {
+    let top_page = (kstack_top_va - 1) & !0xFFF;
+    let phys = {
+        // SAFETY: translation-only mapper over the live kernel CR3, dropped
+        // before the user-half mapper below is created (the A.1 aliasing rule).
+        let kmapper = unsafe { super::paging::get_mapper() };
+        kmapper.translate_addr(VirtAddr::new(top_page))?.as_u64()
+    };
+    let frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(PhysAddr::new(user_pml4_phys));
+    // SAFETY: caller serializes mappers over this user half.
+    let mut mapper = unsafe { mapper_for_frame(frame) };
+    let mut sink: Vec<u64> = Vec::new();
+    let res = {
+        let mut alloc = RecordingAlloc {
+            recorded: &mut sink,
+        };
+        // SAFETY: exclusive mapper (caller-serialized); valid frame from the
+        // live translation above.
+        unsafe { map_entry_page(&mut mapper, top_page, phys, RW, &mut alloc) }
+    };
+    match res {
+        Ok(()) => Some(()),
+        Err(_) => {
+            for f in &sink {
+                frame_allocator::free_frame(*f);
+            }
+            None
+        }
+    }
+}
+
 /// Build a real user-half PML4 via the production [`build_user_half`] over a
 /// synthetic kernel PML4, returning the arena for the caller to walk then free.
 ///
@@ -566,16 +612,38 @@ fn build_selftest_pair() -> Option<SelfTestArena> {
         }
     };
 
+    // A.3b part 5 — exercise the CLONE_VM thread-kstack add path
+    // (`map_kstack_top_into_user_half`) against the just-built half. The page
+    // below the BSP syscall-stack top stands in for a second thread's kstack
+    // top: live-mapped, and not already in the entry set (the builder mapped
+    // only the top page). Its reachability is asserted by the round-trip below
+    // like every other entry-set page.
+    let thread_kstack_top = kstack_top - 0x1000;
+    if unsafe { map_kstack_top_into_user_half(user_pml4_phys, thread_kstack_top) }.is_none() {
+        unsafe { free_user_half(user_pml4_phys) };
+        for f in &owned_frames {
+            frame_allocator::free_frame(*f);
+        }
+        return None;
+    }
+
     // Recompute the entry-set page list (deterministic) for classification +
-    // reachability: the shared set + this half's kstack top page.
+    // reachability: the shared set + this half's kstack top page + the
+    // thread-add page.
     let mut entry_pages = collect_entry_pages()?;
     let top_page = (kstack_top - 1) & !0xFFF;
     // SAFETY: translate through the live kernel map for the expected phys.
-    let kstack_phys = {
+    let (kstack_phys, thread_page_phys) = {
         let kmapper = unsafe { super::paging::get_mapper() };
-        kmapper.translate_addr(VirtAddr::new(top_page))?.as_u64()
+        (
+            kmapper.translate_addr(VirtAddr::new(top_page))?.as_u64(),
+            kmapper
+                .translate_addr(VirtAddr::new((thread_kstack_top - 1) & !0xFFF))?
+                .as_u64(),
+        )
     };
     entry_pages.push((top_page, kstack_phys, RW));
+    entry_pages.push(((thread_kstack_top - 1) & !0xFFF, thread_page_phys, RW));
 
     Some(SelfTestArena {
         owned_frames,
