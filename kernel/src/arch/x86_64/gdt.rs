@@ -50,12 +50,27 @@ pub const USER_CODE_SELECTOR: u16 = 0x20 | 3; // 0x23
 #[allow(dead_code)]
 pub const USER_DATA_SELECTOR: u16 = 0x18 | 3; // 0x1B
 
-/// 16-byte-aligned wrapper for the double-fault stack.
+/// Page-isolation wrapper — the m3OS `cpu_entry_area` primitive (Phase 110
+/// A.3b part 4).
 ///
-/// x86_64 ABI requires the stack pointer to be 16-byte aligned before a CALL.
-/// Using a plain `[u8; N]` only guarantees 1-byte alignment; wrapping it here
-/// ensures the IST pointer we write into the TSS is always correctly aligned.
-#[repr(align(16))]
+/// `align(4096)` forces the wrapped value onto a page boundary **and** (since
+/// Rust rounds a type's size up to a multiple of its alignment) pads its size
+/// to whole pages — so a static or heap allocation of this type owns its pages
+/// exclusively. Interrupt-delivery structures (GDT/IDT/TSS, `PerCoreData`) are
+/// mapped into every KPTI user half at their live addresses; wrapping them in
+/// `PageIsolated` guarantees those mappings expose no adjacent `.data` / heap
+/// neighbours to a Meltdown-style read from ring 3.
+#[repr(C, align(4096))]
+pub struct PageIsolated<T>(pub T);
+
+/// Page-aligned wrapper for the BSP entry stacks (double-fault / NMI / syscall).
+///
+/// x86_64 ABI requires the stack pointer to be 16-byte aligned before a CALL;
+/// Phase 110 A.3b part 4 raises this to 4096: the NMI/#DF IST **top pages**
+/// are mapped into every KPTI user half, so each stack must own its pages
+/// exclusively (the sizes are already page multiples). Page alignment
+/// trivially satisfies the ABI's 16-byte requirement.
+#[repr(align(4096))]
 struct AlignedStack<const N: usize>([u8; N]);
 
 /// Static double-fault stack. Must be static so its address is valid for the
@@ -77,7 +92,7 @@ static mut NMI_STACK: AlignedStack<NMI_STACK_SIZE> = AlignedStack([0; NMI_STACK_
 /// every ring-3 → ring-0 transition. It must be writable and 'static.
 static mut SYSCALL_STACK: AlignedStack<SYSCALL_STACK_SIZE> = AlignedStack([0; SYSCALL_STACK_SIZE]);
 
-static TSS: Lazy<TaskStateSegment> = Lazy::new(|| {
+static TSS: Lazy<PageIsolated<TaskStateSegment>> = Lazy::new(|| {
     let mut tss = TaskStateSegment::new();
     tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
         // Safety: we only take the address of the static here; the CPU writes
@@ -103,7 +118,7 @@ static TSS: Lazy<TaskStateSegment> = Lazy::new(|| {
             unsafe { VirtAddr::from_ptr(core::ptr::addr_of!(SYSCALL_STACK.0).cast::<u8>()) };
         stack_start + SYSCALL_STACK_SIZE as u64
     };
-    tss
+    PageIsolated(tss)
 });
 
 struct Selectors {
@@ -114,7 +129,7 @@ struct Selectors {
     user_data: SegmentSelector,
 }
 
-static GDT: Lazy<(GlobalDescriptorTable, Selectors)> = Lazy::new(|| {
+static GDT: Lazy<(PageIsolated<GlobalDescriptorTable>, Selectors)> = Lazy::new(|| {
     let mut gdt = GlobalDescriptorTable::new();
     // Layout (offsets must match USER_CODE_SELECTOR / USER_DATA_SELECTOR above
     // and the STAR MSR arithmetic in syscall::init):
@@ -129,9 +144,9 @@ static GDT: Lazy<(GlobalDescriptorTable, Selectors)> = Lazy::new(|| {
     let data = gdt.append(Descriptor::kernel_data_segment());
     let user_data = gdt.append(Descriptor::user_data_segment());
     let user_code = gdt.append(Descriptor::user_code_segment());
-    let tss = gdt.append(Descriptor::tss_segment(&TSS));
+    let tss = gdt.append(Descriptor::tss_segment(&TSS.0));
     (
-        gdt,
+        PageIsolated(gdt),
         Selectors {
             code,
             data,
@@ -158,9 +173,10 @@ pub fn syscall_stack_top() -> u64 {
 /// Phase 110 Track A.3 (KPTI): like [`tss_extent`], the CPU reads the GDT
 /// through the *active* paging on a ring-3 → ring-0 interrupt (to load the
 /// target CS/SS descriptors), so the user-half entry set must map it. BSP-only;
-/// AP per-core GDTs are exposed via their `PerCoreData`.
+/// AP per-core GDTs are exposed via their `PerCoreData`. Page-isolated
+/// (`PageIsolated`, A.3b part 4) so the mapping exposes no adjacent `.data`.
 pub fn gdt_extent() -> (u64, u64) {
-    let base = &GDT.0 as *const GlobalDescriptorTable as u64;
+    let base = &GDT.0.0 as *const GlobalDescriptorTable as u64;
     (base, core::mem::size_of::<GlobalDescriptorTable>() as u64)
 }
 
@@ -174,7 +190,7 @@ pub fn gdt_extent() -> (u64, u64) {
 /// `PerCoreData.tss_ptr` by the per-core builder.
 pub fn tss_extent() -> (u64, u64) {
     // Forces the Lazy to init and reads only the address; the TSS is 'static.
-    let base = &*TSS as *const TaskStateSegment as u64;
+    let base = &TSS.0 as *const TaskStateSegment as u64;
     (base, core::mem::size_of::<TaskStateSegment>() as u64)
 }
 
@@ -188,8 +204,8 @@ pub fn tss_extent() -> (u64, u64) {
 /// their own `PerCoreData.tss_ptr` TSS and are read there.
 pub fn bsp_ist_tops() -> [u64; 2] {
     [
-        TSS.interrupt_stack_table[NMI_IST_INDEX as usize].as_u64(),
-        TSS.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize].as_u64(),
+        TSS.0.interrupt_stack_table[NMI_IST_INDEX as usize].as_u64(),
+        TSS.0.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize].as_u64(),
     ]
 }
 
@@ -206,13 +222,14 @@ pub fn bsp_ist_tops() -> [u64; 2] {
 /// on the next ring-3 interrupt.
 pub unsafe fn set_kernel_stack(rsp0: u64) {
     unsafe {
-        // Safety: `&*TSS` forces the Lazy to initialize and gives us a &TaskStateSegment
-        // at the correct address for the inner value (not the Lazy wrapper).
-        // Casting to *mut is sound here because:
+        // Safety: `&TSS.0` forces the Lazy to initialize and gives us a
+        // &TaskStateSegment at the correct address for the inner value (not
+        // the Lazy or PageIsolated wrappers). Casting to *mut is sound here
+        // because:
         //   1. We only call this on the single-CPU init path, before any ring-3 code runs.
         //   2. No interrupt handler references privilege_stack_table[0] between
         //      gdt::init() and the first iretq into userspace.
-        let tss_ptr = &*TSS as *const TaskStateSegment as *mut TaskStateSegment;
+        let tss_ptr = &TSS.0 as *const TaskStateSegment as *mut TaskStateSegment;
         (*tss_ptr).privilege_stack_table[0] = VirtAddr::new(rsp0);
     }
 }
@@ -223,7 +240,7 @@ pub unsafe fn set_kernel_stack(rsp0: u64) {
 ///
 /// Must be called exactly once, before any exception or interrupt can fire.
 pub fn init() {
-    GDT.0.load();
+    GDT.0.0.load();
     unsafe {
         CS::set_reg(GDT.1.code);
         DS::set_reg(GDT.1.data);
@@ -240,7 +257,7 @@ pub fn init() {
 /// the *active* GDT base from `sgdt` — layout-independent of the
 /// `GlobalDescriptorTable` internals — then `ltr` normally.
 pub fn reinit_after_resume() {
-    GDT.0.load();
+    GDT.0.0.load();
     unsafe {
         CS::set_reg(GDT.1.code);
         DS::set_reg(GDT.1.data);

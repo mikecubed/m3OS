@@ -52,14 +52,16 @@
 //! synthetic kernel PML4, then (a) walks it and asserts no kernel-secret leaf
 //! and (b) round-trip-translates every entry-set page to prove it is reachable.
 //!
-//! **Isolation caveats (A.3b/hardening TODO).** (1) GDT/IDT/TSS are ordinary
-//! kernel statics, not page-isolated, so mapping their pages also exposes
-//! adjacent `.data`. (2) The kstack top page exposes ~4 KiB of this process's
-//! own kernel stack to itself. Both are small, bounded residual Meltdown
-//! surfaces vs. the whole kernel; closing them means a page-isolated
-//! `cpu_entry_area` (Linux model) with a dedicated trampoline stack. That
-//! hardening lands with the live IRQ trampoline, the first consumer that makes
-//! it load-bearing.
+//! **Isolation status.** The A.3a caveat — GDT/IDT/TSS as ordinary statics
+//! exposing adjacent `.data` through the entry-set mappings — is **closed**
+//! (A.3b part 4): GDT/IDT/TSS, every `PerCoreData`, and the BSP entry stacks
+//! are `PageIsolated` (`arch::x86_64::gdt::PageIsolated`: page-aligned,
+//! page-multiple-sized, so each owns its pages exclusively — the m3OS
+//! `cpu_entry_area`), and the self-test asserts their page alignment
+//! (`reason=entry-struct-alignment`). Remaining accepted surface: the kstack
+//! top page exposes ~4 KiB of this process's **own** kernel stack to itself —
+//! small, bounded, self-only; hardening it means a dedicated per-CPU
+//! trampoline stack (post-A.4 follow-up).
 
 use alloc::vec::Vec;
 
@@ -677,6 +679,46 @@ pub fn self_test() {
             "KPTI_SELFTEST:FAIL reason=exit-layout start={exit_start:#x} end={exit_end:#x}"
         );
         return;
+    }
+
+    // A.3b part 4: the interrupt-delivery structures (GDT/TSS/IDT +
+    // PerCoreData, per online core) must be page-aligned — they are
+    // `PageIsolated` (own their pages exclusively, so the user-half mappings
+    // leak no adjacent `.data`/heap), and page alignment is the observable
+    // proxy for that isolation (an un-isolated static or plain heap Box is
+    // essentially never page-aligned by accident). Catch a regression at boot.
+    {
+        let (gdt_base, _) = crate::arch::x86_64::gdt::gdt_extent();
+        let (tss_base, _) = crate::arch::x86_64::gdt::tss_extent();
+        let idt_base = x86_64::instructions::tables::sidt().base.as_u64();
+        let mut misaligned = [
+            ("bsp-gdt", gdt_base),
+            ("bsp-tss", tss_base),
+            ("idt", idt_base),
+        ]
+        .iter()
+        .find(|(_, base)| base % 0x1000 != 0)
+        .map(|(what, base)| (*what, *base));
+        if misaligned.is_none() {
+            'cores: for core_id in 0..crate::smp::core_count() {
+                let Some(pcd) = crate::smp::get_core_data(core_id) else {
+                    continue;
+                };
+                if !pcd.is_online.load(core::sync::atomic::Ordering::Acquire) {
+                    continue;
+                }
+                for (base, _) in pcd.entry_struct_extents() {
+                    if base % 0x1000 != 0 {
+                        misaligned = Some(("core-entry-struct", base));
+                        break 'cores;
+                    }
+                }
+            }
+        }
+        if let Some((what, base)) = misaligned {
+            log::error!("KPTI_SELFTEST:FAIL reason=entry-struct-alignment {what}={base:#x}");
+            return;
+        }
     }
 
     // kimg_idx the same way build does (the entry-text section's slot).

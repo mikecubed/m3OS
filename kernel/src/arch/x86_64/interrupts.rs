@@ -54,6 +54,7 @@ use crate::panic_diag;
 use crate::serial::_panic_print;
 
 use super::gdt;
+use super::gdt::PageIsolated;
 use super::preempt_trap_frame::{
     PreemptTrapFrameKernel, PreemptTrapFrameUser, TrapFrame, TrapFrameErr,
 };
@@ -1133,7 +1134,12 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
 // IDT
 // ---------------------------------------------------------------------------
 
-static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
+// Page-isolated (`PageIsolated`, Phase 110 A.3b part 4): the IDT is mapped
+// into every KPTI user half (the CPU reads the gate through the *active*
+// paging on interrupt delivery), so it must own its page exclusively. An
+// `InterruptDescriptorTable` is exactly 4096 bytes (256 × 16), so the wrapper
+// pads nothing — it only pins the page boundary.
+static IDT: Lazy<PageIsolated<InterruptDescriptorTable>> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
 
     // CPU exceptions.
@@ -1278,12 +1284,12 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
         }
     }
 
-    idt
+    PageIsolated(idt)
 });
 
 /// Load the IDT.
 pub fn init() {
-    IDT.load();
+    IDT.0.load();
 }
 
 // ---------------------------------------------------------------------------

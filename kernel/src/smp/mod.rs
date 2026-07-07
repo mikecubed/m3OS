@@ -166,7 +166,15 @@ impl Iterator for IsrWakeDrain<'_> {
 /// Each core has one of these, initialized during BSP init or AP bootstrap.
 /// The `gs_base` MSR points to this struct so that `per_core()` can retrieve
 /// it in O(1) without MMIO.
-#[repr(C)]
+///
+/// `align(4096)` (Phase 110 A.3b part 4): every core's `PerCoreData` is mapped
+/// whole into every KPTI user half (the entry asm reads `gs:[…]` before the
+/// CR3 switch — no swapgs in m3OS), so the Box allocation must own its pages
+/// exclusively; page alignment + page-multiple size (Rust rounds size up to
+/// alignment) keep adjacent heap data out of the mapped pages. Field offsets
+/// are unchanged (`repr(C)` layout is alignment-independent), and the
+/// `smp::offsets` constants are `offset_of!`-computed so they track anyway.
+#[repr(C, align(4096))]
 pub struct PerCoreData {
     /// Self-pointer at offset 0 — reserved for future `gs:[0]` access.
     /// Currently unused: `per_core()` reads `IA32_GS_BASE` via `rdmsr`.
@@ -1088,19 +1096,29 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
     let double_fault_stack_top = crate::task::kstack::alloc_leaked_top();
     let nmi_stack_top = crate::task::kstack::alloc_leaked_top();
 
-    // Allocate and configure TSS.
-    let tss = Box::into_raw(Box::new({
+    // Allocate and configure TSS. Page-isolated (`PageIsolated`, Phase 110
+    // A.3b part 4): this TSS (and the GDT below) is mapped into every KPTI
+    // user half at its live address, so a plain heap Box — which shares its
+    // page with arbitrary neighbouring allocations — would leak adjacent heap
+    // data to ring 3. The wrapper gives the allocation exclusive, page-aligned
+    // pages; the raw pointer to the inner value is what `tss_ptr`/`gdt_ptr`
+    // store (leaked deliberately — per-core structures live forever).
+    let tss_iso = Box::into_raw(Box::new(crate::arch::x86_64::gdt::PageIsolated({
         let mut tss = TaskStateSegment::new();
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
             VirtAddr::new(double_fault_stack_top);
         tss.interrupt_stack_table[NMI_IST_INDEX as usize] = VirtAddr::new(nmi_stack_top);
         tss.privilege_stack_table[0] = VirtAddr::new(kernel_stack_top);
         tss
-    }));
+    })));
+    let tss: *mut TaskStateSegment = unsafe { core::ptr::addr_of_mut!((*tss_iso).0) };
 
     // Pre-allocate GDT on the BSP so the AP doesn't need heap access.
     let tss_ref: &'static TaskStateSegment = unsafe { &*tss };
-    let gdt = Box::into_raw(Box::new(GlobalDescriptorTable::new()));
+    let gdt_iso = Box::into_raw(Box::new(crate::arch::x86_64::gdt::PageIsolated(
+        GlobalDescriptorTable::new(),
+    )));
+    let gdt: *mut GlobalDescriptorTable = unsafe { core::ptr::addr_of_mut!((*gdt_iso).0) };
     let (gdt_code, gdt_data, gdt_tss) = unsafe {
         let gdt_ref = &mut *gdt;
         let code = gdt_ref.append(Descriptor::kernel_code_segment());
