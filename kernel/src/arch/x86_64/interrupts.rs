@@ -3877,10 +3877,11 @@ pub fn kpti_irq_entry_range() -> (u64, u64) {
 //   3. flip CR3 via the scratch slot (no-op while `kpti_user_cr3 == 0`).
 //   4. `iretq`.
 //
-// Part 3a landed `preempt_resume_to_user` (the preemption-resume path) as the
-// proof of pattern; part 3b adds `fork_enter_userspace`, part 3c
-// `execve_enter_userspace`. `restore_and_enter_userspace` (sigreturn) follows
-// the same recipe in a later sub-commit.
+// The four ring0→ring3 exit trampolines all live here: part 3a landed
+// `preempt_resume_to_user` (the preemption-resume path) as the proof of
+// pattern; part 3b `fork_enter_userspace`; part 3c `execve_enter_userspace`;
+// part 3d `sigreturn_enter_userspace`. (The fifth user-return path, the
+// syscall sysret tail, is in `.text.kpti_entry` — A.2.)
 core::arch::global_asm!(
     ".equ EXIT_OFF_USER_CR3,  {exit_off_user_cr3}",
     ".equ EXIT_OFF_SCRATCH,   {exit_off_scratch}",
@@ -4015,6 +4016,54 @@ core::arch::global_asm!(
     "push rdx",   // cs
     "push rdi",   // rip
     // KPTI exit: flip to the user CR3. No-op while inactive.
+    "mov gs:[EXIT_OFF_SCRATCH], rax",
+    "mov rax, gs:[EXIT_OFF_USER_CR3]",
+    "test rax, rax",
+    "jz 1f",
+    "mov cr3, rax",
+    "1:",
+    "mov rax, gs:[EXIT_OFF_SCRATCH]",
+    "iretq",
+    "",
+    // sigreturn_enter_userspace(rdi = *const SavedUserRegs, rsi = ss,
+    //                           rdx = cs, rcx = sanitized rflags) -> !
+    // The sigreturn full-register restore (called by
+    // syscall::restore_and_enter_userspace, which sanitizes rflags and
+    // validates rip/rsp canonical). Restores ALL GPRs so ring 3 resumes at
+    // the exact pre-signal state.
+    // SavedUserRegs offsets (signal.rs, #[repr(C)]): rax=0 rbx=8 rcx=16
+    //   rdx=24 rsi=32 rdi=40 rbp=48 rsp=56 r8=64 r9=72 r10=80 r11=88 r12=96
+    //   r13=104 r14=112 r15=120 rip=128 rflags=136
+    ".global sigreturn_enter_userspace",
+    "sigreturn_enter_userspace:",
+    // Reset rsp to this task's kstack top page (user-mapped); the sigreturn
+    // syscall continuation below is abandoned (this trampoline never returns).
+    "mov rsp, gs:[EXIT_OFF_STACK_TOP]",
+    // Build the 5-field iretq frame on the top page (push in reverse: ss first).
+    "push rsi",         // ss
+    "push [rdi + 56]",  // user rsp
+    "push rcx",         // sanitized rflags
+    "push rdx",         // cs
+    "push [rdi + 128]", // rip
+    // Restore ALL GPRs from the SavedUserRegs BEFORE the CR3 flip — the
+    // sigframe copy lives on the kernel stack, gone after the flip.
+    "mov rax, [rdi + 0]",
+    "mov rbx, [rdi + 8]",
+    "mov rcx, [rdi + 16]",
+    "mov rdx, [rdi + 24]",
+    "mov rsi, [rdi + 32]",
+    "mov rbp, [rdi + 48]",
+    "mov r8,  [rdi + 64]",
+    "mov r9,  [rdi + 72]",
+    "mov r10, [rdi + 80]",
+    "mov r11, [rdi + 88]",
+    "mov r12, [rdi + 96]",
+    "mov r13, [rdi + 104]",
+    "mov r14, [rdi + 112]",
+    "mov r15, [rdi + 120]",
+    "mov rdi, [rdi + 40]", // rdi last (pointer becomes invalid)
+    // KPTI exit: flip to the user CR3 (rax holds the user rax → spill via
+    // gs:[scratch], mapped on both halves). No-op while inactive.
     "mov gs:[EXIT_OFF_SCRATCH], rax",
     "mov rax, gs:[EXIT_OFF_USER_CR3]",
     "test rax, rax",

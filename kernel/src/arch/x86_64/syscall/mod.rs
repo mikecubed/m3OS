@@ -3808,6 +3808,19 @@ pub(super) fn sys_sigreturn(user_rsp: u64) -> ! {
     unsafe { restore_and_enter_userspace(&regs) }
 }
 
+unsafe extern "C" {
+    /// The sigreturn full-register-restore ring-3 trampoline. Phase 110 A.3b
+    /// part 3: the asm lives in the user-mapped `.text.kpti_exit` section
+    /// (`interrupts.rs`, bottom) so it can flip to the user CR3 immediately
+    /// before its `iretq`.
+    fn sigreturn_enter_userspace(
+        regs: *const crate::signal::SavedUserRegs,
+        ss: u64,
+        cs: u64,
+        rflags: u64,
+    ) -> !;
+}
+
 /// Enter ring 3 with a full set of restored registers from a sigframe.
 ///
 /// Restores all GPRs then uses `iretq` to return to the interrupted
@@ -3824,57 +3837,15 @@ unsafe fn restore_and_enter_userspace(regs: &crate::signal::SavedUserRegs) -> ! 
     crate::task::scheduler::assert_preempt_count_zero_at_user_return();
     // Phase 57d G.4: consume deferred reschedule at every user-return boundary.
     crate::task::scheduler::check_deferred_preempt_at_user_return();
-    unsafe {
-        use core::arch::asm;
-        // We need to restore all GPRs.  The simplest approach: push the iretq
-        // frame first, then load all GPRs from the struct, then iretq.
-        //
-        // We save the struct pointer in a register, set up the iretq frame,
-        // then load all registers from the struct.
-        let ss = u64::from(crate::arch::x86_64::gdt::user_data_selector().0);
-        let cs = u64::from(crate::arch::x86_64::gdt::user_code_selector().0);
-        // Sanitize rflags: clear all privileged/reserved bits that could cause
-        // #GP during iretq, then force IF (bit 9) and reserved bit 1.
-        // Cleared: IOPL (12-13), NT (14), VM (17), VIF (19), VIP (20), ID (21).
-        const PRIV_MASK: u64 =
-            (1 << 12) | (1 << 13) | (1 << 14) | (1 << 17) | (1 << 19) | (1 << 20) | (1 << 21);
-        let rflags = (regs.rflags & !PRIV_MASK) | 0x202;
-
-        asm!(
-            // Build the iretq frame on the kernel stack.
-            "push {ss}",
-            "push {user_rsp}",
-            "push {rflags}",
-            "push {cs}",
-            "push {user_rip}",
-            // Now restore all GPRs from the SavedUserRegs struct.
-            // r14 holds the pointer to the struct (chosen because we restore it last-ish).
-            "mov r15, [r14 + 120]",  // r15 offset
-            "mov r13, [r14 + 104]",  // r13
-            "mov r12, [r14 + 96]",   // r12
-            "mov r11, [r14 + 88]",   // r11
-            "mov r10, [r14 + 80]",   // r10
-            "mov r9, [r14 + 72]",    // r9
-            "mov r8, [r14 + 64]",    // r8
-            "mov rbp, [r14 + 48]",   // rbp
-            "mov rbx, [r14 + 8]",    // rbx
-            "mov rdx, [r14 + 24]",   // rdx
-            "mov rsi, [r14 + 32]",   // rsi
-            "mov rdi, [r14 + 40]",   // rdi
-            "mov rcx, [r14 + 16]",   // rcx
-            "mov rax, [r14 + 0]",    // rax
-            // Restore r14 last (it was our pointer register).
-            "mov r14, [r14 + 112]",  // r14
-            "iretq",
-            ss       = in(reg) ss,
-            user_rsp = in(reg) regs.rsp,
-            rflags   = in(reg) rflags,
-            cs       = in(reg) cs,
-            user_rip = in(reg) regs.rip,
-            in("r14") regs as *const crate::signal::SavedUserRegs as u64,
-            options(noreturn)
-        )
-    }
+    let ss = u64::from(crate::arch::x86_64::gdt::user_data_selector().0);
+    let cs = u64::from(crate::arch::x86_64::gdt::user_code_selector().0);
+    // Sanitize rflags: clear all privileged/reserved bits that could cause
+    // #GP during iretq, then force IF (bit 9) and reserved bit 1.
+    // Cleared: IOPL (12-13), NT (14), VM (17), VIF (19), VIP (20), ID (21).
+    const PRIV_MASK: u64 =
+        (1 << 12) | (1 << 13) | (1 << 14) | (1 << 17) | (1 << 19) | (1 << 20) | (1 << 21);
+    let rflags = (regs.rflags & !PRIV_MASK) | 0x202;
+    unsafe { sigreturn_enter_userspace(regs, ss, cs, rflags) }
 }
 
 fn encode_rt_sigaction(action: crate::process::SignalAction) -> [u8; 32] {
