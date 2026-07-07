@@ -153,6 +153,20 @@ pub fn syscall_stack_top() -> u64 {
     (stack_start + SYSCALL_STACK_SIZE as u64).as_u64()
 }
 
+/// `(base_va, size_in_bytes)` of the BSP's TaskStateSegment.
+///
+/// Phase 110 Track A.3 (KPTI): the CPU reads TSS.RSP0 through the *active*
+/// paging when delivering a ring-3 → ring-0 interrupt, so the user-half PML4's
+/// minimal entry set must map the TSS. This exposes its live extent to the
+/// `mm::kpti` entry-set builder. BSP-only (`tss_ptr` is null for the BSP, which
+/// uses this global `TSS`); AP per-core TSSes are mapped from their own
+/// `PerCoreData.tss_ptr` by the per-core builder.
+pub fn tss_extent() -> (u64, u64) {
+    // Forces the Lazy to init and reads only the address; the TSS is 'static.
+    let base = &*TSS as *const TaskStateSegment as u64;
+    (base, core::mem::size_of::<TaskStateSegment>() as u64)
+}
+
 /// Update TSS.RSP0 (privilege stack 0) at runtime.
 ///
 /// Called when a new kernel stack should be used for ring-3 → ring-0

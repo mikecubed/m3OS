@@ -9,13 +9,16 @@
 //! Meltdown itself cannot be exercised) that no kernel-secret leaf is reachable
 //! from the user CR3.
 //!
-//! ## What A.1 delivers (and what it deliberately does not)
+//! ## What this delivers (and what it deliberately does not)
 //!
-//! A.1 is the **builder + validation**, with `KPTI_WIRED` still `false`: the
-//! user PML4 is constructed and asserted, but never loaded into CR3, so the
-//! live syscall/IRQ paths and every existing gate are untouched. The CR3
-//! trampoline that consumes this pair (A.2/A.3) and the activation on the
-//! policy path (A.4) land in follow-on PRs.
+//! Through A.3a this is still **builder + validation**, with `KPTI_WIRED` still
+//! `false`: the user PML4 is constructed and asserted, but never loaded into
+//! CR3, so the live syscall/IRQ paths and every existing gate are untouched.
+//! A.2 added the syscall CR3 trampoline (`syscall_entry_kpti`, LSTAR-selected,
+//! dormant in production). A.3a grew the validated entry set to the full
+//! interrupt-delivery structure set (GDT/IDT/TSS) and added the reachability
+//! round-trip. The live IRQ/IST trampolines that consume this (A.3b) and the
+//! activation on the policy path (A.4) land in follow-on PRs.
 //!
 //! ## The minimal entry set (the load-bearing subtlety)
 //!
@@ -31,11 +34,23 @@
 //! would silently re-expose all of physical memory; see
 //! [`kernel_core::kpti::may_clone_slot_into_user_half`]).
 //!
-//! The self-test builds a representative entry set — the `PerCoreData` page(s),
-//! the page-aligned `.text.kpti_entry` section (both SYSCALL stubs + shared
-//! body + sysret tail, as of A.2), and a fresh entry-stack page — exercising
-//! the three distinct source regions (kernel heap VA, kernel-image VA, a fresh
-//! frame). A.3 extends it with the GDT/TSS/IDT the IRQ-path switch also needs.
+//! The self-test builds the entry set the live trampoline needs — the
+//! `PerCoreData` page(s), the page-aligned `.text.kpti_entry` section (both
+//! SYSCALL stubs + shared body + sysret tail, A.2), the **GDT / IDT / TSS**
+//! (A.3 — the CPU reads all three through the *active* paging when delivering a
+//! ring-3 → ring-0 interrupt, so they must be user-mapped or delivery itself
+//! triple-faults), and a fresh entry-stack page. After building over the live
+//! kernel page tables it (a) walks the result and asserts no kernel-secret leaf
+//! and (b) round-trip-translates every entry-set page in the built user PML4 to
+//! prove it is actually reachable.
+//!
+//! **Isolation caveat (A.3b TODO).** The GDT/IDT/TSS are ordinary kernel
+//! statics, not page-isolated, so mapping their pages also exposes whatever
+//! adjacent `.data` shares those pages — a (small, bounded) residual Meltdown
+//! surface. Closing it means relocating the interrupt-delivery structures into
+//! a dedicated page-aligned entry section (Linux's `cpu_entry_area`); that
+//! hardening lands with the live IRQ trampoline (A.3b), which is also the first
+//! consumer that makes it load-bearing. A.3a wires + validates the mechanism.
 
 use alloc::vec::Vec;
 
@@ -60,10 +75,45 @@ const SELFTEST_USER_VA: u64 = 0x0020_0000;
 /// in the recorded entry-set list, not by range.
 const SELFTEST_ENTRY_STACK_VA: u64 = 0xFFFF_9F00_0000_0000;
 
+/// Leaf flags for read-execute entry-set pages (entry text): ring-0 only, no
+/// `USER_ACCESSIBLE`, no `NO_EXECUTE`.
+const RX: PageTableFlags = PageTableFlags::PRESENT;
+/// Leaf flags for read-write entry-set pages (PerCoreData, GDT, IDT, TSS,
+/// entry stacks): ring-0 only, writable, non-executable.
+const RW: PageTableFlags = PageTableFlags::from_bits_truncate(
+    PageTableFlags::PRESENT.bits()
+        | PageTableFlags::WRITABLE.bits()
+        | PageTableFlags::NO_EXECUTE.bits(),
+);
+
 /// `PML4[idx]` of a canonical virtual address.
 #[inline]
 fn pml4_index(va: u64) -> usize {
     ((va >> 39) & 0x1FF) as usize
+}
+
+/// Translate each 4 KiB page of the kernel VA range `[start, end)` through the
+/// live kernel mapper and append `(va, phys, flags)` to `out`. The range is
+/// rounded down/up to page boundaries. Returns `None` if any page is
+/// unmapped (which for an entry-set structure is a build-time bug).
+fn push_kernel_range(
+    kmapper: &x86_64::structures::paging::OffsetPageTable<'static>,
+    out: &mut Vec<(u64, u64, PageTableFlags)>,
+    start: u64,
+    end: u64,
+    flags: PageTableFlags,
+) -> Option<()> {
+    let mut va = start & !0xFFF;
+    let last = (end - 1) & !0xFFF;
+    while va <= last {
+        let phys = kmapper.translate_addr(VirtAddr::new(va))?.as_u64();
+        // De-dup: adjacent structures (e.g. GDT + TSS) can share a page.
+        if !out.iter().any(|(v, _, _)| *v == va) {
+            out.push((va, phys, flags));
+        }
+        va += 0x1000;
+    }
+    Some(())
 }
 
 /// A frame allocator that records every frame it hands out, so the self-test
@@ -218,7 +268,10 @@ struct SelfTestArena {
     /// are *not* here and are never freed.
     leaf_frames: Vec<u64>,
     user_pml4_phys: u64,
-    entry_vas: Vec<u64>,
+    /// Every entry-set page as `(kernel_va, expected_phys)` — used both to
+    /// classify leaves as `EntrySet` during the walk and to round-trip-verify
+    /// each page actually translates in the built user PML4.
+    entry_pages: Vec<(u64, u64)>,
 }
 
 impl SelfTestArena {
@@ -249,26 +302,58 @@ fn build_selftest_pair() -> Option<SelfTestArena> {
         // spans so no field read faults on the user CR3.
         let pcd_base = crate::smp::per_core() as *const _ as u64;
         let pcd_size = core::mem::size_of::<crate::smp::PerCoreData>() as u64;
-        let first = pcd_base & !0xFFF;
-        let last = (pcd_base + pcd_size - 1) & !0xFFF;
-        let mut va = first;
-        while va <= last {
-            let phys = kmapper.translate_addr(VirtAddr::new(va))?.as_u64();
-            entry_pages.push((va, phys, PageTableFlags::PRESENT | PageTableFlags::WRITABLE));
-            va += 0x1000;
-        }
+        push_kernel_range(
+            &kmapper,
+            &mut entry_pages,
+            pcd_base,
+            pcd_base + pcd_size,
+            RW,
+        )?;
 
         // Entry text — the whole page-aligned `.text.kpti_entry` section (both
         // SYSCALL stubs + shared body + sysret tail; A.2). This is the real
         // range the live trampoline executes on the user CR3, mapped r-x
         // ring-0-only.
         let (text_start, text_end) = crate::arch::x86_64::syscall::kpti_entry_text_range();
-        let mut text_va = text_start;
-        while text_va < text_end {
-            let phys = kmapper.translate_addr(VirtAddr::new(text_va))?.as_u64();
-            entry_pages.push((text_va, phys, PageTableFlags::PRESENT));
-            text_va += 0x1000;
-        }
+        push_kernel_range(&kmapper, &mut entry_pages, text_start, text_end, RX)?;
+
+        // Interrupt-delivery structures (A.3). On a ring-3 → ring-0 IRQ the CPU
+        // reads the IDT gate, the GDT descriptors for the target CS/SS, and
+        // TSS.RSP0 — all through the CURRENTLY ACTIVE (user) paging, *before*
+        // any handler code runs. If any of the three is absent from the user
+        // half, delivery itself faults → #DF → triple fault. Map them r/w
+        // (the CPU may set the TSS busy bit / descriptor accessed bits) at
+        // their live linear addresses read from GDTR/IDTR (`sgdt`/`sidt`) so
+        // this is layout-independent of how the tables were built.
+        let gdtr = x86_64::instructions::tables::sgdt();
+        let gdt_base = gdtr.base.as_u64();
+        push_kernel_range(
+            &kmapper,
+            &mut entry_pages,
+            gdt_base,
+            gdt_base + u64::from(gdtr.limit) + 1,
+            RW,
+        )?;
+
+        let idtr = x86_64::instructions::tables::sidt();
+        let idt_base = idtr.base.as_u64();
+        push_kernel_range(
+            &kmapper,
+            &mut entry_pages,
+            idt_base,
+            idt_base + u64::from(idtr.limit) + 1,
+            RW,
+        )?;
+
+        // The TSS the GDT selector resolves to (RSP0 + the IST pointers).
+        let (tss_base, tss_size) = crate::arch::x86_64::gdt::tss_extent();
+        push_kernel_range(
+            &kmapper,
+            &mut entry_pages,
+            tss_base,
+            tss_base + tss_size,
+            RW,
+        )?;
     }
 
     let mut table_frames: Vec<u64> = Vec::new();
@@ -291,10 +376,8 @@ fn build_selftest_pair() -> Option<SelfTestArena> {
     entry_pages.push((
         SELFTEST_ENTRY_STACK_VA,
         stack_leaf.start_address().as_u64(),
-        PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        RW,
     ));
-
-    let entry_vas: Vec<u64> = entry_pages.iter().map(|(va, _, _)| *va).collect();
 
     // --- populate the user PML4.
     // SAFETY: user_pml4 is a fresh, non-live table owned solely here.
@@ -332,8 +415,49 @@ fn build_selftest_pair() -> Option<SelfTestArena> {
         table_frames,
         leaf_frames,
         user_pml4_phys,
-        entry_vas,
+        entry_pages: entry_pages
+            .iter()
+            .map(|(va, phys, _)| (*va, *phys))
+            .collect(),
     })
+}
+
+/// Manually translate `va` in the (inactive) PML4 at `pml4_phys` by walking the
+/// four levels through the direct map — no CR3 switch, no live mapper alias.
+/// Returns the mapped 4 KiB physical frame base, or `None` if unmapped.
+///
+/// # Safety
+/// `pml4_phys` must reference a valid PML4 reachable through the direct map.
+unsafe fn translate_in(pml4_phys: u64, va: u64) -> Option<u64> {
+    let phys_off = phys_offset();
+    // SAFETY: page tables are reachable read-only through the direct map.
+    let table =
+        |phys: u64| -> &'static PageTable { unsafe { &*((phys_off + phys) as *const PageTable) } };
+    let idx = |lvl: u32| ((va >> (12 + 9 * lvl)) & 0x1FF) as usize;
+
+    let e4 = &table(pml4_phys)[idx(3)];
+    if !e4.flags().contains(PageTableFlags::PRESENT) {
+        return None;
+    }
+    let e3 = &table(e4.addr().as_u64())[idx(2)];
+    if !e3.flags().contains(PageTableFlags::PRESENT) {
+        return None;
+    }
+    if e3.flags().contains(PageTableFlags::HUGE_PAGE) {
+        return Some(e3.addr().as_u64() + (va & 0x3FFF_FFFF));
+    }
+    let e2 = &table(e3.addr().as_u64())[idx(1)];
+    if !e2.flags().contains(PageTableFlags::PRESENT) {
+        return None;
+    }
+    if e2.flags().contains(PageTableFlags::HUGE_PAGE) {
+        return Some(e2.addr().as_u64() + (va & 0x1F_FFFF));
+    }
+    let e1 = &table(e2.addr().as_u64())[idx(0)];
+    if !e1.flags().contains(PageTableFlags::PRESENT) {
+        return None;
+    }
+    Some(e1.addr().as_u64())
 }
 
 /// Run the KPTI user-half self-test once, emitting a `KPTI_SELFTEST:` sentinel.
@@ -380,8 +504,10 @@ pub fn self_test() {
         }
     };
 
+    let entry_vas: Vec<u64> = arena.entry_pages.iter().map(|(va, _)| *va).collect();
+
     // SAFETY: arena.user_pml4_phys is a valid, non-live PML4; we only read it.
-    let obs = unsafe { walk_user_half(arena.user_pml4_phys, &arena.entry_vas, kimg_idx, dm_idx) };
+    let obs = unsafe { walk_user_half(arena.user_pml4_phys, &entry_vas, kimg_idx, dm_idx) };
 
     let secret_leaves = obs
         .iter()
@@ -396,16 +522,40 @@ pub fn self_test() {
 
     let result = check_user_half_invariant(obs.iter());
 
+    // Reachability round-trip (A.3): every entry-set page must actually
+    // translate in the built user PML4 to the SAME physical frame the kernel
+    // map resolves it to. The invariant walk above proves nothing *extra* is
+    // reachable; this proves everything the live trampoline will touch on the
+    // user CR3 (GDT/IDT/TSS/PerCoreData/entry text/entry stack) IS reachable —
+    // a missing entry would be interrupt-delivery #DF-then-triple-fault at A.4.
+    let mut unreachable = 0usize;
+    for (va, expected_phys) in &arena.entry_pages {
+        // SAFETY: user_pml4_phys is a valid, non-live PML4 read via direct map.
+        match unsafe { translate_in(arena.user_pml4_phys, *va) } {
+            Some(got) if got == (*expected_phys & !0xFFF) => {}
+            _ => unreachable += 1,
+        }
+    }
+
     // Free the throwaway pair before reporting (report is the observable point).
     let user_pml4_phys = arena.user_pml4_phys;
+    let entry_page_count = arena.entry_pages.len();
     arena.free();
+
+    if unreachable != 0 {
+        log::error!(
+            "KPTI_SELFTEST:FAIL reason=entry-set-unreachable unreachable={unreachable} of {entry_page_count}"
+        );
+        return;
+    }
 
     match result {
         Ok(()) if secret_leaves == 0 => {
             log::info!(
-                "KPTI_SELFTEST:PASS user_pml4={:#x} entry_set={} leaves; no kernel-secret leaf reachable from user CR3",
+                "KPTI_SELFTEST:PASS user_pml4={:#x} entry_set={} leaves ({} pages, all reachable); no kernel-secret leaf reachable from user CR3",
                 user_pml4_phys,
                 entry_leaves,
+                entry_page_count,
             );
         }
         Ok(()) => {

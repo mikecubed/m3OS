@@ -46,14 +46,17 @@
 
 ### A.3 — IRQ / IST CR3 symmetry
 
-**File:** `kernel/src/arch/x86_64/interrupts.rs`
-**Symbol:** the IRQ entry/exit stubs + NMI/`#DF` IST handlers
+**File:** `kernel/src/arch/x86_64/interrupts.rs`, `kernel/src/mm/kpti.rs`, `kernel/src/arch/x86_64/gdt.rs`
+**Symbol:** the IRQ entry/exit stubs + NMI/`#DF` IST handlers; `mm::kpti` entry-set builder
 **Why it matters:** Hardware interrupts arriving in user mode are on the user CR3 and must do the same switch; NMI/`#DF`/IST vectors can interrupt **either** address space, so they must save-and-restore the entry CR3 (paranoid path).
 
+**As-built — A.3a (entry-set builder + validation, inert):** Grew the `mm::kpti` entry set to the full set the live IRQ trampoline needs — the **GDT, IDT, and TSS**, mapped at their live linear addresses (`sgdt`/`sidt` + `gdt::tss_extent()`), because the CPU reads all three through the *active* (user) paging when delivering a ring-3 → ring-0 interrupt, so a missing one is delivery-time `#DF` → triple fault. The self-test now builds over the live kernel PML4 and adds a **reachability round-trip** (`translate_in`): every entry-set page must translate in the built user PML4 to the same frame the kernel map resolves — proving not just "nothing extra leaks" but "everything the trampoline touches is present." Flags split into `RX` (entry text) / `RW` (data: PerCoreData/GDT/IDT/TSS/stacks, `NO_EXECUTE`). **Isolation caveat:** GDT/IDT/TSS are un-page-isolated statics, so their pages leak adjacent `.data` — a small bounded residual surface closed in A.3b by relocating them into a page-aligned entry section (`cpu_entry_area`). Green: `kpti-selftest-smoke`, `check`.
+
 **Acceptance:**
-- [ ] Every maskable IRQ entry switches to the kernel CR3 and restores the entry CR3 on exit.
-- [ ] NMI and `#DF` (IST) handlers save the entry CR3 on entry and restore it on exit (correct whether they interrupted ring 0 or ring 3).
-- [ ] `kstack-overflow-smoke` and the existing fault-recovery gates still pass (the `#DF` path is unaffected functionally).
+- [ ] Every maskable IRQ entry switches to the kernel CR3 and restores the entry CR3 on exit. *(A.3b)*
+- [ ] NMI and `#DF` (IST) handlers save the entry CR3 on entry and restore it on exit (correct whether they interrupted ring 0 or ring 3). *(A.3b)*
+- [ ] `kstack-overflow-smoke` and the existing fault-recovery gates still pass (the `#DF` path is unaffected functionally). *(A.3b)*
+- [x] The user-half entry set includes the interrupt-delivery structures (GDT/IDT/TSS) and every entry-set page is proven reachable in the built user PML4 (A.3a self-test round-trip).
 
 ### A.4 — Flip `KPTI_WIRED` + activate on the policy path
 
