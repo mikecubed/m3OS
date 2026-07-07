@@ -55,7 +55,7 @@ use crate::panic_diag;
 use crate::serial::_panic_print;
 
 use super::gdt;
-use super::preempt_trap_frame::{PreemptTrapFrameKernel, PreemptTrapFrameUser};
+use super::preempt_trap_frame::{PreemptTrapFrameKernel, PreemptTrapFrameUser, TrapFrame};
 
 // ---------------------------------------------------------------------------
 // APIC / PIC mode flag
@@ -1214,49 +1214,68 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
         idt[InterruptIndex::Timer as u8]
             .set_handler_addr(VirtAddr::new(timer_entry as *const () as u64));
     }
-    idt[InterruptIndex::Keyboard as u8].set_handler_fn(keyboard_handler);
-    // Vector 34 (`InterruptIndex::VirtioNet`) is reserved but no longer
-    // installed — Phase 55 C.5 migrated virtio-net to the HAL IRQ contract
-    // (allocated from the device-IRQ bank at `DEVICE_IRQ_VECTOR_BASE`).
-    idt[InterruptIndex::Serial as u8].set_handler_fn(serial_handler);
-    idt[InterruptIndex::Mouse as u8].set_handler_fn(mouse_handler);
-    // Phase 101 D.2 — ACPI SCI (routed on demand by sys_acpi_sci_subscribe).
-    idt[InterruptIndex::Sci as u8].set_handler_fn(sci_handler);
-
-    // APIC spurious interrupt vector — must NOT send EOI.
-    idt[InterruptIndex::Spurious as u8].set_handler_fn(spurious_handler);
-
-    // SMP IPI vectors (Phase 25).
+    // Phase 110 Track A.3b — the ring-3-reachable maskable IRQ / IPI vectors
+    // now use naked-asm entry stubs (`*_entry`) in the page-aligned
+    // `.text.kpti_irq_entry` section so each can (once KPTI activates) switch to
+    // the kernel CR3 on entry and back to the user CR3 immediately before its
+    // `iretq` — an `extern "x86-interrupt"` handler cannot, because the compiler
+    // owns the `iretq` (see the module-level A.3b block). While `KPTI_WIRED` is
+    // false every switch is a never-taken branch (`kpti_user_cr3 == 0`), so this
+    // is behaviourally identical to the old `set_handler_fn` install and is
+    // exercised on every boot by the existing IRQ-driven gates.
     unsafe {
+        idt[InterruptIndex::Keyboard as u8]
+            .set_handler_addr(VirtAddr::new(keyboard_entry as *const () as u64));
+        // Vector 34 (`InterruptIndex::VirtioNet`) is reserved but no longer
+        // installed — Phase 55 C.5 migrated virtio-net to the HAL IRQ contract
+        // (allocated from the device-IRQ bank at `DEVICE_IRQ_VECTOR_BASE`).
+        idt[InterruptIndex::Serial as u8]
+            .set_handler_addr(VirtAddr::new(serial_entry as *const () as u64));
+        idt[InterruptIndex::Mouse as u8]
+            .set_handler_addr(VirtAddr::new(mouse_entry as *const () as u64));
+        // Phase 101 D.2 — ACPI SCI (routed on demand by sys_acpi_sci_subscribe).
+        idt[InterruptIndex::Sci as u8]
+            .set_handler_addr(VirtAddr::new(sci_entry as *const () as u64));
+        // APIC spurious interrupt vector — must NOT send EOI.
+        idt[InterruptIndex::Spurious as u8]
+            .set_handler_addr(VirtAddr::new(spurious_entry as *const () as u64));
+
+        // SMP IPI vectors (Phase 25).
         idt[crate::smp::ipi::IPI_RESCHEDULE]
             .set_handler_addr(VirtAddr::new(reschedule_ipi_entry as *const () as u64));
+        idt[crate::smp::ipi::IPI_TLB_SHOOTDOWN]
+            .set_handler_addr(VirtAddr::new(tlb_shootdown_ipi_entry as *const () as u64));
+        idt[crate::smp::ipi::IPI_CACHE_DRAIN]
+            .set_handler_addr(VirtAddr::new(cache_drain_ipi_entry as *const () as u64));
     }
-    idt[crate::smp::ipi::IPI_TLB_SHOOTDOWN].set_handler_fn(tlb_shootdown_ipi_handler);
-    idt[crate::smp::ipi::IPI_CACHE_DRAIN].set_handler_fn(cache_drain_ipi_handler);
 
     // Phase 55 C.3: device MSI / MSI-X vector stubs.
     // Each stub dispatches through DEVICE_IRQ_TABLE; callers register
-    // handlers at runtime via `register_device_irq`.
-    let bank: &[(u8, extern "x86-interrupt" fn(InterruptStackFrame))] = &[
-        (DEVICE_IRQ_VECTOR_BASE, device_irq_stub_0),
-        (DEVICE_IRQ_VECTOR_BASE + 1, device_irq_stub_1),
-        (DEVICE_IRQ_VECTOR_BASE + 2, device_irq_stub_2),
-        (DEVICE_IRQ_VECTOR_BASE + 3, device_irq_stub_3),
-        (DEVICE_IRQ_VECTOR_BASE + 4, device_irq_stub_4),
-        (DEVICE_IRQ_VECTOR_BASE + 5, device_irq_stub_5),
-        (DEVICE_IRQ_VECTOR_BASE + 6, device_irq_stub_6),
-        (DEVICE_IRQ_VECTOR_BASE + 7, device_irq_stub_7),
-        (DEVICE_IRQ_VECTOR_BASE + 8, device_irq_stub_8),
-        (DEVICE_IRQ_VECTOR_BASE + 9, device_irq_stub_9),
-        (DEVICE_IRQ_VECTOR_BASE + 10, device_irq_stub_10),
-        (DEVICE_IRQ_VECTOR_BASE + 11, device_irq_stub_11),
-        (DEVICE_IRQ_VECTOR_BASE + 12, device_irq_stub_12),
-        (DEVICE_IRQ_VECTOR_BASE + 13, device_irq_stub_13),
-        (DEVICE_IRQ_VECTOR_BASE + 14, device_irq_stub_14),
-        (DEVICE_IRQ_VECTOR_BASE + 15, device_irq_stub_15),
+    // handlers at runtime via `register_device_irq`. Phase 110 A.3b: naked
+    // KPTI-aware entry stubs (`device_irq_entry_N`), same rationale as above.
+    let bank: [unsafe extern "C" fn(); DEVICE_IRQ_VECTOR_COUNT as usize] = [
+        device_irq_entry_0,
+        device_irq_entry_1,
+        device_irq_entry_2,
+        device_irq_entry_3,
+        device_irq_entry_4,
+        device_irq_entry_5,
+        device_irq_entry_6,
+        device_irq_entry_7,
+        device_irq_entry_8,
+        device_irq_entry_9,
+        device_irq_entry_10,
+        device_irq_entry_11,
+        device_irq_entry_12,
+        device_irq_entry_13,
+        device_irq_entry_14,
+        device_irq_entry_15,
     ];
-    for (vec, stub) in bank {
-        idt[*vec].set_handler_fn(*stub);
+    for (off, stub) in bank.iter().enumerate() {
+        unsafe {
+            idt[DEVICE_IRQ_VECTOR_BASE + off as u8]
+                .set_handler_addr(VirtAddr::new(*stub as *const () as u64));
+        }
     }
 
     idt
@@ -3128,7 +3147,8 @@ fn ps2_drain_all_bytes() {
     }
 }
 
-extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
+#[unsafe(no_mangle)]
+extern "C" fn keyboard_body(frame: &mut TrapFrame) {
     clac_on_irq_entry(); // SMAP enforce in-ISR when interrupted from ring 3 (M1)
     super::ps2::IRQ1_ENTRIES.fetch_add(1, Ordering::Relaxed);
     ps2_drain_all_bytes();
@@ -3141,7 +3161,7 @@ extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
                 .notify_end_of_interrupt(InterruptIndex::Keyboard as u8);
         }
     }
-    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+    assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
 }
 
 // ---------------------------------------------------------------------------
@@ -3163,7 +3183,8 @@ extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
 /// asserted enable bits is what de-asserts the level-triggered line before
 /// the EOI — without it the SCI would re-fire in a storm until the ring-3
 /// `acpid` serviced the event.
-extern "x86-interrupt" fn sci_handler(stack_frame: InterruptStackFrame) {
+#[unsafe(no_mangle)]
+extern "C" fn sci_body(frame: &mut TrapFrame) {
     clac_on_irq_entry();
     let _ = crate::acpi::sci::sci_demux();
     if USING_APIC.load(Ordering::Relaxed) {
@@ -3174,10 +3195,11 @@ extern "x86-interrupt" fn sci_handler(stack_frame: InterruptStackFrame) {
                 .notify_end_of_interrupt(InterruptIndex::Sci as u8);
         }
     }
-    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+    assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
 }
 
-extern "x86-interrupt" fn mouse_handler(stack_frame: InterruptStackFrame) {
+#[unsafe(no_mangle)]
+extern "C" fn mouse_body(frame: &mut TrapFrame) {
     clac_on_irq_entry(); // SMAP enforce in-ISR when interrupted from ring 3 (M1)
     super::ps2::IRQ12_ENTRIES.fetch_add(1, Ordering::Relaxed);
     // Both kbd and mouse bytes drain through the same helper — see the
@@ -3193,16 +3215,17 @@ extern "x86-interrupt" fn mouse_handler(stack_frame: InterruptStackFrame) {
                 .notify_end_of_interrupt(InterruptIndex::Mouse as u8);
         }
     }
-    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+    assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
 }
 
 // ---------------------------------------------------------------------------
 // APIC spurious interrupt handler
 // ---------------------------------------------------------------------------
 
-extern "x86-interrupt" fn spurious_handler(stack_frame: InterruptStackFrame) {
+#[unsafe(no_mangle)]
+extern "C" fn spurious_body(frame: &mut TrapFrame) {
     // Spurious interrupt (vector 0xFF) — no EOI must be sent.
-    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+    assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
 }
 
 // ---------------------------------------------------------------------------
@@ -3268,10 +3291,11 @@ pub unsafe extern "C" fn reschedule_ipi_handler_kernel(
 ///
 /// Invalidates a specific page on this core's TLB. The target address and
 /// synchronization are managed by the TLB shootdown request in `smp::tlb`.
-extern "x86-interrupt" fn tlb_shootdown_ipi_handler(stack_frame: InterruptStackFrame) {
+#[unsafe(no_mangle)]
+extern "C" fn tlb_shootdown_ipi_body(frame: &mut TrapFrame) {
     crate::smp::tlb::handle_tlb_shootdown_ipi();
     super::apic::lapic_eoi();
-    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+    assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
 }
 
 /// NMI handler — services TLB shootdown requests via NMI delivery.
@@ -3353,17 +3377,19 @@ extern "x86-interrupt" fn nmi_handler(_stack_frame: InterruptStackFrame) {
 /// active and also services slab-local reclaim handshakes when requested. The
 /// handler always runs on the owning core, so mutating CPU-local cache state is
 /// safe.
-extern "x86-interrupt" fn cache_drain_ipi_handler(stack_frame: InterruptStackFrame) {
+#[unsafe(no_mangle)]
+extern "C" fn cache_drain_ipi_body(frame: &mut TrapFrame) {
     crate::mm::frame_allocator::handle_cache_drain_ipi();
     super::apic::lapic_eoi();
-    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+    assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
 }
 
 // ---------------------------------------------------------------------------
 // Serial (COM1) IRQ handler — vector 36
 // ---------------------------------------------------------------------------
 
-extern "x86-interrupt" fn serial_handler(stack_frame: InterruptStackFrame) {
+#[unsafe(no_mangle)]
+extern "C" fn serial_body(frame: &mut TrapFrame) {
     clac_on_irq_entry(); // SMAP enforce in-ISR when interrupted from ring 3 (M1)
     crate::serial::handle_serial_irq();
 
@@ -3375,7 +3401,7 @@ extern "x86-interrupt" fn serial_handler(stack_frame: InterruptStackFrame) {
                 .notify_end_of_interrupt(InterruptIndex::Serial as u8);
         }
     }
-    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+    assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
 }
 
 // ---------------------------------------------------------------------------
@@ -3557,7 +3583,7 @@ pub fn unregister_device_irq(vector: u8) {
 /// gate here covers every device IRQ — DRY-clean per the Engineering
 /// Practice Gates.
 #[inline(always)]
-fn dispatch_device_irq(vector: u8, stack_frame: &InterruptStackFrame) {
+fn dispatch_device_irq(vector: u8, cs: u64) {
     // A device IRQ can interrupt a userspace task running with AC=1; clear AC so
     // SMAP enforces while the (DMA-adjacent) device handler runs. No-op when the
     // IRQ interrupted kernel context (AC already 0). See M1.
@@ -3585,7 +3611,7 @@ fn dispatch_device_irq(vector: u8, stack_frame: &InterruptStackFrame) {
     if USING_APIC.load(Ordering::Relaxed) {
         super::apic::lapic_eoi();
     }
-    assert_preempt_count_zero_on_return_to_user(stack_frame);
+    assert_preempt_count_zero_on_return_to_user_cs(cs);
 }
 
 /// Test-only entry point into the device-IRQ dispatcher.
@@ -3598,76 +3624,252 @@ fn dispatch_device_irq(vector: u8, stack_frame: &InterruptStackFrame) {
 /// side effect. The function is `#[cfg(test)]`-gated so it does not ship in
 /// release builds.
 ///
-/// Synthesises a fresh `InterruptStackFrame` on the stack so the
-/// dispatch helper has a real reference to forward.  Tests run in ring 0
-/// (the kernel test harness boots before any userspace task), so the
-/// frame's CS naturally reflects ring 0 and the user-mode-return
-/// assertion is a no-op for the test path.
+/// Passes a ring-0 CS directly (Phase 110 A.3b dropped the `InterruptStackFrame`
+/// parameter for a raw `cs: u64`). Tests run in ring 0 (the kernel test harness
+/// boots before any userspace task), so the user-mode-return assertion is a
+/// no-op for the test path.
 #[cfg(test)]
 pub fn dispatch_device_irq_for_test(vector: u8) {
-    // Build a synthetic `InterruptStackFrame` whose CS encodes ring 0 —
-    // the user-mode-return assertion gate will skip it.  We never
-    // `iretq` through this frame; it exists only to satisfy
-    // `dispatch_device_irq`'s signature.
-    let frame = InterruptStackFrame::new(
-        VirtAddr::new(0),
-        gdt::kernel_code_selector(),
-        x86_64::registers::rflags::RFlags::empty(),
-        VirtAddr::new(0),
-        gdt::kernel_data_selector(),
-    );
-    dispatch_device_irq(vector, &frame);
+    // Pass a ring-0 CS so the user-mode-return assertion gate skips it — the
+    // test harness boots before any userspace task.
+    dispatch_device_irq(vector, u64::from(gdt::kernel_code_selector().0));
 }
 
-// Stubs — one per vector slot. The IDT requires a real
-// `extern "x86-interrupt"` function at each vector; we cannot generate them
-// at runtime. Each stub thunks to `dispatch_device_irq` with a compile-time
-// vector number.
-extern "x86-interrupt" fn device_irq_stub_0(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE, &stack_frame);
+/// The `extern "C"` body every `device_irq_entry_N` naked stub calls after its
+/// KPTI entry-CR3 switch. `vector` is the absolute IDT vector the stub baked in;
+/// `frame.cs` drives the user-return preempt assertion.
+#[unsafe(no_mangle)]
+extern "C" fn device_irq_body(frame: &mut TrapFrame, vector: u64) {
+    dispatch_device_irq(vector as u8, frame.cs);
 }
-extern "x86-interrupt" fn device_irq_stub_1(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 1, &stack_frame);
+
+// ---------------------------------------------------------------------------
+// Phase 110 Track A.3b — KPTI-aware naked IRQ entry section
+// ---------------------------------------------------------------------------
+//
+// Every ring-3-reachable **maskable** IRQ / IPI vector enters through a naked
+// stub here instead of an `extern "x86-interrupt"` handler. The reason is the
+// KPTI *exit* switch: on a return to ring 3 the CR3 must flip to the user half
+// in the last instruction before `iretq`, and an `extern "x86-interrupt"`
+// handler ends in a compiler-generated `iretq` we cannot precede. So each stub
+// owns the whole `entry → body → exit → iretq` sequence (the `timer_entry` /
+// `bp_entry` model), and its exit switch runs immediately before its `iretq`.
+//
+// The whole section is page-aligned (`.balign 4096` both ends) and lives in
+// `.text.kpti_irq_entry`, which `mm::kpti` maps into every user PML4 as
+// entry-set text (r-x): when KPTI is active and the interrupt fires while ring 3
+// runs, the CPU begins executing the stub on the *user* CR3, so the stub's
+// instructions up to the `mov cr3` (and, on the way out, from the exit `mov cr3`
+// through `iretq`) must be user-mapped or the very first fetch #PFs.
+//
+// **CR3 discipline (both macros are no-ops until A.4 activates KPTI).**
+//   - Entry: after saving the GPRs, if the frame came from ring 3 (`cs & 3`)
+//     and KPTI is active (`gs:[kpti_user_cr3] != 0`), load `gs:[kpti_kernel_cr3]`
+//     → the full kernel map (kstacks below the top page become reachable) before
+//     the body runs. A ring-0 interruption skips the switch (already kernel CR3).
+//   - Exit: symmetric — re-test the (possibly body-rewritten, e.g. a fault
+//     redirect to a ring-0 trampoline) `cs`; if it is ring 3 and KPTI is active,
+//     load `gs:[kpti_user_cr3]` in the instruction before `iretq`. The exit
+//     re-reads `cs` from the frame rather than assuming ring 3 so a body that
+//     redirected to a kernel continuation returns on the kernel CR3.
+//
+// The GPR save area + CPU frame (160 bytes) live on the process kstack **top
+// page**, which `build_user_half` maps into the user half, so the entry saves
+// and the exit restores are valid on either CR3; the body descends into the
+// kstack below the top page only after the entry switch has made the whole
+// kstack reachable. Maskable IRQ gates enter with IF=0, so nothing nests on the
+// top page before the switch (NMI/#DF use IST stacks + the A.3b paranoid path).
+//
+// While `KPTI_WIRED` is false, `gs:[kpti_user_cr3]` is 0 on every core, so both
+// switches fall through their `jz` — behaviourally identical to the old
+// `extern "x86-interrupt"` handlers, and exercised on every boot by the
+// IRQ-driven gates (keyboard/serial input, device IRQs, TLB shootdowns).
+//
+// `kpti_save_gprs` push order (r15 first → rax last) puts rax at the lowest
+// address (`gprs[0]`), matching `TrapFrame`. Alignment: re-align the stack to 16
+// with the `r12` trick (callee-saved across the call; `pop r12` in the restore
+// reloads the interrupted r12 from its frame slot), the same shape `bp_entry`
+// uses — correct regardless of the RSP0 / kernel-stack entry alignment.
+core::arch::global_asm!(
+    // Bind the `const` operands to assembler symbols the macro bodies reference
+    // (the same `.equ …, {operand}` indirection the syscall entry block uses).
+    ".equ IRQ_OFF_KERNEL_CR3, {irq_off_kernel_cr3}",
+    ".equ IRQ_OFF_USER_CR3,   {irq_off_user_cr3}",
+    ".equ IRQ_DEV_BASE,       {irq_dev_base}",
+    "",
+    ".macro kpti_save_gprs",
+    "push r15",
+    "push r14",
+    "push r13",
+    "push r12",
+    "push r11",
+    "push r10",
+    "push r9",
+    "push r8",
+    "push rbp",
+    "push rdi",
+    "push rsi",
+    "push rdx",
+    "push rcx",
+    "push rbx",
+    "push rax",
+    ".endm",
+    "",
+    ".macro kpti_restore_gprs",
+    "pop rax",
+    "pop rbx",
+    "pop rcx",
+    "pop rdx",
+    "pop rsi",
+    "pop rdi",
+    "pop rbp",
+    "pop r8",
+    "pop r9",
+    "pop r10",
+    "pop r11",
+    "pop r12",
+    "pop r13",
+    "pop r14",
+    "pop r15",
+    ".endm",
+    "",
+    // Entry: switch to the kernel CR3 iff (from ring 3) AND (KPTI active).
+    // Runs after kpti_save_gprs, so cs is at [rsp+128]. Clobbers rax (its user
+    // value is already saved at [rsp]); the body gets its frame via rdi.
+    ".macro kpti_entry_switch",
+    "test qword ptr [rsp + 128], 3",
+    "jz 2f",
+    "mov rax, gs:[IRQ_OFF_USER_CR3]",
+    "test rax, rax",
+    "jz 2f",
+    "mov rax, gs:[IRQ_OFF_KERNEL_CR3]",
+    "mov cr3, rax",
+    "2:",
+    ".endm",
+    "",
+    // Exit: switch to the user CR3 iff (returning to ring 3) AND (KPTI active).
+    // rax is clobbered but immediately reloaded by the following kpti_restore_gprs
+    // `pop rax`.
+    ".macro kpti_exit_switch",
+    "test qword ptr [rsp + 128], 3",
+    "jz 3f",
+    "mov rax, gs:[IRQ_OFF_USER_CR3]",
+    "test rax, rax",
+    "jz 3f",
+    "mov cr3, rax",
+    "3:",
+    ".endm",
+    "",
+    // A no-error-code vector whose body is `extern "C" fn(&mut TrapFrame)`.
+    r".macro kpti_simple_stub name, body",
+    r".global \name",
+    r"\name:",
+    r"kpti_save_gprs",
+    r"kpti_entry_switch",
+    r"cld",
+    r"mov rdi, rsp",
+    r"mov r12, rsp",
+    r"and rsp, -16",
+    r"call \body",
+    r"mov rsp, r12",
+    r"kpti_exit_switch",
+    r"kpti_restore_gprs",
+    r"iretq",
+    r".endm",
+    "",
+    // A device-IRQ vector: body is `extern "C" fn(&mut TrapFrame, vector)`.
+    r".macro kpti_device_stub num",
+    r".global device_irq_entry_\num",
+    r"device_irq_entry_\num:",
+    r"kpti_save_gprs",
+    r"kpti_entry_switch",
+    r"cld",
+    r"mov rdi, rsp",
+    r"mov esi, IRQ_DEV_BASE + \num",
+    r"mov r12, rsp",
+    r"and rsp, -16",
+    r"call device_irq_body",
+    r"mov rsp, r12",
+    r"kpti_exit_switch",
+    r"kpti_restore_gprs",
+    r"iretq",
+    r".endm",
+    "",
+    ".section .text.kpti_irq_entry, \"ax\"",
+    ".balign 4096",
+    ".global kpti_irq_entry_start",
+    "kpti_irq_entry_start:",
+    "",
+    "kpti_simple_stub keyboard_entry, keyboard_body",
+    "kpti_simple_stub serial_entry, serial_body",
+    "kpti_simple_stub mouse_entry, mouse_body",
+    "kpti_simple_stub sci_entry, sci_body",
+    "kpti_simple_stub spurious_entry, spurious_body",
+    "kpti_simple_stub tlb_shootdown_ipi_entry, tlb_shootdown_ipi_body",
+    "kpti_simple_stub cache_drain_ipi_entry, cache_drain_ipi_body",
+    "",
+    "kpti_device_stub 0",
+    "kpti_device_stub 1",
+    "kpti_device_stub 2",
+    "kpti_device_stub 3",
+    "kpti_device_stub 4",
+    "kpti_device_stub 5",
+    "kpti_device_stub 6",
+    "kpti_device_stub 7",
+    "kpti_device_stub 8",
+    "kpti_device_stub 9",
+    "kpti_device_stub 10",
+    "kpti_device_stub 11",
+    "kpti_device_stub 12",
+    "kpti_device_stub 13",
+    "kpti_device_stub 14",
+    "kpti_device_stub 15",
+    "",
+    ".balign 4096",
+    ".global kpti_irq_entry_end",
+    "kpti_irq_entry_end:",
+    ".text",
+    irq_off_kernel_cr3 = const crate::smp::offsets::KPTI_KERNEL_CR3,
+    irq_off_user_cr3 = const crate::smp::offsets::KPTI_USER_CR3,
+    irq_dev_base = const DEVICE_IRQ_VECTOR_BASE as usize,
+);
+
+unsafe extern "C" {
+    fn keyboard_entry();
+    fn serial_entry();
+    fn mouse_entry();
+    fn sci_entry();
+    fn spurious_entry();
+    fn tlb_shootdown_ipi_entry();
+    fn cache_drain_ipi_entry();
+    fn device_irq_entry_0();
+    fn device_irq_entry_1();
+    fn device_irq_entry_2();
+    fn device_irq_entry_3();
+    fn device_irq_entry_4();
+    fn device_irq_entry_5();
+    fn device_irq_entry_6();
+    fn device_irq_entry_7();
+    fn device_irq_entry_8();
+    fn device_irq_entry_9();
+    fn device_irq_entry_10();
+    fn device_irq_entry_11();
+    fn device_irq_entry_12();
+    fn device_irq_entry_13();
+    fn device_irq_entry_14();
+    fn device_irq_entry_15();
+    /// Bounds of the page-aligned `.text.kpti_irq_entry` section — mapped into
+    /// every user PML4 as entry-set text by `mm::kpti::collect_entry_pages`.
+    fn kpti_irq_entry_start();
+    fn kpti_irq_entry_end();
 }
-extern "x86-interrupt" fn device_irq_stub_2(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 2, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_3(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 3, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_4(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 4, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_5(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 5, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_6(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 6, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_7(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 7, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_8(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 8, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_9(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 9, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_10(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 10, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_11(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 11, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_12(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 12, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_13(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 13, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_14(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 14, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_15(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 15, &stack_frame);
+
+/// `[start, end)` VA range of the `.text.kpti_irq_entry` section: the naked
+/// maskable-IRQ / IPI entry stubs the user PML4 maps (r-x, ring-0 only). Both
+/// bounds are page-aligned by the section's `.balign 4096`.
+pub fn kpti_irq_entry_range() -> (u64, u64) {
+    (
+        kpti_irq_entry_start as *const () as u64,
+        kpti_irq_entry_end as *const () as u64,
+    )
 }

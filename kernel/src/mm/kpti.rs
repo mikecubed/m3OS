@@ -361,6 +361,13 @@ fn collect_entry_pages() -> Option<Vec<(u64, u64, PageTableFlags)>> {
     let (text_start, text_end) = crate::arch::x86_64::syscall::kpti_entry_text_range();
     push_kernel_range(&kmapper, &mut out, text_start, text_end, RX)?;
 
+    // Phase 110 A.3b — the naked maskable-IRQ / IPI entry stubs
+    // (`.text.kpti_irq_entry`): when KPTI is active and an IRQ fires while ring 3
+    // runs, the CPU begins executing the stub on the *user* CR3, so its
+    // instructions up to the `mov cr3` must be user-mapped (r-x).
+    let (irq_start, irq_end) = crate::arch::x86_64::interrupts::kpti_irq_entry_range();
+    push_kernel_range(&kmapper, &mut out, irq_start, irq_end, RX)?;
+
     let idtr = x86_64::instructions::tables::sidt();
     let idt_base = idtr.base.as_u64();
     push_kernel_range(
@@ -624,6 +631,18 @@ pub fn self_test() {
         log::error!(
             "KPTI_SELFTEST:FAIL reason=entry-text-layout start={text_start:#x} end={text_end:#x} \
              syscall_entry={entry_plain:#x} syscall_entry_kpti={entry_kpti:#x}"
+        );
+        return;
+    }
+
+    // A.3b: the naked maskable-IRQ / IPI entry section must likewise be
+    // page-aligned and non-empty — it is the only other kernel text the user
+    // PML4 maps, so a linker regression that shrank or misaligned it would
+    // #PF-loop on the first ring-3 IRQ once A.4 activates. Catch it at boot.
+    let (irq_start, irq_end) = crate::arch::x86_64::interrupts::kpti_irq_entry_range();
+    if irq_start % 0x1000 != 0 || irq_end % 0x1000 != 0 || irq_start >= irq_end {
+        log::error!(
+            "KPTI_SELFTEST:FAIL reason=irq-entry-layout start={irq_start:#x} end={irq_end:#x}"
         );
         return;
     }

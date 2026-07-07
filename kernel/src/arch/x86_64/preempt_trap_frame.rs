@@ -49,6 +49,52 @@ pub struct PreemptTrapFrameUser {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 110 Track A.3b — generic full-GPR trap frame (any ring, any vector)
+// ---------------------------------------------------------------------------
+
+/// On-stack trap frame captured by the generic KPTI-aware IRQ entry stubs
+/// (`kpti_irq_stub` / `kpti_device_stub` in `interrupts.rs`) for every
+/// converted no-error-code vector (device IRQs, keyboard/serial/mouse/SCI,
+/// spurious, TLB-shootdown/cache-drain IPIs).
+///
+/// Unlike the preempt frames above there is **no ring split**: in 64-bit mode
+/// the CPU pushes the full 5-field iretq frame (`rip/cs/rflags/rsp/ss`)
+/// unconditionally — SS:RSP is pushed even without a privilege change (Intel
+/// SDM Vol 3A §6.14.2) — so one layout serves both rings and handlers ring-test
+/// in Rust via `cs & 3` (the same shape as `debug::DebugTrapFrame`).
+///
+/// Layout (low → high address): `gprs[0..14]` (asm-pushed, same order as
+/// [`PreemptTrapFrameUser`]), then the CPU-pushed `rip/cs/rflags/rsp/ss`.
+#[repr(C)]
+pub struct TrapFrame {
+    /// GPR block — same order as [`PreemptTrapFrameUser`]:
+    /// `[rax, rbx, rcx, rdx, rsi, rdi, rbp, r8, r9, r10, r11, r12, r13, r14, r15]`
+    pub gprs: [u64; 15],
+    // CPU-pushed iretq frame (always 5 fields in 64-bit mode)
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+
+const _: () = assert!(
+    offset_of!(TrapFrame, gprs) == 0 && offset_of!(TrapFrame, rip) == 15 * 8,
+    "TrapFrame: gprs at 0, rip at 120 (after 15 GPRs)"
+);
+const _: () = assert!(
+    offset_of!(TrapFrame, cs) == 16 * 8
+        && offset_of!(TrapFrame, rflags) == 17 * 8
+        && offset_of!(TrapFrame, rsp) == 18 * 8
+        && offset_of!(TrapFrame, ss) == 19 * 8,
+    "TrapFrame: CPU frame fields must follow the GPR block contiguously"
+);
+const _: () = assert!(
+    core::mem::size_of::<TrapFrame>() == 20 * 8,
+    "TrapFrame must be 160 bytes (15 GPRs + 5 CPU fields)"
+);
+
+// ---------------------------------------------------------------------------
 // Ring-0 on-stack trap frame
 // ---------------------------------------------------------------------------
 
