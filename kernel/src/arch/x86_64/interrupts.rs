@@ -1222,13 +1222,14 @@ static IDT: Lazy<PageIsolated<InterruptDescriptorTable>> = Lazy::new(|| {
     }
     // Phase 110 Track A.3b — the ring-3-reachable maskable IRQ / IPI vectors
     // now use naked-asm entry stubs (`*_entry`) in the page-aligned
-    // `.text.kpti_irq_entry` section so each can (once KPTI activates) switch to
-    // the kernel CR3 on entry and back to the user CR3 immediately before its
-    // `iretq` — an `extern "x86-interrupt"` handler cannot, because the compiler
-    // owns the `iretq` (see the module-level A.3b block). While `KPTI_WIRED` is
-    // false every switch is a never-taken branch (`kpti_user_cr3 == 0`), so this
-    // is behaviourally identical to the old `set_handler_fn` install and is
-    // exercised on every boot by the existing IRQ-driven gates.
+    // `.text.kpti_irq_entry` section so each can switch to the kernel CR3 on
+    // entry and back to the user CR3 immediately before its `iretq` — an
+    // `extern "x86-interrupt"` handler cannot, because the compiler owns the
+    // `iretq` (see the module-level A.3b block). While KPTI is inactive
+    // (`mitigations=off`, or `auto` on `RDCL_NO` silicon) every switch is a
+    // never-taken branch (`kpti_user_cr3 == 0`), behaviourally identical to
+    // the old `set_handler_fn` install; since A.4 the default QEMU boot
+    // (`auto`, `rdcl_no=false`) runs the switches live on every gate.
     unsafe {
         idt[InterruptIndex::Keyboard as u8]
             .set_handler_addr(VirtAddr::new(keyboard_entry as *const () as u64));
@@ -3469,10 +3470,12 @@ extern "C" fn device_irq_body(frame: &mut TrapFrame, vector: u64) {
 // kstack reachable. Maskable IRQ gates enter with IF=0, so nothing nests on the
 // top page before the switch (NMI/#DF use IST stacks + the A.3b paranoid path).
 //
-// While `KPTI_WIRED` is false, `gs:[kpti_user_cr3]` is 0 on every core, so both
-// switches fall through their `jz` — behaviourally identical to the old
-// `extern "x86-interrupt"` handlers, and exercised on every boot by the
-// IRQ-driven gates (keyboard/serial input, device IRQs, TLB shootdowns).
+// While KPTI is inactive (`mitigations=off` / `auto` on `RDCL_NO` silicon),
+// `gs:[kpti_user_cr3]` is 0 on every core, so both switches fall through their
+// `jz` — behaviourally identical to the old `extern "x86-interrupt"` handlers.
+// Since A.4 the default QEMU boot (`auto`, `rdcl_no=false`) is KPTI-active, so
+// the IRQ-driven gates (keyboard/serial input, device IRQs, TLB shootdowns)
+// exercise the live switches on every boot.
 //
 // `kpti_save_gprs` push order (r15 first → rax last) puts rax at the lowest
 // address (`gprs[0]`), matching `TrapFrame`. Alignment: re-align the stack to 16
@@ -3692,10 +3695,24 @@ core::arch::global_asm!(
     "iretq",
     "",
     // --- #BP / #DB (Phase 111 Track C.2; single layout, ring test in Rust) ----
+    //
+    // Phase 110 A.4 — **paranoid ENTRY** (not the `cs & 3` ring test). #BP/#DB
+    // are IF-independent exceptions that can fire while a KPTI trampoline is in
+    // its ring-0/user-CR3 window (a hardware breakpoint or `RFLAGS.TF`
+    // single-step trapping on a window instruction), where the ring test reads
+    // a ring-0 `cs` and would *skip* the switch, running the body on the user
+    // half → nested fault → `#DF`. The paranoid entry reads the actual CR3 and
+    // loads the kernel CR3 unconditionally (when active), so the body always
+    // runs on the full map. The EXIT stays the `cs`-based `kpti_exit_switch`
+    // (ring-3 return → user CR3; ring-0 return → keep kernel CR3): a fault
+    // taken inside a window is non-resumable in production (the window
+    // instructions only touch mapped memory, so a real #PF there is a kernel
+    // bug that halts; TF/DR7 on kernel code exists only under the off-in-prod
+    // `kgdb`/`ptrace` features), so no ring-0 return ever needs the user CR3.
     ".global bp_entry",
     "bp_entry:",
     "kpti_save_gprs",
-    "kpti_entry_switch",
+    "kpti_paranoid_entry",
     "cld",
     "mov rdi, rsp", // &mut DebugTrapFrame
     "mov r12, rsp",
@@ -3709,7 +3726,7 @@ core::arch::global_asm!(
     ".global db_entry",
     "db_entry:",
     "kpti_save_gprs",
-    "kpti_entry_switch",
+    "kpti_paranoid_entry",
     "cld",
     "mov rdi, rsp",
     "mov r12, rsp",
@@ -3721,13 +3738,30 @@ core::arch::global_asm!(
     "iretq",
     "",
     // --- #PF / #GP (error-code exceptions; body is `fn(&mut TrapFrameErr)`) ----
-    // The body may rewrite the frame's cs to a ring-0 fault-kill trampoline; the
-    // exit switch re-tests cs, so such a redirect returns on the kernel CR3.
-    // `add rsp, 8` discards the CPU error code (iretq does not pop it).
+    //
+    // Phase 110 A.4 — **paranoid ENTRY** (not `kpti_entry_switch_err`'s ring
+    // test). Like #BP/#DB, a #PF/#GP can arrive while a trampoline holds the
+    // user CR3 in ring 0 — e.g. a non-canonical/bad-frame `iretq`/`sysretq`
+    // faulting *inside* an exit window (ring-0 `cs`, `CR3 = user`). The old
+    // ring test skipped the switch there, ran the deep-diagnostic
+    // `page_fault_body` on the partial user half, and it re-faulted descending
+    // the kstack below the single user-mapped top page → `#DF`
+    // (observed under regression-suite load). Paranoid entry loads the kernel
+    // CR3 unconditionally, so the body runs on the full map regardless of how
+    // it was entered.
+    //
+    // The EXIT keeps `kpti_exit_switch_err` (the `cs`-based test): this is what
+    // makes the body's **fatal-fault redirect** work — `page_fault_body` /
+    // `try_recover_kstack_overflow` rewrite the frame's `cs` to a ring-0 kill
+    // trampoline on a kernel stack, and the `cs`-based exit then keeps the
+    // kernel CR3 for that ring-0 target (a paranoid exit would instead restore
+    // the *saved* entry CR3 — the user half for a ring-3-origin fault — and run
+    // the kill trampoline unisolated). Genuine ring-3 faults still return on the
+    // user CR3 (ring-3 `cs`). `add rsp, 8` discards the CPU error code.
     ".global page_fault_entry",
     "page_fault_entry:",
     "kpti_save_gprs",
-    "kpti_entry_switch_err",
+    "kpti_paranoid_entry",
     "cld",
     "mov rdi, rsp", // &mut TrapFrameErr
     "mov r12, rsp",
@@ -3742,7 +3776,7 @@ core::arch::global_asm!(
     ".global general_protection_fault_entry",
     "general_protection_fault_entry:",
     "kpti_save_gprs",
-    "kpti_entry_switch_err",
+    "kpti_paranoid_entry",
     "cld",
     "mov rdi, rsp",
     "mov r12, rsp",
@@ -3883,6 +3917,23 @@ pub fn kpti_irq_entry_range() -> (u64, u64) {
 //   3. flip CR3 via the scratch slot (no-op while `kpti_user_cr3 == 0`).
 //   4. `iretq`.
 //
+// Phase 110 A.4 — each trampoline `cli`s first. After the CR3 flip (step 3) we
+// are in ring 0 on the USER CR3 (which maps only the entry set + kstack top
+// page, not the general kernel image), and stay there until `iretq`. A maskable
+// timer/reschedule IPI delivered in that window would vector to its naked stub,
+// see the interrupted ring-0 `cs`, take the "ring 0 ⟹ already-kernel-CR3"
+// kernel path (which does NO CR3 switch), and `call` its `.text` body — which is
+// absent from the user half → `INSTRUCTION_FETCH` #PF, and (pre-A.4-fix)
+// nested-fault #DF. `execve`/`sigreturn`/`fork` reach their trampoline with
+// IF=1 (the syscall's SFMASK cleared IF, but they re-enable it doing blocking
+// IPC / disk / scheduler work), so the flip window is genuinely IF=1 without
+// this `cli`. `dispatch_preempted_and_resume` already `cli`s before jumping to
+// `preempt_resume_to_user`; the explicit `cli` here makes all four uniform. NMI
+// is unmaskable but uses the paranoid entry (reads/loads the kernel CR3), and
+// the window instructions themselves touch only mapped memory, so IF=0 closes
+// the last delivery path into the window. The `iretq` restores the task's own
+// IF from the frame's rflags.
+//
 // The four ring0→ring3 exit trampolines all live here: part 3a landed
 // `preempt_resume_to_user` (the preemption-resume path) as the proof of
 // pattern; part 3b `fork_enter_userspace`; part 3c `execve_enter_userspace`;
@@ -3903,6 +3954,9 @@ core::arch::global_asm!(
     //   rip=120 cs=128 rflags=136 rsp=144 ss=152
     ".global preempt_resume_to_user",
     "preempt_resume_to_user:",
+    // Mask IRQs through the CR3-flip → iretq window (see the section header).
+    // Redundant here (dispatch_preempted_and_resume already cli'd) but uniform.
+    "cli",
     // Reset rsp to this (resumed) task's kstack top page — the dispatch prep
     // block published it to gs:[STACK_TOP] before the jmp here, and it is the
     // one kstack page the user half maps. The scheduler stack we abandon was
@@ -3957,6 +4011,8 @@ core::arch::global_asm!(
     //   r9=112 r10=120 rflags=128
     ".global fork_enter_userspace",
     "fork_enter_userspace:",
+    // Mask IRQs through the CR3-flip → iretq window (see the section header).
+    "cli",
     // Reset rsp to this task's kstack top page — the child was dispatched via
     // switch_context, so the dispatch prep block already published its kstack
     // top to gs:[STACK_TOP]. The continuation stack below is abandoned (this
@@ -4017,6 +4073,11 @@ core::arch::global_asm!(
     // fork-overlap regression (caught by the a3b pre-push gate).
     ".global execve_enter_userspace",
     "execve_enter_userspace:",
+    // Mask IRQs through the CR3-flip → iretq window (see the section header).
+    // execve reaches here with IF=1 (it re-enabled during its blocking IPC /
+    // disk load), so without this the flip window is a live ring-0/user-CR3
+    // IRQ target — the exact source of the A.4 reschedule-IPI-on-user-half #PF.
+    "cli",
     // Reset rsp to this task's kstack top page (user-mapped); the execve
     // continuation stack below is abandoned (this trampoline never returns).
     "mov rsp, gs:[EXIT_OFF_STACK_TOP]",
@@ -4064,6 +4125,8 @@ core::arch::global_asm!(
     //   r13=104 r14=112 r15=120 rip=128 rflags=136
     ".global sigreturn_enter_userspace",
     "sigreturn_enter_userspace:",
+    // Mask IRQs through the CR3-flip → iretq window (see the section header).
+    "cli",
     // Reset rsp to this task's kstack top page (user-mapped); the sigreturn
     // syscall continuation below is abandoned (this trampoline never returns).
     "mov rsp, gs:[EXIT_OFF_STACK_TOP]",

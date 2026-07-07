@@ -1346,14 +1346,14 @@ global_asm!(
     // The body is shared between both entry stubs, so the tail re-derives the
     // posture from `gs:[OFF_KPTI_USER_CR3]`: non-zero exactly when this core
     // dispatched the current task with KPTI active (the same slot the entry
-    // stub's kernel-CR3 twin came from), zero otherwise — including on every
-    // production boot while `KPTI_WIRED` is false, where the cost is two
-    // gs-moves and one never-taken branch. Reading the slot (not a saved
-    // register) also keeps `execve` correct: it retargets the per-core pair
-    // mid-syscall, and the tail must return on the NEW address space's user
-    // CR3. IF is already masked (`cli` above), so nothing can preempt between
-    // the CR3 switch and `sysretq`; NMI is the one exception and is handled
-    // by the paranoid save/restore path (A.3).
+    // stub's kernel-CR3 twin came from), zero otherwise — kernel threads, or a
+    // whole boot with KPTI inactive (`mitigations=off` / `auto` on `RDCL_NO`
+    // silicon), where the cost is two gs-moves and one never-taken branch.
+    // Reading the slot (not a saved register) also keeps `execve` correct: it
+    // retargets the per-core pair mid-syscall, and the tail must return on
+    // the NEW address space's user CR3. IF is already masked (`cli` above),
+    // so nothing can preempt between the CR3 switch and `sysretq`; NMI is the
+    // one exception and is handled by the paranoid save/restore path (A.3).
     //
     // `rax` holds the syscall return value and `rcx`/`r11` the user RIP/
     // RFLAGS, so the user-CR3 load spills `rax` through the scratch slot —
@@ -1444,12 +1444,11 @@ pub fn syscall_entry_stub_addrs() -> (u64, u64) {
 /// The SYSCALL entry stub matching this boot's KPTI posture: the CR3
 /// trampoline when `kpti_active`, the direct stub otherwise.
 ///
-/// While `KPTI_WIRED` is false (A.2) `kpti_active` is never set, so this
-/// always yields the non-KPTI stub and production behaviour is unchanged. Once
-/// A.4 lands: APs run `mitigations::init_ap()` before `syscall::init_ap()` and
-/// the S3 resume path re-runs `init()` after the (static) policy decision, so
-/// both pick the right stub here; only the BSP's early `init()` predates
-/// `mitigations::init_bsp()` and needs the explicit A.4 LSTAR re-install.
+/// Live since A.4 (`KPTI_WIRED = true`): APs run `mitigations::init_ap()`
+/// before `syscall::init_ap()` and the S3 resume path re-runs `init()` after
+/// the (static) policy decision, so both pick the right stub here; only the
+/// BSP's early `init()` predates `mitigations::init_bsp()` and gets the
+/// explicit [`reinstall_lstar`] from `lib.rs` right after the policy decision.
 fn lstar_target() -> VirtAddr {
     let kpti_active = crate::mitigations::state().is_some_and(|s| s.kpti_active);
     if kpti_active {
@@ -6410,6 +6409,21 @@ pub fn init() {
     unsafe {
         Efer::update(|flags| *flags |= EferFlags::SYSTEM_CALL_EXTENSIONS);
     }
+}
+
+/// Phase 110 A.4 — re-select the LSTAR target after the mitigations policy
+/// decision.
+///
+/// The BSP's [`init`] runs before `mitigations::init_bsp()` (the SYSCALL MSRs
+/// must exist early in boot), so it installs the non-KPTI stub; once
+/// `kpti_active` is decided this re-install swaps in `syscall_entry_kpti`
+/// when active (and is a same-value rewrite otherwise). APs (`init_ap` runs
+/// after `mitigations::init_ap`, with the BSP's policy snapshot long
+/// published) and the S3-resume re-`init()` self-select via [`lstar_target`]
+/// and do not need this. No ring-3 code exists yet at the call site, so the
+/// swap cannot race a live SYSCALL.
+pub fn reinstall_lstar() {
+    LStar::write(lstar_target());
 }
 
 /// Initialize SYSCALL MSRs on an AP core.

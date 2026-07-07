@@ -17082,14 +17082,20 @@ fn cmd_session_restart_smoke(args: &SmokeBootArgs) {
 // ---------------------------------------------------------------------------
 //
 // Boots the default image and asserts, at RUNTIME on a real boot:
-//   1. the boot mitigation policy snapshot logged (D.2/A.6) and the A.4
-//      GLOBAL-bit guard reported 0 (the `[sec] mitigations=... global_kernel_ptes=0`
-//      line — `global_kernel_ptes=0` uniquely identifies it);
+//   1. the boot mitigation policy snapshot logged (D.2/A.6), Phase 110 A.4
+//      KPTI **activation** (`kpti(policy=true active=true)` — QEMU TCG reports
+//      `rdcl_no=false`, so the default `auto` build enforces KPTI on every
+//      boot now that `KPTI_WIRED` is true), and the A.4 GLOBAL-bit guard
+//      reported 0 — all on the single `[sec] mitigations=...` line;
 //   2. `m3ctl mitigations status` prints the honest reporter output (D.3):
-//      the per-vuln Meltdown line, the compiled-in retpoline line, and the
-//      UNADDRESSED enumeration.
-// KPTI-independent (default boot, `kpti_active=false`), so this validates the
-// Spectre-v2 + config + reporter layer without needing KPTI activation.
+//      Meltdown as `Mitigation: PTI` (the reporter overrides Meltdown with the
+//      ACTUAL kpti_active, so this asserts enforcement, not policy), the
+//      compiled-in retpoline line, and the UNADDRESSED enumeration.
+// The `auto` policy on the TCG lane is KPTI-equivalent to `full` (both reduce
+// to `kpti_policy=true` when `rdcl_no=false`), so this default lane satisfies
+// the Phase 110 A.4 "assert active=true" acceptance without an env rebuild.
+// The `off` / `RDCL_NO` deactivation arms stay host-tested (kernel-core
+// spectre::report_map tests).
 
 /// Smoke step list for `cargo xtask mitigations-status-smoke`.
 fn mitigations_status_smoke_steps() -> Vec<SmokeStep> {
@@ -17099,15 +17105,20 @@ fn mitigations_status_smoke_steps() -> Vec<SmokeStep> {
             timeout_secs: 30,
             label: "guest/mitigations: kernel first message",
         },
-        // D.2 (policy snapshot) + A.4 (GLOBAL guard) + A.6 (policy decision):
-        // the `[sec] mitigations=...` line ends with `global_kernel_ptes=N`,
-        // so matching `global_kernel_ptes=0` asserts the whole line printed
-        // and the guard found zero GLOBAL kernel PTEs. Checked BEFORE any Send
+        // D.2 (policy snapshot) + Phase 110 A.4 (KPTI activation + GLOBAL
+        // guard): the `[sec] mitigations=...` line ends with
+        // `kpti(policy=… active=…) global_kernel_ptes=N`, so matching the
+        // combined tail asserts (a) the whole line printed, (b) KPTI is
+        // ENFORCING this boot (active=true — the A.4 flip; TCG reports
+        // `rdcl_no=false` so the default `auto` build activates), and (c) the
+        // guard found zero GLOBAL kernel PTEs (none survive the CR3 switch).
+        // One pattern because both facts live on the same line and the serial
+        // Wait cursor advances past each match. Checked BEFORE any Send
         // (which drains the serial buffer).
         SmokeStep::Wait {
-            pattern: "global_kernel_ptes=0",
+            pattern: "kpti(policy=true active=true) global_kernel_ptes=0",
             timeout_secs: 90,
-            label: "guest/mitigations: boot policy logged + A.4 GLOBAL guard = 0",
+            label: "guest/mitigations: boot policy logged + A.4 KPTI active + GLOBAL guard = 0",
         },
     ];
     // Log into sh0 so the next Send lands at a shell prompt.
@@ -17124,10 +17135,13 @@ fn mitigations_status_smoke_steps() -> Vec<SmokeStep> {
         timeout_secs: 10,
         label: "guest/mitigations: reporter prints the compiled-in retpoline line",
     });
+    // Phase 110 A.4 — the reporter's Meltdown line reflects ACTUAL
+    // enforcement (report_map overrides with kpti_active), so with KPTI live
+    // it must read `Mitigation: PTI`, never `Vulnerable`.
     steps.push(SmokeStep::Wait {
-        pattern: "Meltdown:",
+        pattern: "Meltdown: Mitigation: PTI",
         timeout_secs: 5,
-        label: "guest/mitigations: reporter prints the Meltdown per-vuln line",
+        label: "guest/mitigations: reporter shows Meltdown mitigated by PTI (KPTI enforcing)",
     });
     steps.push(SmokeStep::Wait {
         pattern: "UNADDRESSED",
@@ -17443,7 +17457,11 @@ fn cmd_debug_substrate_smoke(args: &SmokeBootArgs) {
 /// exercise Meltdown itself — that the pair builder maps only the user lower
 /// half + entry set, with no kernel image / heap / kstack / direct-map leaf
 /// reachable from the user CR3. No special kernel feature: the sentinel prints
-/// on every boot (KPTI is not yet live; `KPTI_WIRED` is `false`).
+/// on every boot. Since Phase 110 A.4 (`KPTI_WIRED = true`) the same boot also
+/// runs KPTI **live** (default `auto` + TCG `rdcl_no=false` → active), so
+/// reaching the login prompt after the sentinel additionally proves the live
+/// CR3 trampoline boots; the self-test's throwaway pair stays the isolation
+/// proof (built + walked + freed, never loaded).
 fn cmd_kpti_selftest_smoke(args: &SmokeBootArgs) {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);

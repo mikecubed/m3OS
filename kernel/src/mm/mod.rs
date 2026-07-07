@@ -103,8 +103,9 @@ impl AddressSpace {
     /// value published to `gs:[SYSCALL_STACK_TOP]` / TSS.RSP0 at dispatch; its
     /// top page is the one kstack page the user half maps).
     ///
-    /// No-op (returning `true`) while KPTI is inactive — the inert
-    /// `KPTI_WIRED=false` production path adds zero per-process overhead.
+    /// No-op (returning `true`) while KPTI is inactive (`mitigations=off` /
+    /// `auto` on `RDCL_NO` silicon) — that path adds zero per-process
+    /// overhead.
     /// Returns `false` on allocation failure (logged); A.4 fails closed on it:
     /// `execve` returns `ENOMEM` before its destructive steps, and the
     /// fork-child trampoline kills the child rather than entering ring 3
@@ -212,8 +213,9 @@ impl AddressSpace {
 /// manually at the teardown sites) only knows the kernel half, while the last
 /// `Arc<AddressSpace>` drop is the natural end-of-life for the pair.
 /// [`kpti::free_user_half`] frees only the private entry-set sub-tables and
-/// the user PML4 frame itself — never `PML4[0]` (shared with the kernel half)
-/// nor any leaf page — so the ordering relative to
+/// the user PML4 frame itself — never the shared user-mapping slots
+/// (`kernel_core::kpti::USER_PML4_SLOTS`, owned by the kernel half) nor any
+/// leaf page — so the ordering relative to
 /// `free_process_page_table(kernel_pml4)` is immaterial.
 impl Drop for AddressSpace {
     fn drop(&mut self) {

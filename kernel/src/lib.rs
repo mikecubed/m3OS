@@ -538,8 +538,14 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
         // the user lower half + minimal entry set, and no kernel-secret leaf, on
         // real hardware page tables (QEMU cannot exercise Meltdown itself). A
         // throwaway pair, built + walked + freed; emits a `KPTI_SELFTEST:`
-        // sentinel. Inert w.r.t. the live CR3 (KPTI_WIRED is still false).
+        // sentinel. Inert w.r.t. the live CR3 (a throwaway table, never loaded).
         crate::mm::kpti::self_test();
+        // Phase 110 Track A.4 — the BSP's early `syscall::init()` predates the
+        // mitigations policy decision and installed the non-KPTI stub; now that
+        // `kpti_active` is known, re-select LSTAR (`syscall_entry_kpti` when
+        // active). APs and the S3-resume path self-select. No userspace exists
+        // yet, so this cannot race a live SYSCALL.
+        arch::x86_64::syscall::reinstall_lstar();
     });
 
     // Phase 103 Track E: probe HWP and opt in on the BSP (IA32_PM_ENABLE is

@@ -11,16 +11,18 @@
 //!
 //! ## What this delivers (and what it deliberately does not)
 //!
-//! Through A.3b's data plane this is still **builder + validation**, with
-//! `KPTI_WIRED` still `false`: the user PML4 is constructed and asserted, but
-//! never loaded into CR3, so the live syscall/IRQ paths and every existing gate
-//! are untouched. A.2 added the syscall CR3 trampoline (`syscall_entry_kpti`,
-//! LSTAR-selected, dormant in production). A.3a grew the validated entry set to
-//! the interrupt-delivery structures (GDT/IDT/TSS) + the reachability
-//! round-trip. A.3a→b factored the reusable per-process builder
-//! ([`build_user_half`] / [`free_user_half`]) the activation loads as the ring-3
-//! CR3 — the self-test now exercises that exact path. The live IRQ/IST asm that
-//! consumes it and the activation on the policy path (A.4) land in follow-ons.
+//! This module is the **builder + validation** plane; the *live* consumers
+//! landed across A.2–A.4. A.2 added the syscall CR3 trampoline
+//! (`syscall_entry_kpti`, LSTAR-selected). A.3a grew the validated entry set
+//! to the interrupt-delivery structures (GDT/IDT/TSS) + the reachability
+//! round-trip. A.3b factored the reusable per-process builder
+//! ([`build_user_half`] / [`free_user_half`]) and the naked entry/exit stubs
+//! that consume it. **A.4 activated the pair**: `KPTI_WIRED = true`, so on
+//! Meltdown-susceptible silicon (`auto`, incl. every QEMU TCG boot) each
+//! process's user half is built at address-space birth, published per-core at
+//! dispatch, and loaded as the ring-3 CR3 by the entry/exit stubs. The boot
+//! self-test below still builds a throwaway pair (never loaded) so its
+//! invariant walk stays independent of the live tables.
 //!
 //! ## The minimal entry set (the load-bearing subtlety)
 //!
@@ -42,11 +44,12 @@
 //! The CPU reads GDT/IDT/TSS and switches to the IST top through the *active*
 //! paging when delivering a ring-3 → ring-0 interrupt, so all must be user-mapped
 //! or delivery itself triple-faults. [`build_user_half`] adds the two per-process
-//! bits: the shared user lower half (`PML4[0]`, the same frame the kernel half
-//! points at, so mmap/brk/stack stay in sync) and this process's **kstack top
-//! page** — where the CPU pushes the interrupt frame on the user CR3 before the
-//! stub switches to the kernel CR3 (only the top page is exposed; the whole
-//! kstack reappears once on the kernel half).
+//! bits: the shared user-mapping slots (`kernel_core::kpti::USER_PML4_SLOTS` —
+//! `PML4[0]` for image/brk/mmap and `PML4[255]` for the stack, the same
+//! sub-table frames the kernel half points at, so user mappings stay in sync)
+//! and this process's **kstack top page** — where the CPU pushes the interrupt
+//! frame on the user CR3 before the stub switches to the kernel CR3 (only the
+//! top page is exposed; the whole kstack reappears once on the kernel half).
 //!
 //! The self-test builds a real user half via [`build_user_half`] over a
 //! synthetic kernel PML4, then (a) walks it and asserts no kernel-secret leaf
@@ -78,8 +81,16 @@ use kernel_core::kpti::{KernelRange, KptiInvariantError, check_user_half_invaria
 use super::{frame_allocator, mapper_for_frame, phys_offset};
 
 /// VA the self-test maps its synthetic user leaf at (mirrors the ELF loader's
-/// `USER_VADDR_MIN`, so it lands in `PML4[0]` — the user lower half).
+/// `USER_VADDR_MIN`, so it lands in `PML4[0]` — the image/brk/mmap user slot).
 const SELFTEST_USER_VA: u64 = 0x0020_0000;
+
+/// VA of the self-test's synthetic user **stack** leaf (one page below the ELF
+/// loader's `ELF_STACK_TOP`, so it lands in `PML4[255]` — the stack user
+/// slot). Proves the user half shares BOTH user-mapping slots
+/// (`kernel_core::kpti::USER_PML4_SLOTS`): sharing only `PML4[0]` was the A.4
+/// bring-up wedge (the first ring-3 stack access #PF-looped silently, because
+/// the stack mapping existed only in the kernel half).
+const SELFTEST_USER_STACK_VA: u64 = crate::mm::elf::ELF_STACK_TOP - 0x1000;
 
 /// Leaf flags for read-execute entry-set pages (entry text): ring-0 only, no
 /// `USER_ACCESSIBLE`, no `NO_EXECUTE`.
@@ -178,7 +189,9 @@ fn classify(va: u64, entry_vas: &[u64], kimg_idx: usize, dm_idx: usize) -> Kerne
         return KernelRange::EntrySet;
     }
     match pml4_index(va) {
-        0 => KernelRange::UserLowerHalf,
+        // The user-mapping slots (image/brk/mmap `PML4[0]` + stack `PML4[255]`),
+        // shared verbatim with the kernel half.
+        i if kernel_core::kpti::is_user_pml4_slot(i) => KernelRange::UserLowerHalf,
         i if i == kimg_idx => KernelRange::KernelImage,
         256 | 257 => KernelRange::KernelHeap, // heap + kernel stacks: kernel secrets
         i if i == dm_idx => KernelRange::DirectMap,
@@ -277,12 +290,17 @@ struct SelfTestArena {
     /// classify leaves as `EntrySet` during the walk and to round-trip-verify
     /// each page actually translates in the built user PML4.
     entry_pages: Vec<(u64, u64)>,
+    /// The synthetic user leaves as `(user_va, expected_phys)` — one per
+    /// user-mapping slot (`USER_PML4_SLOTS`), round-trip-verified in the built
+    /// user half exactly like the entry set (a missing one is the stack-slot
+    /// #PF-loop wedge, not a triple fault, so it needs its own check).
+    user_leaf_pages: Vec<(u64, u64)>,
 }
 
 impl SelfTestArena {
     fn free(self) {
         // The user half via the production free path (frees its private
-        // entry-set sub-tables + top frame, skips the shared PML4[0]).
+        // entry-set sub-tables + top frame, skips the shared user slots).
         // SAFETY: user_pml4_phys is a valid user half no longer loaded anywhere.
         unsafe { free_user_half(self.user_pml4_phys) };
         // Then the synthetic kernel PML4 + user chain the test owns.
@@ -292,12 +310,14 @@ impl SelfTestArena {
     }
 }
 
-/// Build a throwaway **kernel** PML4 carrying a single synthetic user leaf at
-/// [`SELFTEST_USER_VA`] in `PML4[0]`, so [`build_user_half`] has a real kernel
-/// half to derive from (its shared `PML4[0]` then presents a `UserLowerHalf`
-/// leaf the invariant requires). Returns `(kernel_pml4_phys, owned_frames)`;
-/// every frame in `owned_frames` (PML4 + PDPT/PD/PT + leaf) is the caller's to
-/// free.
+/// Build a throwaway **kernel** PML4 carrying one synthetic user leaf per
+/// user-mapping slot — [`SELFTEST_USER_VA`] in `PML4[0]` and
+/// [`SELFTEST_USER_STACK_VA`] in `PML4[255]` — so [`build_user_half`] has a
+/// real kernel half to derive from (each shared slot then presents a
+/// `UserLowerHalf` leaf, proving the builder shares the FULL
+/// `USER_PML4_SLOTS` set, not just `PML4[0]`). Returns
+/// `(kernel_pml4_phys, owned_frames)`; every frame in `owned_frames`
+/// (PML4 + PDPT/PD/PT + leaves) is the caller's to free.
 fn build_synthetic_kernel_pml4() -> Option<(u64, Vec<u64>)> {
     let phys_off = phys_offset();
     let mut owned: Vec<u64> = Vec::new();
@@ -310,20 +330,23 @@ fn build_synthetic_kernel_pml4() -> Option<(u64, Vec<u64>)> {
         core::ptr::write_bytes((phys_off + pml4_phys) as *mut u8, 0, 4096);
     }
 
-    let leaf = frame_allocator::allocate_frame()?;
-    owned.push(leaf.start_address().as_u64());
-
     // SAFETY: pml4 is a fresh, non-live table owned solely here.
     let mut mapper = unsafe { mapper_for_frame(pml4) };
-    let ok = {
+    let mut ok = true;
+    for va in [SELFTEST_USER_VA, SELFTEST_USER_STACK_VA] {
+        let Some(leaf) = frame_allocator::allocate_frame() else {
+            ok = false;
+            break;
+        };
+        owned.push(leaf.start_address().as_u64());
         let mut alloc = RecordingAlloc {
             recorded: &mut owned,
         };
         // SAFETY: exclusive mapper; valid frame.
-        unsafe {
+        ok = unsafe {
             map_entry_page(
                 &mut mapper,
-                SELFTEST_USER_VA,
+                va,
                 leaf.start_address().as_u64(),
                 PageTableFlags::PRESENT
                     | PageTableFlags::WRITABLE
@@ -331,8 +354,11 @@ fn build_synthetic_kernel_pml4() -> Option<(u64, Vec<u64>)> {
                 &mut alloc,
             )
         }
-        .is_ok()
-    };
+        .is_ok();
+        if !ok {
+            break;
+        }
+    }
     if !ok {
         for f in &owned {
             frame_allocator::free_frame(*f);
@@ -390,14 +416,21 @@ fn collect_entry_pages() -> Option<Vec<(u64, u64, PageTableFlags)>> {
         RW,
     )?;
 
-    // Per online core: PerCoreData + GDT + TSS.
-    for core_id in 0..crate::smp::core_count() {
+    // Per ALLOCATED core (not merely online, and not bounded by
+    // `core_count()` — suspend shrinks that to 1 while the APs are parked):
+    // PerCoreData + GDT + TSS. An allocated-but-offline core is either
+    // mid-cold-boot (no processes exist yet) or S3-parked — and on resume the
+    // BSP can create/exec a process BEFORE `resume_reboot_aps` brings the APs
+    // back online, so keying on `is_online`/`core_count()` would build that
+    // process's user half without the AP structures and triple-fault its
+    // first ring-3 interrupt on that core. The addresses are stable across S3
+    // (suspend keeps the allocations; `init_ap_per_core` re-inits them in
+    // place), so mapping a parked core's structures is always valid; a
+    // boot-failed AP's slot is nulled by `release_failed_ap` and skipped.
+    for core_id in 0..crate::smp::MAX_CORES as u8 {
         let Some(pcd) = crate::smp::get_core_data(core_id) else {
             continue;
         };
-        if !pcd.is_online.load(core::sync::atomic::Ordering::Acquire) {
-            continue;
-        }
         for (base, size) in pcd.entry_struct_extents() {
             push_kernel_range(&kmapper, &mut out, base, base + size, RW)?;
         }
@@ -420,11 +453,13 @@ fn collect_entry_pages() -> Option<Vec<(u64, u64, PageTableFlags)>> {
 /// Build a live per-process **user-half** PML4 for the kernel PML4 at
 /// `kernel_pml4_phys`, mapping the shared entry set, this process's kstack top
 /// page (`kstack_top_va`, where the CPU pushes an IRQ frame on the user CR3),
-/// and — shared with the kernel half — the user lower half (`PML4[0]`).
+/// and — shared with the kernel half — the user-mapping slots
+/// (`kernel_core::kpti::USER_PML4_SLOTS`: `PML4[0]` image/brk/mmap +
+/// `PML4[255]` stack).
 ///
 /// Returns the user PML4 physical address, or `None` on allocation failure.
-/// Consumed by A.4 activation (dispatch loads this as the ring-3 CR3); inert
-/// while `KPTI_WIRED` is false.
+/// A.4 publishes this per-core at dispatch (`smp::publish_kpti_cr3_pair`) and
+/// the entry/exit stubs load it as the ring-3 CR3 when KPTI is active.
 ///
 /// # Safety
 /// `kernel_pml4_phys` must be a valid process kernel PML4 reachable through the
@@ -451,15 +486,28 @@ pub unsafe fn build_user_half(kernel_pml4_phys: u64, kstack_top_va: u64) -> Opti
         core::ptr::write_bytes((phys_off + user_pml4_phys) as *mut u8, 0, 4096);
     }
 
-    // Share the user lower half (PML4[0]) with the kernel half so user mappings
-    // (ELF, mmap, brk, stack) stay in sync automatically — the same frame the
-    // kernel half points at, not a copy.
-    // SAFETY: both PML4s are reachable through the direct map; we only copy one
-    // 8-byte slot.
+    // Share every user-mapping slot (kernel_core::kpti::USER_PML4_SLOTS) with
+    // the kernel half so user mappings stay in sync automatically — the same
+    // sub-table frames the kernel half points at, not copies. Two slots today:
+    // PML4[0] (ELF image + brk + the 128 GiB anonymous-mmap region) and
+    // PML4[255] (the user stack at ELF_STACK_TOP minus ASLR jitter). Sharing
+    // only PML4[0] was the A.4 bring-up wedge: the first ring-3 stack access
+    // #PF-looped silently — the fault resolved fine in the kernel half, so the
+    // handler saw nothing to fix and the iretq re-faulted forever.
+    //
+    // The shared slots' sub-trees must already exist in the kernel half here
+    // (an empty slot cloned now stays empty in the user half forever): true at
+    // every call site — the ELF loader maps image + stack before the
+    // AddressSpace (and hence the pair) is created, and fork copies the full
+    // table first.
+    // SAFETY: both PML4s are reachable through the direct map; we only copy
+    // top-level 8-byte slots.
     unsafe {
         let kern = &*((phys_off + kernel_pml4_phys) as *const PageTable);
         let user = &mut *((phys_off + user_pml4_phys) as *mut PageTable);
-        user[0] = kern[0].clone();
+        for slot in kernel_core::kpti::USER_PML4_SLOTS {
+            user[slot] = kern[slot].clone();
+        }
     }
 
     // Map the entry set through fresh private sub-tables (never cloning a whole
@@ -491,10 +539,10 @@ pub unsafe fn build_user_half(kernel_pml4_phys: u64, kstack_top_va: u64) -> Opti
 }
 
 /// Free a user-half PML4 built by [`build_user_half`]: the private entry-set
-/// sub-tables (PDPT/PD/PT for `PML4[1..512]`) and the top PML4 frame. Never
-/// frees `PML4[0]` (shared with the kernel half, freed by
-/// `free_process_page_table`) nor any leaf page (real kernel structures the
-/// entry set only *points* at).
+/// sub-tables and the top PML4 frame. Never frees the shared user-mapping
+/// slots' sub-trees (`kernel_core::kpti::USER_PML4_SLOTS`, owned by the kernel
+/// half and freed by `free_process_page_table`) nor any leaf page (real kernel
+/// structures the entry set only *points* at).
 ///
 /// # Safety
 /// `user_pml4_phys` must be a user-half PML4 no longer loaded in any CR3.
@@ -505,10 +553,16 @@ pub unsafe fn free_user_half(user_pml4_phys: u64) {
         |phys: u64| -> &'static PageTable { unsafe { &*((phys_off + phys) as *const PageTable) } };
 
     let pml4 = table(user_pml4_phys);
-    // Slots 1..512 are private entry-set sub-tables (slot 0 is the shared user
-    // half — skip it). Walk each present slot and free its PDPT/PD/PT frames,
-    // never the leaf pages.
-    for i4 in 1usize..512 {
+    // Every non-user slot holds private entry-set sub-tables; the user-mapping
+    // slots (kernel_core::kpti::USER_PML4_SLOTS — image/mmap + stack) are
+    // SHARED with the kernel half and must be skipped: their sub-table frames
+    // are owned by the kernel half and freed by `free_process_page_table`.
+    // Walk each present private slot and free its PDPT/PD/PT frames, never the
+    // leaf pages.
+    for i4 in 0usize..512 {
+        if kernel_core::kpti::is_user_pml4_slot(i4) {
+            continue;
+        }
         let e4 = &pml4[i4];
         if !e4.flags().contains(PageTableFlags::PRESENT) {
             continue;
@@ -589,10 +643,12 @@ pub unsafe fn map_kstack_top_into_user_half(user_pml4_phys: u64, kstack_top_va: 
 /// synthetic kernel PML4, returning the arena for the caller to walk then free.
 ///
 /// This exercises the exact builder + free path A.4 activation uses (the shared
-/// entry set from `collect_entry_pages`, the shared `PML4[0]`, the kstack top
-/// page, and `free_user_half`), rather than a bespoke test-only table.
+/// entry set from `collect_entry_pages`, the shared user-mapping slots, the
+/// kstack top page, and `free_user_half`), rather than a bespoke test-only
+/// table.
 fn build_selftest_pair() -> Option<SelfTestArena> {
-    // A synthetic kernel half with a user leaf in PML4[0].
+    // A synthetic kernel half with one user leaf per user-mapping slot
+    // (PML4[0] image + PML4[255] stack).
     let (kernel_pml4_phys, owned_frames) = build_synthetic_kernel_pml4()?;
 
     // A real, mapped kernel-stack top to stand in for the process kstack (its
@@ -645,6 +701,16 @@ fn build_selftest_pair() -> Option<SelfTestArena> {
     entry_pages.push((top_page, kstack_phys, RW));
     entry_pages.push(((thread_kstack_top - 1) & !0xFFF, thread_page_phys, RW));
 
+    // The synthetic user leaves, resolved through the synthetic KERNEL half —
+    // the user half must translate each to the same frame (shared sub-trees).
+    let mut user_leaf_pages: Vec<(u64, u64)> = Vec::new();
+    for va in [SELFTEST_USER_VA, SELFTEST_USER_STACK_VA] {
+        // SAFETY: the synthetic kernel PML4 is valid, non-live, direct-map
+        // reachable.
+        let phys = unsafe { translate_in(kernel_pml4_phys, va) }?;
+        user_leaf_pages.push((va, phys));
+    }
+
     Some(SelfTestArena {
         owned_frames,
         user_pml4_phys,
@@ -652,6 +718,7 @@ fn build_selftest_pair() -> Option<SelfTestArena> {
             .iter()
             .map(|(va, phys, _)| (*va, *phys))
             .collect(),
+        user_leaf_pages,
     })
 }
 
@@ -792,6 +859,21 @@ pub fn self_test() {
     // kimg_idx the same way build does (the entry-text section's slot).
     let kimg_idx = pml4_index(text_start);
 
+    // Defence in depth for classify(): its user-slot arm precedes the
+    // kernel-image / direct-map arms, so if either secret slot ever collided
+    // with a USER_PML4_SLOTS entry the walk would silently classify kernel
+    // leaves as user. The layout makes collision impossible today (image at
+    // PML4[2] via the fixed 1 TiB PIE base, direct map in the upper half);
+    // assert it stays that way.
+    if kernel_core::kpti::is_user_pml4_slot(kimg_idx)
+        || kernel_core::kpti::is_user_pml4_slot(dm_idx)
+    {
+        log::error!(
+            "KPTI_SELFTEST:FAIL reason=user-slot-overlap kimg_idx={kimg_idx} dm_idx={dm_idx}"
+        );
+        return;
+    }
+
     let arena = match build_selftest_pair() {
         Some(a) => a,
         None => {
@@ -833,14 +915,36 @@ pub fn self_test() {
         }
     }
 
+    // User-leaf round-trip (A.4): one synthetic leaf per user-mapping slot
+    // (PML4[0] image + PML4[255] stack) must translate in the user half to the
+    // frame the kernel half maps — proving BOTH USER_PML4_SLOTS are shared. A
+    // missing one is not a triple fault but the silent stack-slot #PF-loop
+    // wedge (the fault resolves in the kernel half, so the handler finds
+    // nothing to fix and ring 3 re-faults forever).
+    let mut user_unreachable = 0usize;
+    for (va, expected_phys) in &arena.user_leaf_pages {
+        // SAFETY: user_pml4_phys is a valid, non-live PML4 read via direct map.
+        match unsafe { translate_in(arena.user_pml4_phys, *va) } {
+            Some(got) if got == (*expected_phys & !0xFFF) => {}
+            _ => user_unreachable += 1,
+        }
+    }
+
     // Free the throwaway pair before reporting (report is the observable point).
     let user_pml4_phys = arena.user_pml4_phys;
     let entry_page_count = arena.entry_pages.len();
+    let user_leaf_count = arena.user_leaf_pages.len();
     arena.free();
 
     if unreachable != 0 {
         log::error!(
             "KPTI_SELFTEST:FAIL reason=entry-set-unreachable unreachable={unreachable} of {entry_page_count}"
+        );
+        return;
+    }
+    if user_unreachable != 0 {
+        log::error!(
+            "KPTI_SELFTEST:FAIL reason=user-slot-unreachable unreachable={user_unreachable} of {user_leaf_count}"
         );
         return;
     }

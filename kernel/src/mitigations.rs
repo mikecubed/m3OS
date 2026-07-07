@@ -35,13 +35,21 @@ const MITIGATIONS_DEFAULT: &str = match option_env!("M3OS_MITIGATIONS") {
     None => "auto",
 };
 
-/// `true` once Track A (KPTI) is wired into the page-table / trampoline path.
-/// Until then KPTI cannot enforce regardless of policy, so [`MitigationState`]
-/// reports `kpti_active = false` and the reporter honestly shows Meltdown as
-/// `Vulnerable` (or `Not affected` on `RDCL_NO` silicon) — a half-built KPTI
-/// can never read as `Mitigated`. Flipped to `true` by the KPTI landing PR,
-/// which also adds the actual enable on the `kpti_policy` path.
-const KPTI_WIRED: bool = false;
+/// `true` since Phase 110 A.4: Track A (KPTI) is fully wired into the
+/// page-table / trampoline path — per-process user-half PML4s
+/// (`AddressSpace::build_kpti_user_half`, A.3b), the LSTAR-selected
+/// `syscall_entry_kpti` stub + KPTI-aware sysret tail (A.2), naked entry/exit
+/// CR3 switches on every ring-3-reachable vector incl. the NMI/`#DF` paranoid
+/// path (A.3b), all four ring0→ring3 exit trampolines (A.3b part 3), and the
+/// per-core CR3-pair publish at every dispatch locus (A.4). `kpti_active =
+/// kpti_policy && KPTI_WIRED` therefore reflects real enforcement: `auto`
+/// activates on Meltdown-susceptible silicon — QEMU TCG reports
+/// `rdcl_no=false`, so **every default QEMU boot runs the CR3 trampoline** —
+/// and deactivates under `off` or `auto` + `RDCL_NO`. The activation itself is
+/// the A.4 trio: this flag, the BSP LSTAR re-install after [`init_bsp`]
+/// (`lib.rs`; APs and the S3-resume path self-select via `lstar_target`), and
+/// `smp::publish_kpti_cr3_pair` going live (it no-ops while inactive).
+const KPTI_WIRED: bool = true;
 
 /// The boot-populated mitigation snapshot. Immutable after [`init_bsp`].
 #[derive(Clone, Copy, Debug)]
@@ -98,8 +106,15 @@ pub fn init_bsp() -> &'static MitigationState {
             MitigationLevel::Full => true,
             MitigationLevel::Auto => !features.rdcl_no,
         };
-        // KPTI can only enforce once Track A is wired. (When it is, this same
-        // path will perform the enable and set `kpti_active` to the result.)
+        // Phase 110 A.4 — KPTI enforcement. The wired substrate (A.1–A.3b)
+        // activates through three consumers of this flag, all downstream of
+        // this snapshot: `lstar_target()` selects `syscall_entry_kpti` (the
+        // BSP re-installs LSTAR right after this returns; APs and the S3
+        // resume path run their `syscall::init*` after the policy decision),
+        // `AddressSpace::build_kpti_user_half` builds the per-process user
+        // half at every address-space birth, and `smp::publish_kpti_cr3_pair`
+        // publishes the per-core CR3 pair at every dispatch locus (it no-ops
+        // while inactive, keeping every entry/exit switch never-taken).
         let kpti_active = kpti_policy && KPTI_WIRED;
 
         let ibpb_active = !off && features.ibrs_ibpb;
