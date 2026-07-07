@@ -403,6 +403,13 @@ extern "C" fn resume_entry(_unused: *mut core::ffi::c_void) -> ! {
     // GS bases (the per-core pointer) were wiped with the MSRs — restore
     // before anything touches `per_core()`.
     crate::smp::restore_bsp_gs_base();
+    // Phase 110 A.5 — the KPTI CR3-pair slots survived S3 in RAM with the
+    // PCID no-flush bit (bit 63) set, but the reset cleared CR4.PCIDE. Zero
+    // them now (gs is valid) so a paranoid NMI/#DF in the window before PCIDE
+    // is re-enabled skips its CR3 load instead of #GP'ing on a bit-63 value;
+    // the first post-resume dispatch republishes the tagged pair. No-op on the
+    // inactive lane (slots already 0).
+    crate::smp::clear_kpti_cr3_slots();
     crate::arch::x86_64::syscall::init();
     crate::arch::x86_64::pat::init();
     // SAFETY: same call the BSP boot and every AP entry make — sets this

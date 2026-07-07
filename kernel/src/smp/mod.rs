@@ -992,6 +992,33 @@ pub fn publish_kpti_cr3_pair(kernel_cr3: u64, user_cr3: u64) {
     }
 }
 
+/// Zero this core's KPTI CR3-pair slots (`kpti_kernel_cr3`/`kpti_user_cr3`/
+/// `kpti_scratch`).
+///
+/// Used on the **BSP S3-resume** path (Phase 110 A.5). The slots survive S3 in
+/// RAM holding **PCID-tagged** values (bit 63 = no-flush set), but the machine
+/// reset cleared `CR4.PCIDE`. Until the resume path re-enables PCIDE, a `mov
+/// cr3` of a bit-63 value `#GP`s — so a paranoid NMI/`#DF` landing in that
+/// window (which loads `kpti_kernel_cr3` whenever nonzero) would fault. Zeroing
+/// makes the paranoid path skip its CR3 load (`test rax,rax; jz`) until the
+/// first post-resume dispatch republishes the tagged pair with PCIDE back on.
+/// The AP re-boot path (`init_ap_per_core`) already zeroes these before an AP's
+/// IDT loads, so only the BSP needs this; safe on the inactive lane too (the
+/// slots are already 0). Requires `gs` (per-core base) restored first.
+pub fn clear_kpti_cr3_slots() {
+    if !is_per_core_ready() {
+        return;
+    }
+    let pc = per_core() as *const PerCoreData as *mut PerCoreData;
+    // SAFETY: PerCoreData is only written by its owning core; volatile so the
+    // `gs:`-relative asm readers observe the zeroing before any interrupt.
+    unsafe {
+        core::ptr::write_volatile(&raw mut (*pc).kpti_kernel_cr3, 0);
+        core::ptr::write_volatile(&raw mut (*pc).kpti_user_cr3, 0);
+        core::ptr::write_volatile(&raw mut (*pc).kpti_scratch, 0);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BSP initialization (T002, T004)
 // ---------------------------------------------------------------------------
