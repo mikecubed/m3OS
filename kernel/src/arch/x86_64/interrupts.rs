@@ -3878,9 +3878,9 @@ pub fn kpti_irq_entry_range() -> (u64, u64) {
 //   4. `iretq`.
 //
 // Part 3a landed `preempt_resume_to_user` (the preemption-resume path) as the
-// proof of pattern; part 3b adds `fork_enter_userspace`. `enter_userspace`
-// (execve) and `restore_and_enter_userspace` (sigreturn) follow the same
-// recipe in later sub-commits.
+// proof of pattern; part 3b adds `fork_enter_userspace`, part 3c
+// `execve_enter_userspace`. `restore_and_enter_userspace` (sigreturn) follows
+// the same recipe in a later sub-commit.
 core::arch::global_asm!(
     ".equ EXIT_OFF_USER_CR3,  {exit_off_user_cr3}",
     ".equ EXIT_OFF_SCRATCH,   {exit_off_scratch}",
@@ -3987,6 +3987,33 @@ core::arch::global_asm!(
     // RAX = 0 (fork child return value) — preserved across the flip by the
     // scratch spill/restore.
     "xor eax, eax",
+    // KPTI exit: flip to the user CR3. No-op while inactive.
+    "mov gs:[EXIT_OFF_SCRATCH], rax",
+    "mov rax, gs:[EXIT_OFF_USER_CR3]",
+    "test rax, rax",
+    "jz 1f",
+    "mov cr3, rax",
+    "1:",
+    "mov rax, gs:[EXIT_OFF_SCRATCH]",
+    "iretq",
+    "",
+    // execve_enter_userspace(rdi = user rip, rsi = user rsp, rdx = cs,
+    //                        rcx = ss) -> !
+    // The execve initial-entry trampoline (called by
+    // arch::x86_64::enter_userspace): a fresh image has no GPR state to
+    // restore, so this only builds the iretq frame (rflags = 0x202: IF +
+    // reserved bit 1) and flips CR3.
+    ".global execve_enter_userspace",
+    "execve_enter_userspace:",
+    // Reset rsp to this task's kstack top page (user-mapped); the execve
+    // continuation stack below is abandoned (this trampoline never returns).
+    "mov rsp, gs:[EXIT_OFF_STACK_TOP]",
+    // Build the 5-field iretq frame on the top page (push in reverse: ss first).
+    "push rcx",   // ss
+    "push rsi",   // user rsp
+    "push 0x202", // rflags: IF + reserved bit 1
+    "push rdx",   // cs
+    "push rdi",   // rip
     // KPTI exit: flip to the user CR3. No-op while inactive.
     "mov gs:[EXIT_OFF_SCRATCH], rax",
     "mov rax, gs:[EXIT_OFF_USER_CR3]",

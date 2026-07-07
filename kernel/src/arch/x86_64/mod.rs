@@ -41,11 +41,15 @@ pub unsafe fn enable_interrupts() {
     }
 }
 
-/// Transfer execution to ring 3 (userspace).
-///
-/// Not used in Phase 6 (kernel-thread IPC demo) — will be re-enabled in
-/// Phase 7+ when multi-process userspace is introduced.
-#[allow(dead_code)]
+unsafe extern "C" {
+    /// The execve initial-entry ring-3 trampoline. Phase 110 A.3b part 3: the
+    /// asm lives in the user-mapped `.text.kpti_exit` section
+    /// (`interrupts.rs`, bottom) so it can flip to the user CR3 immediately
+    /// before its `iretq`.
+    fn execve_enter_userspace(rip: u64, rsp: u64, cs: u64, ss: u64) -> !;
+}
+
+/// Transfer execution to ring 3 (userspace) — the execve initial-entry path.
 ///
 /// Uses `iretq` to atomically switch to user code segment, user stack, and
 /// the given entry point with interrupts enabled (RFLAGS.IF = 1).
@@ -68,54 +72,11 @@ pub unsafe fn enter_userspace(entry: u64, user_stack_top: u64) -> ! {
     // the new image has ever run. Timer IRQ-return preemption can reschedule
     // the task immediately after ring 3 starts.
     unsafe {
-        use core::arch::asm;
-        asm!(
-            "push {ss}",
-            "push {rsp}",
-            "push {rflags}",
-            "push {cs}",
-            "push {rip}",
-            "iretq",
-            ss     = in(reg) u64::from(gdt::user_data_selector().0),
-            rsp    = in(reg) user_stack_top,
-            rflags = const 0x202u64,
-            cs     = in(reg) u64::from(gdt::user_code_selector().0),
-            rip    = in(reg) entry,
-            options(noreturn)
-        )
-    }
-}
-
-/// Enter ring 3 at `rip` with `rsp` as the stack pointer and `rax` as the
-/// return value visible to userspace code (used by `fork` to return 0 to
-/// the child).
-///
-/// # Safety
-/// Same requirements as [`enter_userspace`].  `rax` is placed in RAX before
-/// `iretq` so the child sees it as its syscall return value.
-#[allow(dead_code)]
-pub unsafe fn enter_userspace_with_retval(rip: u64, rsp: u64, rax: u64) -> ! {
-    // Phase 57b D.3: assert preempt_count == 0 before iretq to ring 3.
-    crate::task::scheduler::assert_preempt_count_zero_at_user_return();
-    // Phase 57d G.4: consume deferred reschedule at this user-return boundary.
-    crate::task::scheduler::check_deferred_preempt_at_user_return();
-    unsafe {
-        use core::arch::asm;
-        asm!(
-            "push {ss}",
-            "push {rsp_val}",
-            "push {rflags}",
-            "push {cs}",
-            "push {rip_val}",
-            "mov rax, {rax_val}",
-            "iretq",
-            ss      = in(reg) u64::from(gdt::user_data_selector().0),
-            rsp_val = in(reg) rsp,
-            rflags  = const 0x202u64,
-            cs      = in(reg) u64::from(gdt::user_code_selector().0),
-            rip_val = in(reg) rip,
-            rax_val = in(reg) rax,
-            options(noreturn)
+        execve_enter_userspace(
+            entry,
+            user_stack_top,
+            u64::from(gdt::user_code_selector().0),
+            u64::from(gdt::user_data_selector().0),
         )
     }
 }
