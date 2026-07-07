@@ -5536,18 +5536,11 @@ pub fn run() -> ! {
                     .unwrap_or_default();
 
                 if let Some(urs) = urs {
-                    // Restore CR3 from task-owned state.
+                    // Restore CR3 from task-owned state. Address-space switch:
+                    // `write_kernel_cr3` flushes both KPTI PCIDs when the A.5
+                    // scheme is active, else a plain flushing `Cr3::write`.
                     if urs.cr3_phys != 0 {
-                        unsafe {
-                            use x86_64::{
-                                PhysAddr,
-                                registers::control::{Cr3, Cr3Flags},
-                                structures::paging::{PhysFrame, Size4KiB},
-                            };
-                            let frame: PhysFrame<Size4KiB> =
-                                PhysFrame::containing_address(PhysAddr::new(urs.cr3_phys));
-                            Cr3::write(frame, Cr3Flags::empty());
-                        }
+                        crate::mm::write_kernel_cr3(urs.cr3_phys);
                         #[cfg(debug_assertions)]
                         {
                             let (loaded_frame, _) = x86_64::registers::control::Cr3::read();
@@ -5613,16 +5606,9 @@ pub fn run() -> ! {
                         }
                     };
                     if let Some(cr3) = cr3_phys {
-                        unsafe {
-                            use x86_64::{
-                                PhysAddr,
-                                registers::control::{Cr3, Cr3Flags},
-                                structures::paging::{PhysFrame, Size4KiB},
-                            };
-                            let frame: PhysFrame<Size4KiB> =
-                                PhysFrame::containing_address(PhysAddr::new(cr3.as_u64()));
-                            Cr3::write(frame, Cr3Flags::empty());
-                        }
+                        // Address-space switch (both KPTI PCIDs flushed under the
+                        // A.5 scheme; plain flushing write otherwise).
+                        crate::mm::write_kernel_cr3(cr3.as_u64());
                         // Phase 110 A.4 — publish the KPTI CR3 pair with the
                         // CR3 load; cr3 and the user half were read from the
                         // same PROCESS_TABLE entry, so the pair is consistent

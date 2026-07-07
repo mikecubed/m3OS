@@ -557,8 +557,20 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
     // BSP decided Enhanced IBRS and the silicon supports it.
     crate::mitigations::init_ap();
 
+    // Phase 110 A.5 — CR4.PCIDE was captured into `DATA_CR4` from the BSP (which
+    // enabled it before `boot_aps`) and reloaded above, so this AP already
+    // carries the bit when `pcid_active`. The explicit call is idempotent
+    // (skips when PCIDE is already set / KPTI inactive) and guards against a
+    // future reorder where the CR4 snapshot predates the BSP enable — a tagged
+    // CR3 load on an AP without PCIDE would `#GP`.
+    unsafe {
+        crate::arch::x86_64::cpuid::enable_pcid_if_kpti_active(
+            crate::mitigations::state().is_some_and(|s| s.kpti_active),
+        );
+    }
+
     log::info!(
-        "[sec] AP CR4.SMEP {} CR4.SMAP {} CR4.PKE {}",
+        "[sec] AP CR4.SMEP {} CR4.SMAP {} CR4.PKE {} CR4.PCIDE {}",
         if crate::arch::x86_64::cpuid::cr4_smep_enabled() {
             "enabled"
         } else {
@@ -572,6 +584,13 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
         // Phase 90a B.1 — read the live register so the log proves CR4.PKE
         // actually landed on *this* AP (the per-core security-hole guard).
         if crate::arch::x86_64::cpuid::cr4_pke_enabled() {
+            "enabled"
+        } else {
+            "off"
+        },
+        // Phase 110 A.5 — read the live bit so the log proves PCIDE landed on
+        // *this* AP before it can dispatch a PCID-tagged CR3.
+        if crate::arch::x86_64::cpuid::cr4_pcide_enabled() {
             "enabled"
         } else {
             "off"

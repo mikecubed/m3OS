@@ -504,6 +504,83 @@ pub fn cr4_smap_enabled() -> bool {
     cr4 & (1 << 21) != 0
 }
 
+// ---------------------------------------------------------------------------
+// Phase 110 Track A.5 — PCID / INVPCID (KPTI TLB-cost recovery)
+// ---------------------------------------------------------------------------
+//
+// KPTI switches CR3 twice per syscall/IRQ. With PCID (`CR4.PCIDE`) the
+// entry/exit trampolines can load the kernel/user half **no-flush** (distinct
+// PCIDs tag the two halves), recovering the bulk of the ~30 % naive-KPTI cost.
+// The pure bit-layout/gate logic is host-tested in `kernel_core::kpti_pcid`;
+// this file performs the privileged probe + `CR4.PCIDE` write, gated on both
+// the PCID and INVPCID CPUID bits so a CPU lacking either never `#GP`s and runs
+// the A.4 full-flush fallback. QEMU TCG advertises neither bit, so on every CI
+// lane `probe_pcid()` is `false` and `CR4.PCIDE` stays 0 — the scheme is live
+// only on bare metal (validated on the Dell).
+
+static PCID_SUPPORTED: Once<bool> = Once::new();
+
+/// Probe whether the KPTI PCID scheme is usable: **both** `CPUID.01H:ECX[17]`
+/// (PCID) and `CPUID.07H.0:EBX[10]` (INVPCID) present. Idempotent — first call
+/// wins. The gate decision is the host-tested
+/// [`kernel_core::kpti_pcid::pcid_supported`]. Both bits are `0` under QEMU TCG.
+pub fn probe_pcid() -> bool {
+    *PCID_SUPPORTED.call_once(|| {
+        let leaf1_ecx = cpuid_raw(1, 0).ecx;
+        // Leaf 7 is guarded by the max-basic-leaf check (same trap as
+        // `probe_smep_smap`): reading leaf 7 on a CPU whose max basic leaf is
+        // < 7 returns the highest leaf's data, which could spuriously set the
+        // INVPCID bit and enable an unsupported feature.
+        let leaf7_ebx = if cpuid_raw(0, 0).eax >= 0x07 {
+            cpuid_raw(0x07, 0).ebx
+        } else {
+            0
+        };
+        kernel_core::kpti_pcid::pcid_supported(leaf1_ecx, leaf7_ebx)
+    })
+}
+
+/// Enable `CR4.PCIDE` (bit 17) on the **current** core when the CPU supports the
+/// PCID scheme AND KPTI is active this boot. Returns whether PCIDE is now set.
+///
+/// `CR4.PCIDE` may be set only while `CR3[11:0] == 0` (Intel SDM Vol. 3A
+/// §4.10.1) — true at every call site (the kernel runs on a page-aligned boot /
+/// process PML4 with no PCID yet), so no explicit CR3 scrub is needed. Enabling
+/// PCIDE changes how `mov cr3` interprets bits 11:0 and 63, so the kernel only
+/// enables it once every CR3-write locus is PCID-aware (Phase 110 A.5). No-op
+/// unless [`probe_pcid`] holds — so on QEMU/CI it never runs and the CR3 writes
+/// keep loading `PCID = 0` with a plain flush (the A.4 fallback).
+///
+/// Must run on the BSP **before** `smp::boot::boot_aps()` so the trampoline's
+/// captured `DATA_CR4` carries the bit and every AP inherits it, and on the S3
+/// resume path (the machine reset clears CR4).
+///
+/// # Safety
+/// CR4 is a privileged register; ring 0, IRQs disabled or single-threaded.
+pub unsafe fn enable_pcid_if_kpti_active(kpti_active: bool) -> bool {
+    if !kpti_active || !probe_pcid() {
+        return false;
+    }
+    let mut cr4: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+    }
+    cr4 |= 1 << 17; // CR4.PCIDE
+    unsafe {
+        core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack));
+    }
+    true
+}
+
+/// True if `CR4.PCIDE` (bit 17) is currently set on this core.
+pub fn cr4_pcide_enabled() -> bool {
+    let cr4: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+    }
+    cr4 & (1 << 17) != 0
+}
+
 /// True if `EFLAGS.AC` (bit 18) is currently set on this core.
 pub fn eflags_ac_set() -> bool {
     use x86_64::registers::rflags::{self, RFlags};

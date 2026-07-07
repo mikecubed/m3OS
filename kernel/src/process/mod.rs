@@ -2222,16 +2222,9 @@ pub fn fork_child_trampoline() -> ! {
             );
             crate::arch::x86_64::syscall::terminate_thread_group_and_exit(ctx.pid, -9);
         }
-        unsafe {
-            use x86_64::{
-                PhysAddr,
-                registers::control::{Cr3, Cr3Flags},
-                structures::paging::{PhysFrame, Size4KiB},
-            };
-            let frame: PhysFrame<Size4KiB> =
-                PhysFrame::containing_address(PhysAddr::new(cr3.as_u64()));
-            Cr3::write(frame, Cr3Flags::empty());
-        }
+        // Address-space switch into the child (both KPTI PCIDs flushed under
+        // the A.5 scheme; plain flushing write otherwise).
+        crate::mm::write_kernel_cr3(cr3.as_u64());
         // Phase 110 A.4 — publish the KPTI CR3 pair for the entry/exit stubs
         // before the ring-3 entry below (no-op while KPTI is inactive).
         crate::smp::publish_kpti_cr3_pair(cr3.as_u64(), kpti_user_half);

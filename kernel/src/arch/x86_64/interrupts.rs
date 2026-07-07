@@ -520,7 +520,9 @@ pub fn resolve_cow_fault(vaddr: u64) -> bool {
     {
         tlb_shootdown_range_from_fault_context(unsafe { addr_space.as_ref() }, vaddr, vaddr + 4096);
     } else {
-        x86_64::instructions::tlb::flush(VirtAddr::new(vaddr));
+        // Phase 110 A.5 — both KPTI PCIDs (the CoW'd user page is visible in the
+        // user half too, so a kernel-PCID-only invlpg would loop the fault).
+        crate::smp::tlb::flush_local(vaddr);
     }
     if let Some(old_phys) = old_phys_to_free {
         crate::mm::frame_allocator::free_frame(old_phys);
@@ -1733,7 +1735,9 @@ extern "C" fn page_fault_body(frame: &mut TrapFrameErr) {
                         n + 1,
                     );
                 }
-                x86_64::instructions::tlb::flush(VirtAddr::new(fault_vaddr.as_u64()));
+                // Phase 110 A.5 — both KPTI PCIDs (this user page is mapped in
+                // the user half; a kernel-PCID-only invlpg would re-loop).
+                crate::smp::tlb::flush_local(fault_vaddr.as_u64());
                 crate::task::scheduler::current_task_record_page_fault(false);
                 assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
                 return;

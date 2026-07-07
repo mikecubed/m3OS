@@ -430,6 +430,7 @@ fn mitigations_status_format_is_honest() {
         wx_v2: false,
         pku_present: false,
         pku_active: false,
+        pcid_active: false,
     };
     let r = format_mitigations(&report);
     assert!(r.contains("level=full"));
@@ -442,13 +443,30 @@ fn mitigations_status_format_is_honest() {
     assert!(r.contains("Grimsdal"));
     // Phase 90a C.2 — the no-PKU boot prints the v1 / PKU-absent W^X line.
     assert!(r.contains("W^X: v1 (PKU absent)"));
+    // Phase 110 A.5 — KPTI is NOT enforcing here, so no PCID line is printed.
+    assert!(!r.contains("KPTI PCID:"));
 
     // KPTI enforcing → Meltdown reads "Mitigation: PTI".
     let report2 = MitigationReport {
         kpti_active: true,
         ..report
     };
-    assert!(format_mitigations(&report2).contains("Meltdown: Mitigation: PTI"));
+    let r2 = format_mitigations(&report2);
+    assert!(r2.contains("Meltdown: Mitigation: PTI"));
+    // Phase 110 A.5 — KPTI enforcing without PCID (the default QEMU lane) prints
+    // the fallback PCID posture line.
+    assert!(r2.contains("KPTI PCID: fallback (full TLB flush; no PCID/INVPCID)"));
+
+    // KPTI enforcing WITH the PCID scheme (bare-metal PCID silicon) prints the
+    // active posture line instead.
+    let report_pcid = MitigationReport {
+        kpti_active: true,
+        pcid_active: true,
+        ..report
+    };
+    assert!(
+        format_mitigations(&report_pcid).contains("KPTI PCID: active (kernel/user PCID, no-flush)")
+    );
 
     // RDCL_NO silicon → "Not affected" regardless of kpti_active.
     let report3 = MitigationReport {
@@ -475,6 +493,7 @@ fn mitigations_status_wx_pku_line() {
         wx_v2: false,
         pku_present: false,
         pku_active: false,
+        pcid_active: false,
     };
 
     // No-PKU boot (the default TCG lane): v1, PKU absent.

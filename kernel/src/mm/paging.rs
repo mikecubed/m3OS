@@ -198,7 +198,10 @@ unsafe fn map_current_user_page_inner(
             pml4[p4_idx].set_addr(frame.start_address(), user_flags);
         }
 
-        x86_64::instructions::tlb::flush(vaddr);
+        // Phase 110 A.5 — invalidate under both KPTI PCIDs: this is a user page
+        // in a slot shared with the user half, so a kernel-PCID-only `invlpg`
+        // could leave a stale user-half translation when the scheme is active.
+        crate::smp::tlb::flush_local(vaddr.as_u64());
         Ok(())
     }
 }

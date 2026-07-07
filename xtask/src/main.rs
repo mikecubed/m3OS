@@ -17106,19 +17106,23 @@ fn mitigations_status_smoke_steps() -> Vec<SmokeStep> {
             label: "guest/mitigations: kernel first message",
         },
         // D.2 (policy snapshot) + Phase 110 A.4 (KPTI activation + GLOBAL
-        // guard): the `[sec] mitigations=...` line ends with
-        // `kpti(policy=… active=…) global_kernel_ptes=N`, so matching the
-        // combined tail asserts (a) the whole line printed, (b) KPTI is
-        // ENFORCING this boot (active=true — the A.4 flip; TCG reports
-        // `rdcl_no=false` so the default `auto` build activates), and (c) the
-        // guard found zero GLOBAL kernel PTEs (none survive the CR3 switch).
-        // One pattern because both facts live on the same line and the serial
+        // guard) + Phase 110 A.5 (PCID posture): the `[sec] mitigations=...`
+        // line ends with `kpti(policy=… active=…) pcid(active=… supported=…)
+        // global_kernel_ptes=N`, so matching the combined tail asserts (a) the
+        // whole line printed, (b) KPTI is ENFORCING this boot (active=true —
+        // the A.4 flip; TCG reports `rdcl_no=false` so the default `auto` build
+        // activates), (c) the A.5 PCID scheme is on its **fallback** — QEMU TCG
+        // advertises neither PCID nor INVPCID, so `pcid(active=false
+        // supported=false)` and the kernel runs the full-flush path (the
+        // PCID-active arm is bare-metal-only, validated on the Dell), and (d)
+        // the guard found zero GLOBAL kernel PTEs (none survive the CR3 switch).
+        // One pattern because all facts live on the same line and the serial
         // Wait cursor advances past each match. Checked BEFORE any Send
         // (which drains the serial buffer).
         SmokeStep::Wait {
-            pattern: "kpti(policy=true active=true) global_kernel_ptes=0",
+            pattern: "kpti(policy=true active=true) pcid(active=false supported=false) global_kernel_ptes=0",
             timeout_secs: 90,
-            label: "guest/mitigations: boot policy logged + A.4 KPTI active + GLOBAL guard = 0",
+            label: "guest/mitigations: boot policy + A.4 KPTI active + A.5 PCID fallback + GLOBAL guard = 0",
         },
     ];
     // Log into sh0 so the next Send lands at a shell prompt.
@@ -17157,6 +17161,14 @@ fn mitigations_status_smoke_steps() -> Vec<SmokeStep> {
         pattern: "W^X: v1 (PKU absent)",
         timeout_secs: 5,
         label: "guest/mitigations: reporter prints the W^X v1 / PKU-absent line (no-PKU lane)",
+    });
+    // Phase 110 A.5 — with KPTI enforcing but the CPU lacking PCID/INVPCID (the
+    // default QEMU TCG lane), the reporter prints the fallback PCID posture line
+    // (the `active (kernel/user PCID, no-flush)` form is bare-metal-only).
+    steps.push(SmokeStep::Wait {
+        pattern: "KPTI PCID: fallback (full TLB flush; no PCID/INVPCID)",
+        timeout_secs: 5,
+        label: "guest/mitigations: reporter prints the A.5 KPTI-PCID fallback line",
     });
     steps
 }

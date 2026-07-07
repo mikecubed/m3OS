@@ -357,6 +357,22 @@ pub fn format_mitigations(report: &kernel_core::spectre::MitigationReport) -> St
     }
     out.push_str(")\n");
 
+    // Phase 110 A.5 — KPTI PCID TLB-cost-recovery posture. Only meaningful when
+    // KPTI is enforcing (Meltdown mitigated by PTI); a Meltdown-immune or `off`
+    // boot never reaches the trampoline, so the line is printed only then. On
+    // the default QEMU lane KPTI is active but the CPU has no PCID/INVPCID, so
+    // this reads `fallback (full TLB flush; no PCID/INVPCID)`; on PCID silicon
+    // it reads `active (kernel/user PCID, no-flush)`.
+    if report.kpti_active {
+        out.push_str("  KPTI PCID: ");
+        out.push_str(if report.pcid_active {
+            "active (kernel/user PCID, no-flush)"
+        } else {
+            "fallback (full TLB flush; no PCID/INVPCID)"
+        });
+        out.push('\n');
+    }
+
     // Honesty: enumerate the UNADDRESSED classes + the microkernel caveat.
     out.push_str(
         "note: UNADDRESSED — Spectre-v1, MDS, L1TF, SSB, Retbleed, Downfall/GDS are not mitigated.\n",

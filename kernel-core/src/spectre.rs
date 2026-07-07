@@ -295,6 +295,14 @@ pub struct MitigationReport {
     /// `RDPKRU`/`WRPKRU` and the v2 W+X exception are live). On the default TCG
     /// lane (no PKU) this is `false`; under a PKU host it is `true`.
     pub pku_active: bool,
+    /// Phase 110 Track A.5 — the KPTI **PCID** TLB-cost-recovery scheme is active
+    /// this boot: KPTI enforces AND the CPU has PCID + INVPCID, so `CR4.PCIDE` is
+    /// on and the trampoline CR3 loads carry distinct kernel/user PCIDs +
+    /// no-flush. `false` on every QEMU lane (TCG models neither instruction), so
+    /// KPTI there runs the full-flush fallback. Only meaningful when
+    /// `kpti_active`; a Meltdown-immune (`RDCL_NO`) or `off` boot leaves it
+    /// `false`.
+    pub pcid_active: bool,
 }
 
 impl MitigationReport {
@@ -317,24 +325,26 @@ impl MitigationReport {
             MitigationLevel::Full => 2,
         };
         // Bits 0..=2 are the Phase 84 flags; bits 3..=5 carry the Phase 90a
-        // C.2 W^X/PKU posture in the same byte (no parallel channel, no length
-        // change). Bits 6..=7 stay free for future flags.
+        // C.2 W^X/PKU posture; bit 6 carries the Phase 110 A.5 PCID flag — all
+        // in the same byte (no parallel channel, no length change). Bit 7 stays
+        // free for a future flag.
         b[1] = (self.level_recognized as u8)
             | ((self.kpti_active as u8) << 1)
             | ((self.ibpb_active as u8) << 2)
             | ((self.wx_v2 as u8) << 3)
             | ((self.pku_present as u8) << 4)
-            | ((self.pku_active as u8) << 5);
+            | ((self.pku_active as u8) << 5)
+            | ((self.pcid_active as u8) << 6);
         b[2] = match self.ibrs_mode {
             IbrsMode::None => 0,
             IbrsMode::Legacy => 1,
             IbrsMode::Enhanced => 2,
         };
-        // Wire version 2 (Phase 90a C.2 added the W^X/PKU flag bits to `b[1]`).
-        // Bumped from 1 so a stale decoder refuses rather than reading the new
-        // bits as zero. The kernel and `m3ctl` are built together, so both
-        // sides move in lock-step.
-        b[3] = 2;
+        // Wire version 3 (Phase 110 A.5 added the PCID flag bit to `b[1]`; v2 was
+        // Phase 90a C.2's W^X/PKU bits). Bumped so a stale decoder refuses rather
+        // than reading the new bit as zero. The kernel and `m3ctl` are built
+        // together, so both sides move in lock-step.
+        b[3] = 3;
         b[4..8].copy_from_slice(&self.leaf7_edx.to_le_bytes());
         b[8..16].copy_from_slice(&self.arch_caps.to_le_bytes());
         b
@@ -347,10 +357,10 @@ impl MitigationReport {
         if buf.len() < MITIGATION_REPORT_WIRE_LEN {
             return None;
         }
-        // Wire version (written as `b[3] = 2` by `encode()`; was 1 pre-90a).
-        // Reject anything we do not know how to parse so a bumped format fails
-        // cleanly here.
-        if buf[3] != 2 {
+        // Wire version (written as `b[3] = 3` by `encode()`; was 2 for 90a, 1
+        // pre-90a). Reject anything we do not know how to parse so a bumped
+        // format fails cleanly here.
+        if buf[3] != 3 {
             return None;
         }
         let level = match buf[0] {
@@ -379,6 +389,7 @@ impl MitigationReport {
             wx_v2: flags & 0b0000_1000 != 0,
             pku_present: flags & 0b0001_0000 != 0,
             pku_active: flags & 0b0010_0000 != 0,
+            pcid_active: flags & 0b0100_0000 != 0,
         })
     }
 }
@@ -645,6 +656,10 @@ mod tests {
                     wx_v2: pku_active,
                     pku_present: !matches!(ibrs_mode, IbrsMode::None),
                     pku_active,
+                    // Phase 110 A.5 — vary the PCID bit across the matrix so the
+                    // flag-byte packing is exercised set and clear (PCID implies
+                    // KPTI active, so key it on the same condition).
+                    pcid_active: matches!(ibrs_mode, IbrsMode::Enhanced),
                 };
                 let bytes = r.encode();
                 assert_eq!(bytes.len(), MITIGATION_REPORT_WIRE_LEN);
@@ -673,16 +688,17 @@ mod tests {
             wx_v2: false,
             pku_present: false,
             pku_active: false,
+            pcid_active: false,
         }
         .encode();
         assert!(MitigationReport::decode(&wrong_ver).is_some());
-        wrong_ver[3] = 3; // bump the version byte past the current v2
+        wrong_ver[3] = 4; // bump the version byte past the current v3
         assert!(MitigationReport::decode(&wrong_ver).is_none());
     }
 
     /// Phase 90a C.2 — the W^X v2 / PKU posture bits survive the wire
     /// round-trip independently of the Phase 84 flags, and are packed into the
-    /// spare bits of `b[1]` (no length change, version byte = 2).
+    /// spare bits of `b[1]` (no length change, version byte = 3 since A.5).
     #[test]
     fn wx_pku_posture_wire_round_trip() {
         let base = MitigationReport {
@@ -696,12 +712,13 @@ mod tests {
             wx_v2: false,
             pku_present: false,
             pku_active: false,
+            pcid_active: false,
         };
 
         // No-PKU boot (default TCG lane): all three posture bits clear.
         let no_pku = base.encode();
         assert_eq!(no_pku.len(), MITIGATION_REPORT_WIRE_LEN);
-        assert_eq!(no_pku[3], 2, "wire version must be 2 after C.2");
+        assert_eq!(no_pku[3], 3, "wire version must be 3 after A.5");
         let back = MitigationReport::decode(&no_pku).expect("decode no-pku");
         assert!(!back.wx_v2 && !back.pku_present && !back.pku_active);
 
@@ -727,5 +744,38 @@ mod tests {
         assert!(back.pku_present && !back.pku_active && !back.wx_v2);
         // The Phase 84 flag bits (0..=2) are untouched by the C.2 bits.
         assert!(back.level_recognized && !back.kpti_active && !back.ibpb_active);
+    }
+
+    /// Phase 110 A.5 — the PCID flag (bit 6 of `b[1]`) survives the wire
+    /// round-trip and is independent of every other flag.
+    #[test]
+    fn pcid_active_wire_round_trip() {
+        let base = MitigationReport {
+            level: MitigationLevel::Full,
+            level_recognized: true,
+            kpti_active: true,
+            ibpb_active: false,
+            ibrs_mode: IbrsMode::None,
+            leaf7_edx: 0,
+            arch_caps: 0,
+            wx_v2: false,
+            pku_present: false,
+            pku_active: false,
+            pcid_active: false,
+        };
+
+        // Fallback lane: KPTI active, PCID off.
+        let back = MitigationReport::decode(&base.encode()).expect("decode fallback");
+        assert!(back.kpti_active && !back.pcid_active);
+
+        // PCID-active lane: the bit round-trips set, without disturbing the
+        // adjacent PKU bits.
+        let pcid = MitigationReport {
+            pcid_active: true,
+            ..base
+        };
+        let back = MitigationReport::decode(&pcid.encode()).expect("decode pcid");
+        assert!(back.pcid_active);
+        assert!(!back.pku_present && !back.pku_active && !back.wx_v2);
     }
 }

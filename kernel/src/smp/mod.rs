@@ -948,15 +948,47 @@ pub mod offsets {
 /// at a ring-3 transition — which cannot occur mid-publish (the publishing
 /// code path itself stands between the stores and any user return).
 pub fn publish_kpti_cr3_pair(kernel_cr3: u64, user_cr3: u64) {
-    if !crate::mitigations::state().is_some_and(|s| s.kpti_active) || !is_per_core_ready() {
+    let Some(state) = crate::mitigations::state() else {
+        return;
+    };
+    if !state.kpti_active || !is_per_core_ready() {
         return;
     }
+    // Phase 110 A.5 — when the PCID scheme is active, bake the fixed
+    // kernel/user PCIDs + the no-flush bit into the published slot values. The
+    // entry/exit trampolines load these verbatim (`mov cr3, gs:[…]`), so a
+    // syscall/IRQ kernel↔user round trip within one process is no-flush: the
+    // two halves' entries coexist under distinct PCIDs and neither is dropped.
+    // The `user_cr3 == 0` kernel-thread sentinel stays 0 (never no-flush: the
+    // exit stubs skip the switch on 0). While the scheme is inactive the slots
+    // carry the raw page-aligned frames exactly as in A.4 (PCID = 0, and bit 63
+    // clear — mandatory, since a `mov cr3` with bit 63 set `#GP`s when
+    // CR4.PCIDE = 0).
+    let (kernel_val, user_val) = if state.pcid_active {
+        use kernel_core::kpti_pcid::{kernel_cr3 as tag_kernel, user_cr3 as tag_user};
+        let user_val = if user_cr3 == 0 {
+            0
+        } else {
+            tag_user(user_cr3, true)
+        };
+        // A 0 kernel value (published by `restore_kernel_cr3`'s successor is
+        // always the real boot PML4, so `kernel_cr3` here is nonzero) is passed
+        // through untagged for safety; every real caller passes a live PML4.
+        let kernel_val = if kernel_cr3 == 0 {
+            0
+        } else {
+            tag_kernel(kernel_cr3, true)
+        };
+        (kernel_val, user_val)
+    } else {
+        (kernel_cr3, user_cr3)
+    };
     let pc = per_core() as *const PerCoreData as *mut PerCoreData;
     // SAFETY: PerCoreData is only written by its owning core; volatile so the
     // `gs:`-relative asm readers always see the stores.
     unsafe {
-        core::ptr::write_volatile(&raw mut (*pc).kpti_kernel_cr3, kernel_cr3);
-        core::ptr::write_volatile(&raw mut (*pc).kpti_user_cr3, user_cr3);
+        core::ptr::write_volatile(&raw mut (*pc).kpti_kernel_cr3, kernel_val);
+        core::ptr::write_volatile(&raw mut (*pc).kpti_user_cr3, user_val);
     }
 }
 

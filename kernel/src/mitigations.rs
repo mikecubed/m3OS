@@ -67,6 +67,15 @@ pub struct MitigationState {
     pub kpti_policy: bool,
     /// KPTI **actually enforcing** this boot — the reporter's source of truth.
     pub kpti_active: bool,
+    /// Phase 110 A.5 — the KPTI PCID scheme is **active** this boot: KPTI is
+    /// enforcing AND the CPU advertises both PCID and INVPCID
+    /// ([`cpuid::probe_pcid`]), so `CR4.PCIDE` is enabled and the CR3-write loci
+    /// tag the kernel/user halves with distinct PCIDs + the no-flush bit. On
+    /// every QEMU lane (TCG advertises neither bit) this is `false` and the
+    /// kernel runs the A.4 full-flush fallback. The single gate consulted by
+    /// `smp::publish_kpti_cr3_pair`, `mm::write_kernel_cr3`, and the SMP
+    /// shootdown to decide whether to emit PCID-tagged CR3 loads.
+    pub pcid_active: bool,
     /// IBPB **enabled** this boot: when `true`, an IBPB is issued on every
     /// cross-process switch. Set once from policy + CPU features at boot — this
     /// is a configuration flag, not a counter of barriers actually issued.
@@ -117,6 +126,13 @@ pub fn init_bsp() -> &'static MitigationState {
         // while inactive, keeping every entry/exit switch never-taken).
         let kpti_active = kpti_policy && KPTI_WIRED;
 
+        // Phase 110 A.5 — PCID TLB-cost recovery is active iff KPTI enforces AND
+        // the CPU has both PCID + INVPCID. `enable_pcid_if_kpti_active` (called
+        // right after this returns on the BSP, per-AP via the CR4 trampoline
+        // copy, and on S3 resume) sets `CR4.PCIDE` under the same condition, so
+        // this flag and the live register agree. False on every QEMU lane.
+        let pcid_active = kpti_active && cpuid::probe_pcid();
+
         let ibpb_active = !off && features.ibrs_ibpb;
 
         // Track A.4 — KPTI GLOBAL-bit guard. m3OS marks no kernel PTE GLOBAL, so
@@ -140,13 +156,14 @@ pub fn init_bsp() -> &'static MitigationState {
             ibrs_mode,
             kpti_policy,
             kpti_active,
+            pcid_active,
             ibpb_active,
             leaf7_edx,
             arch_caps,
         };
 
         log::info!(
-            "[sec] mitigations={:?}{} ibrs={:?} ibpb={} stibp_avail={} rdcl_no={} kpti(policy={} active={}) global_kernel_ptes={}",
+            "[sec] mitigations={:?}{} ibrs={:?} ibpb={} stibp_avail={} rdcl_no={} kpti(policy={} active={}) pcid(active={} supported={}) global_kernel_ptes={}",
             state.level,
             if state.level_recognized { "" } else { " (unrecognized→auto)" },
             state.ibrs_mode,
@@ -155,6 +172,8 @@ pub fn init_bsp() -> &'static MitigationState {
             state.features.rdcl_no,
             state.kpti_policy,
             state.kpti_active,
+            state.pcid_active,
+            cpuid::probe_pcid(),
             global_kernel_ptes,
         );
         state
@@ -190,6 +209,16 @@ pub fn mitigations_off() -> bool {
         .get()
         .map(|s| matches!(s.level, MitigationLevel::Off))
         .unwrap_or(false)
+}
+
+/// Whether the KPTI PCID scheme is active this boot (Phase 110 A.5): the single
+/// gate `smp::publish_kpti_cr3_pair`, `mm::write_kernel_cr3`, and the SMP
+/// shootdown consult before emitting PCID-tagged / no-flush CR3 loads. `false`
+/// before [`init_bsp`] and on every QEMU lane (no PCID/INVPCID). Cheap (one
+/// `Once` read) — safe on the dispatch hot path.
+#[inline]
+pub fn pcid_active() -> bool {
+    STATE.get().map(|s| s.pcid_active).unwrap_or(false)
 }
 
 /// Whether IBPB should be issued on cross-process switches (C.3): the feature
@@ -289,6 +318,7 @@ pub fn report() -> MitigationReport {
             wx_v2,
             pku_present,
             pku_active,
+            pcid_active: s.pcid_active,
         },
         None => MitigationReport {
             level: MitigationLevel::Auto,
@@ -301,6 +331,7 @@ pub fn report() -> MitigationReport {
             wx_v2,
             pku_present,
             pku_active,
+            pcid_active: false,
         },
     }
 }

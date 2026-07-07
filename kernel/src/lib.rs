@@ -546,6 +546,21 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
         // active). APs and the S3-resume path self-select. No userspace exists
         // yet, so this cannot race a live SYSCALL.
         arch::x86_64::syscall::reinstall_lstar();
+        // Phase 110 Track A.5 — enable CR4.PCIDE on the BSP once KPTI is active
+        // and the CPU has PCID + INVPCID (no-op on every QEMU lane). Must run
+        // BEFORE `boot_aps()` captures the BSP's CR4 into the trampoline's
+        // `DATA_CR4`, so every AP inherits PCIDE and the tagged CR3 loads (gated
+        // on the same `pcid_active`) never `#GP` on a core without the bit. The
+        // BSP has no PCID-tagged CR3 in flight yet (still on the boot PML4,
+        // `PCID = 0`), so enabling PCIDE here is safe.
+        let pcide = unsafe {
+            arch::x86_64::cpuid::enable_pcid_if_kpti_active(
+                crate::mitigations::state().is_some_and(|s| s.kpti_active),
+            )
+        };
+        if pcide {
+            log::info!("[sec] CR4.PCIDE enabled (KPTI PCID TLB-cost recovery active)");
+        }
     });
 
     // Phase 103 Track E: probe HWP and opt in on the BSP (IA32_PM_ENABLE is

@@ -252,6 +252,60 @@ pub fn kernel_pml4_phys() -> u64 {
     *KERNEL_PML4_PHYS.get().expect("mm not initialized")
 }
 
+/// Load a **kernel-half** PML4 as this core's CR3 across an address-space
+/// boundary (scheduler dispatch, `execve`, `fork`, restore-to-kernel).
+///
+/// This is the single PCID-aware CR3-write locus (Phase 110 A.5). `pml4_phys`
+/// is the (page-aligned) kernel half — the full map the kernel runs on. The
+/// caller publishes the KPTI CR3 pair separately via
+/// [`crate::smp::publish_kpti_cr3_pair`] right after.
+///
+/// * **PCID scheme active** — load the frame under [`KERNEL_PCID`] with a
+///   *flushing* `mov cr3` (drops the previous occupant's kernel-half entries,
+///   which reuse the same global PCID), then `INVPCID` the [`USER_PCID`] to drop
+///   the previous occupant's user-half entries too (a CR3 load only affects the
+///   PCID it loads, and the exit trampolines about to run will load the user
+///   half **no-flush**). This is the "flush both PCIDs of the target ASID" the
+///   charter requires, applied at the switch-in.
+/// * **PCID scheme inactive** (every QEMU lane / no-KPTI) — a plain
+///   `Cr3::write(frame, empty())` with `PCID = 0`, byte-identical to Phase 84.
+///
+/// # Safety-adjacent contract
+/// Must run in ring 0 with the target address space's page tables live. When
+/// the scheme is active, `CR4.PCIDE` must already be set on this core (the
+/// `enable_pcid_if_kpti_active` calls guarantee it precedes any dispatch).
+pub fn write_kernel_cr3(pml4_phys: u64) {
+    use x86_64::{
+        PhysAddr,
+        registers::control::{Cr3, Cr3Flags},
+        structures::paging::PhysFrame,
+    };
+    let aligned = pml4_phys & !kernel_core::kpti_pcid::PCID_MASK;
+    let frame =
+        PhysFrame::from_start_address(PhysAddr::new(aligned)).expect("kernel PML4 unaligned");
+    if crate::mitigations::pcid_active() {
+        use kernel_core::kpti_pcid::{KERNEL_PCID, USER_PCID};
+        use x86_64::instructions::tlb::{InvPcidCommand, Pcid, flush_pcid};
+        // SAFETY: ring 0; CR4.PCIDE is enabled under the active scheme; the
+        // frame is a live kernel PML4 and the PCIDs are the fixed <= 4095
+        // constants.
+        unsafe {
+            // Flushing load of the kernel half (drops the old KERNEL_PCID
+            // entries), then invalidate the user PCID so the exit trampoline's
+            // no-flush user load cannot resurrect the old process's user pages.
+            Cr3::write_pcid(frame, Pcid::new(KERNEL_PCID).expect("KERNEL_PCID in range"));
+            flush_pcid(InvPcidCommand::Single(
+                Pcid::new(USER_PCID).expect("USER_PCID in range"),
+            ));
+        }
+    } else {
+        // SAFETY: ring 0; `frame` is a live kernel PML4.
+        unsafe {
+            Cr3::write(frame, Cr3Flags::empty());
+        }
+    }
+}
+
 /// Switch CR3 back to the kernel's original page table.
 ///
 /// Called from process-exit paths (syscall handlers, fault trampolines) that
@@ -265,18 +319,10 @@ pub fn kernel_pml4_phys() -> u64 {
 /// where re-entrancy is not a concern.  Only callable from ring 0 (Cr3::write
 /// is a privileged operation).
 pub fn restore_kernel_cr3() {
-    use x86_64::{
-        PhysAddr,
-        registers::control::{Cr3, Cr3Flags},
-        structures::paging::PhysFrame,
-    };
     let phys = *KERNEL_PML4_PHYS.get().expect("mm not initialized");
-    // SAFETY: phys is the bootloader's PML4 frame — always valid.
-    unsafe {
-        let frame =
-            PhysFrame::from_start_address(PhysAddr::new(phys)).expect("kernel PML4 unaligned");
-        Cr3::write(frame, Cr3Flags::empty());
-    }
+    // Load the boot PML4 as the kernel half (PCID-tagged + both-PCID flush when
+    // the A.5 scheme is active; a plain flushing `Cr3::write` otherwise).
+    write_kernel_cr3(phys);
     // Phase 110 A.4 — this core now runs pure kernel context on the boot PML4:
     // retarget the per-core KPTI pair so the paranoid NMI/#DF entry (which
     // loads `kpti_kernel_cr3` whenever non-zero) never chases the process PML4

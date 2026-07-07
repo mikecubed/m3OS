@@ -5783,7 +5783,6 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // Switch to the new page table and enter ring 3.
     // SAFETY: new_cr3 is valid, entry and user_rsp are within it.
     unsafe {
-        use x86_64::registers::control::{Cr3, Cr3Flags};
         // Read kstack/fs_base from PROCESS_TABLE first; these don't depend
         // on CR3 and we want them in scope for `set_current_user_return`
         // which we run BEFORE `Cr3::write` (Bug #5 fix below).
@@ -5848,7 +5847,10 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             addr_space_gen: new_addr_space.generation(),
         });
 
-        Cr3::write(new_cr3, Cr3Flags::empty());
+        // Address-space switch to the fresh execve image: `write_kernel_cr3`
+        // flushes both KPTI PCIDs under the A.5 scheme, else a plain flushing
+        // write (A.4 behavior).
+        crate::mm::write_kernel_cr3(new_cr3.start_address().as_u64());
         // Phase 110 A.4 — retarget the per-core KPTI pair at the same moment:
         // this syscall returns to ring 3 on the NEW image, so the sysret tail /
         // exit trampolines (which read `gs:[kpti_user_cr3]`, not a saved flag —

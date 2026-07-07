@@ -327,6 +327,20 @@ pub fn enter_sleep_s3() -> i64 {
     // controllers (PICs masked + LAPIC/IOAPIC/timer — calibrations are
     // Once-cached from boot and stable across S3).
     crate::mitigations::init_bsp();
+    // Phase 110 A.5 — the machine reset cleared CR4, so re-enable CR4.PCIDE on
+    // the BSP (no-op on QEMU / when KPTI is inactive). Must precede
+    // `resume_reboot_aps` so the re-`boot_aps` CR4 capture carries the bit and
+    // resumed APs inherit it; a resumed process's first tagged CR3 load then
+    // finds PCIDE set. The KPTI user halves and CR3-pair slots survive S3 in
+    // RAM, so `pcid_active` is unchanged across the cycle.
+    unsafe {
+        let pcide = crate::arch::x86_64::cpuid::enable_pcid_if_kpti_active(
+            crate::mitigations::state().is_some_and(|s| s.kpti_active),
+        );
+        if pcide {
+            log::info!("[suspend] CR4.PCIDE re-enabled after resume");
+        }
+    }
     crate::arch::x86_64::cpufreq::init_bsp();
     unsafe {
         crate::arch::x86_64::interrupts::init_pics();
