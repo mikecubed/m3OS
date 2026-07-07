@@ -4001,9 +4001,14 @@ core::arch::global_asm!(
     // execve_enter_userspace(rdi = user rip, rsi = user rsp, rdx = cs,
     //                        rcx = ss) -> !
     // The execve initial-entry trampoline (called by
-    // arch::x86_64::enter_userspace): a fresh image has no GPR state to
-    // restore, so this only builds the iretq frame (rflags = 0x202: IF +
-    // reserved bit 1) and flips CR3.
+    // arch::x86_64::enter_userspace): builds the iretq frame (rflags = 0x202:
+    // IF + reserved bit 1), zeroes every GPR, and flips CR3. The zeroing
+    // matters: a fresh image must start with deterministic registers (Linux
+    // does the same), both so no kernel values leak into ring 3 and because
+    // userspace observably depends on it — fork-test's `syscall2(WAITPID, …)`
+    // leaves `options` = the initial rdx, and the pre-zeroing trampoline
+    // leaked cs (0x23, odd) into rdx = accidental WNOHANG = a flaky
+    // fork-overlap regression (caught by the a3b pre-push gate).
     ".global execve_enter_userspace",
     "execve_enter_userspace:",
     // Reset rsp to this task's kstack top page (user-mapped); the execve
@@ -4015,7 +4020,24 @@ core::arch::global_asm!(
     "push 0x202", // rflags: IF + reserved bit 1
     "push rdx",   // cs
     "push rdi",   // rip
-    // KPTI exit: flip to the user CR3. No-op while inactive.
+    // Fresh image: zero every GPR (rsp/rip come from the iretq frame).
+    "xor eax, eax",
+    "xor ebx, ebx",
+    "xor ecx, ecx",
+    "xor edx, edx",
+    "xor esi, esi",
+    "xor edi, edi",
+    "xor ebp, ebp",
+    "xor r8d, r8d",
+    "xor r9d, r9d",
+    "xor r10d, r10d",
+    "xor r11d, r11d",
+    "xor r12d, r12d",
+    "xor r13d, r13d",
+    "xor r14d, r14d",
+    "xor r15d, r15d",
+    // KPTI exit: flip to the user CR3. No-op while inactive. (rax is 0 here;
+    // the scratch spill/restore keeps it 0 across the flip.)
     "mov gs:[EXIT_OFF_SCRATCH], rax",
     "mov rax, gs:[EXIT_OFF_USER_CR3]",
     "test rax, rax",
