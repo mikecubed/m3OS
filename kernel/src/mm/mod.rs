@@ -105,9 +105,10 @@ impl AddressSpace {
     ///
     /// No-op (returning `true`) while KPTI is inactive — the inert
     /// `KPTI_WIRED=false` production path adds zero per-process overhead.
-    /// Returns `false` on allocation failure (logged); A.4 treats a missing
-    /// user half at dispatch as fatal for the process rather than silently
-    /// running it unisolated.
+    /// Returns `false` on allocation failure (logged); A.4 fails closed on it:
+    /// `execve` returns `ENOMEM` before its destructive steps, and the
+    /// fork-child trampoline kills the child rather than entering ring 3
+    /// unisolated (the exit stubs skip the CR3 switch on `user_cr3 == 0`).
     pub fn build_kpti_user_half(&self, kstack_top: u64) -> bool {
         if !crate::mitigations::state().is_some_and(|s| s.kpti_active) {
             return true;
@@ -274,6 +275,13 @@ pub fn restore_kernel_cr3() {
             PhysFrame::from_start_address(PhysAddr::new(phys)).expect("kernel PML4 unaligned");
         Cr3::write(frame, Cr3Flags::empty());
     }
+    // Phase 110 A.4 — this core now runs pure kernel context on the boot PML4:
+    // retarget the per-core KPTI pair so the paranoid NMI/#DF entry (which
+    // loads `kpti_kernel_cr3` whenever non-zero) never chases the process PML4
+    // this core just switched away from — the exit paths that call us free it
+    // next — and so the exit stubs stay inert (`user_cr3 = 0`) until the next
+    // user dispatch publishes a real pair. No-op while KPTI is inactive.
+    crate::smp::publish_kpti_cr3_pair(phys, 0);
 }
 
 /// Phase 84 Track A.4 — KPTI `GLOBAL`-bit guard.

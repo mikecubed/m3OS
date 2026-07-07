@@ -5558,6 +5558,21 @@ pub fn run() -> ! {
                                 core_id
                             );
                         }
+                        // Phase 110 A.4 — publish the KPTI CR3 pair alongside
+                        // the CR3 restore (no-op while KPTI is inactive). The
+                        // user half must come from the SAME address space as
+                        // `urs.cr3_phys`: mid-execve the PROCESS_TABLE already
+                        // holds the new space while urs still has the old CR3,
+                        // so the filter publishes user=0 for that transient —
+                        // harmless, because `kpti_user_cr3` is only consumed
+                        // at a ring-3 transition and the task is mid-syscall
+                        // in ring 0 until execve republishes the matched pair.
+                        let user_half = new_as_guard
+                            .as_deref()
+                            .filter(|a| a.pml4_phys().as_u64() == urs.cr3_phys)
+                            .map(|a| a.kpti_user_pml4())
+                            .unwrap_or(0);
+                        crate::smp::publish_kpti_cr3_pair(urs.cr3_phys, user_half);
                     }
                     // Restore kernel stack top (TSS.RSP0 + per-core SYSCALL_STACK_TOP).
                     if urs.kernel_stack_top != 0 {
@@ -5582,15 +5597,19 @@ pub fn run() -> ! {
                     // Fallback for tasks that have not yet entered syscall_handler
                     // (e.g. freshly forked children before first dispatch).
                     // Read from PROCESS_TABLE as the legacy path.
-                    let (cr3_phys, kstack, fs) = {
+                    let (cr3_phys, kstack, fs, kpti_user_half) = {
                         let table = crate::process::PROCESS_TABLE.lock();
                         match table.find(pid) {
                             Some(p) => (
                                 p.addr_space.as_ref().map(|a| a.pml4_phys()),
                                 p.kernel_stack_top,
                                 p.fs_base,
+                                p.addr_space
+                                    .as_ref()
+                                    .map(|a| a.kpti_user_pml4())
+                                    .unwrap_or(0),
                             ),
-                            None => (None, 0, 0),
+                            None => (None, 0, 0, 0),
                         }
                     };
                     if let Some(cr3) = cr3_phys {
@@ -5604,6 +5623,11 @@ pub fn run() -> ! {
                                 PhysFrame::containing_address(PhysAddr::new(cr3.as_u64()));
                             Cr3::write(frame, Cr3Flags::empty());
                         }
+                        // Phase 110 A.4 — publish the KPTI CR3 pair with the
+                        // CR3 load; cr3 and the user half were read from the
+                        // same PROCESS_TABLE entry, so the pair is consistent
+                        // by construction. No-op while KPTI is inactive.
+                        crate::smp::publish_kpti_cr3_pair(cr3.as_u64(), kpti_user_half);
                     }
                     if kstack != 0 {
                         crate::smp::set_current_core_kernel_stack(kstack);

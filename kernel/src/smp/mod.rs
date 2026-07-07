@@ -925,6 +925,38 @@ pub mod offsets {
     pub const KPTI_SCRATCH: usize = core::mem::offset_of!(PerCoreData, kpti_scratch);
 }
 
+/// Phase 110 Track A.4 — publish this core's KPTI CR3 pair for the task it is
+/// about to run (or has just switched to).
+///
+/// `kernel_cr3` must be the PML4 this core's CR3 was just loaded with (the
+/// full kernel map); `user_cr3` the task's KPTI user-half PML4, or 0 for
+/// kernel threads / the boot PML4 (every exit stub skips its CR3 switch on 0).
+/// Call sites: the scheduler dispatch prep, the fork-child trampoline, execve's
+/// mid-syscall retarget, and `restore_kernel_cr3` (which republishes the boot
+/// PML4 so the slot never dangles at a dying process's soon-freed PML4 — the
+/// paranoid NMI/`#DF` entry loads `kpti_kernel_cr3` whenever it is non-zero).
+///
+/// No-op unless KPTI is **active** this boot: while inactive the slots must
+/// stay 0, precisely so that paranoid load never happens.
+///
+/// Tearing: an NMI can land between the two stores, but each value is
+/// individually valid at every call site (both PML4s are live), the paranoid
+/// path consumes only `kpti_kernel_cr3`, and `kpti_user_cr3` is only consumed
+/// at a ring-3 transition — which cannot occur mid-publish (the publishing
+/// code path itself stands between the stores and any user return).
+pub fn publish_kpti_cr3_pair(kernel_cr3: u64, user_cr3: u64) {
+    if !crate::mitigations::state().is_some_and(|s| s.kpti_active) || !is_per_core_ready() {
+        return;
+    }
+    let pc = per_core() as *const PerCoreData as *mut PerCoreData;
+    // SAFETY: PerCoreData is only written by its owning core; volatile so the
+    // `gs:`-relative asm readers always see the stores.
+    unsafe {
+        core::ptr::write_volatile(&raw mut (*pc).kpti_kernel_cr3, kernel_cr3);
+        core::ptr::write_volatile(&raw mut (*pc).kpti_user_cr3, user_cr3);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BSP initialization (T002, T004)
 // ---------------------------------------------------------------------------

@@ -5667,9 +5667,6 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // For the in-kernel (boot-window) source this is a cheap no-op drop.
     drop(exec_stream);
 
-    // Close file descriptors with FD_CLOEXEC set.
-    crate::process::close_cloexec_fds(pid);
-
     // Keep the old AddressSpace alive across the CR3 switch. The process table
     // replacement below drops its Arc, but this core still runs on the old CR3
     // until `Cr3::write(new_cr3)` completes.
@@ -5691,8 +5688,20 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // Phase 110 A.3b part 5 — execve replaces the kernel PML4, so the KPTI
     // user half is rebuilt against it (the process keeps its kstack). No-op
     // while KPTI is inactive; the old half dies with the old Arc's Drop.
-    new_addr_space.build_kpti_user_half(proc_kstack_top);
+    //
+    // A.4 fail-closed: this runs BEFORE the destructive steps below
+    // (close_cloexec_fds / PROCESS_TABLE commit), so an allocation failure
+    // surfaces as a clean ENOMEM to the caller — the process must never reach
+    // ring 3 without a user half while KPTI is active. The fresh page table
+    // leaks on this path, like every other post-`new_process_page_table`
+    // error return (bump allocator).
+    if !new_addr_space.build_kpti_user_half(proc_kstack_top) {
+        return NEG_ENOMEM;
+    }
     let new_as_ptr = alloc::sync::Arc::as_ptr(&new_addr_space);
+
+    // Close file descriptors with FD_CLOEXEC set.
+    crate::process::close_cloexec_fds(pid);
 
     // Update the process entry with the new CR3 and entry point.
     // Reset brk/mmap state since the address space is completely replaced.
@@ -5841,6 +5850,15 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         });
 
         Cr3::write(new_cr3, Cr3Flags::empty());
+        // Phase 110 A.4 — retarget the per-core KPTI pair at the same moment:
+        // this syscall returns to ring 3 on the NEW image, so the sysret tail /
+        // exit trampolines (which read `gs:[kpti_user_cr3]`, not a saved flag —
+        // exactly for this mid-syscall retarget) must load the rebuilt user
+        // half. No-op while KPTI is inactive.
+        crate::smp::publish_kpti_cr3_pair(
+            new_cr3.start_address().as_u64(),
+            new_addr_space.kpti_user_pml4(),
+        );
         if crate::smp::is_per_core_ready() {
             let pc = crate::smp::per_core();
             let core_id = pc.core_id;
@@ -19526,7 +19544,16 @@ fn sys_clone_thread(
     // task's kstack top page; this thread's ring-3 interrupt frames push onto
     // ITS kstack top on the user CR3, so map that page too (no-op while KPTI
     // is inactive).
-    parent_addr_space.kpti_map_thread_kstack(kstack_top);
+    //
+    // A.4 fail-closed: on mapping failure the thread must not start — its
+    // first ring-3 interrupt would push the CPU frame onto an unmapped kstack
+    // top on the user CR3 and escalate #PF → #DF, killing the whole thread
+    // group. Fail the clone cleanly instead (the freshly-allocated kstack
+    // leaks, like the other rare OOM error returns).
+    if !parent_addr_space.kpti_map_thread_kstack(kstack_top) {
+        const NEG_ENOMEM: u64 = (-12_i64) as u64;
+        return NEG_ENOMEM;
+    }
 
     // Determine TLS: if CLONE_SETTLS, use the provided tls value.
     let child_fs_base = if flags & CLONE_SETTLS != 0 {
