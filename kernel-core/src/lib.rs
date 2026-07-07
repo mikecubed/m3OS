@@ -29,6 +29,7 @@ pub mod installer;
 pub mod iommu;
 pub mod ipc;
 pub mod kpti;
+pub mod kpti_pcid;
 pub mod log_ring;
 pub mod magazine;
 pub mod microcode;
