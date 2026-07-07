@@ -32,9 +32,10 @@
 //! [`kernel_core::kpti::may_clone_slot_into_user_half`]).
 //!
 //! The self-test builds a representative entry set — the `PerCoreData` page(s),
-//! the `syscall_entry` text page, and a fresh entry-stack page — exercising the
-//! three distinct source regions (kernel heap VA, kernel-image VA, a fresh
-//! frame). A.2 extends it with the GDT/TSS/IDT the real switch also needs.
+//! the page-aligned `.text.kpti_entry` section (both SYSCALL stubs + shared
+//! body + sysret tail, as of A.2), and a fresh entry-stack page — exercising
+//! the three distinct source regions (kernel heap VA, kernel-image VA, a fresh
+//! frame). A.3 extends it with the GDT/TSS/IDT the IRQ-path switch also needs.
 
 use alloc::vec::Vec;
 
@@ -257,13 +258,17 @@ fn build_selftest_pair() -> Option<SelfTestArena> {
             va += 0x1000;
         }
 
-        // Entry text — the `syscall_entry` naked stub page (executable, r/o).
-        unsafe extern "C" {
-            fn syscall_entry();
+        // Entry text — the whole page-aligned `.text.kpti_entry` section (both
+        // SYSCALL stubs + shared body + sysret tail; A.2). This is the real
+        // range the live trampoline executes on the user CR3, mapped r-x
+        // ring-0-only.
+        let (text_start, text_end) = crate::arch::x86_64::syscall::kpti_entry_text_range();
+        let mut text_va = text_start;
+        while text_va < text_end {
+            let phys = kmapper.translate_addr(VirtAddr::new(text_va))?.as_u64();
+            entry_pages.push((text_va, phys, PageTableFlags::PRESENT));
+            text_va += 0x1000;
         }
-        let text_va = (syscall_entry as *const () as u64) & !0xFFF;
-        let text_phys = kmapper.translate_addr(VirtAddr::new(text_va))?.as_u64();
-        entry_pages.push((text_va, text_phys, PageTableFlags::PRESENT));
     }
 
     let mut table_frames: Vec<u64> = Vec::new();
@@ -342,15 +347,30 @@ fn build_selftest_pair() -> Option<SelfTestArena> {
 /// a regression is caught by the `kpti-selftest-smoke` gate at the right
 /// granularity without bricking unrelated boots (KPTI is not yet live).
 pub fn self_test() {
-    let kimg_idx;
     let dm_idx = pml4_index(phys_offset());
-    // Recompute kimg_idx the same way build does (syscall_entry's slot).
+
+    // A.2 layout invariant: both SYSCALL stubs must live inside the
+    // page-aligned `.text.kpti_entry` section — it is the ONLY kernel text the
+    // user PML4 maps, so a stub drifting outside it (linker/section
+    // regression) would #PF-loop on the first KPTI syscall's user-CR3
+    // instruction fetch once A.4 activates. Catch it here, at boot, instead.
+    let (text_start, text_end) = crate::arch::x86_64::syscall::kpti_entry_text_range();
+    let (entry_plain, entry_kpti) = crate::arch::x86_64::syscall::syscall_entry_stub_addrs();
+    if text_start % 0x1000 != 0
+        || text_end % 0x1000 != 0
+        || text_start >= text_end
+        || !(text_start..text_end).contains(&entry_plain)
+        || !(text_start..text_end).contains(&entry_kpti)
     {
-        unsafe extern "C" {
-            fn syscall_entry();
-        }
-        kimg_idx = pml4_index((syscall_entry as *const () as u64) & !0xFFF);
+        log::error!(
+            "KPTI_SELFTEST:FAIL reason=entry-text-layout start={text_start:#x} end={text_end:#x} \
+             syscall_entry={entry_plain:#x} syscall_entry_kpti={entry_kpti:#x}"
+        );
+        return;
     }
+
+    // kimg_idx the same way build does (the entry-text section's slot).
+    let kimg_idx = pml4_index(text_start);
 
     let arena = match build_selftest_pair() {
         Some(a) => a,

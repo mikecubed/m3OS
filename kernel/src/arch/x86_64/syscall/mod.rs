@@ -1134,6 +1134,14 @@ global_asm!(
     ".equ OFF_STACK_TOP,           {off_stack_top}",
     ".equ OFF_USER_RSP,            {off_user_rsp}",
     ".equ OFF_ARG3,                {off_arg3}",
+    // Phase 110 Track A.2 (KPTI) — per-core CR3-pair slots read by the
+    // trampoline. All live in `PerCoreData`, which the user PML4's minimal
+    // entry set maps at its kernel VA, so every `gs:[…]` access below is valid
+    // on EITHER CR3 (m3OS never executes `swapgs`; GS_BASE is PerCoreData in
+    // both rings).
+    ".equ OFF_KPTI_KERNEL_CR3,     {off_kpti_kernel_cr3}",
+    ".equ OFF_KPTI_USER_CR3,       {off_kpti_user_cr3}",
+    ".equ OFF_KPTI_SCRATCH,        {off_kpti_scratch}",
     // Phase 57e Bug #3 fix — pointer-to-task-snapshot indirection.
     ".equ OFF_TASK_SNAPSHOT_PTR,   {off_task_snapshot_ptr}",
     // Field offsets within `TaskSyscallSnapshot` (target of the indirection).
@@ -1152,6 +1160,49 @@ global_asm!(
     ".equ SNAP_USER_RFLAGS, {snap_user_rflags}",
     ".equ SNAP_USER_RSP,    {snap_user_rsp}",
 
+    // -----------------------------------------------------------------------
+    // KPTI entry-text section (Phase 110 Track A.2).
+    //
+    // Everything between `kpti_entry_text_start` and `kpti_entry_text_end` is
+    // the instructions a syscall may execute while the USER CR3 is (or may
+    // be) live: the two entry stubs, the shared body, and the sysret tail.
+    // The user PML4's minimal entry set maps this whole range (r-x, ring-0
+    // only) at its kernel VA — mapping the shared body too costs nothing
+    // secret-wise (entry text is not a secret; Linux maps all of
+    // `.entry.text` the same way) and keeps the section a single contiguous,
+    // page-aligned unit. The `.balign 4096` on both ends guarantees no
+    // unrelated kernel text shares a page with it, so mapping the range into
+    // the user half never leaks neighbouring code.
+    //
+    // The section is emitted exactly once (this block); `mm::kpti` maps
+    // `[kpti_entry_text_start, kpti_entry_text_end)` into every user PML4 and
+    // the boot self-test asserts both stubs live inside it.
+    // -----------------------------------------------------------------------
+    ".section .text.kpti_entry, \"ax\"",
+    ".balign 4096",
+    ".global kpti_entry_text_start",
+    "kpti_entry_text_start:",
+
+    // --- KPTI SYSCALL entry (LSTAR target when `kpti_active`) ---
+    //
+    // At entry the USER CR3 is live. SYSCALL auto-switches nothing (no stack,
+    // no CR3), so unlike the IRQ path no trampoline stack is needed — the stub
+    // owns the whole sequence. Until the `mov cr3` below, it may touch ONLY
+    // `gs:[…]` slots (PerCoreData is in the user half) and registers: no
+    // kernel stack, no kernel globals. `rax` (the syscall number) is the one
+    // scratch register spilled across the CR3 load; the arg registers
+    // rdi/rsi/rdx/r10/r8/r9 and rcx/r11 (user RIP/RFLAGS) pass through
+    // untouched, preserving the syscall ABI contract.
+    ".global syscall_entry_kpti",
+    "syscall_entry_kpti:",
+    "mov gs:[OFF_USER_RSP], rsp",
+    "mov gs:[OFF_KPTI_SCRATCH], rax",
+    "mov rax, gs:[OFF_KPTI_KERNEL_CR3]",
+    "mov cr3, rax", // → kernel CR3; the full kernel map (and kstacks) now visible
+    "mov rax, gs:[OFF_KPTI_SCRATCH]",
+    "jmp .Lsyscall_entry_common",
+
+    // --- Non-KPTI SYSCALL entry (LSTAR target when KPTI is inactive) ---
     ".global syscall_entry",
     "syscall_entry:",
     // At entry (from ring 3 via SYSCALL):
@@ -1164,6 +1215,7 @@ global_asm!(
 
     // --- Switch to per-core kernel stack ---
     "mov gs:[OFF_USER_RSP], rsp",
+    ".Lsyscall_entry_common:",
     "mov rsp, gs:[OFF_STACK_TOP]",
     "cld",
 
@@ -1289,13 +1341,50 @@ global_asm!(
     "pop r11", // user RFLAGS
     "pop rcx", // user RIP
 
+    // --- KPTI-aware sysret tail (Phase 110 Track A.2) ---
+    //
+    // The body is shared between both entry stubs, so the tail re-derives the
+    // posture from `gs:[OFF_KPTI_USER_CR3]`: non-zero exactly when this core
+    // dispatched the current task with KPTI active (the same slot the entry
+    // stub's kernel-CR3 twin came from), zero otherwise — including on every
+    // production boot while `KPTI_WIRED` is false, where the cost is two
+    // gs-moves and one never-taken branch. Reading the slot (not a saved
+    // register) also keeps `execve` correct: it retargets the per-core pair
+    // mid-syscall, and the tail must return on the NEW address space's user
+    // CR3. IF is already masked (`cli` above), so nothing can preempt between
+    // the CR3 switch and `sysretq`; NMI is the one exception and is handled
+    // by the paranoid save/restore path (A.3).
+    //
+    // `rax` holds the syscall return value and `rcx`/`r11` the user RIP/
+    // RFLAGS, so the user-CR3 load spills `rax` through the scratch slot —
+    // PerCoreData is mapped on both CR3s, making the post-switch reads
+    // (`scratch`, `user_rsp`) valid on the user CR3.
+    "mov gs:[OFF_KPTI_SCRATCH], rax",
+    "mov rax, gs:[OFF_KPTI_USER_CR3]",
+    "test rax, rax",
+    "jz .Lsysret_cr3_done",
+    "mov cr3, rax", // → user CR3; kernel map gone, entry set + user half remain
+    ".Lsysret_cr3_done:",
+    "mov rax, gs:[OFF_KPTI_SCRATCH]",
+
     // --- Restore user RSP and return ---
     "mov rsp, gs:[OFF_USER_RSP]",
     "sysretq",
 
+    // Page-align the end so the mapped range [start, end) contains only this
+    // section's code + padding, never a neighbouring function.
+    ".balign 4096",
+    ".global kpti_entry_text_end",
+    "kpti_entry_text_end:",
+    // Return to the normal text section for any later module-level asm.
+    ".text",
+
     off_stack_top         = const crate::smp::offsets::SYSCALL_STACK_TOP,
     off_user_rsp          = const crate::smp::offsets::SYSCALL_USER_RSP,
     off_arg3              = const crate::smp::offsets::SYSCALL_ARG3,
+    off_kpti_kernel_cr3   = const crate::smp::offsets::KPTI_KERNEL_CR3,
+    off_kpti_user_cr3     = const crate::smp::offsets::KPTI_USER_CR3,
+    off_kpti_scratch      = const crate::smp::offsets::KPTI_SCRATCH,
     off_task_snapshot_ptr = const crate::smp::offsets::CURRENT_SYSCALL_SNAPSHOT_PTR,
     snap_user_rbx    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RBX,
     snap_user_rbp    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RBP,
@@ -1312,6 +1401,66 @@ global_asm!(
     snap_user_rflags = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RFLAGS,
     snap_user_rsp    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RSP,
 );
+
+// ---------------------------------------------------------------------------
+// KPTI entry-text section bounds + LSTAR stub selection (Phase 110 Track A.2)
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    /// Start of the page-aligned `.text.kpti_entry` section (see the
+    /// `global_asm!` block above).
+    fn kpti_entry_text_start();
+    /// One-past-the-end of the section (page-aligned by the trailing
+    /// `.balign`).
+    fn kpti_entry_text_end();
+    /// The CR3-switching SYSCALL stub — LSTAR target when KPTI is active.
+    fn syscall_entry_kpti();
+}
+
+/// `[start, end)` VA range of the `.text.kpti_entry` section: the only kernel
+/// text the KPTI user PML4 maps (both SYSCALL stubs + shared body + sysret
+/// tail). Both bounds are page-aligned; `mm::kpti` maps exactly this range
+/// into the user half's minimal entry set.
+pub fn kpti_entry_text_range() -> (u64, u64) {
+    (
+        kpti_entry_text_start as *const () as u64,
+        kpti_entry_text_end as *const () as u64,
+    )
+}
+
+/// The two SYSCALL entry stub addresses `(non_kpti, kpti)` — exposed so the
+/// KPTI boot self-test can assert both live inside
+/// [`kpti_entry_text_range`].
+pub fn syscall_entry_stub_addrs() -> (u64, u64) {
+    unsafe extern "C" {
+        fn syscall_entry();
+    }
+    (
+        syscall_entry as *const () as u64,
+        syscall_entry_kpti as *const () as u64,
+    )
+}
+
+/// The SYSCALL entry stub matching this boot's KPTI posture: the CR3
+/// trampoline when `kpti_active`, the direct stub otherwise.
+///
+/// While `KPTI_WIRED` is false (A.2) `kpti_active` is never set, so this
+/// always yields the non-KPTI stub and production behaviour is unchanged. Once
+/// A.4 lands: APs run `mitigations::init_ap()` before `syscall::init_ap()` and
+/// the S3 resume path re-runs `init()` after the (static) policy decision, so
+/// both pick the right stub here; only the BSP's early `init()` predates
+/// `mitigations::init_bsp()` and needs the explicit A.4 LSTAR re-install.
+fn lstar_target() -> VirtAddr {
+    let kpti_active = crate::mitigations::state().is_some_and(|s| s.kpti_active);
+    if kpti_active {
+        VirtAddr::new(syscall_entry_kpti as *const () as u64)
+    } else {
+        unsafe extern "C" {
+            fn syscall_entry();
+        }
+        VirtAddr::new(syscall_entry as *const () as u64)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Syscall number constants (x86_64 Linux ABI + m3OS custom range)
@@ -6259,10 +6408,7 @@ pub fn init() {
     )
     .expect("STAR MSR write failed: segment selector layout mismatch");
 
-    unsafe extern "C" {
-        fn syscall_entry();
-    }
-    LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
+    LStar::write(lstar_target());
     SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG | RFlags::ALIGNMENT_CHECK);
     unsafe {
         Efer::update(|flags| *flags |= EferFlags::SYSTEM_CALL_EXTENSIONS);
@@ -6284,10 +6430,7 @@ pub fn init_ap() {
     )
     .expect("STAR MSR write failed on AP");
 
-    unsafe extern "C" {
-        fn syscall_entry();
-    }
-    LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
+    LStar::write(lstar_target());
     SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG | RFlags::ALIGNMENT_CHECK);
     unsafe {
         Efer::update(|flags| *flags |= EferFlags::SYSTEM_CALL_EXTENSIONS);
