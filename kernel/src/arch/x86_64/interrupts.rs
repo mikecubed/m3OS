@@ -3877,9 +3877,10 @@ pub fn kpti_irq_entry_range() -> (u64, u64) {
 //   3. flip CR3 via the scratch slot (no-op while `kpti_user_cr3 == 0`).
 //   4. `iretq`.
 //
-// Part 3a lands `preempt_resume_to_user` (the preemption-resume path) as the
-// proof of pattern; `fork_enter_userspace`, `enter_userspace`, and
-// `restore_and_enter_userspace` follow the same recipe in later sub-commits.
+// Part 3a landed `preempt_resume_to_user` (the preemption-resume path) as the
+// proof of pattern; part 3b adds `fork_enter_userspace`. `enter_userspace`
+// (execve) and `restore_and_enter_userspace` (sigreturn) follow the same
+// recipe in later sub-commits.
 core::arch::global_asm!(
     ".equ EXIT_OFF_USER_CR3,  {exit_off_user_cr3}",
     ".equ EXIT_OFF_SCRATCH,   {exit_off_scratch}",
@@ -3930,6 +3931,63 @@ core::arch::global_asm!(
     "mov rdi, [rdi + 40]", // rdi last (pointer becomes invalid)
     // KPTI exit: flip to the user CR3 (rax holds a user value → spill via
     // gs:[scratch], which is mapped on both halves). No-op while inactive.
+    "mov gs:[EXIT_OFF_SCRATCH], rax",
+    "mov rax, gs:[EXIT_OFF_USER_CR3]",
+    "test rax, rax",
+    "jz 1f",
+    "mov cr3, rax",
+    "1:",
+    "mov rax, gs:[EXIT_OFF_SCRATCH]",
+    "iretq",
+    "",
+    // fork_enter_userspace(rdi = *const ForkEntryCtx) -> !
+    // Restores ALL registers preserved by the Linux syscall ABI (everything
+    // except RAX/RCX/R11) so the fork child resumes with the parent's register
+    // state at the `syscall` instruction, with RAX = 0 (the child's fork
+    // return value).
+    // ForkEntryCtx offsets (arch/x86_64/mod.rs): rip=0 rsp=8 rbx=16 rbp=24
+    //   r12=32 r13=40 r14=48 r15=56 ss=64 cs=72 rdi=80 rsi=88 rdx=96 r8=104
+    //   r9=112 r10=120 rflags=128
+    ".global fork_enter_userspace",
+    "fork_enter_userspace:",
+    // Reset rsp to this task's kstack top page — the child was dispatched via
+    // switch_context, so the dispatch prep block already published its kstack
+    // top to gs:[STACK_TOP]. The continuation stack below is abandoned (this
+    // trampoline never returns).
+    "mov rsp, gs:[EXIT_OFF_STACK_TOP]",
+    // Build the 5-field iretq frame on the top page (push in reverse: ss first).
+    "mov rax, [rdi + 64]", // ss
+    "push rax",
+    "mov rax, [rdi + 8]", // user rsp
+    "push rax",
+    // Saved user RFLAGS, sanitized: force IF, clear IOPL/VM/RF/reserved.
+    "mov rax, [rdi + 128]",
+    "or  rax, 0x200",
+    "and eax, 0x000ED7FF",
+    "push rax",
+    "mov rax, [rdi + 72]", // cs
+    "push rax",
+    "mov rax, [rdi + 0]", // rip
+    "push rax",
+    // Restore GPRs from the ForkEntryCtx BEFORE the CR3 flip. (The ctx lives
+    // in PerCoreData — mapped on both halves — so fork *could* restore after
+    // the flip, but the exit trampolines stay uniform: reg source first.)
+    "mov rbx, [rdi + 16]",
+    "mov rbp, [rdi + 24]",
+    "mov r12, [rdi + 32]",
+    "mov r13, [rdi + 40]",
+    "mov r14, [rdi + 48]",
+    "mov r15, [rdi + 56]",
+    "mov rsi, [rdi + 88]",
+    "mov rdx, [rdi + 96]",
+    "mov r8,  [rdi + 104]",
+    "mov r9,  [rdi + 112]",
+    "mov r10, [rdi + 120]",
+    "mov rdi, [rdi + 80]", // rdi last (pointer becomes invalid)
+    // RAX = 0 (fork child return value) — preserved across the flip by the
+    // scratch spill/restore.
+    "xor eax, eax",
+    // KPTI exit: flip to the user CR3. No-op while inactive.
     "mov gs:[EXIT_OFF_SCRATCH], rax",
     "mov rax, gs:[EXIT_OFF_USER_CR3]",
     "test rax, rax",

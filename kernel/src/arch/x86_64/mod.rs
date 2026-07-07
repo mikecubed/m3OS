@@ -1,5 +1,3 @@
-use core::arch::global_asm;
-
 pub mod apic;
 pub mod cpufreq;
 pub mod cpuid;
@@ -174,46 +172,12 @@ impl ForkEntryCtx {
 // FORK_ENTRY_CTX has moved to PerCoreData (Phase 35).
 // The fork_enter_userspace assembly reads it via gs-relative addressing.
 
-// Assembly trampoline: reads ForkEntryCtx from a pointer (rdi), restores ALL
-// registers, then IRETs to ring 3.
-global_asm!(
-    ".global fork_enter_userspace",
-    "fork_enter_userspace:",
-    // On entry: rdi = pointer to ForkEntryCtx (SysV calling convention).
-    "mov rax, rdi",
-    // Restore callee-saved registers.
-    "mov rbx, [rax + 16]",
-    "mov rbp, [rax + 24]",
-    "mov r12, [rax + 32]",
-    "mov r13, [rax + 40]",
-    "mov r14, [rax + 48]",
-    "mov r15, [rax + 56]",
-    // Restore caller-saved registers (syscall-preserved).
-    "mov rsi, [rax + 88]",
-    "mov rdx, [rax + 96]",
-    "mov r8,  [rax + 104]",
-    "mov r9,  [rax + 112]",
-    "mov r10, [rax + 120]",
-    // Build IRET frame: SS, RSP, RFLAGS, CS, RIP
-    "mov rcx, [rax + 64]", // ss
-    "push rcx",
-    "push [rax + 8]", // user RSP
-    // Use saved user RFLAGS (sanitized: ensure IF is set, clear IOPL/VM/RF).
-    "mov rcx, [rax + 128]", // user RFLAGS
-    "or  rcx, 0x200",       // ensure IF (interrupt enable) is set
-    "and ecx, 0x000ED7FF",  // clear IOPL, VM, RF, reserved bits
-    "push rcx",
-    "mov rcx, [rax + 72]", // cs
-    "push rcx",
-    "push [rax]", // user RIP
-    // Restore rdi AFTER we're done using rax as base (rdi is offset 80).
-    "mov rdi, [rax + 80]",
-    // RAX = 0 (fork child return value).
-    "xor eax, eax",
-    "iretq",
-);
-
 unsafe extern "C" {
+    /// The fork-child ring-3 entry trampoline. Phase 110 A.3b part 3: the asm
+    /// lives in the user-mapped `.text.kpti_exit` section (`interrupts.rs`,
+    /// bottom) so it can flip to the user CR3 immediately before its `iretq`.
+    /// Restores ALL syscall-preserved registers from the `ForkEntryCtx` and
+    /// enters ring 3 with RAX = 0 (the child's fork return value).
     fn fork_enter_userspace(ctx: *const ForkEntryCtx) -> !;
 }
 
