@@ -41,6 +41,37 @@ handoff](./2026-06-30-phase-100-bare-metal-gui-hw-validation.md) §6.
       `acpid` GPE/fixed dispatch to log it (D.3/D.4 HW arm; charter's
       lid `Validated-on-HW` item). Power button press is the fallback arm.
 
+## Phase 110 — Real-Hardware Security (KPTI Meltdown + PCID on metal)
+
+Track A (KPTI) is merged and live on every QEMU boot, but QEMU TCG models
+**no** speculation and advertises **no** PCID/INVPCID, so two arms are inherently
+bare-metal-only. The Precision 5560 (Intel Tiger Lake) has both PCID and INVPCID
+and is Meltdown-susceptible with KPTI off, so it is the right target.
+
+- [ ] **A.6 — Meltdown PoC reject** (`Validated-on-HW`, never a bare "Complete").
+      Boot `M3OS_MITIGATIONS=full` on the Dell, run a ported public Meltdown PoC:
+      it must **leak** kernel memory with KPTI off (`M3OS_MITIGATIONS=off`) and
+      **fail** to leak with it on. Record the run (`run N, YYYY-MM-DD`) + the
+      capture path. This is the whole point of Track A — QEMU can never prove it.
+- [ ] **A.5 — PCID scheme is live on real silicon.** Boot the default image and
+      confirm the A.5 fallback flips to *active* on PCID hardware: the `[sec]`
+      line reads `pcid(active=true supported=true)` (vs the QEMU
+      `active=false supported=false`), every `[sec] AP CR4… CR4.PCIDE enabled`,
+      and `m3ctl mitigations status` prints `KPTI PCID: active (kernel/user PCID,
+      no-flush)`. This is the first boot the tagged-CR3 + no-flush trampolines +
+      both-PCID `INVPCID` shootdown actually execute — so it doubles as the
+      functional proof of the whole A.5 asm/CR3 path (QEMU only ever ran the
+      fallback). Watch for any CR3 `#GP` / triple-fault at first ring-3 entry
+      (a PCIDE-ordering bug) or a wedged CoW/demand-fault loop (a missed
+      user-PCID invalidation).
+- [ ] **A.5 — PCID perf bound.** With PCID active under `M3OS_MITIGATIONS=full`,
+      the smoke suite must be **≤30 %** slower than `M3OS_MITIGATIONS=off` (the
+      Phase 84 bound the naive full-flush KPTI cannot meet). Capture both wall
+      times; if the delta exceeds 30 %, the same-address-space re-dispatch
+      no-flush optimization (a documented A.5 follow-up: per-CPU last-CR3 cache)
+      is the next lever. Also worth a same-boot A/B: temporarily force the
+      fallback (mask PCID in `probe_pcid`) to measure the recovery the tags buy.
+
 ## Phase 111 — Remote Debugging (kgdb / ptrace on metal)
 
 The whole phase is merged and QEMU-green; these arms prove the *bare-metal* value

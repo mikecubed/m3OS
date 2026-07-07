@@ -9,7 +9,7 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Activate + bare-metal-validate KPTI (PML4 pair, CR3 trampoline, `KPTI_WIRED`, PCID, Meltdown PoC) | Phase 84 ✅, Phase 99 ✅ | Planned |
+| A | Activate + bare-metal-validate KPTI (PML4 pair, CR3 trampoline, `KPTI_WIRED`, PCID, Meltdown PoC) | Phase 84 ✅, Phase 99 ✅ | 🟢 **A.1–A.5 landed + green** (KPTI live on every default boot; PCID scheme wired, dormant on QEMU / live on PCID silicon). Remaining: A.6 Meltdown-PoC reject + A.5 PCID-active/perf arms — **Dell-only** |
 | B | Userspace ASLR + stack canaries + CET shadow stacks | Phase 86a ✅, A (shares the mm/exec path) | 🟢 **B.1 (ASLR) + B.2 (canaries) landed + green** (`aslr-smoke` + `stack-smash-smoke`); B.3 (CET) bare-metal-gated (planned) |
 | C | argon2id password hashing migration (fallback read path + re-hash) | Phase 48 ✅ | ✅ **Landed** — RFC 9106 argon2id (+ BLAKE2b) host-tested; passwd/adduser/login write argon2id; verify_password fallback + login re-hash; seeded images argon2id; `argon2-smoke` PASS |
 | D | Secure Boot on-metal validation + Phase 59 Track J / Phase 10 C.3 closeout | Phase 10 ✅, A (validated boot platform) | Planned |
@@ -60,7 +60,7 @@
 
 **As-built — A.3b part 5 (per-process pair on `AddressSpace`):** `AddressSpace` carries `kpti_user_pml4`, built by `build_kpti_user_half(kstack_top)` at every address-space birth (spawn/fork/execve — execve rebuilds against the replacement kernel PML4), **gated on `kpti_active`** so the inert production path builds nothing; `kpti_user_pml4()` is what A.4's dispatch publishes to `gs:[kpti_user_cr3]`; freed by `Drop` via `free_user_half`. **Thread coverage:** `sys_clone_thread` maps each new `CLONE_VM` thread's kstack top page into the shared half (`kpti_map_thread_kstack` → `mm::kpti::map_kstack_top_into_user_half`, page-table-lock serialized) — a thread's ring-3 interrupt frames push onto *its own* kstack top on the user CR3, so missing this would triple-fault any pthread app at A.4. The self-test exercises the thread-add path (second stand-in kstack page + reachability round-trip).
 
-**A.3b is complete.** Remaining in Track A: A.5 (PCID). *(A.4 landed — below.)*
+**A.3b is complete.** **A.4 and A.5 have landed** (below). Remaining in Track A: A.6 (bare-metal Meltdown-PoC reject) and the A.5 PCID-active + perf-bound arms — all Dell-only (see [`docs/handoffs/next-dell-session.md`](../../handoffs/next-dell-session.md#phase-110--real-hardware-security-kpti-meltdown--pcid-on-metal)).
 
 **Acceptance:**
 - [x] Every maskable IRQ entry switches to the kernel CR3 and restores the entry CR3 on exit. *(A.3b pt2 — inert until A.4; `kpti_entry_switch`/`kpti_exit_switch`.)*
@@ -83,14 +83,16 @@
 
 ### A.5 — PCID / INVPCID TLB-cost recovery
 
-**File:** `kernel/src/arch/x86_64/syscall/mod.rs`, `kernel/src/mm/mod.rs`, `kernel/src/smp/tlb.rs`
-**Symbol:** the CR3-write sites + `restore_kernel_cr3` + the SMP shootdown path
+**File:** `kernel-core/src/kpti_pcid.rs` (pure model), `kernel/src/arch/x86_64/cpuid.rs`, `kernel/src/mm/mod.rs`, `kernel/src/smp/{mod,tlb}.rs`, `kernel/src/mitigations.rs`
+**Symbol:** `kpti_pcid::{compose_cr3,pcid_supported}`, `cpuid::{probe_pcid,enable_pcid_if_kpti_active}`, `mm::write_kernel_cr3`, `smp::publish_kpti_cr3_pair`, `smp::tlb::{flush_local,flush_local_all}`, `MitigationState.pcid_active`
 **Why it matters:** A naive KPTI flushes the whole TLB on every CR3 switch (~30 % syscall overhead); PCID-tagged CR3 loads avoid the flush (~5 %). The SMP shootdown must flush **both** the kernel and user PCID of the target ASID.
 
+**As-built (A.5, dormant on QEMU / live on bare-metal PCID silicon):** A **fixed two-PCID scheme** modeled in host-tested `kernel_core::kpti_pcid` — `KERNEL_PCID = 1` / `USER_PCID = 2`, the `CR3[63]` no-flush bit, `compose_cr3`, and the `pcid_supported` gate (needs **both** `CPUID.01H:ECX[17]` PCID and `CPUID.07H:EBX[10]` INVPCID). `MitigationState.pcid_active = kpti_active && cpuid::probe_pcid()` is the single runtime gate; `cpuid::enable_pcid_if_kpti_active` sets `CR4.PCIDE` on the BSP (before `boot_aps` captures `DATA_CR4`, so APs inherit it), on S3 resume, and idempotently per-AP. **The recovery:** `smp::publish_kpti_cr3_pair` bakes the PCIDs + no-flush bit into the per-core slots, so the A.2/A.3b entry/exit trampolines (which load the slots verbatim) do a same-process kernel↔user round trip **without** flushing — every syscall/IRQ. **Correctness across an address-space change:** `mm::write_kernel_cr3` (the single dispatch/execve/fork/restore CR3 locus) does a flushing `write_pcid(KERNEL_PCID)` load **plus** `INVPCID Single(USER_PCID)`, dropping the previous occupant's entries under both reused global PCIDs. **Both-PCID invalidation:** `smp::tlb::flush_local`/`flush_local_all` (INVPCID Address / All) route the SMP shootdown (sender-local + IPI handler; single-addr + range + big-range) and the local CoW/spurious-write/user-map invlpg sites, so a user-reachable mapping mutated on the kernel PCID never leaves a stale user-PCID entry (which would loop the CoW/demand fault). **Dormant everywhere testable:** QEMU TCG advertises neither instruction, so `pcid_active = false` and the whole path reduces byte-for-byte to the A.4 full-flush behavior — the `[sec]` line reads `pcid(active=false supported=false)` and `m3ctl mitigations status` prints `KPTI PCID: fallback (full TLB flush; no PCID/INVPCID)`. The D.3 report wire carries the bit (b[1] bit 6, version 3). Green (fallback lane): `check` (+ 6 new `kpti_pcid` host tests + a `pcid_active` wire round-trip), `kpti-selftest-smoke`, `mitigations-status-smoke` (extended: asserts the fallback boot line + reporter line), `smoke-test`, `cargo xtask test` (13, incl. `munmap-tlb-smp`), `kstack-overflow-smoke`, `suspend-smoke`, `termios-smoke`, `aslr-smoke`, `regression` (11/11).
+
 **Acceptance:**
-- [ ] CR3 loads on the trampoline carry distinct kernel/user PCIDs (gated on `CPUID` PCID + `INVPCID` support; plain full-flush fallback when absent).
-- [ ] The SMP TLB-shootdown path invalidates both PCIDs of the target ASID (no stale cross-core translation).
-- [ ] Under QEMU + `mitigations=full`, the smoke suite is at most 30 % slower than `mitigations=off` **when PCID is active** (the Phase 84 bound).
+- [x] CR3 loads on the trampoline carry distinct kernel/user PCIDs (gated on `CPUID` PCID + `INVPCID` support; plain full-flush fallback when absent). *(Baked into the published slots by `publish_kpti_cr3_pair` when `pcid_active`; `write_kernel_cr3` tags the address-space-switch load. The composition + gate are host-tested in `kpti_pcid`; the live-tagged path runs only on PCID silicon — the Dell A.5-active arm.)*
+- [x] The SMP TLB-shootdown path invalidates both PCIDs of the target ASID (no stale cross-core translation). *(`flush_local`/`flush_local_all` via `INVPCID Address`/`All`, routed through every shootdown site + the local CoW/demand invlpg sites. `munmap-tlb-smp` exercises the fallback path green; the both-PCID `INVPCID` executes on the Dell.)*
+- [ ] Under QEMU + `mitigations=full`, the smoke suite is at most 30 % slower than `mitigations=off` **when PCID is active** (the Phase 84 bound). *(**Bare-metal-only** — QEMU TCG has no PCID/INVPCID, so the active path never runs there. Deferred to the Dell A.5 perf arm, [`next-dell-session.md`](../../handoffs/next-dell-session.md#phase-110--real-hardware-security-kpti-meltdown--pcid-on-metal).)*
 
 ### A.6 — Bare-metal KPTI boot + Meltdown-PoC validation
 

@@ -41,7 +41,7 @@
 //! implements neither PCID nor INVPCID, so on every CI/QEMU lane
 //! [`pcid_supported`] is `false` and the kernel runs the full-flush fallback
 //! (identical to the Phase 110 A.4 behavior). The PCID-active path is validated
-//! on the Dell (see `docs/roadmap/next-dell-session.md`).
+//! on the Dell (see `docs/handoffs/next-dell-session.md`).
 
 /// The PCID tagging every process's **kernel-half** TLB entries. Nonzero so it
 /// never collides with the `PCID = 0` a pre-`CR4.PCIDE` boot (or a raw
