@@ -153,6 +153,17 @@ pub fn syscall_stack_top() -> u64 {
     (stack_start + SYSCALL_STACK_SIZE as u64).as_u64()
 }
 
+/// `(base_va, size_in_bytes)` of the BSP's live GlobalDescriptorTable.
+///
+/// Phase 110 Track A.3 (KPTI): like [`tss_extent`], the CPU reads the GDT
+/// through the *active* paging on a ring-3 → ring-0 interrupt (to load the
+/// target CS/SS descriptors), so the user-half entry set must map it. BSP-only;
+/// AP per-core GDTs are exposed via their `PerCoreData`.
+pub fn gdt_extent() -> (u64, u64) {
+    let base = &GDT.0 as *const GlobalDescriptorTable as u64;
+    (base, core::mem::size_of::<GlobalDescriptorTable>() as u64)
+}
+
 /// `(base_va, size_in_bytes)` of the BSP's TaskStateSegment.
 ///
 /// Phase 110 Track A.3 (KPTI): the CPU reads TSS.RSP0 through the *active*

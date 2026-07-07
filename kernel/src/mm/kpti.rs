@@ -11,46 +11,52 @@
 //!
 //! ## What this delivers (and what it deliberately does not)
 //!
-//! Through A.3a this is still **builder + validation**, with `KPTI_WIRED` still
-//! `false`: the user PML4 is constructed and asserted, but never loaded into
-//! CR3, so the live syscall/IRQ paths and every existing gate are untouched.
-//! A.2 added the syscall CR3 trampoline (`syscall_entry_kpti`, LSTAR-selected,
-//! dormant in production). A.3a grew the validated entry set to the full
-//! interrupt-delivery structure set (GDT/IDT/TSS) and added the reachability
-//! round-trip. The live IRQ/IST trampolines that consume this (A.3b) and the
-//! activation on the policy path (A.4) land in follow-on PRs.
+//! Through A.3b's data plane this is still **builder + validation**, with
+//! `KPTI_WIRED` still `false`: the user PML4 is constructed and asserted, but
+//! never loaded into CR3, so the live syscall/IRQ paths and every existing gate
+//! are untouched. A.2 added the syscall CR3 trampoline (`syscall_entry_kpti`,
+//! LSTAR-selected, dormant in production). A.3a grew the validated entry set to
+//! the interrupt-delivery structures (GDT/IDT/TSS) + the reachability
+//! round-trip. A.3a→b factored the reusable per-process builder
+//! ([`build_user_half`] / [`free_user_half`]) the activation loads as the ring-3
+//! CR3 — the self-test now exercises that exact path. The live IRQ/IST asm that
+//! consumes it and the activation on the policy path (A.4) land in follow-ons.
 //!
 //! ## The minimal entry set (the load-bearing subtlety)
 //!
 //! m3OS never executes `swapgs`: `GS_BASE` points at this core's
 //! [`crate::smp::PerCoreData`] in **both** rings (no FSGSBASE, no ring-3
 //! `wrmsr`). The KPTI entry asm therefore reads `gs:[…]` *before* the CR3
-//! switch — so the `PerCoreData` page(s) MUST be present in the user PML4. The
-//! entry set also needs the entry **text** (the instructions between the
-//! CPU delivering the trap on the user CR3 and the switch to the kernel CR3)
-//! and a per-CPU entry **stack**. Each is mapped into the user half at its
-//! existing kernel VA through **freshly-allocated private sub-tables** — never
-//! by cloning a whole kernel `PML4[i]` slot (cloning e.g. the direct-map slot
-//! would silently re-expose all of physical memory; see
-//! [`kernel_core::kpti::may_clone_slot_into_user_half`]).
+//! switch — so the `PerCoreData` page(s) MUST be present in the user PML4. Each
+//! entry-set page is mapped into the user half at its existing kernel VA through
+//! **freshly-allocated private sub-tables** — never by cloning a whole kernel
+//! `PML4[i]` slot (cloning e.g. the direct-map slot would silently re-expose all
+//! of physical memory; see [`kernel_core::kpti::may_clone_slot_into_user_half`]).
 //!
-//! The self-test builds the entry set the live trampoline needs — the
-//! `PerCoreData` page(s), the page-aligned `.text.kpti_entry` section (both
-//! SYSCALL stubs + shared body + sysret tail, A.2), the **GDT / IDT / TSS**
-//! (A.3 — the CPU reads all three through the *active* paging when delivering a
-//! ring-3 → ring-0 interrupt, so they must be user-mapped or delivery itself
-//! triple-faults), and a fresh entry-stack page. After building over the live
-//! kernel page tables it (a) walks the result and asserts no kernel-secret leaf
-//! and (b) round-trip-translates every entry-set page in the built user PML4 to
-//! prove it is actually reachable.
+//! The entry set ([`collect_entry_pages`]) is, per **online core** (a process
+//! may run on any core): its `PerCoreData`, GDT, and TSS; plus the shared
+//! page-aligned `.text.kpti_entry` section (both SYSCALL stubs + body + tail,
+//! A.2) and the IDT. The CPU reads GDT/IDT/TSS through the *active* paging when
+//! delivering a ring-3 → ring-0 interrupt, so all must be user-mapped or
+//! delivery itself triple-faults. [`build_user_half`] adds the two per-process
+//! bits: the shared user lower half (`PML4[0]`, the same frame the kernel half
+//! points at, so mmap/brk/stack stay in sync) and this process's **kstack top
+//! page** — where the CPU pushes the interrupt frame on the user CR3 before the
+//! stub switches to the kernel CR3 (only the top page is exposed; the whole
+//! kstack reappears once on the kernel half).
 //!
-//! **Isolation caveat (A.3b TODO).** The GDT/IDT/TSS are ordinary kernel
-//! statics, not page-isolated, so mapping their pages also exposes whatever
-//! adjacent `.data` shares those pages — a (small, bounded) residual Meltdown
-//! surface. Closing it means relocating the interrupt-delivery structures into
-//! a dedicated page-aligned entry section (Linux's `cpu_entry_area`); that
-//! hardening lands with the live IRQ trampoline (A.3b), which is also the first
-//! consumer that makes it load-bearing. A.3a wires + validates the mechanism.
+//! The self-test builds a real user half via [`build_user_half`] over a
+//! synthetic kernel PML4, then (a) walks it and asserts no kernel-secret leaf
+//! and (b) round-trip-translates every entry-set page to prove it is reachable.
+//!
+//! **Isolation caveats (A.3b/hardening TODO).** (1) GDT/IDT/TSS are ordinary
+//! kernel statics, not page-isolated, so mapping their pages also exposes
+//! adjacent `.data`. (2) The kstack top page exposes ~4 KiB of this process's
+//! own kernel stack to itself. Both are small, bounded residual Meltdown
+//! surfaces vs. the whole kernel; closing them means a page-isolated
+//! `cpu_entry_area` (Linux model) with a dedicated trampoline stack. That
+//! hardening lands with the live IRQ trampoline, the first consumer that makes
+//! it load-bearing.
 
 use alloc::vec::Vec;
 
@@ -69,11 +75,6 @@ use super::{frame_allocator, mapper_for_frame, phys_offset};
 /// VA the self-test maps its synthetic user leaf at (mirrors the ELF loader's
 /// `USER_VADDR_MIN`, so it lands in `PML4[0]` — the user lower half).
 const SELFTEST_USER_VA: u64 = 0x0020_0000;
-
-/// VA the self-test maps its synthetic entry-stack frame at. An otherwise
-/// unused upper-half slot; the classifier admits it as `EntrySet` because it is
-/// in the recorded entry-set list, not by range.
-const SELFTEST_ENTRY_STACK_VA: u64 = 0xFFFF_9F00_0000_0000;
 
 /// Leaf flags for read-execute entry-set pages (entry text): ring-0 only, no
 /// `USER_ACCESSIBLE`, no `NO_EXECUTE`.
@@ -262,11 +263,10 @@ unsafe fn walk_user_half(
 /// created regardless of which step failed.
 struct SelfTestArena {
     /// Private page-table frames + the user PML4 (all safe to free).
-    table_frames: Vec<u64>,
-    /// Synthetic leaf frames the test itself allocated (user page, entry
-    /// stack) — also safe to free. Real kernel pages the entry set points at
-    /// are *not* here and are never freed.
-    leaf_frames: Vec<u64>,
+    /// Frames the test itself owns: the synthetic **kernel** PML4 + its user
+    /// `PML4[0]` sub-tables + the synthetic user leaf. Freed with `free_frame`.
+    /// (The user-half PML4's own frames are freed via `free_user_half`.)
+    owned_frames: Vec<u64>,
     user_pml4_phys: u64,
     /// Every entry-set page as `(kernel_va, expected_phys)` — used both to
     /// classify leaves as `EntrySet` during the walk and to round-trip-verify
@@ -276,144 +276,279 @@ struct SelfTestArena {
 
 impl SelfTestArena {
     fn free(self) {
-        for f in self.leaf_frames {
-            frame_allocator::free_frame(f);
-        }
-        for f in self.table_frames {
+        // The user half via the production free path (frees its private
+        // entry-set sub-tables + top frame, skips the shared PML4[0]).
+        // SAFETY: user_pml4_phys is a valid user half no longer loaded anywhere.
+        unsafe { free_user_half(self.user_pml4_phys) };
+        // Then the synthetic kernel PML4 + user chain the test owns.
+        for f in self.owned_frames {
             frame_allocator::free_frame(f);
         }
     }
 }
 
-/// Build a throwaway user PML4 with a synthetic user page + a representative
-/// entry set, returning the arena for the caller to walk then free.
-fn build_selftest_pair() -> Option<SelfTestArena> {
+/// Build a throwaway **kernel** PML4 carrying a single synthetic user leaf at
+/// [`SELFTEST_USER_VA`] in `PML4[0]`, so [`build_user_half`] has a real kernel
+/// half to derive from (its shared `PML4[0]` then presents a `UserLowerHalf`
+/// leaf the invariant requires). Returns `(kernel_pml4_phys, owned_frames)`;
+/// every frame in `owned_frames` (PML4 + PDPT/PD/PT + leaf) is the caller's to
+/// free.
+fn build_synthetic_kernel_pml4() -> Option<(u64, Vec<u64>)> {
     let phys_off = phys_offset();
+    let mut owned: Vec<u64> = Vec::new();
 
-    // --- resolve the real entry-set pages (VA -> phys) through the kernel map.
-    // Scope the kernel mapper so it drops before we build over the user PML4.
-    let mut entry_pages: Vec<(u64, u64, PageTableFlags)> = Vec::new();
-    {
-        // SAFETY: no other mapper is live here; get_mapper wraps the active
-        // (kernel) CR3 for translation only.
-        let kmapper = unsafe { super::paging::get_mapper() };
-
-        // PerCoreData — reached via GS_BASE by the entry asm; map every page it
-        // spans so no field read faults on the user CR3.
-        let pcd_base = crate::smp::per_core() as *const _ as u64;
-        let pcd_size = core::mem::size_of::<crate::smp::PerCoreData>() as u64;
-        push_kernel_range(
-            &kmapper,
-            &mut entry_pages,
-            pcd_base,
-            pcd_base + pcd_size,
-            RW,
-        )?;
-
-        // Entry text — the whole page-aligned `.text.kpti_entry` section (both
-        // SYSCALL stubs + shared body + sysret tail; A.2). This is the real
-        // range the live trampoline executes on the user CR3, mapped r-x
-        // ring-0-only.
-        let (text_start, text_end) = crate::arch::x86_64::syscall::kpti_entry_text_range();
-        push_kernel_range(&kmapper, &mut entry_pages, text_start, text_end, RX)?;
-
-        // Interrupt-delivery structures (A.3). On a ring-3 → ring-0 IRQ the CPU
-        // reads the IDT gate, the GDT descriptors for the target CS/SS, and
-        // TSS.RSP0 — all through the CURRENTLY ACTIVE (user) paging, *before*
-        // any handler code runs. If any of the three is absent from the user
-        // half, delivery itself faults → #DF → triple fault. Map them r/w
-        // (the CPU may set the TSS busy bit / descriptor accessed bits) at
-        // their live linear addresses read from GDTR/IDTR (`sgdt`/`sidt`) so
-        // this is layout-independent of how the tables were built.
-        let gdtr = x86_64::instructions::tables::sgdt();
-        let gdt_base = gdtr.base.as_u64();
-        push_kernel_range(
-            &kmapper,
-            &mut entry_pages,
-            gdt_base,
-            gdt_base + u64::from(gdtr.limit) + 1,
-            RW,
-        )?;
-
-        let idtr = x86_64::instructions::tables::sidt();
-        let idt_base = idtr.base.as_u64();
-        push_kernel_range(
-            &kmapper,
-            &mut entry_pages,
-            idt_base,
-            idt_base + u64::from(idtr.limit) + 1,
-            RW,
-        )?;
-
-        // The TSS the GDT selector resolves to (RSP0 + the IST pointers).
-        let (tss_base, tss_size) = crate::arch::x86_64::gdt::tss_extent();
-        push_kernel_range(
-            &kmapper,
-            &mut entry_pages,
-            tss_base,
-            tss_base + tss_size,
-            RW,
-        )?;
-    }
-
-    let mut table_frames: Vec<u64> = Vec::new();
-    let mut leaf_frames: Vec<u64> = Vec::new();
-
-    // --- allocate + zero the user PML4.
-    let user_pml4 = frame_allocator::allocate_frame()?;
-    let user_pml4_phys = user_pml4.start_address().as_u64();
-    table_frames.push(user_pml4_phys);
-    // SAFETY: freshly allocated frame, no other reference.
+    let pml4 = frame_allocator::allocate_frame()?;
+    let pml4_phys = pml4.start_address().as_u64();
+    owned.push(pml4_phys);
+    // SAFETY: fresh frame, no other reference.
     unsafe {
-        core::ptr::write_bytes((phys_off + user_pml4_phys) as *mut u8, 0, 4096);
+        core::ptr::write_bytes((phys_off + pml4_phys) as *mut u8, 0, 4096);
     }
 
-    // Synthetic user leaf + entry stack (frames the test owns and will free).
-    let user_leaf = frame_allocator::allocate_frame()?;
-    leaf_frames.push(user_leaf.start_address().as_u64());
-    let stack_leaf = frame_allocator::allocate_frame()?;
-    leaf_frames.push(stack_leaf.start_address().as_u64());
-    entry_pages.push((
-        SELFTEST_ENTRY_STACK_VA,
-        stack_leaf.start_address().as_u64(),
-        RW,
-    ));
+    let leaf = frame_allocator::allocate_frame()?;
+    owned.push(leaf.start_address().as_u64());
 
-    // --- populate the user PML4.
-    // SAFETY: user_pml4 is a fresh, non-live table owned solely here.
-    let mut mapper = unsafe { mapper_for_frame(user_pml4) };
-    {
+    // SAFETY: pml4 is a fresh, non-live table owned solely here.
+    let mut mapper = unsafe { mapper_for_frame(pml4) };
+    let ok = {
         let mut alloc = RecordingAlloc {
-            recorded: &mut table_frames,
+            recorded: &mut owned,
         };
-        // The user lower-half page (USER_ACCESSIBLE leaf → classified user).
         // SAFETY: exclusive mapper; valid frame.
         unsafe {
             map_entry_page(
                 &mut mapper,
                 SELFTEST_USER_VA,
-                user_leaf.start_address().as_u64(),
+                leaf.start_address().as_u64(),
                 PageTableFlags::PRESENT
                     | PageTableFlags::WRITABLE
                     | PageTableFlags::USER_ACCESSIBLE,
                 &mut alloc,
             )
-            .ok()?;
         }
-        // The entry set, at kernel VAs, ring-0-only.
-        for (va, phys, flags) in &entry_pages {
-            // SAFETY: exclusive mapper; valid frames resolved above.
-            unsafe {
-                map_entry_page(&mut mapper, *va, *phys, *flags, &mut alloc).ok()?;
-            }
+        .is_ok()
+    };
+    if !ok {
+        for f in &owned {
+            frame_allocator::free_frame(*f);
+        }
+        return None;
+    }
+    Some((pml4_phys, owned))
+}
+
+/// Collect the shared entry set — the pages every user PML4 must map so a
+/// ring-3 → ring-0 transition (SYSCALL or interrupt) can reach the kernel CR3
+/// without faulting. Resolved (VA → phys) through the live kernel map.
+///
+/// Per **online** core: its `PerCoreData` (read via `gs:` before the CR3
+/// switch), its GDT and its TSS (read by the CPU on interrupt delivery). Plus
+/// the shared, core-independent `.text.kpti_entry` section and the IDT. A
+/// process may run on any core, so every online core's structures are included.
+///
+/// Does **not** include the per-process bits (`PML4[0]` user PDPT, the process
+/// kstack top page) — those are added by [`build_user_half`] / the self-test.
+fn collect_entry_pages() -> Option<Vec<(u64, u64, PageTableFlags)>> {
+    let mut out: Vec<(u64, u64, PageTableFlags)> = Vec::new();
+    // SAFETY: no other mapper is live here; get_mapper wraps the active
+    // (kernel) CR3 for translation only, and is dropped before any user PML4 is
+    // built over the direct map.
+    let kmapper = unsafe { super::paging::get_mapper() };
+
+    // Shared: the entry text (r-x) — the instructions the trampoline runs on
+    // the user CR3 before switching — and the IDT (r/w; the CPU sets accessed
+    // bits) the CPU reads to deliver any interrupt.
+    let (text_start, text_end) = crate::arch::x86_64::syscall::kpti_entry_text_range();
+    push_kernel_range(&kmapper, &mut out, text_start, text_end, RX)?;
+
+    let idtr = x86_64::instructions::tables::sidt();
+    let idt_base = idtr.base.as_u64();
+    push_kernel_range(
+        &kmapper,
+        &mut out,
+        idt_base,
+        idt_base + u64::from(idtr.limit) + 1,
+        RW,
+    )?;
+
+    // Per online core: PerCoreData + GDT + TSS.
+    for core_id in 0..crate::smp::core_count() {
+        let Some(pcd) = crate::smp::get_core_data(core_id) else {
+            continue;
+        };
+        if !pcd.is_online.load(core::sync::atomic::Ordering::Acquire) {
+            continue;
+        }
+        for (base, size) in pcd.entry_struct_extents() {
+            push_kernel_range(&kmapper, &mut out, base, base + size, RW)?;
         }
     }
-    // `mapper` (the exclusive borrow over the user PML4) drops at scope end,
-    // before the caller walks the same table read-only through the direct map.
+
+    Some(out)
+}
+
+/// Build a live per-process **user-half** PML4 for the kernel PML4 at
+/// `kernel_pml4_phys`, mapping the shared entry set, this process's kstack top
+/// page (`kstack_top_va`, where the CPU pushes an IRQ frame on the user CR3),
+/// and — shared with the kernel half — the user lower half (`PML4[0]`).
+///
+/// Returns the user PML4 physical address, or `None` on allocation failure.
+/// Consumed by A.4 activation (dispatch loads this as the ring-3 CR3); inert
+/// while `KPTI_WIRED` is false.
+///
+/// # Safety
+/// `kernel_pml4_phys` must be a valid process kernel PML4 reachable through the
+/// direct map, and `kstack_top_va` a mapped kernel-stack top for this process.
+pub unsafe fn build_user_half(kernel_pml4_phys: u64, kstack_top_va: u64) -> Option<u64> {
+    let phys_off = phys_offset();
+
+    let mut entry_pages = collect_entry_pages()?;
+    // This process's kstack top page: RSP0 points here, so the CPU pushes the
+    // ring-3 → ring-0 interrupt frame onto it on the *user* CR3. Only the top
+    // page is exposed (the stub switches to the kernel CR3, which maps the whole
+    // kstack, before touching anything below it).
+    {
+        let kmapper = unsafe { super::paging::get_mapper() };
+        let top_page = (kstack_top_va - 1) & !0xFFF;
+        push_kernel_range(&kmapper, &mut entry_pages, top_page, top_page + 0x1000, RW)?;
+    }
+
+    // Allocate + zero the user PML4.
+    let user_pml4 = frame_allocator::allocate_frame()?;
+    let user_pml4_phys = user_pml4.start_address().as_u64();
+    // SAFETY: freshly allocated frame, no other reference.
+    unsafe {
+        core::ptr::write_bytes((phys_off + user_pml4_phys) as *mut u8, 0, 4096);
+    }
+
+    // Share the user lower half (PML4[0]) with the kernel half so user mappings
+    // (ELF, mmap, brk, stack) stay in sync automatically — the same frame the
+    // kernel half points at, not a copy.
+    // SAFETY: both PML4s are reachable through the direct map; we only copy one
+    // 8-byte slot.
+    unsafe {
+        let kern = &*((phys_off + kernel_pml4_phys) as *const PageTable);
+        let user = &mut *((phys_off + user_pml4_phys) as *mut PageTable);
+        user[0] = kern[0].clone();
+    }
+
+    // Map the entry set through fresh private sub-tables (never cloning a whole
+    // kernel PML4 slot). All frames created are tracked so a partial-failure
+    // rollback (and free_user_half) frees exactly them.
+    let mut sink: Vec<u64> = Vec::new();
+    // SAFETY: user_pml4 is a fresh, non-live table owned solely here.
+    let mut mapper = unsafe { mapper_for_frame(user_pml4) };
+    let ok = {
+        let mut alloc = RecordingAlloc {
+            recorded: &mut sink,
+        };
+        entry_pages.iter().all(|(va, phys, flags)| {
+            // SAFETY: exclusive mapper; valid frames resolved above.
+            unsafe { map_entry_page(&mut mapper, *va, *phys, *flags, &mut alloc) }.is_ok()
+        })
+    };
+
+    if !ok {
+        // Roll back: free the sub-table frames created so far + the PML4.
+        for f in &sink {
+            frame_allocator::free_frame(*f);
+        }
+        frame_allocator::free_frame(user_pml4_phys);
+        return None;
+    }
+
+    Some(user_pml4_phys)
+}
+
+/// Free a user-half PML4 built by [`build_user_half`]: the private entry-set
+/// sub-tables (PDPT/PD/PT for `PML4[1..512]`) and the top PML4 frame. Never
+/// frees `PML4[0]` (shared with the kernel half, freed by
+/// `free_process_page_table`) nor any leaf page (real kernel structures the
+/// entry set only *points* at).
+///
+/// # Safety
+/// `user_pml4_phys` must be a user-half PML4 no longer loaded in any CR3.
+pub unsafe fn free_user_half(user_pml4_phys: u64) {
+    let phys_off = phys_offset();
+    // SAFETY: reachable through the direct map; no live alias (not the active CR3).
+    let table =
+        |phys: u64| -> &'static PageTable { unsafe { &*((phys_off + phys) as *const PageTable) } };
+
+    let pml4 = table(user_pml4_phys);
+    // Slots 1..512 are private entry-set sub-tables (slot 0 is the shared user
+    // half — skip it). Walk each present slot and free its PDPT/PD/PT frames,
+    // never the leaf pages.
+    for i4 in 1usize..512 {
+        let e4 = &pml4[i4];
+        if !e4.flags().contains(PageTableFlags::PRESENT) {
+            continue;
+        }
+        let pdpt_phys = e4.addr().as_u64();
+        let pdpt = table(pdpt_phys);
+        for e3 in pdpt.iter() {
+            if !e3.flags().contains(PageTableFlags::PRESENT)
+                || e3.flags().contains(PageTableFlags::HUGE_PAGE)
+            {
+                continue;
+            }
+            let pd_phys = e3.addr().as_u64();
+            let pd = table(pd_phys);
+            for e2 in pd.iter() {
+                if !e2.flags().contains(PageTableFlags::PRESENT)
+                    || e2.flags().contains(PageTableFlags::HUGE_PAGE)
+                {
+                    continue;
+                }
+                // Free the PT frame (its PTEs point at real kernel leaves — not freed).
+                frame_allocator::free_frame(e2.addr().as_u64());
+            }
+            frame_allocator::free_frame(pd_phys);
+        }
+        frame_allocator::free_frame(pdpt_phys);
+    }
+    frame_allocator::free_frame(user_pml4_phys);
+}
+
+/// Build a real user-half PML4 via the production [`build_user_half`] over a
+/// synthetic kernel PML4, returning the arena for the caller to walk then free.
+///
+/// This exercises the exact builder + free path A.4 activation uses (the shared
+/// entry set from `collect_entry_pages`, the shared `PML4[0]`, the kstack top
+/// page, and `free_user_half`), rather than a bespoke test-only table.
+fn build_selftest_pair() -> Option<SelfTestArena> {
+    // A synthetic kernel half with a user leaf in PML4[0].
+    let (kernel_pml4_phys, owned_frames) = build_synthetic_kernel_pml4()?;
+
+    // A real, mapped kernel-stack top to stand in for the process kstack (its
+    // top page is what RSP0 points at / the CPU pushes an IRQ frame onto).
+    let kstack_top = crate::arch::x86_64::gdt::syscall_stack_top();
+
+    // The production builder.
+    // SAFETY: kernel_pml4_phys is the synthetic half just built; kstack_top is a
+    // live mapped kernel stack top.
+    let user_pml4_phys = match unsafe { build_user_half(kernel_pml4_phys, kstack_top) } {
+        Some(p) => p,
+        None => {
+            for f in &owned_frames {
+                frame_allocator::free_frame(*f);
+            }
+            return None;
+        }
+    };
+
+    // Recompute the entry-set page list (deterministic) for classification +
+    // reachability: the shared set + this half's kstack top page.
+    let mut entry_pages = collect_entry_pages()?;
+    let top_page = (kstack_top - 1) & !0xFFF;
+    // SAFETY: translate through the live kernel map for the expected phys.
+    let kstack_phys = {
+        let kmapper = unsafe { super::paging::get_mapper() };
+        kmapper.translate_addr(VirtAddr::new(top_page))?.as_u64()
+    };
+    entry_pages.push((top_page, kstack_phys, RW));
 
     Some(SelfTestArena {
-        table_frames,
-        leaf_frames,
+        owned_frames,
         user_pml4_phys,
         entry_pages: entry_pages
             .iter()

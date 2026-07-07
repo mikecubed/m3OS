@@ -422,6 +422,38 @@ impl PerCoreData {
         crate::task::scheduler::preempt_enable();
         result
     }
+
+    /// Phase 110 Track A.3 (KPTI) — `[(base_va, size)]` of this core's
+    /// interrupt-delivery structures the user-half entry set must map: its
+    /// `PerCoreData`, its GDT, and its TSS. The CPU reads the GDT/TSS through
+    /// the *active* paging when delivering a ring-3 → ring-0 interrupt on this
+    /// core, and the KPTI entry asm reads `gs:` (this `PerCoreData`) before the
+    /// CR3 switch — so all three of *this core's* structures must be present in
+    /// the user PML4 of any process that may run here. BSP (`gdt_ptr`/`tss_ptr`
+    /// null) falls back to the global `gdt.rs` GDT/TSS.
+    pub fn entry_struct_extents(&self) -> [(u64, u64); 3] {
+        let pcd = (
+            self as *const PerCoreData as u64,
+            core::mem::size_of::<PerCoreData>() as u64,
+        );
+        let gdt = if self.gdt_ptr.is_null() {
+            crate::arch::x86_64::gdt::gdt_extent()
+        } else {
+            (
+                self.gdt_ptr as u64,
+                core::mem::size_of::<GlobalDescriptorTable>() as u64,
+            )
+        };
+        let tss = if self.tss_ptr.is_null() {
+            crate::arch::x86_64::gdt::tss_extent()
+        } else {
+            (
+                self.tss_ptr as u64,
+                core::mem::size_of::<TaskStateSegment>() as u64,
+            )
+        };
+        [pcd, gdt, tss]
+    }
 }
 
 /// Global array of per-core data pointers. Indexed by logical core_id (0 = BSP).
