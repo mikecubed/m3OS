@@ -3503,6 +3503,9 @@ core::arch::global_asm!(
     ".equ IRQ_OFF_KERNEL_CR3, {irq_off_kernel_cr3}",
     ".equ IRQ_OFF_USER_CR3,   {irq_off_user_cr3}",
     ".equ IRQ_OFF_STACK_TOP,  {irq_off_stack_top}",
+    ".equ IRQ_OFF_SCRATCH,    {irq_off_scratch}",
+    ".equ IRQ_OFF_SCRATCH2,   {irq_off_scratch2}",
+    ".equ IRQ_OFF_TRAMP_TOP,  {irq_off_tramp_top}",
     ".equ IRQ_DEV_BASE,       {irq_dev_base}",
     "",
     ".macro kpti_save_gprs",
@@ -3594,17 +3597,60 @@ core::arch::global_asm!(
     "2:",
     ".endm",
     "",
-    // Exit: switch to the user CR3 iff (returning to ring 3) AND (KPTI active).
-    // rax is clobbered but immediately reloaded by the following kpti_restore_gprs
-    // `pop rax`.
-    ".macro kpti_exit_switch",
+    // Exit + iretq (Phase 110 hardening). Replaces the old "flip CR3, then
+    // pop GPRs + iretq from the (user-mapped) kstack top page" tail: the GPR
+    // pops now happen on the KERNEL CR3 from the kstack copy, then the 5-word
+    // iretq frame is copied to the per-CPU trampoline stack, rsp pivots
+    // there, the CR3 flips, and `iretq` reads the frame from the trampoline
+    // stack's user-mapped top page — so the kstack needs no user-half mapping
+    // at all (dropped in 21/n).
+    //
+    // The ring-3 + KPTI-active branch `cli`s first: the copy parks live
+    // values in the persistent per-core scratch slots and targets a per-core
+    // stack, so neither a maskable preemption (which could migrate cores, or
+    // let another task's syscall clobber `kpti_scratch`) nor a post-flip
+    // delivery (the A.4 ring-0/user-CR3 #DF wedge) may interleave; `iretq`
+    // restores the task's own IF from the frame. A nested NMI (IST +
+    // paranoid, r15-based) preserves all of this state. The post-flip window
+    // stays two instructions, as before. The cs re-test keeps the body's
+    // fatal-fault redirects working: a frame rewritten to a ring-0 kill
+    // trampoline takes the plain branch — iretq from the kstack on the
+    // kernel CR3, exactly as pre-hardening.
+    ".macro kpti_exit_iretq",
     "test qword ptr [rsp + 128], 3",
     "jz 3f",
     "mov rax, gs:[IRQ_OFF_USER_CR3]",
     "test rax, rax",
     "jz 3f",
+    "cli",
+    "kpti_restore_gprs",
+    // rsp → the 5-word iretq frame on the kstack (kernel CR3). Copy it to
+    // the trampoline-stack top via the two scratch slots (all GPRs are live).
+    "mov gs:[IRQ_OFF_SCRATCH], rax",
+    "mov gs:[IRQ_OFF_SCRATCH2], rbx",
+    "mov rbx, gs:[IRQ_OFF_TRAMP_TOP]",
+    "sub rbx, 40",
+    "mov rax, [rsp + 0]",
+    "mov [rbx + 0], rax", // rip
+    "mov rax, [rsp + 8]",
+    "mov [rbx + 8], rax", // cs
+    "mov rax, [rsp + 16]",
+    "mov [rbx + 16], rax", // rflags
+    "mov rax, [rsp + 24]",
+    "mov [rbx + 24], rax", // user rsp
+    "mov rax, [rsp + 32]",
+    "mov [rbx + 32], rax", // ss
+    "mov rsp, rbx",
+    "mov rbx, gs:[IRQ_OFF_SCRATCH2]",
+    "mov rax, gs:[IRQ_OFF_USER_CR3]",
     "mov cr3, rax",
+    "mov rax, gs:[IRQ_OFF_SCRATCH]",
+    "iretq",
+    // Ring-0 return or KPTI inactive: pop + iretq in place (kernel CR3, or
+    // the whole path is inert), byte-for-byte the pre-hardening tail.
     "3:",
+    "kpti_restore_gprs",
+    "iretq",
     ".endm",
     "",
     // Error-code variants (#PF/#GP): the CPU pushed an 8-byte error code below
@@ -3622,14 +3668,42 @@ core::arch::global_asm!(
     "4:",
     ".endm",
     "",
-    ".macro kpti_exit_switch_err",
+    // Error-code variant of kpti_exit_iretq (#PF/#GP): cs sits at [rsp+136]
+    // pre-restore, and both branches discard the CPU error code after the
+    // GPR pops.
+    ".macro kpti_exit_iretq_err",
     "test qword ptr [rsp + 136], 3",
     "jz 5f",
     "mov rax, gs:[IRQ_OFF_USER_CR3]",
     "test rax, rax",
     "jz 5f",
+    "cli",
+    "kpti_restore_gprs",
+    "add rsp, 8", // discard error code
+    "mov gs:[IRQ_OFF_SCRATCH], rax",
+    "mov gs:[IRQ_OFF_SCRATCH2], rbx",
+    "mov rbx, gs:[IRQ_OFF_TRAMP_TOP]",
+    "sub rbx, 40",
+    "mov rax, [rsp + 0]",
+    "mov [rbx + 0], rax", // rip
+    "mov rax, [rsp + 8]",
+    "mov [rbx + 8], rax", // cs
+    "mov rax, [rsp + 16]",
+    "mov [rbx + 16], rax", // rflags
+    "mov rax, [rsp + 24]",
+    "mov [rbx + 24], rax", // user rsp
+    "mov rax, [rsp + 32]",
+    "mov [rbx + 32], rax", // ss
+    "mov rsp, rbx",
+    "mov rbx, gs:[IRQ_OFF_SCRATCH2]",
+    "mov rax, gs:[IRQ_OFF_USER_CR3]",
     "mov cr3, rax",
+    "mov rax, gs:[IRQ_OFF_SCRATCH]",
+    "iretq",
     "5:",
+    "kpti_restore_gprs",
+    "add rsp, 8", // discard error code
+    "iretq",
     ".endm",
     "",
     // Paranoid entry/exit for NMI + #DF (IST stacks). They can interrupt EITHER
@@ -3668,9 +3742,7 @@ core::arch::global_asm!(
     r"and rsp, -16",
     r"call \body",
     r"mov rsp, r12",
-    r"kpti_exit_switch",
-    r"kpti_restore_gprs",
-    r"iretq",
+    r"kpti_exit_iretq",
     r".endm",
     "",
     // A device-IRQ vector: body is `extern "C" fn(&mut TrapFrame, vector)`.
@@ -3686,9 +3758,7 @@ core::arch::global_asm!(
     r"and rsp, -16",
     r"call device_irq_body",
     r"mov rsp, r12",
-    r"kpti_exit_switch",
-    r"kpti_restore_gprs",
-    r"iretq",
+    r"kpti_exit_iretq",
     r".endm",
     "",
     ".section .text.kpti_irq_entry, \"ax\"",
@@ -3709,9 +3779,7 @@ core::arch::global_asm!(
     "cld",
     "mov rdi, rsp", // &mut PreemptTrapFrameUser
     "call timer_handler_user",
-    "kpti_exit_switch", // re-tests cs — group-exit redirect may have rewritten it
-    "kpti_restore_gprs",
-    "iretq",
+    "kpti_exit_iretq", // re-tests cs — group-exit redirect may have rewritten it
     // Kernel path (ring 0): already on the kernel CR3, no switch.
     ".Ltimer_kernel:",
     "kpti_save_gprs",
@@ -3735,9 +3803,7 @@ core::arch::global_asm!(
     "cld",
     "mov rdi, rsp",
     "call reschedule_ipi_handler_user",
-    "kpti_exit_switch",
-    "kpti_restore_gprs",
-    "iretq",
+    "kpti_exit_iretq",
     ".Lrescheduleipi_kernel:",
     "kpti_save_gprs",
     "lea rsi, [rsp + 144]",
@@ -3759,7 +3825,7 @@ core::arch::global_asm!(
     // a ring-0 `cs` and would *skip* the switch, running the body on the user
     // half → nested fault → `#DF`. The paranoid entry reads the actual CR3 and
     // loads the kernel CR3 unconditionally (when active), so the body always
-    // runs on the full map. The EXIT stays the `cs`-based `kpti_exit_switch`
+    // runs on the full map. The EXIT stays the `cs`-based `kpti_exit_iretq`
     // (ring-3 return → user CR3; ring-0 return → keep kernel CR3): a fault
     // taken inside a window is non-resumable in production (the window
     // instructions only touch mapped memory, so a real #PF there is a kernel
@@ -3780,9 +3846,7 @@ core::arch::global_asm!(
     "and rsp, -16",
     "call bp_trap_handler",
     "mov rsp, r12",
-    "kpti_exit_switch",
-    "kpti_restore_gprs",
-    "iretq",
+    "kpti_exit_iretq",
     "",
     ".global db_entry",
     "db_entry:",
@@ -3796,9 +3860,7 @@ core::arch::global_asm!(
     "and rsp, -16",
     "call db_trap_handler",
     "mov rsp, r12",
-    "kpti_exit_switch",
-    "kpti_restore_gprs",
-    "iretq",
+    "kpti_exit_iretq",
     "",
     // --- #PF / #GP (error-code exceptions; body is `fn(&mut TrapFrameErr)`) ----
     //
@@ -3813,7 +3875,7 @@ core::arch::global_asm!(
     // CR3 unconditionally, so the body runs on the full map regardless of how
     // it was entered.
     //
-    // The EXIT keeps `kpti_exit_switch_err` (the `cs`-based test): this is what
+    // The EXIT keeps `kpti_exit_iretq_err` (the `cs`-based test): this is what
     // makes the body's **fatal-fault redirect** work — `page_fault_body` /
     // `try_recover_kstack_overflow` rewrite the frame's `cs` to a ring-0 kill
     // trampoline on a kernel stack, and the `cs`-based exit then keeps the
@@ -3837,10 +3899,7 @@ core::arch::global_asm!(
     "and rsp, -16",
     "call page_fault_body",
     "mov rsp, r12",
-    "kpti_exit_switch_err",
-    "kpti_restore_gprs",
-    "add rsp, 8", // discard error code
-    "iretq",
+    "kpti_exit_iretq_err",
     "",
     ".global general_protection_fault_entry",
     "general_protection_fault_entry:",
@@ -3854,10 +3913,7 @@ core::arch::global_asm!(
     "and rsp, -16",
     "call general_protection_fault_body",
     "mov rsp, r12",
-    "kpti_exit_switch_err",
-    "kpti_restore_gprs",
-    "add rsp, 8",
-    "iretq",
+    "kpti_exit_iretq_err",
     "",
     // --- NMI (paranoid; IST stack; no error code) -----------------------------
     ".global nmi_entry",
@@ -3924,6 +3980,9 @@ core::arch::global_asm!(
     irq_off_kernel_cr3 = const crate::smp::offsets::KPTI_KERNEL_CR3,
     irq_off_user_cr3 = const crate::smp::offsets::KPTI_USER_CR3,
     irq_off_stack_top = const crate::smp::offsets::SYSCALL_STACK_TOP,
+    irq_off_scratch = const crate::smp::offsets::KPTI_SCRATCH,
+    irq_off_scratch2 = const crate::smp::offsets::KPTI_SCRATCH2,
+    irq_off_tramp_top = const crate::smp::offsets::KPTI_TRAMP_TOP,
     irq_dev_base = const DEVICE_IRQ_VECTOR_BASE as usize,
 );
 
@@ -3980,10 +4039,17 @@ pub fn kpti_irq_entry_range() -> (u64, u64) {
 // the user CR3 in the instruction before `iretq`, and after that flip only the
 // user half is mapped — so both the `iretq` frame AND the `mov cr3 … iretq`
 // instructions must be user-mapped. Each trampoline therefore:
-//   1. `mov rsp, gs:[STACK_TOP]` — reset to this task's kstack **top page**, the
-//      one page `build_user_half` maps into the user half. Safe: the trampolines
-//      are `-> !` and build a fresh frame (for the preempt path the scheduler RSP
-//      was already saved by `dispatch_preempted_and_resume` before its `jmp`).
+//   1. `mov rsp, gs:[TRAMP_TOP]` — pivot to this core's KPTI **trampoline
+//      stack** (Phase 110 hardening; its top page is mapped into every user
+//      half, and — unlike the task-kstack top page it replaced — its frames
+//      only ever hold ring-3 register state). Per-core is safe: IF=0 from the
+//      `cli` below through `iretq`, so no migration and no reuse window (a
+//      nested NMI is IST + paranoid and touches neither this stack nor rsp).
+//      The trampolines are `-> !` and build a fresh frame (for the preempt
+//      path the scheduler RSP was already saved by
+//      `dispatch_preempted_and_resume` before its `jmp`). On the
+//      KPTI-inactive lane the pivot still happens (the slot is populated on
+//      every boot) — the frame just lives on a kernel-mapped stack instead.
 //   2. build the 5-field `iretq` frame there + restore GPRs from the kernel-
 //      mapped reg source (done BEFORE the flip — the source is gone afterwards).
 //   3. flip CR3 via the scratch slot (no-op while `kpti_user_cr3 == 0`).
@@ -4014,7 +4080,7 @@ pub fn kpti_irq_entry_range() -> (u64, u64) {
 core::arch::global_asm!(
     ".equ EXIT_OFF_USER_CR3,  {exit_off_user_cr3}",
     ".equ EXIT_OFF_SCRATCH,   {exit_off_scratch}",
-    ".equ EXIT_OFF_STACK_TOP, {exit_off_stack_top}",
+    ".equ EXIT_OFF_TRAMP_TOP, {exit_off_tramp_top}",
     ".section .text.kpti_exit, \"ax\"",
     ".balign 4096",
     ".global kpti_exit_start",
@@ -4029,12 +4095,11 @@ core::arch::global_asm!(
     // Mask IRQs through the CR3-flip → iretq window (see the section header).
     // Redundant here (dispatch_preempted_and_resume already cli'd) but uniform.
     "cli",
-    // Reset rsp to this (resumed) task's kstack top page — the dispatch prep
-    // block published it to gs:[STACK_TOP] before the jmp here, and it is the
-    // one kstack page the user half maps. The scheduler stack we abandon was
-    // already saved by dispatch_preempted_and_resume.
-    "mov rsp, gs:[EXIT_OFF_STACK_TOP]",
-    // Build the 5-field iretq frame on the top page (push in reverse: ss first).
+    // Pivot to this core's KPTI trampoline stack (user-half mapped; per-core
+    // safe under the cli above). The scheduler stack we abandon was already
+    // saved by dispatch_preempted_and_resume.
+    "mov rsp, gs:[EXIT_OFF_TRAMP_TOP]",
+    // Build the 5-field iretq frame there (push in reverse: ss first).
     "mov rax, [rdi + 152]", // ss
     "push rax",
     "mov rax, [rdi + 144]", // user rsp
@@ -4085,12 +4150,11 @@ core::arch::global_asm!(
     "fork_enter_userspace:",
     // Mask IRQs through the CR3-flip → iretq window (see the section header).
     "cli",
-    // Reset rsp to this task's kstack top page — the child was dispatched via
-    // switch_context, so the dispatch prep block already published its kstack
-    // top to gs:[STACK_TOP]. The continuation stack below is abandoned (this
-    // trampoline never returns).
-    "mov rsp, gs:[EXIT_OFF_STACK_TOP]",
-    // Build the 5-field iretq frame on the top page (push in reverse: ss first).
+    // Pivot to this core's KPTI trampoline stack (user-half mapped; per-core
+    // safe under the cli above). The continuation stack below is abandoned
+    // (this trampoline never returns).
+    "mov rsp, gs:[EXIT_OFF_TRAMP_TOP]",
+    // Build the 5-field iretq frame there (push in reverse: ss first).
     "mov rax, [rdi + 64]", // ss
     "push rax",
     "mov rax, [rdi + 8]", // user rsp
@@ -4150,10 +4214,11 @@ core::arch::global_asm!(
     // disk load), so without this the flip window is a live ring-0/user-CR3
     // IRQ target — the exact source of the A.4 reschedule-IPI-on-user-half #PF.
     "cli",
-    // Reset rsp to this task's kstack top page (user-mapped); the execve
-    // continuation stack below is abandoned (this trampoline never returns).
-    "mov rsp, gs:[EXIT_OFF_STACK_TOP]",
-    // Build the 5-field iretq frame on the top page (push in reverse: ss first).
+    // Pivot to this core's KPTI trampoline stack (user-half mapped; per-core
+    // safe under the cli above); the execve continuation stack below is
+    // abandoned (this trampoline never returns).
+    "mov rsp, gs:[EXIT_OFF_TRAMP_TOP]",
+    // Build the 5-field iretq frame there (push in reverse: ss first).
     "push rcx",   // ss
     "push rsi",   // user rsp
     "push 0x202", // rflags: IF + reserved bit 1
@@ -4199,10 +4264,11 @@ core::arch::global_asm!(
     "sigreturn_enter_userspace:",
     // Mask IRQs through the CR3-flip → iretq window (see the section header).
     "cli",
-    // Reset rsp to this task's kstack top page (user-mapped); the sigreturn
-    // syscall continuation below is abandoned (this trampoline never returns).
-    "mov rsp, gs:[EXIT_OFF_STACK_TOP]",
-    // Build the 5-field iretq frame on the top page (push in reverse: ss first).
+    // Pivot to this core's KPTI trampoline stack (user-half mapped; per-core
+    // safe under the cli above); the sigreturn syscall continuation below is
+    // abandoned (this trampoline never returns).
+    "mov rsp, gs:[EXIT_OFF_TRAMP_TOP]",
+    // Build the 5-field iretq frame there (push in reverse: ss first).
     "push rsi",         // ss
     "push [rdi + 56]",  // user rsp
     "push rcx",         // sanitized rflags
@@ -4242,7 +4308,7 @@ core::arch::global_asm!(
     ".text",
     exit_off_user_cr3  = const crate::smp::offsets::KPTI_USER_CR3,
     exit_off_scratch   = const crate::smp::offsets::KPTI_SCRATCH,
-    exit_off_stack_top = const crate::smp::offsets::SYSCALL_STACK_TOP,
+    exit_off_tramp_top = const crate::smp::offsets::KPTI_TRAMP_TOP,
 );
 
 unsafe extern "C" {
