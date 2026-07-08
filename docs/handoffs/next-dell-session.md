@@ -71,6 +71,28 @@ and is Meltdown-susceptible with KPTI off, so it is the right target.
       no-flush optimization (a documented A.5 follow-up: per-CPU last-CR3 cache)
       is the next lever. Also worth a same-boot A/B: temporarily force the
       fallback (mask PCID in `probe_pcid`) to measure the recovery the tags buy.
+- [ ] **B.3 — CET user shadow stacks are live on real silicon.** The whole B.3
+      substrate is dormant on QEMU (TCG models no CET); Tiger Lake has `CET_SS`,
+      so the Dell is the only place the active path runs. Boot the default image
+      and confirm: the `[sec]` line flips to `cet(active=true supported=true)`
+      (QEMU is `active=false supported=false`), every `[sec] CR4.CET enabled` +
+      per-AP `IA32_U_CET` re-assert logs, and `m3ctl mitigations status` prints
+      `CET: enabled (user shadow stacks)`. A clean boot-to-login here is the
+      first proof the shadow-stack **enable + per-task SSP + context-switch
+      save/restore + the shadow-stack PTE encoding** are all correct — a wrong
+      encoding or a stale SSP restore shows up immediately as a `#CP` kill or a
+      `#PF` on the first ring-3 `CALL`. **Watch for:** the fork **CoW-of-shadow-
+      stack** interaction (a child's first shadow-stack push CoW-duplicating the
+      RO+Dirty page — m3OS's generic CoW may need a shadow-stack-aware arm,
+      unlike Linux's explicit copy), and **nested-signal** shadow-stack handling
+      (the single-slot `cet_signal_ssp` covers non-nested; nesting needs the
+      `RSTORSSP`-token path modeled in `kernel_core::cet::shadow_stack_restore_token`).
+- [ ] **B.3 — CET catches a real ROP/overwrite.** Port (or write) a tiny
+      return-address-overwrite PoC: with CET **on** it must fault `#CP` (the
+      `control_protection_fault_body` kill: `userspace #CP (CET control-protection)
+      … process killed`); with CET off (mask `CET_SS` in `probe_cet`) the same
+      overwrite returns into the planted address. `Validated-on-HW (run N, date)`,
+      the CFI analogue of the A.6 Meltdown PoC. Skip-with-reason under QEMU TCG.
 
 ## Phase 111 — Remote Debugging (kgdb / ptrace on metal)
 
