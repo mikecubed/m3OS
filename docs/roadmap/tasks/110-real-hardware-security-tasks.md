@@ -9,7 +9,7 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Activate + bare-metal-validate KPTI (PML4 pair, CR3 trampoline, `KPTI_WIRED`, PCID, Meltdown PoC) | Phase 84 ✅, Phase 99 ✅ | 🟢 **A.1–A.5 landed + green** (KPTI live on every default boot; PCID scheme wired, dormant on QEMU / live on PCID silicon). Remaining: A.6 Meltdown-PoC reject + A.5 PCID-active/perf arms — **Dell-only** |
+| A | Activate + bare-metal-validate KPTI (PML4 pair, CR3 trampoline, `KPTI_WIRED`, PCID, Meltdown PoC) | Phase 84 ✅, Phase 99 ✅ | 🟢 **A.1–A.5 + trampoline-stack hardening landed + green** (KPTI live on every default boot; PCID scheme wired, dormant on QEMU / live on PCID silicon; per-CPU trampoline stack — no kernel-stack page in any user half). Remaining: A.6 Meltdown-PoC reject + A.5 PCID-active/perf arms — **Dell-only** |
 | B | Userspace ASLR + stack canaries + CET shadow stacks | Phase 86a ✅, A (shares the mm/exec path) | 🟢 **B.1 (ASLR) + B.2 (canaries) landed + green** (`aslr-smoke` + `stack-smash-smoke`); B.3 (CET) bare-metal-gated (planned) |
 | C | argon2id password hashing migration (fallback read path + re-hash) | Phase 48 ✅ | ✅ **Landed** — RFC 9106 argon2id (+ BLAKE2b) host-tested; passwd/adduser/login write argon2id; verify_password fallback + login re-hash; seeded images argon2id; `argon2-smoke` PASS |
 | D | Secure Boot on-metal validation + Phase 59 Track J / Phase 10 C.3 closeout | Phase 10 ✅, A (validated boot platform) | Planned |
@@ -60,7 +60,9 @@
 
 **As-built — A.3b part 5 (per-process pair on `AddressSpace`):** `AddressSpace` carries `kpti_user_pml4`, built by `build_kpti_user_half(kstack_top)` at every address-space birth (spawn/fork/execve — execve rebuilds against the replacement kernel PML4), **gated on `kpti_active`** so the inert production path builds nothing; `kpti_user_pml4()` is what A.4's dispatch publishes to `gs:[kpti_user_cr3]`; freed by `Drop` via `free_user_half`. **Thread coverage:** `sys_clone_thread` maps each new `CLONE_VM` thread's kstack top page into the shared half (`kpti_map_thread_kstack` → `mm::kpti::map_kstack_top_into_user_half`, page-table-lock serialized) — a thread's ring-3 interrupt frames push onto *its own* kstack top on the user CR3, so missing this would triple-fault any pthread app at A.4. The self-test exercises the thread-add path (second stand-in kstack page + reachability round-trip).
 
-**A.3b is complete.** **A.4 and A.5 have landed** (below). Remaining in Track A: A.6 (bare-metal Meltdown-PoC reject) and the A.5 PCID-active + perf-bound arms — all Dell-only (see [`docs/handoffs/next-dell-session.md`](../../handoffs/next-dell-session.md#phase-110--real-hardware-security-kpti-meltdown--pcid-on-metal)).
+**A.3b is complete.** **A.4 and A.5 have landed** (below), plus the **post-A.5 trampoline-stack hardening** (see after A.5). Remaining in Track A: A.6 (bare-metal Meltdown-PoC reject) and the A.5 PCID-active + perf-bound arms — all Dell-only (see [`docs/handoffs/next-dell-session.md`](../../handoffs/next-dell-session.md#phase-110--real-hardware-security-kpti-meltdown--pcid-on-metal)).
+
+> **Note (post-A.5 hardening):** part 5's per-thread kstack mapping (`kpti_map_thread_kstack` / `map_kstack_top_into_user_half`) and the "kstack top page in the user half" design described above were **superseded** by the dedicated per-CPU trampoline stack — see the hardening subsection below. The as-built text above is kept as the historical record of A.3b.
 
 **Acceptance:**
 - [x] Every maskable IRQ entry switches to the kernel CR3 and restores the entry CR3 on exit. *(A.3b pt2 — inert until A.4; `kpti_entry_switch`/`kpti_exit_switch`.)*
@@ -93,6 +95,19 @@
 - [x] CR3 loads on the trampoline carry distinct kernel/user PCIDs (gated on `CPUID` PCID + `INVPCID` support; plain full-flush fallback when absent). *(Baked into the published slots by `publish_kpti_cr3_pair` when `pcid_active`; `write_kernel_cr3` tags the address-space-switch load. The composition + gate are host-tested in `kpti_pcid`; the live-tagged path runs only on PCID silicon — the Dell A.5-active arm.)*
 - [x] The SMP TLB-shootdown path invalidates both PCIDs of the target ASID (no stale cross-core translation). *(`flush_local`/`flush_local_all` via `INVPCID Address`/`All`, routed through every shootdown site + the local CoW/demand invlpg sites. `munmap-tlb-smp` exercises the fallback path green; the both-PCID `INVPCID` executes on the Dell.)*
 - [ ] Under QEMU + `mitigations=full`, the smoke suite is at most 30 % slower than `mitigations=off` **when PCID is active** (the Phase 84 bound). *(**Bare-metal-only** — QEMU TCG has no PCID/INVPCID, so the active path never runs there. Deferred to the Dell A.5 perf arm, [`next-dell-session.md`](../../handoffs/next-dell-session.md#phase-110--real-hardware-security-kpti-meltdown--pcid-on-metal).)*
+
+### Post-A.5 hardening — the dedicated per-CPU trampoline stack (18–21/n, PR #324)
+
+**File:** `kernel/src/smp/mod.rs`, `kernel/src/arch/x86_64/interrupts.rs`, `kernel/src/mm/{kpti,mod}.rs`, `kernel/src/process/mod.rs`, `kernel/src/arch/x86_64/syscall/mod.rs`
+**Symbol:** `PerCoreData::{kpti_tramp_top,kpti_scratch2}`, `smp::set_current_core_kernel_stack` (KPTI redirect), `kpti_copy_frame_to_kstack` / `kpti_entry_copy_if_user` / `kpti_exit_iretq{,_err}` (asm), `mm::kpti::build_user_half` (kstack arg dropped)
+**Why it matters:** the A.3b design mapped each task's kstack **top page** into its own user half (RSP0 target + exit-iretq frame source) — a residual ~4 KiB Meltdown surface of the process's own kernel stack (live interrupt frames: kernel RIP/RSP values), plus a mandatory per-thread map on every `CLONE_VM` clone whose absence is a delivery triple fault.
+
+**As-built:** the m3OS `cpu_entry_area` entry stack. Each core owns an address-stable 8 KiB trampoline stack (`kpti_tramp_top`; top page user-mapped via the entry set, lower page kernel-only spillover; S3 reuse keeps it, `release_failed_ap` reclaims it). While KPTI is active, TSS.RSP0 targets it (redirect inside `set_current_core_kernel_stack` — the single RSP0 choke point of every dispatch locus), so ring-3 interrupt frames land on it on the user CR3 holding **only ring-3 register state**; the entry stubs copy the 20/21-qword block to `gs:[SYSCALL_STACK_TOP]-160/168` (the exact pre-hardening address — bodies/preempt/fault-redirects unchanged) after the CR3 switch, paranoid non-IST vectors (`#PF`/`#GP`/`#BP`/`#DB`) via their own ring-3+active-gated copy, NMI/`#DF` (IST) untouched. The exits (`kpti_exit_iretq{,_err}` + the four `.text.kpti_exit` trampolines) restore GPRs on the kernel CR3 and build the 5-word iretq frame on the trampoline stack (`cli`-guarded: the copy uses the persistent per-core scratch slots) before the flip. `build_user_half` drops its kstack arg (the user half is process-independent apart from the shared `USER_PML4_SLOTS`); `map_kstack_top_into_user_half` / `kpti_map_thread_kstack` / the `sys_clone_thread` ENOMEM arm are deleted; the self-test asserts the pre-hardening kstack page is **unreachable** (`reason=kstack-reachable`) and the trampoline top page reachable + aligned. Inactive lane byte-identical to A.5. Green: `check`, `kpti-selftest-smoke`, `smoke-test`, `kstack-overflow-smoke`, `termios-smoke`, `cargo xtask test` (13), `aslr-smoke`, `stack-smash-smoke`, `suspend-smoke`, `regression`, `smp-smoke`-to-known-pre-existing-crash (PR #323).
+
+**Acceptance:**
+- [x] No kernel-stack page is reachable from any user CR3 (self-test `kstack-reachable` negative round-trip; the invariant walk already fails on any `PML4[257]` leaf).
+- [x] `CLONE_VM` threads need no per-thread KPTI work (the pthread-heavy gates run on the shared entry set alone).
+- [x] The inactive lane (`mitigations=off` / `RDCL_NO`) is behaviourally unchanged (RSP0 stays the task kstack top; every new asm branch keys off `gs:[kpti_user_cr3] != 0`).
 
 ### A.6 — Bare-metal KPTI boot + Meltdown-PoC validation
 
