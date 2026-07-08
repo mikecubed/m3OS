@@ -5697,6 +5697,7 @@ pub fn run() -> ! {
             _task_preempt_frame_ptr,
             task_fpu_state_ptr,
             task_syscall_snapshot_ptr,
+            task_cet_ssp,
         ) = {
             let sched = scheduler_lock();
             if let Some(task) = sched.get_task(_task_idx) {
@@ -5726,6 +5727,7 @@ pub fn run() -> ! {
                         .map(|area| area.as_ref() as *const XSaveArea)
                         .unwrap_or(core::ptr::null()),
                     task.syscall_snapshot.get(),
+                    task.cet_ssp,
                 )
             } else {
                 (
@@ -5734,6 +5736,7 @@ pub fn run() -> ! {
                     core::ptr::null(),
                     core::ptr::null(),
                     core::ptr::null_mut(),
+                    0u64,
                 )
             }
         };
@@ -5812,6 +5815,10 @@ pub fn run() -> ! {
         if !task_fpu_state_ptr.is_null() {
             unsafe { restore_fpu_state(&*task_fpu_state_ptr) };
         }
+        // Phase 110 B.3 — restore this task's user shadow-stack pointer
+        // alongside the FPU state (identical per-task-CPU-state lifecycle).
+        // No-op unless CET is active (QEMU: never touches the MSR).
+        crate::arch::x86_64::cet::restore_task_ssp(task_cet_ssp);
 
         // Switch to the task.
         //
@@ -5916,6 +5923,13 @@ pub fn run() -> ! {
                         unsafe { save_fpu_state(area.as_mut()) };
                     }
                     let task = &mut sched.tasks[sidx];
+                    // Phase 110 B.3 — save this task's user shadow-stack pointer
+                    // alongside the FPU state (same lifecycle): the live
+                    // IA32_PL3_SSP still holds the outgoing task's user SSP here
+                    // (hardware preserved it from that task's kernel entry, and
+                    // no new task's SSP has been loaded yet). No-op unless CET
+                    // is active (QEMU: never reads the MSR).
+                    crate::arch::x86_64::cet::save_task_ssp(&mut task.cet_ssp);
                     task.saved_rsp = saved_rsp;
                     // E.1 epilogue: clear on_cpu AFTER saved_rsp is durably written.
                     // The Release ordering ensures that a concurrent waker observing

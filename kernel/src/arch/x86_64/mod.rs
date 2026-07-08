@@ -1,4 +1,7 @@
 pub mod apic;
+// Phase 110 Track B.3 — CET user shadow stacks (per-task shadow-stack setup,
+// IA32_PL3_SSP save/restore, the #CP handler seam).
+pub mod cet;
 pub mod cpufreq;
 pub mod cpuid;
 // Phase 111 Track B — trap & debug-register substrate (#DB/#BP dispatch,

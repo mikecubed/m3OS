@@ -669,6 +669,16 @@ pub struct Task {
     /// `sys_getrusage(RUSAGE_CHILDREN)` to populate `ru_stime`.
     /// Phase 61 Track E.1.
     pub child_system_ticks: u64,
+    /// Phase 110 Track B.3 — this task's saved `IA32_PL3_SSP` (user shadow-stack
+    /// pointer). Same lifecycle as the FPU/XSAVE state: saved from the live MSR
+    /// at switch-out (co-located with `save_fpu_state`) and restored to the MSR
+    /// at switch-in (co-located with `restore_fpu_state`), both gated on
+    /// `cet_active`. `0` for kernel tasks and until a shadow stack is installed
+    /// (a `0` restore leaves the task with no shadow stack). Only meaningful
+    /// when CET is active; inert on QEMU.
+    ///
+    /// Placed AFTER `preempt_frame` to preserve `EXPECTED_TASK_PREEMPT_FRAME_OFFSET`.
+    pub cet_ssp: u64,
     /// Phase 61 Track E.4 — page-fault counters for `getrusage(2)`.
     ///
     /// Minor faults — fault successfully resolved in-memory (e.g., CoW page
@@ -801,6 +811,7 @@ impl Task {
             ipc_cleaned: false,
             group_exit_pending: false,
             user_return: None,
+            cet_ssp: 0,
             fork_ctx: None,
             wake_deadline: None,
             blocked_since_tick: 0,
