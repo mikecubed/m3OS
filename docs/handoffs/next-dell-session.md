@@ -1,5 +1,11 @@
 # Standing checklist — next Dell (Precision 5560) session
 
+> **Running a session?** Use the sequenced runbook:
+> [2026-07-09 Dell validation session](./2026-07-09-dell-validation-session.md)
+> — objectives, per-test expected serial lines, pass/fail bars, and a
+> failure→cause map, ordered by value. This file stays the standing *checklist*
+> the runbook works down.
+
 A running list of everything waiting on physical access to the reference laptop, so
 bench time gets batched instead of spent one item per session. **Add items here when
 work lands that needs a hardware arm; check items off (with the capture path / run
