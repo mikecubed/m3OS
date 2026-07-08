@@ -1,8 +1,10 @@
 # Handoff — Phase 110 Track B.3: CET user shadow stacks
 
 **Date:** 2026-07-08
-**Branch:** `feat/phase-110-cet-shstk` (PR pending), stacked on `main` (independent
-of the KPTI A.5/hardening chain, though it shares the mm/exec path).
+**Branch:** `feat/phase-110-cet-shstk`, stacked on `feat/phase-110-kpti-hardening2`
+(continues the KPTI #322 → #324 → #325 chain; shares the mm/exec path). The CET
+work itself is independent of KPTI — it is stacked only because it was cut from
+that branch tip.
 **State:** ✅ **Substrate COMPLETE + green on QEMU (dormant); active path
 Dell-pending.** The whole feature is gated on `cet_active` and **byte-for-byte
 inert on every QEMU lane** (TCG models no CET). The active behaviour (shadow-stack
