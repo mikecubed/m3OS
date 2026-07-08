@@ -1459,8 +1459,29 @@ pub unsafe fn per_core_gdt_init(data: &PerCoreData) {
 ///
 /// Called when switching to a userspace process to set the kernel stack
 /// used on ring-3 → ring-0 transitions.
+///
+/// **Phase 110 hardening — the KPTI redirect.** When KPTI is active, RSP0
+/// permanently targets this core's trampoline-stack top
+/// ([`PerCoreData::kpti_tramp_top`]) rather than the passed task kstack top:
+/// ring-3 interrupt frames are pushed there on the *user* CR3 and the entry
+/// stub copies them to the real kstack after its CR3 switch, so the task
+/// kstack no longer needs a user-half mapping. The caller still publishes the
+/// task kstack top to `gs:[SYSCALL_STACK_TOP]` (via
+/// `set_per_core_syscall_stack_top`, always alongside this call) — that slot
+/// is the copy destination and the SYSCALL-path stack, and stays per-task.
+/// This function is the single RSP0 choke point for every dispatch locus
+/// (scheduler dispatch both branches, the fork-child trampoline, execve), so
+/// the redirect here covers every ring-3 return; boot-time init sites write
+/// RSP0 directly but always before the first dispatch. While KPTI is
+/// inactive the passed value is used verbatim — the pre-hardening behaviour.
 pub fn set_current_core_kernel_stack(rsp0: u64) {
     let data = per_core();
+    let rsp0 =
+        if crate::mitigations::state().is_some_and(|s| s.kpti_active) && data.kpti_tramp_top != 0 {
+            data.kpti_tramp_top
+        } else {
+            rsp0
+        };
     if data.tss_ptr.is_null() {
         // BSP uses the existing gdt.rs TSS — delegate to the old path.
         unsafe { crate::arch::x86_64::gdt::set_kernel_stack(rsp0) };

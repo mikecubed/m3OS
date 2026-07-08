@@ -3467,12 +3467,23 @@ extern "C" fn device_irq_body(frame: &mut TrapFrame, vector: u64) {
 //     re-reads `cs` from the frame rather than assuming ring 3 so a body that
 //     redirected to a kernel continuation returns on the kernel CR3.
 //
-// The GPR save area + CPU frame (160 bytes) live on the process kstack **top
-// page**, which `build_user_half` maps into the user half, so the entry saves
-// and the exit restores are valid on either CR3; the body descends into the
-// kstack below the top page only after the entry switch has made the whole
-// kstack reachable. Maskable IRQ gates enter with IF=0, so nothing nests on the
-// top page before the switch (NMI/#DF use IST stacks + the A.3b paranoid path).
+// **Phase 110 hardening — the per-CPU trampoline stack.** When KPTI is active,
+// RSP0 points at this core's trampoline-stack top (`gs:[kpti_tramp_top]`, the
+// m3OS `cpu_entry_area` entry stack), NOT at the task kstack: the CPU pushes
+// the ring-3 frame there on the *user* CR3, the stub pushes the GPRs after it,
+// and the entry switch — once on the kernel CR3 — copies the whole 20/21-qword
+// block to `gs:[SYSCALL_STACK_TOP] - 160/168`, exactly where it landed
+// pre-hardening (RSP0 was the kstack top then), so bodies, the preempt
+// capture, and the fault redirects see a byte-identical machine state. The
+// trampoline stack's frames only ever hold ring-3 register state, so its
+// user-half mapping (unlike the kstack top page it replaces) exposes no
+// kernel data. Maskable IRQ gates enter with IF=0 and the copy touches only
+// gs-reachable + kstack memory (no faults), so nothing nests on the
+// trampoline stack before the pivot (NMI/#DF use IST stacks + the A.3b
+// paranoid path; a nested NMI's paranoid entry/exit restores CR3 and touches
+// neither the trampoline stack nor rsp). While KPTI is inactive RSP0 stays
+// the task kstack top and the copy branch is never taken — the pre-hardening
+// behaviour, byte for byte.
 //
 // While KPTI is inactive (`mitigations=off` / `auto` on `RDCL_NO` silicon),
 // `gs:[kpti_user_cr3]` is 0 on every core, so both switches fall through their
@@ -3491,6 +3502,7 @@ core::arch::global_asm!(
     // (the same `.equ …, {operand}` indirection the syscall entry block uses).
     ".equ IRQ_OFF_KERNEL_CR3, {irq_off_kernel_cr3}",
     ".equ IRQ_OFF_USER_CR3,   {irq_off_user_cr3}",
+    ".equ IRQ_OFF_STACK_TOP,  {irq_off_stack_top}",
     ".equ IRQ_DEV_BASE,       {irq_dev_base}",
     "",
     ".macro kpti_save_gprs",
@@ -3529,9 +3541,47 @@ core::arch::global_asm!(
     "pop r15",
     ".endm",
     "",
+    // Phase 110 hardening — copy the saved block (15 GPRs + [error code +]
+    // 5-word iretq frame = \\words qwords, rsp-based) from the per-CPU
+    // trampoline stack to the task kstack top, and pivot rsp there. Runs on
+    // the kernel CR3 (both stacks mapped). Destination = the exact address
+    // the block landed at pre-hardening (RSP0 was the kstack top then), so
+    // everything downstream is unchanged. Clobbers rsi/rdi/rcx + DF — their
+    // interrupted values are in the copied block and are restored from the
+    // kstack copy by kpti_restore_gprs; the explicit `cld` matters because
+    // ring 3 controls DF at delivery. IF=0 throughout (interrupt gates), and
+    // a nested NMI (IST + paranoid) preserves all of this state.
+    r".macro kpti_copy_frame_to_kstack words",
+    r"cld",
+    r"mov rsi, rsp",
+    r"mov rdi, gs:[IRQ_OFF_STACK_TOP]",
+    r"sub rdi, 8*\words",
+    r"mov rsp, rdi",
+    r"mov ecx, \words",
+    r"rep movsq",
+    r".endm",
+    "",
+    // The trampoline-stack copy for the PARANOID non-IST vectors (#PF/#GP/
+    // #BP/#DB): their CR3 load is unconditional-when-active (not ring-gated),
+    // so the copy needs its own "came from ring 3 on the trampoline stack"
+    // test — ring-3 cs in the frame AND a published user CR3 (⟺ RSP0 was the
+    // trampoline stack at delivery). Ring-0 faults pushed on the interrupted
+    // stack and are left in place.
+    r".macro kpti_entry_copy_if_user cs_off, words",
+    r"test qword ptr [rsp + \cs_off], 3",
+    r"jz 15f",
+    r"mov rax, gs:[IRQ_OFF_USER_CR3]",
+    r"test rax, rax",
+    r"jz 15f",
+    r"kpti_copy_frame_to_kstack \words",
+    r"15:",
+    r".endm",
+    "",
     // Entry: switch to the kernel CR3 iff (from ring 3) AND (KPTI active).
     // Runs after kpti_save_gprs, so cs is at [rsp+128]. Clobbers rax (its user
-    // value is already saved at [rsp]); the body gets its frame via rdi.
+    // value is already saved in the frame); the body gets its frame via rdi.
+    // When the switch is taken, the frame is on the per-CPU trampoline stack
+    // (RSP0 while KPTI is active) — copy it to the task kstack and pivot.
     ".macro kpti_entry_switch",
     "test qword ptr [rsp + 128], 3",
     "jz 2f",
@@ -3540,6 +3590,7 @@ core::arch::global_asm!(
     "jz 2f",
     "mov rax, gs:[IRQ_OFF_KERNEL_CR3]",
     "mov cr3, rax",
+    "kpti_copy_frame_to_kstack 20",
     "2:",
     ".endm",
     "",
@@ -3558,7 +3609,7 @@ core::arch::global_asm!(
     "",
     // Error-code variants (#PF/#GP): the CPU pushed an 8-byte error code below
     // the iretq frame, so after kpti_save_gprs cs sits at [rsp+136], not
-    // [rsp+128].
+    // [rsp+128], and the copied block is 21 qwords.
     ".macro kpti_entry_switch_err",
     "test qword ptr [rsp + 136], 3",
     "jz 4f",
@@ -3567,6 +3618,7 @@ core::arch::global_asm!(
     "jz 4f",
     "mov rax, gs:[IRQ_OFF_KERNEL_CR3]",
     "mov cr3, rax",
+    "kpti_copy_frame_to_kstack 21",
     "4:",
     ".endm",
     "",
@@ -3717,6 +3769,11 @@ core::arch::global_asm!(
     "bp_entry:",
     "kpti_save_gprs",
     "kpti_paranoid_entry",
+    // Phase 110 hardening: a ring-3 #BP was delivered on the trampoline stack
+    // (RSP0 while KPTI is active) — copy the frame to the task kstack. The
+    // paranoid CR3 load above already put us on the kernel map. Ring-0 #BP
+    // (kgdb freeze point) stays on the interrupted stack.
+    "kpti_entry_copy_if_user 128, 20",
     "cld",
     "mov rdi, rsp", // &mut DebugTrapFrame
     "mov r12, rsp",
@@ -3731,6 +3788,8 @@ core::arch::global_asm!(
     "db_entry:",
     "kpti_save_gprs",
     "kpti_paranoid_entry",
+    // Ring-3 #DB (ptrace single-step) arrives on the trampoline stack — copy.
+    "kpti_entry_copy_if_user 128, 20",
     "cld",
     "mov rdi, rsp",
     "mov r12, rsp",
@@ -3766,6 +3825,12 @@ core::arch::global_asm!(
     "page_fault_entry:",
     "kpti_save_gprs",
     "kpti_paranoid_entry",
+    // Phase 110 hardening: a ring-3 #PF (CoW/demand paging) was delivered on
+    // the trampoline stack (RSP0 while KPTI is active) — copy the 21-qword
+    // block (error code included) to the task kstack. Ring-0 faults —
+    // including the kstack-overflow recovery path and a paranoid-window
+    // fault — pushed on the interrupted stack and are left in place.
+    "kpti_entry_copy_if_user 136, 21",
     "cld",
     "mov rdi, rsp", // &mut TrapFrameErr
     "mov r12, rsp",
@@ -3781,6 +3846,8 @@ core::arch::global_asm!(
     "general_protection_fault_entry:",
     "kpti_save_gprs",
     "kpti_paranoid_entry",
+    // Ring-3 #GP arrives on the trampoline stack — copy (see page_fault_entry).
+    "kpti_entry_copy_if_user 136, 21",
     "cld",
     "mov rdi, rsp",
     "mov r12, rsp",
@@ -3856,6 +3923,7 @@ core::arch::global_asm!(
     ".text",
     irq_off_kernel_cr3 = const crate::smp::offsets::KPTI_KERNEL_CR3,
     irq_off_user_cr3 = const crate::smp::offsets::KPTI_USER_CR3,
+    irq_off_stack_top = const crate::smp::offsets::SYSCALL_STACK_TOP,
     irq_dev_base = const DEVICE_IRQ_VECTOR_BASE as usize,
 );
 
