@@ -36,8 +36,11 @@
 //! of physical memory; see [`kernel_core::kpti::may_clone_slot_into_user_half`]).
 //!
 //! The entry set ([`collect_entry_pages`]) is, per **online core** (a process
-//! may run on any core): its `PerCoreData`, GDT, TSS, and the top page of each
-//! of its NMI + `#DF` IST stacks; plus the shared page-aligned `.text.kpti_entry`
+//! may run on any core): its `PerCoreData`, GDT, TSS, the top page of each
+//! of its NMI + `#DF` IST stacks, and the top page of its KPTI trampoline
+//! stack (Phase 110 hardening — where TSS.RSP0 points while KPTI is active,
+//! so ring-3 interrupt frames land there instead of on the task kstack); plus
+//! the shared page-aligned `.text.kpti_entry`
 //! section (both SYSCALL stubs + body + tail, A.2), the `.text.kpti_irq_entry`
 //! section (A.3b: the naked IRQ/exception entry stubs — the CPU begins executing
 //! them on the user CR3 when an interrupt fires while ring 3 runs), and the IDT.
@@ -445,6 +448,19 @@ fn collect_entry_pages() -> Option<Vec<(u64, u64, PageTableFlags)>> {
             let top_page = (ist_top - 1) & !0xFFF;
             push_kernel_range(&kmapper, &mut out, top_page, top_page + 0x1000, RW)?;
         }
+        // Phase 110 hardening — this core's KPTI trampoline stack **top page**
+        // (the m3OS `cpu_entry_area` entry stack). When KPTI is active,
+        // TSS.RSP0 points at `kpti_tramp_top`, so the CPU pushes every ring-3
+        // interrupt frame here on the *user* CR3 (and the exit path builds its
+        // `iretq` frame here before the CR3 flip). Only the top page is
+        // exposed; the page below is kernel-only diagnostic spillover. Frames
+        // on it carry only ring-3 register state — unlike the task-kstack top
+        // page it replaces, it holds no kernel data at all.
+        let tramp_top = pcd.kpti_tramp_top;
+        if tramp_top != 0 {
+            let top_page = (tramp_top - 1) & !0xFFF;
+            push_kernel_range(&kmapper, &mut out, top_page, top_page + 0x1000, RW)?;
+        }
     }
 
     Some(out)
@@ -847,6 +863,15 @@ pub fn self_test() {
                         misaligned = Some(("core-entry-struct", base));
                         break 'cores;
                     }
+                }
+                // Phase 110 hardening — the per-CPU KPTI trampoline stack:
+                // must exist and be page-aligned (its top page is entry-set
+                // mapped and TSS.RSP0 points at the top when KPTI is active;
+                // page alignment is also what keeps the CPU's frame pushes
+                // 16-aligned and the mapping free of neighbouring heap data).
+                if pcd.kpti_tramp_top == 0 || pcd.kpti_tramp_top % 0x1000 != 0 {
+                    misaligned = Some(("kpti-tramp-top", pcd.kpti_tramp_top));
+                    break 'cores;
                 }
             }
         }

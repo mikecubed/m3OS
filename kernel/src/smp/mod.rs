@@ -391,6 +391,27 @@ pub struct PerCoreData {
     /// (the SYSCALL path has no free GPR at entry; this lives in the user
     /// minimal set so it is writable on the user CR3).
     pub kpti_scratch: u64,
+    /// Second scratch slot for the KPTI exit path (Phase 110 hardening): the
+    /// ring-3 exit copies the 5-word `iretq` frame from the task kstack to the
+    /// per-CPU trampoline stack after all GPRs are restored, so it needs TWO
+    /// spill slots (`rax` shuttle + `rbx` destination pointer). Like
+    /// `kpti_scratch`, only used with IF=0 on the owning core.
+    pub kpti_scratch2: u64,
+    /// Top VA of this core's KPTI interrupt trampoline stack (Phase 110
+    /// hardening — the m3OS `cpu_entry_area` entry stack). When KPTI is
+    /// active, TSS.RSP0 points here (NOT at the task kstack), so the CPU
+    /// pushes every ring-3 interrupt frame onto it on the *user* CR3; the
+    /// entry stub then switches CR3 and copies the frame to the real task
+    /// kstack. The exit path builds its `iretq` frame here symmetrically.
+    /// Only the **top page** is mapped into user halves (the pages below are
+    /// kernel-only spillover for a should-never-happen ring-0 fault while
+    /// `rsp` is on this stack); frames only ever hold ring-3 register state,
+    /// never kernel secrets. Allocated once per core
+    /// ([`alloc_kpti_tramp_stack`]) and — like the GDT/TSS — **never freed or
+    /// re-allocated** (every user half maps it at its live address; S3 resume
+    /// reuses it in place). Nonzero on every boot lane, consumed only when
+    /// KPTI is active.
+    pub kpti_tramp_top: u64,
 }
 
 // Safety: PerCoreData is only accessed by its owning core (via gs_base) or
@@ -926,6 +947,39 @@ pub mod offsets {
     pub const KPTI_KERNEL_CR3: usize = core::mem::offset_of!(PerCoreData, kpti_kernel_cr3);
     pub const KPTI_USER_CR3: usize = core::mem::offset_of!(PerCoreData, kpti_user_cr3);
     pub const KPTI_SCRATCH: usize = core::mem::offset_of!(PerCoreData, kpti_scratch);
+    pub const KPTI_SCRATCH2: usize = core::mem::offset_of!(PerCoreData, kpti_scratch2);
+    pub const KPTI_TRAMP_TOP: usize = core::mem::offset_of!(PerCoreData, kpti_tramp_top);
+}
+
+/// Size of each core's KPTI interrupt trampoline stack
+/// ([`PerCoreData::kpti_tramp_top`]): one user-mapped top page (all trampoline
+/// traffic fits in its top ~200 bytes) plus one kernel-only spillover page so
+/// a should-never-happen ring-0 fault taken while `rsp` is on this stack can
+/// still reach its diagnostic/panic path without immediately corrupting a
+/// neighbouring allocation.
+pub const KPTI_TRAMP_STACK_SIZE: usize = 4096 * 2;
+
+/// Allocate one core's KPTI interrupt trampoline stack and return its top VA.
+///
+/// A raw page-aligned, whole-page `alloc_zeroed` rather than
+/// `Box<PageIsolated<…>>`: the isolation guarantee is identical (page-aligned
+/// and page-multiple, so the allocation owns its pages exclusively and the
+/// user-half mapping of the top page leaks no neighbouring heap data), and the
+/// raw path avoids materialising the 8 KiB array on the boot stack in debug
+/// builds (the `trace_ring` lesson). Deliberately never freed on the success
+/// path — user halves map the top page at this address for the life of every
+/// process, so it must be address-stable forever (the GDT/TSS discipline).
+fn alloc_kpti_tramp_stack() -> u64 {
+    let layout = core::alloc::Layout::from_size_align(KPTI_TRAMP_STACK_SIZE, 4096)
+        .expect("static layout is valid");
+    // SAFETY: layout is non-zero-sized; the kernel heap is initialized before
+    // any per-core data is built.
+    let base = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    assert!(
+        !base.is_null(),
+        "KPTI trampoline stack allocation failed (out of kernel heap at core init)"
+    );
+    base as u64 + KPTI_TRAMP_STACK_SIZE as u64
 }
 
 /// Phase 110 Track A.4 — publish this core's KPTI CR3 pair for the task it is
@@ -1016,6 +1070,7 @@ pub fn clear_kpti_cr3_slots() {
         core::ptr::write_volatile(&raw mut (*pc).kpti_kernel_cr3, 0);
         core::ptr::write_volatile(&raw mut (*pc).kpti_user_cr3, 0);
         core::ptr::write_volatile(&raw mut (*pc).kpti_scratch, 0);
+        core::ptr::write_volatile(&raw mut (*pc).kpti_scratch2, 0);
     }
 }
 
@@ -1139,6 +1194,8 @@ pub fn init_bsp_per_core() {
         kpti_kernel_cr3: 0,
         kpti_user_cr3: 0,
         kpti_scratch: 0,
+        kpti_scratch2: 0,
+        kpti_tramp_top: alloc_kpti_tramp_stack(),
     }));
 
     // Fill self-pointer and store in global array.
@@ -1229,6 +1286,10 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
             (*existing).kpti_kernel_cr3 = 0;
             (*existing).kpti_user_cr3 = 0;
             (*existing).kpti_scratch = 0;
+            (*existing).kpti_scratch2 = 0;
+            // `kpti_tramp_top` is deliberately KEPT: like the GDT/TSS, every
+            // pre-suspend user half maps the trampoline stack's top page at
+            // its live address, so it must never be re-allocated across S3.
             // Dispatch retargets RSP0 before any ring-3 return; reset it to
             // the boot value for parity with the fresh path anyway.
             (*(*existing).tss_ptr).privilege_stack_table[0] =
@@ -1346,6 +1407,8 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         kpti_kernel_cr3: 0,
         kpti_user_cr3: 0,
         kpti_scratch: 0,
+        kpti_scratch2: 0,
+        kpti_tramp_top: alloc_kpti_tramp_stack(),
     }));
 
     unsafe {
@@ -1447,6 +1510,22 @@ pub(super) unsafe fn release_failed_ap(core_id: u8) {
     let dead_ptr = unsafe { PER_CORE_DATA[core_id as usize] };
     if dead_ptr.is_null() {
         return;
+    }
+    // Reclaim the KPTI trampoline stack (safe here: the AP never came online,
+    // so no user half was ever built while its slot was populated — the
+    // entry-set collector only walks populated PER_CORE_DATA slots, and this
+    // one is nulled below before any process can be created).
+    let tramp_top = unsafe { (*dead_ptr).kpti_tramp_top };
+    if tramp_top != 0 {
+        let layout = core::alloc::Layout::from_size_align(KPTI_TRAMP_STACK_SIZE, 4096)
+            .expect("static layout is valid");
+        // SAFETY: allocated by `alloc_kpti_tramp_stack` with this exact layout.
+        unsafe {
+            alloc::alloc::dealloc(
+                (tramp_top - KPTI_TRAMP_STACK_SIZE as u64) as *mut u8,
+                layout,
+            )
+        };
     }
     // Reclaim the Box that `init_ap_per_core` allocated.
     drop(unsafe { Box::from_raw(dead_ptr) });
