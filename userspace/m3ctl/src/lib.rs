@@ -373,6 +373,20 @@ pub fn format_mitigations(report: &kernel_core::spectre::MitigationReport) -> St
         out.push('\n');
     }
 
+    // Phase 110 B.3 — CET user-shadow-stack posture. On the default QEMU lane
+    // (TCG models no CET) this reads `not-supported`; on CET silicon with the
+    // policy on it reads `enabled (user shadow stacks)`; a present-but-off CPU
+    // (`mitigations=off`) reads `supported, inactive`.
+    out.push_str("  CET: ");
+    out.push_str(match (report.cet_present, report.cet_active) {
+        (true, true) => "enabled (user shadow stacks)",
+        (true, false) => "supported, inactive",
+        // active-without-present is not a state the kernel produces.
+        (false, true) => "active",
+        (false, false) => "not-supported",
+    });
+    out.push('\n');
+
     // Honesty: enumerate the UNADDRESSED classes + the microkernel caveat.
     out.push_str(
         "note: UNADDRESSED — Spectre-v1, MDS, L1TF, SSB, Retbleed, Downfall/GDS are not mitigated.\n",

@@ -561,6 +561,20 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
         if pcide {
             log::info!("[sec] CR4.PCIDE enabled (KPTI PCID TLB-cost recovery active)");
         }
+        // Phase 110 Track B.3 — enable CET user shadow stacks on the BSP when
+        // the CPU supports CET_SS and the policy is on (no-op on every QEMU
+        // lane — TCG models no CET). Like PCIDE, must run BEFORE `boot_aps()`
+        // captures the BSP's CR4 into the trampoline's `DATA_CR4` so every AP
+        // inherits `CR4.CET`; each AP re-asserts `IA32_U_CET` (per-core MSR)
+        // in `mitigations::init_ap`.
+        let cet = unsafe {
+            arch::x86_64::cpuid::enable_user_cet_if_supported(
+                crate::mitigations::state().is_some_and(|s| s.cet_active),
+            )
+        };
+        if cet {
+            log::info!("[sec] CR4.CET enabled (CET user shadow stacks active)");
+        }
     });
 
     // Phase 103 Track E: probe HWP and opt in on the BSP (IA32_PM_ENABLE is

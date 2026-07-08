@@ -341,6 +341,18 @@ pub fn enter_sleep_s3() -> i64 {
             log::info!("[suspend] CR4.PCIDE re-enabled after resume");
         }
     }
+    // Phase 110 B.3 — the reset cleared CR4.CET + the CET MSRs, so re-enable CET
+    // user shadow stacks on the BSP (no-op on QEMU / when CET is inactive).
+    // Like PCIDE, precede `resume_reboot_aps` so the CR4 capture carries CET;
+    // each resumed AP re-asserts IA32_U_CET in `mitigations::init_ap`.
+    unsafe {
+        let cet = crate::arch::x86_64::cpuid::enable_user_cet_if_supported(
+            crate::mitigations::state().is_some_and(|s| s.cet_active),
+        );
+        if cet {
+            log::info!("[suspend] CR4.CET re-enabled after resume");
+        }
+    }
     crate::arch::x86_64::cpufreq::init_bsp();
     unsafe {
         crate::arch::x86_64::interrupts::init_pics();

@@ -431,6 +431,9 @@ fn mitigations_status_format_is_honest() {
         pku_present: false,
         pku_active: false,
         pcid_active: false,
+        // No-CET boot (the default lane): not-supported.
+        cet_present: false,
+        cet_active: false,
     };
     let r = format_mitigations(&report);
     assert!(r.contains("level=full"));
@@ -445,6 +448,8 @@ fn mitigations_status_format_is_honest() {
     assert!(r.contains("W^X: v1 (PKU absent)"));
     // Phase 110 A.5 — KPTI is NOT enforcing here, so no PCID line is printed.
     assert!(!r.contains("KPTI PCID:"));
+    // Phase 110 B.3 — the no-CET boot prints the not-supported CET line.
+    assert!(r.contains("CET: not-supported"));
 
     // KPTI enforcing → Meltdown reads "Mitigation: PTI".
     let report2 = MitigationReport {
@@ -494,6 +499,8 @@ fn mitigations_status_wx_pku_line() {
         pku_present: false,
         pku_active: false,
         pcid_active: false,
+        cet_present: false,
+        cet_active: false,
     };
 
     // No-PKU boot (the default TCG lane): v1, PKU absent.
@@ -515,6 +522,46 @@ fn mitigations_status_wx_pku_line() {
         ..base
     };
     assert!(format_mitigations(&inactive).contains("W^X: v1 (PKU present, inactive)"));
+}
+
+/// Phase 110 B.3 — the CET posture line renders all three boot states.
+#[test]
+fn mitigations_status_cet_line() {
+    use kernel_core::spectre::{IbrsMode, MitigationLevel, MitigationReport};
+
+    let base = MitigationReport {
+        level: MitigationLevel::Auto,
+        level_recognized: true,
+        kpti_active: false,
+        ibpb_active: false,
+        ibrs_mode: IbrsMode::None,
+        leaf7_edx: 0,
+        arch_caps: 0,
+        wx_v2: false,
+        pku_present: false,
+        pku_active: false,
+        pcid_active: false,
+        cet_present: false,
+        cet_active: false,
+    };
+
+    // No-CET boot (the default TCG lane): not-supported.
+    assert!(format_mitigations(&base).contains("CET: not-supported"));
+
+    // CET silicon, policy on (the Dell): enabled.
+    let active = MitigationReport {
+        cet_present: true,
+        cet_active: true,
+        ..base
+    };
+    assert!(format_mitigations(&active).contains("CET: enabled (user shadow stacks)"));
+
+    // CET silicon but mitigations=off: supported, inactive.
+    let inactive = MitigationReport {
+        cet_present: true,
+        ..base
+    };
+    assert!(format_mitigations(&inactive).contains("CET: supported, inactive"));
 }
 
 // ---------------------------------------------------------------------------

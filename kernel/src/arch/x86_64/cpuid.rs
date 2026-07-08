@@ -581,6 +581,104 @@ pub fn cr4_pcide_enabled() -> bool {
     cr4 & (1 << 17) != 0
 }
 
+// ---------------------------------------------------------------------------
+// Phase 110 Track B.3 — CET user shadow stacks
+// ---------------------------------------------------------------------------
+//
+// CET shadow stacks are a hardware CFI layer: CALL pushes the return address to
+// a protected shadow stack, RET checks it, and a mismatch (a return-address
+// overwrite the canary missed) faults #CP before control transfers. The pure
+// bit-layout/decode logic is host-tested in `kernel_core::cet`; this file does
+// the privileged probe + `CR4.CET`/`IA32_U_CET` writes, gated on the CET_SS
+// CPUID bit so a CPU without it never `#GP`s. QEMU TCG does not model CET, so
+// on every CI lane `probe_cet()` is `false`, `CR4.CET` stays 0, and the whole
+// shadow-stack path is inert (validated active on the Dell Tiger Lake).
+
+static CET_FEATURES: Once<kernel_core::cet::CetFeatures> = Once::new();
+static CET_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Probe the CET feature surface: `CPUID.07H.0:ECX[7]` (CET_SS) + `:EDX[20]`
+/// (CET_IBT), guarded by the max-basic-leaf check (the `probe_smep_smap` trap —
+/// reading leaf 7 on a CPU whose max basic leaf is `< 7` returns a lower leaf's
+/// data, which could spuriously set the CET bit and enable an unsupported
+/// feature). Idempotent — first call wins. Decode is the host-tested
+/// [`kernel_core::cet::CetFeatures::from_leaf7`]. Both bits are `0` on QEMU TCG.
+pub fn probe_cet() -> kernel_core::cet::CetFeatures {
+    *CET_FEATURES.call_once(|| {
+        if cpuid_raw(0, 0).eax < 0x07 {
+            return kernel_core::cet::CetFeatures::from_leaf7(0, 0);
+        }
+        let leaf7 = cpuid_raw(0x07, 0);
+        kernel_core::cet::CetFeatures::from_leaf7(leaf7.ecx, leaf7.edx)
+    })
+}
+
+/// True when the kernel may enable user shadow stacks: the architectural
+/// `CET_SS` bit is set ([`kernel_core::cet::CetFeatures::shstk_usable`]).
+/// The single predicate every downstream CET consumer (per-task shadow-stack
+/// alloc, the `#CP` handler's relevance, the reporter) must consult. `false`
+/// on QEMU TCG.
+pub fn cet_shstk_usable() -> bool {
+    probe_cet().shstk_usable()
+}
+
+/// Enable CET user shadow stacks on the **current** core when the CPU supports
+/// `CET_SS` AND the CET policy is on this boot. Sets `CR4.CET` (bit 23) and
+/// `IA32_U_CET.SH_STK_EN` (+ `WR_SHSTK_EN`, so the signal path may seed a
+/// restore token onto the user shadow stack via `WRUSS`). Leaves `IA32_S_CET`
+/// untouched — **no** supervisor (kernel) shadow stack. Returns whether CET is
+/// now enabled on this core.
+///
+/// `IA32_PL3_SSP` is left 0 here; each task's shadow stack is armed at first
+/// entry to ring 3 (Track B.3 3/n) — with `SH_STK_EN` set but `PL3_SSP = 0` a
+/// task that never gets a shadow stack simply performs no shadow-stack ops
+/// until one is installed.
+///
+/// Must run on the BSP **before** `smp::boot::boot_aps()` so the trampoline's
+/// captured `DATA_CR4` carries `CR4.CET` and every AP inherits it, and again on
+/// the S3 resume path (the machine reset clears CR4 + the CET MSRs). No-op
+/// unless [`cet_shstk_usable`] holds — so on QEMU/CI it never runs.
+///
+/// # Safety
+/// CR4 + the CET MSRs are privileged; ring 0, IRQs disabled or single-threaded.
+/// `CR0.WP` must be 1 (m3OS always has it) — the CPU `#GP`s on a `CR4.CET` set
+/// while `CR0.WP = 0`.
+pub unsafe fn enable_user_cet_if_supported(policy_on: bool) -> bool {
+    use kernel_core::cet::{MSR_IA32_U_CET, compose_u_cet};
+    if !policy_on || !cet_shstk_usable() {
+        return false;
+    }
+    let mut cr4: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+    }
+    cr4 |= kernel_core::cet::CR4_CET;
+    unsafe {
+        core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack));
+        // User shadow stacks on; WRUSS allowed (signal restore-token seeding).
+        Msr::new(MSR_IA32_U_CET).write(compose_u_cet(true, true));
+    }
+    CET_ENABLED.store(true, Ordering::Release);
+    true
+}
+
+/// True if `CR4.CET` (bit 23) is currently set on this core (a live-register
+/// audit for the per-core boot log, like [`cr4_pcide_enabled`]).
+pub fn cr4_cet_enabled() -> bool {
+    let cr4: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+    }
+    cr4 & kernel_core::cet::CR4_CET != 0
+}
+
+/// True once [`enable_user_cet_if_supported`] set `CR4.CET` on at least one core
+/// this boot (CET is active). `false` on a no-CET CPU. Mirrors [`ospke_enabled`].
+#[inline]
+pub fn cet_enabled() -> bool {
+    CET_ENABLED.load(Ordering::Acquire)
+}
+
 /// True if `EFLAGS.AC` (bit 18) is currently set on this core.
 pub fn eflags_ac_set() -> bool {
     use x86_64::registers::rflags::{self, RFlags};

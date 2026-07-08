@@ -265,8 +265,9 @@ pub const SYS_MITIGATIONS_STATUS: u64 = 0x1140;
 /// `sys_set_spec_ctrl(enable_stibp) -> isize` (0 on success, negative errno).
 pub const SYS_SET_SPEC_CTRL: u64 = 0x1141;
 
-/// Fixed wire length of an encoded [`MitigationReport`].
-pub const MITIGATION_REPORT_WIRE_LEN: usize = 16;
+/// Fixed wire length of an encoded [`MitigationReport`]. 17 bytes since Phase
+/// 110 B.3 (byte 16 carries the CET posture; was 16 through A.5).
+pub const MITIGATION_REPORT_WIRE_LEN: usize = 17;
 
 /// The boot mitigation snapshot in a compact, fixed-layout, host-testable wire
 /// form. The kernel encodes its boot snapshot; `m3ctl` decodes and formats. The
@@ -303,6 +304,13 @@ pub struct MitigationReport {
     /// `kpti_active`; a Meltdown-immune (`RDCL_NO`) or `off` boot leaves it
     /// `false`.
     pub pcid_active: bool,
+    /// Phase 110 Track B.3 — CET shadow stacks are **supported** in CPUID
+    /// (`CET_SS`). `false` on every QEMU lane (TCG models no CET).
+    pub cet_present: bool,
+    /// Phase 110 Track B.3 — CET user shadow stacks are **active** this boot
+    /// (supported AND policy on, so `CR4.CET` + `IA32_U_CET` are set and each
+    /// task gets a shadow stack). `false` on QEMU / `mitigations=off`.
+    pub cet_active: bool,
 }
 
 impl MitigationReport {
@@ -340,13 +348,18 @@ impl MitigationReport {
             IbrsMode::Legacy => 1,
             IbrsMode::Enhanced => 2,
         };
-        // Wire version 3 (Phase 110 A.5 added the PCID flag bit to `b[1]`; v2 was
-        // Phase 90a C.2's W^X/PKU bits). Bumped so a stale decoder refuses rather
-        // than reading the new bit as zero. The kernel and `m3ctl` are built
-        // together, so both sides move in lock-step.
-        b[3] = 3;
+        // Wire version 4 (Phase 110 B.3 added byte 16, the CET posture, and the
+        // length grew 16→17). v3 was A.5's PCID bit; v2 was 90a's W^X/PKU bits.
+        // Bumped so a stale decoder refuses rather than mis-reading the layout.
+        // The kernel and `m3ctl` are built together, so both sides move in
+        // lock-step.
+        b[3] = 4;
         b[4..8].copy_from_slice(&self.leaf7_edx.to_le_bytes());
         b[8..16].copy_from_slice(&self.arch_caps.to_le_bytes());
+        // Byte 16 — the CET posture (bit 0 = present, bit 1 = active). A
+        // separate byte rather than the last free bit of `b[1]` so both the
+        // "supported but off" and "not supported" states are distinguishable.
+        b[16] = (self.cet_present as u8) | ((self.cet_active as u8) << 1);
         b
     }
 
@@ -357,10 +370,10 @@ impl MitigationReport {
         if buf.len() < MITIGATION_REPORT_WIRE_LEN {
             return None;
         }
-        // Wire version (written as `b[3] = 3` by `encode()`; was 2 for 90a, 1
-        // pre-90a). Reject anything we do not know how to parse so a bumped
-        // format fails cleanly here.
-        if buf[3] != 3 {
+        // Wire version (written as `b[3] = 4` by `encode()`; 3 for A.5, 2 for
+        // 90a, 1 pre-90a). Reject anything we do not know how to parse so a
+        // bumped format fails cleanly here.
+        if buf[3] != 4 {
             return None;
         }
         let level = match buf[0] {
@@ -390,6 +403,8 @@ impl MitigationReport {
             pku_present: flags & 0b0001_0000 != 0,
             pku_active: flags & 0b0010_0000 != 0,
             pcid_active: flags & 0b0100_0000 != 0,
+            cet_present: buf[16] & 0b0000_0001 != 0,
+            cet_active: buf[16] & 0b0000_0010 != 0,
         })
     }
 }
@@ -660,6 +675,10 @@ mod tests {
                     // flag-byte packing is exercised set and clear (PCID implies
                     // KPTI active, so key it on the same condition).
                     pcid_active: matches!(ibrs_mode, IbrsMode::Enhanced),
+                    // Phase 110 B.3 — vary the CET posture (byte 16) across the
+                    // matrix so both bits are exercised set and clear.
+                    cet_present: !matches!(ibrs_mode, IbrsMode::None),
+                    cet_active: matches!(ibrs_mode, IbrsMode::Enhanced),
                 };
                 let bytes = r.encode();
                 assert_eq!(bytes.len(), MITIGATION_REPORT_WIRE_LEN);
@@ -689,10 +708,12 @@ mod tests {
             pku_present: false,
             pku_active: false,
             pcid_active: false,
+            cet_present: false,
+            cet_active: false,
         }
         .encode();
         assert!(MitigationReport::decode(&wrong_ver).is_some());
-        wrong_ver[3] = 4; // bump the version byte past the current v3
+        wrong_ver[3] = 5; // bump the version byte past the current v4
         assert!(MitigationReport::decode(&wrong_ver).is_none());
     }
 
@@ -713,12 +734,14 @@ mod tests {
             pku_present: false,
             pku_active: false,
             pcid_active: false,
+            cet_present: false,
+            cet_active: false,
         };
 
         // No-PKU boot (default TCG lane): all three posture bits clear.
         let no_pku = base.encode();
         assert_eq!(no_pku.len(), MITIGATION_REPORT_WIRE_LEN);
-        assert_eq!(no_pku[3], 3, "wire version must be 3 after A.5");
+        assert_eq!(no_pku[3], 4, "wire version must be 4 after B.3");
         let back = MitigationReport::decode(&no_pku).expect("decode no-pku");
         assert!(!back.wx_v2 && !back.pku_present && !back.pku_active);
 
@@ -762,6 +785,8 @@ mod tests {
             pku_present: false,
             pku_active: false,
             pcid_active: false,
+            cet_present: false,
+            cet_active: false,
         };
 
         // Fallback lane: KPTI active, PCID off.
@@ -777,5 +802,50 @@ mod tests {
         let back = MitigationReport::decode(&pcid.encode()).expect("decode pcid");
         assert!(back.pcid_active);
         assert!(!back.pku_present && !back.pku_active && !back.wx_v2);
+    }
+
+    /// Phase 110 B.3 — the CET posture (byte 16) survives the wire round-trip
+    /// and distinguishes not-supported / supported-inactive / active, without
+    /// disturbing any other flag.
+    #[test]
+    fn cet_posture_wire_round_trip() {
+        let base = MitigationReport {
+            level: MitigationLevel::Auto,
+            level_recognized: true,
+            kpti_active: false,
+            ibpb_active: false,
+            ibrs_mode: IbrsMode::None,
+            leaf7_edx: 0,
+            arch_caps: 0,
+            wx_v2: false,
+            pku_present: false,
+            pku_active: false,
+            pcid_active: false,
+            cet_present: false,
+            cet_active: false,
+        };
+
+        // No-CET (QEMU TCG): both bits clear → "not-supported".
+        let back = MitigationReport::decode(&base.encode()).expect("decode no-cet");
+        assert!(!back.cet_present && !back.cet_active);
+
+        // Supported but inactive (CET silicon, mitigations=off): present only.
+        let present = MitigationReport {
+            cet_present: true,
+            ..base
+        };
+        let back = MitigationReport::decode(&present.encode()).expect("decode present");
+        assert!(back.cet_present && !back.cet_active);
+
+        // Active (Dell, policy on): both bits set, adjacent flags untouched.
+        let active = MitigationReport {
+            cet_present: true,
+            cet_active: true,
+            pcid_active: true,
+            ..base
+        };
+        let back = MitigationReport::decode(&active.encode()).expect("decode active");
+        assert!(back.cet_present && back.cet_active && back.pcid_active);
+        assert!(!back.pku_present && !back.pku_active);
     }
 }

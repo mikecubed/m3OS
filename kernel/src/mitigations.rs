@@ -80,6 +80,15 @@ pub struct MitigationState {
     /// cross-process switch. Set once from policy + CPU features at boot — this
     /// is a configuration flag, not a counter of barriers actually issued.
     pub ibpb_active: bool,
+    /// Phase 110 Track B.3 — CET **shadow stacks are supported** in CPUID
+    /// (`CET_SS`, [`cpuid::cet_shstk_usable`]). `false` on every QEMU lane
+    /// (TCG models no CET); `true` on the Dell Tiger Lake.
+    pub cet_present: bool,
+    /// Phase 110 Track B.3 — CET user shadow stacks are **active** this boot:
+    /// supported AND the policy is on (`!off`), so `CR4.CET` + `IA32_U_CET`
+    /// were set and each new task gets a shadow stack. The single gate the
+    /// per-task shadow-stack setup + the reporter consult. `false` on QEMU.
+    pub cet_active: bool,
     /// Guarded raw `CPUID.07H.0:EDX` (for the D.3 report wire).
     pub leaf7_edx: u32,
     /// Guarded raw `IA32_ARCH_CAPABILITIES` (for the D.3 report wire).
@@ -135,6 +144,15 @@ pub fn init_bsp() -> &'static MitigationState {
 
         let ibpb_active = !off && features.ibrs_ibpb;
 
+        // Phase 110 Track B.3 — CET user shadow stacks. Policy: on unless
+        // `mitigations=off` (a userspace CFI hardening, not tied to Meltdown —
+        // like ASLR/canaries, `auto` and `full` both enable it). Active iff the
+        // CPU advertises CET_SS. `enable_user_cet_if_supported` (BSP before
+        // `boot_aps`, per-AP, S3 resume) sets `CR4.CET` under the same
+        // condition, so this flag and the live register agree. False on QEMU.
+        let cet_present = cpuid::cet_shstk_usable();
+        let cet_active = !off && cet_present;
+
         // Track A.4 — KPTI GLOBAL-bit guard. m3OS marks no kernel PTE GLOBAL, so
         // this must be 0; a nonzero count means a future CR4.PGE optimization
         // introduced global kernel PTEs that would survive a KPTI CR3 switch and
@@ -158,12 +176,14 @@ pub fn init_bsp() -> &'static MitigationState {
             kpti_active,
             pcid_active,
             ibpb_active,
+            cet_present,
+            cet_active,
             leaf7_edx,
             arch_caps,
         };
 
         log::info!(
-            "[sec] mitigations={:?}{} ibrs={:?} ibpb={} stibp_avail={} rdcl_no={} kpti(policy={} active={}) pcid(active={} supported={}) global_kernel_ptes={}",
+            "[sec] mitigations={:?}{} ibrs={:?} ibpb={} stibp_avail={} rdcl_no={} kpti(policy={} active={}) pcid(active={} supported={}) cet(active={} supported={}) global_kernel_ptes={}",
             state.level,
             if state.level_recognized { "" } else { " (unrecognized→auto)" },
             state.ibrs_mode,
@@ -174,6 +194,8 @@ pub fn init_bsp() -> &'static MitigationState {
             state.kpti_active,
             state.pcid_active,
             cpuid::probe_pcid(),
+            state.cet_active,
+            state.cet_present,
             global_kernel_ptes,
         );
         state
@@ -191,6 +213,16 @@ pub fn init_ap() {
         // SAFETY: BSP already proved `ibrs_ibpb`; ring 0 AP boot context.
         unsafe {
             cpuid::enable_ibrs();
+        }
+    }
+    // Phase 110 Track B.3 — CET. `CR4.CET` is inherited from the BSP via the
+    // trampoline's captured `DATA_CR4`, but `IA32_U_CET` is a **per-core** MSR
+    // that the AP boots with cleared — so re-assert the user-shadow-stack
+    // enable on this core. No-op unless CET is active (QEMU: never).
+    if state.cet_active {
+        // SAFETY: BSP already proved `CET_SS`; ring 0 AP boot context.
+        unsafe {
+            cpuid::enable_user_cet_if_supported(true);
         }
     }
 }
@@ -319,6 +351,8 @@ pub fn report() -> MitigationReport {
             pku_present,
             pku_active,
             pcid_active: s.pcid_active,
+            cet_present: s.cet_present,
+            cet_active: s.cet_active,
         },
         None => MitigationReport {
             level: MitigationLevel::Auto,
@@ -332,6 +366,8 @@ pub fn report() -> MitigationReport {
             pku_present,
             pku_active,
             pcid_active: false,
+            cet_present: cpuid::cet_shstk_usable(),
+            cet_active: false,
         },
     }
 }

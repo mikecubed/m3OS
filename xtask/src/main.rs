@@ -17106,23 +17106,27 @@ fn mitigations_status_smoke_steps() -> Vec<SmokeStep> {
             label: "guest/mitigations: kernel first message",
         },
         // D.2 (policy snapshot) + Phase 110 A.4 (KPTI activation + GLOBAL
-        // guard) + Phase 110 A.5 (PCID posture): the `[sec] mitigations=...`
-        // line ends with `kpti(policy=… active=…) pcid(active=… supported=…)
+        // guard) + Phase 110 A.5 (PCID posture) + Phase 110 B.3 (CET posture):
+        // the `[sec] mitigations=...` line ends with `kpti(policy=… active=…)
+        // pcid(active=… supported=…) cet(active=… supported=…)
         // global_kernel_ptes=N`, so matching the combined tail asserts (a) the
         // whole line printed, (b) KPTI is ENFORCING this boot (active=true —
         // the A.4 flip; TCG reports `rdcl_no=false` so the default `auto` build
         // activates), (c) the A.5 PCID scheme is on its **fallback** — QEMU TCG
         // advertises neither PCID nor INVPCID, so `pcid(active=false
         // supported=false)` and the kernel runs the full-flush path (the
-        // PCID-active arm is bare-metal-only, validated on the Dell), and (d)
-        // the guard found zero GLOBAL kernel PTEs (none survive the CR3 switch).
-        // One pattern because all facts live on the same line and the serial
-        // Wait cursor advances past each match. Checked BEFORE any Send
+        // PCID-active arm is bare-metal-only, validated on the Dell), (d) the
+        // B.3 CET scheme is **not-supported** — TCG models no CET, so
+        // `cet(active=false supported=false)` and the shadow-stack path is
+        // inert (the CET-active arm is bare-metal-only, validated on the Dell),
+        // and (e) the guard found zero GLOBAL kernel PTEs (none survive the CR3
+        // switch). One pattern because all facts live on the same line and the
+        // serial Wait cursor advances past each match. Checked BEFORE any Send
         // (which drains the serial buffer).
         SmokeStep::Wait {
-            pattern: "kpti(policy=true active=true) pcid(active=false supported=false) global_kernel_ptes=0",
+            pattern: "kpti(policy=true active=true) pcid(active=false supported=false) cet(active=false supported=false) global_kernel_ptes=0",
             timeout_secs: 90,
-            label: "guest/mitigations: boot policy + A.4 KPTI active + A.5 PCID fallback + GLOBAL guard = 0",
+            label: "guest/mitigations: boot policy + A.4 KPTI active + A.5 PCID fallback + B.3 CET not-supported + GLOBAL guard = 0",
         },
     ];
     // Log into sh0 so the next Send lands at a shell prompt.
@@ -17169,6 +17173,14 @@ fn mitigations_status_smoke_steps() -> Vec<SmokeStep> {
         pattern: "KPTI PCID: fallback (full TLB flush; no PCID/INVPCID)",
         timeout_secs: 5,
         label: "guest/mitigations: reporter prints the A.5 KPTI-PCID fallback line",
+    });
+    // Phase 110 B.3 — QEMU TCG models no CET, so the reporter prints the
+    // not-supported CET posture line (the `enabled (user shadow stacks)` form
+    // is bare-metal-only, validated on the Dell).
+    steps.push(SmokeStep::Wait {
+        pattern: "CET: not-supported",
+        timeout_secs: 5,
+        label: "guest/mitigations: reporter prints the B.3 CET not-supported line",
     });
     steps
 }
