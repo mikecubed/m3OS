@@ -5202,6 +5202,15 @@ pub(super) fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         crate::process::make_fork_ctx(child_pid, user_rip, user_rsp),
         "fork-child",
     );
+    // Phase 110 B.3 — the fork child inherits the parent's shadow-stack pointer:
+    // the child's copied address space includes the parent's shadow-stack pages
+    // (mapped like every other user page), so the same SSP value points into
+    // the child's copy. No-op unless CET is active (`live` reads 0 on QEMU).
+    // (The CoW-of-shadow-stack push interaction is a Dell-validation item.)
+    let parent_ssp = crate::task::scheduler::current_task_cet_ssp_live();
+    if parent_ssp != 0 {
+        crate::task::scheduler::set_task_cet_ssp_by_tid(child_pid, parent_ssp);
+    }
 
     if let Some(parent_exec_path) = current_exec_path_for_debug()
         && is_interactive_debug_exec_path(parent_exec_path.as_str())
@@ -5915,6 +5924,20 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                 }
                 ptrace_park_and_resume();
             }
+        }
+        // Phase 110 B.3 — install this fresh image's CET user shadow stack and
+        // arm IA32_PL3_SSP before the iretq into ring 3 (no-op unless CET is
+        // active). Fail-closed: on frame exhaustion a CET-active core would
+        // fault the image's first CALL (shadow-stack push to a null SSP), so
+        // kill the exec rather than enter ring 3 unarmed. On QEMU this is an
+        // unconditional `true` (cet_active=false), so the path is inert.
+        // SAFETY: the new CR3 is live and this is the execing task's context.
+        if !crate::arch::x86_64::cet::setup_current_task_shadow_stack() {
+            // The new image is already committed (CR3 switched, table replaced),
+            // so there is no clean ENOMEM return; terminate the process instead
+            // (same fail-closed shape as the fork trampoline's missing-user-half
+            // kill). Diverges — never falls through to `enter_userspace`.
+            terminate_thread_group_and_exit(pid, -9);
         }
         crate::arch::x86_64::enter_userspace(loaded.entry, user_rsp)
     }
@@ -19572,6 +19595,33 @@ fn sys_clone_thread(
         0
     };
 
+    // Phase 110 B.3 — a CLONE_VM thread starts with a fresh call stack, so it
+    // needs its OWN empty shadow stack (unlike a fork child, which inherits the
+    // parent's). Allocate + map it in the shared address space (the parent's
+    // live CR3 IS the shared AS) BEFORE spawning, so frame exhaustion fails the
+    // clone cleanly (ENOMEM) rather than starting a thread that faults its
+    // first CALL on a CET-active core. No-op unless CET is active (QEMU).
+    let child_ssp = if crate::mitigations::state().is_some_and(|s| s.cet_active) {
+        let base = parent_addr_space.alloc_shadow_stack_va();
+        let _guard = parent_addr_space.lock_page_tables();
+        // SAFETY: the parent's live CR3 is the shared address space; lock held;
+        // the bumped region is fresh.
+        match unsafe {
+            crate::arch::x86_64::cet::map_user_shadow_stack(
+                base,
+                crate::arch::x86_64::cet::USER_SHADOW_STACK_SIZE,
+            )
+        } {
+            Some(top) => top,
+            None => {
+                const NEG_ENOMEM: u64 = (-12_i64) as u64;
+                return NEG_ENOMEM;
+            }
+        }
+    } else {
+        0
+    };
+
     // Build the child Process entry.
     let child_proc = Process {
         pid: child_pid,
@@ -19676,6 +19726,11 @@ fn sys_clone_thread(
         crate::process::make_fork_ctx_for_thread(child_pid, user_rip, child_stack),
         "clone-thread",
     );
+    // Arm the new thread's shadow-stack pointer (restored into IA32_PL3_SSP at
+    // its first dispatch). No-op when CET is inactive (child_ssp == 0).
+    if child_ssp != 0 {
+        crate::task::scheduler::set_task_cet_ssp_by_tid(child_pid, child_ssp);
+    }
 
     log::debug!("[p{}] clone_thread → child tid {}", parent_pid, child_pid);
     child_pid as u64

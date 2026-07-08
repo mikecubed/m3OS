@@ -51,6 +51,14 @@ pub struct AddressSpace {
     /// publishes it to `gs:[kpti_user_cr3]` for the entry/exit stubs to load
     /// as the ring-3 CR3. Freed by `Drop` via [`kpti::free_user_half`].
     kpti_user_pml4: AtomicU64,
+    /// Phase 110 Track B.3 — next free base VA for a CET user shadow stack in
+    /// this address space. A simple bump allocator in `PML4[255]` (a
+    /// `USER_PML4_SLOTS` slot, so shadow-stack pages are reachable on the KPTI
+    /// user CR3): the main thread (execve) takes the first slot, each
+    /// `CLONE_VM` thread the next. `0` means "not yet initialized" — set to
+    /// [`crate::arch::x86_64::cet::SHSTK_REGION_BASE`] lazily. Only touched when
+    /// CET is active.
+    cet_shstk_next: AtomicU64,
     generation: AtomicU64,
     active_on_cores: AtomicU64,
     page_table_lock: spin::Mutex<()>,
@@ -88,10 +96,29 @@ impl AddressSpace {
         Self {
             pml4_phys,
             kpti_user_pml4: AtomicU64::new(0),
+            cet_shstk_next: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             active_on_cores: AtomicU64::new(0),
             page_table_lock: spin::Mutex::new(()),
         }
+    }
+
+    /// Phase 110 Track B.3 — reserve the next CET shadow-stack base VA in this
+    /// address space (a bump allocator in `PML4[255]`). Lazily initializes the
+    /// cursor to [`crate::arch::x86_64::cet::SHSTK_REGION_BASE`]. Each call
+    /// returns a distinct, `SHSTK_STRIDE`-separated base so per-thread shadow
+    /// stacks never overlap. Only called when CET is active.
+    pub fn alloc_shadow_stack_va(&self) -> u64 {
+        use crate::arch::x86_64::cet::{SHSTK_REGION_BASE, SHSTK_STRIDE};
+        // Initialize the cursor on first use (0 = uninitialized).
+        let _ = self.cet_shstk_next.compare_exchange(
+            0,
+            SHSTK_REGION_BASE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.cet_shstk_next
+            .fetch_add(SHSTK_STRIDE, Ordering::AcqRel)
     }
 
     pub fn pml4_phys(&self) -> PhysAddr {

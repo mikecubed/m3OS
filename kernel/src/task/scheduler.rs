@@ -2902,6 +2902,37 @@ pub fn reset_current_task_fpu_state() {
     }
 }
 
+/// Phase 110 Track B.3 — record the current task's CET shadow-stack pointer so
+/// the next dispatch restores it. Called by
+/// `cet::setup_current_task_shadow_stack` after installing a fresh shadow stack
+/// (execve / clone). No-op if there is no current task.
+pub fn set_current_task_cet_ssp(ssp: u64) {
+    if let Some(idx) = get_current_task_idx() {
+        let mut sched = scheduler_lock();
+        if idx < sched.tasks.len() {
+            sched.tasks[idx].cet_ssp = ssp;
+        }
+    }
+}
+
+/// Phase 110 Track B.3 — set the CET shadow-stack pointer of the task with
+/// `tid` (used to arm a just-spawned fork child / clone thread before its first
+/// dispatch, which restores `cet_ssp` into `IA32_PL3_SSP`). No-op if not found.
+pub fn set_task_cet_ssp_by_tid(tid: u32, ssp: u64) {
+    let mut sched = scheduler_lock();
+    if let Some(task) = sched.tasks.iter_mut().find(|t| t.pid == tid) {
+        task.cet_ssp = ssp;
+    }
+}
+
+/// Phase 110 Track B.3 — the current task's live `IA32_PL3_SSP`, for a fork
+/// child to inherit (the child's copied address space includes the parent's
+/// shadow-stack pages, so the same SSP value points into the child's copy).
+/// Returns 0 when CET is inactive (QEMU) — a harmless inherited value.
+pub fn current_task_cet_ssp_live() -> u64 {
+    crate::arch::x86_64::cet::read_task_ssp_live()
+}
+
 /// Phase 86f Track B.1 — save the current task's live hardware FPU state into
 /// its `XSaveArea` and then call `f` with the raw bytes.
 ///
