@@ -36,8 +36,11 @@ Bench mechanics (flash, serial capture idiom): [phase-100 HW handoff §6](./2026
 3. **Meet the A.5 perf bound** — smoke suite ≤ 30 % slower `full` vs `off`.
 4. **Flush out the two flagged CET risks** — fork CoW-of-shadow-stack and
    nested-signal SSP handling — with targeted stress.
-5. **Batch the older HW arms** if bench time remains (111 kgdb/ptrace, 101
-   ACPI capture, 100 GUI/USB).
+5. **Batch the older bare-metal arms** if bench time remains — **Phase 103
+   power** (battery/backlight/HWP/S3; entirely bare-metal — QEMU has none of the
+   devices) and **Phase 106 M3** (install to the internal NVMe), plus 111
+   kgdb/ptrace, 101 ACPI capture, 100 GUI/USB. Two Phase 103 arms piggyback on
+   the Block 1 boot + the Phase 101 capture, so they cost almost nothing.
 
 **Definition of success:** objectives 1–3 recorded `Validated-on-HW`; objective
 4 either clean or with a captured, root-caused failure that becomes a follow-up.
@@ -252,11 +255,33 @@ restore token per delivery instead of the single slot.
 
 ---
 
-## Block 5 — batch the older HW arms (if bench time remains)
+## Block 5 — batch the older bare-metal arms (if bench time remains)
 
-Lower priority than the security work; pull exact steps from
-`next-dell-session.md`. Quick index:
+Lower priority than the security work, but the machine is already booted — and
+several of these arms exist **only** on metal (a real battery, charger, panel,
+and internal NVMe have no QEMU device). Pull exact steps from
+`next-dell-session.md`. Quick index, highest-value first:
 
+- **Phase 103 power** (image A — no separate build) — the daily-driver headline,
+  entirely bare-metal. On the default boot: `cpufreq: HWP enabled, perf range
+  <lo>..<hi>` (a real Tiger Lake range, not the QEMU no-HWP no-op),
+  `POWERD:ready battery=<path> ac=<path> zones=<N> mech=hwp` (vs the VM
+  `battery=none ac=assumed-online zones=0 mech=none`), and `m3ctl power status`
+  showing a real `battery: <pct>%` / `ac: online` / `thermal: <temp>`. **Track
+  G.3 headline arm:** unplug the charger → `Notify(ADP,0x80)` + `_BST` re-read,
+  AC online→offline, pct decreasing. Then `m3ctl backlight <pct>` visibly dims
+  the panel (photo; `_BCM`/`_BQC`). Stretch: an S3 round trip (`POWERD:resume` +
+  `_WAK(3)` → live shell/disk/brightness) **or** a clean fail-closed. **Near-zero-
+  cost overlaps:** the ACPI capture below also feeds 103's `_BST`/`_BIF` fixture
+  swap, powerd's battery posture flips from the Block 1 boot for free, and the
+  lid-switch SCI is the Phase 101 lid arm — do these in the same pass.
+- **Phase 106 NVMe install (M3)** (combined USB image) — the one arm that
+  deliberately writes the internal `nvme0n1` (**not** the USB `/dev/sda`). Boot
+  the combined USB image (M1: writable ext2 root), run `/sbin/installer --part`
+  targeting the internal NVMe, watch `INSTALLER:mode/layout/target/gpt-written/
+  esp-copied/format/populate` (no `INSTALLER:error part-*`) + the first-user
+  prompt, then reboot **with the USB removed** → the NVMe boots alone to a login
+  as the created first user.
 - **Phase 111 kgdb** (image D) — freezes at `KGDB:waiting`; attach a raw-RSP
   client (or real `gdb`) over COM2 (USB-serial adapter at `0x2F8`), breakpoint at
   `nm` addr + `0x10000000000`, confirm hit + register/memory read-back; then the

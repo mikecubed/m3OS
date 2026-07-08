@@ -47,6 +47,42 @@ handoff](./2026-06-30-phase-100-bare-metal-gui-hw-validation.md) §6.
       `acpid` GPE/fixed dispatch to log it (D.3/D.4 HW arm; charter's
       lid `Validated-on-HW` item). Power button press is the fallback arm.
 
+## Phase 103 — Laptop Power Management (battery/backlight/HWP/S3 on metal)
+
+Merged 2026-07-02 (PRs #286–#293). The phase's headline claim — a usable
+daily-driver laptop — is **entirely bare-metal**: QEMU q35 has no battery, no
+charger, no backlight panel, and no HWP MSRs, so `powerd` runs a no-device
+posture in CI and every live datapath carries a `Validated-on-HW (run N, date)`
+status (Track G.3). The Precision 5560 (Tiger Lake) is the target. Several arms
+piggyback on the Block-1 boot and the Phase 101 ACPI capture above — batch them
+in one pass.
+
+- [ ] **Battery + AC read correctly** — on the default boot the `POWERD:ready`
+      line reads `battery=<path> ac=<path> zones=<N> mech=hwp` (vs the QEMU
+      `battery=none ac=assumed-online zones=0 mech=none`), and `m3ctl power
+      status` prints a real `battery: <pct>%` / `ac: online` / `thermal: <temp>` /
+      `governor: conservative (mech hwp, target N)`.
+- [ ] **AC flips on charger unplug** (Track G.3 headline arm) — pull the charger:
+      expect `Notify(ADP,0x80)` + a `_BST` re-read, AC online→offline, and the
+      percentage decreasing on the next `m3ctl power status`. Replug → online again.
+- [ ] **Backlight brightness** — `m3ctl backlight <pct>` / `up` / `down` drives
+      `_BCM` and **visibly dims the panel** (capture a photo); `_BQC` reads it
+      back. On the panel-less VM this is `backlight: no device`; restore-on-resume
+      joins the S3 arm.
+- [ ] **HWP P-states** — boot line `cpufreq: HWP enabled, perf range <lo>..<hi>`
+      with a real Tiger Lake range (vs the QEMU no-HWP no-op); the governor target
+      programs `IA32_HWP_REQUEST` (package-wide on Tiger Lake — per-core IPI
+      broadcast is a known residual).
+- [ ] **S3 suspend/resume on real firmware (stretch)** — `m3ctl power suspend`
+      → quiesce (AP park + blk drain) → `_PTS(3)` + SLP_TYP write → wake →
+      `_WAK(3)` → `POWERD:resume` → a live shell + disk + re-applied brightness;
+      **or** it fails closed to a live session (an acceptable stretch outcome —
+      record it). Residuals: GPE re-arm, framebuffer re-mode-set on the real GPU,
+      S0ix. (QEMU S3 round trip is green incl. PS/2 re-init; the Dell arm pends.)
+- [ ] **Real `_BST`/`_BIF` fixture swap** — the Track A host tests run on
+      synthetic Dell-shaped packages; capture the real battery objects during the
+      Phase 101 DSDT dump and re-point the decode tests at them (shares that capture).
+
 ## Phase 110 — Real-Hardware Security (KPTI Meltdown + PCID on metal)
 
 Track A (KPTI) is merged and live on every QEMU boot, but QEMU TCG models
@@ -125,7 +161,21 @@ kgdb stub exists). All are `#[cfg]`-gated features — build with
       breakpoint + step + continue-to-exit. Optional: a `-g` (DWARF) userspace
       build + real `gdb` for source-level stepping (the D.4 follow-on).
 
-## Phase 106 — USB Installer (when the combined image lands)
+## Phase 106 — USB Installer + NVMe (Track E bare-metal sign-off)
 
-- [ ] **M1 rung** — boot the combined GPT(ESP+ext2) image from USB and confirm a
-      *writable* ext2 root (not the ramdisk fallback); record per protocol.
+Merged 2026-07-03/05 (PRs #294–#307). Track E — **M1** (USB boot) + **M3** (real
+NVMe install) — is the only open Phase 106 item; operator-owned, needs physical
+access. QEMU proves both in CI (`usb-root-smoke`, `nvme-install-smoke`,
+`nvme-install-part-smoke`); the Dell is the sign-off.
+
+- [ ] **M1 — USB boot to a writable root** — boot the combined GPT(ESP+ext2)
+      image from USB; confirm a *writable* ext2 root (not the ramdisk fallback):
+      OVMF loads the ESP, init brings up xhci + usb-storage, the GPT scan finds the
+      ext2 partition, and a serial login writes + reads back a file.
+- [ ] **M3 — install to the internal NVMe** — the one arm that deliberately writes
+      `nvme0n1` (the internal system disk — **not** the USB `/dev/sda`). On the
+      USB-booted system run `/sbin/installer --part` targeting the NVMe; watch
+      `INSTALLER:mode/layout/target/gpt-written/esp-copied/format/populate` with no
+      `INSTALLER:error part-*`, answer the first-user account prompt, then reboot
+      **with the USB removed** → the NVMe boots alone to a login as the created
+      first user (the `--raw` sparse-copy arm is the fallback).
