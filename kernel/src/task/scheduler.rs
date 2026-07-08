@@ -2933,6 +2933,41 @@ pub fn current_task_cet_ssp_live() -> u64 {
     crate::arch::x86_64::cet::read_task_ssp_live()
 }
 
+/// Phase 110 Track B.3 — at signal delivery, stash the current task's live
+/// user `IA32_PL3_SSP` (the interrupted context's shadow-stack pointer) so
+/// `sigreturn` can restore it. No-op when CET is inactive.
+pub fn save_current_task_signal_ssp() {
+    if !crate::mitigations::state().is_some_and(|s| s.cet_active) {
+        return;
+    }
+    let ssp = crate::arch::x86_64::cet::read_task_ssp_live();
+    if let Some(idx) = get_current_task_idx() {
+        let mut sched = scheduler_lock();
+        if idx < sched.tasks.len() {
+            sched.tasks[idx].cet_signal_ssp = ssp;
+        }
+    }
+}
+
+/// Phase 110 Track B.3 — at `sigreturn`, restore the shadow-stack pointer
+/// stashed at signal delivery into `IA32_PL3_SSP`, discarding the handler's
+/// shadow-stack frames so the interrupted context resumes with a matching SSP.
+/// No-op when CET is inactive.
+pub fn restore_current_task_signal_ssp() {
+    if !crate::mitigations::state().is_some_and(|s| s.cet_active) {
+        return;
+    }
+    let saved = get_current_task_idx().and_then(|idx| {
+        let sched = scheduler_lock();
+        sched.get_task(idx).map(|t| t.cet_signal_ssp)
+    });
+    if let Some(ssp) = saved
+        && ssp != 0
+    {
+        crate::arch::x86_64::cet::restore_task_ssp(ssp);
+    }
+}
+
 /// Phase 86f Track B.1 — save the current task's live hardware FPU state into
 /// its `XSaveArea` and then call `f` with the raw bytes.
 ///

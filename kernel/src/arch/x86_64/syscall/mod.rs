@@ -3026,6 +3026,10 @@ fn deliver_user_signal(
     //    ignore RSI/RDX — Linux likewise always sets them for rt_sigframe.
     let siginfo_ptr = frame_rsp + crate::signal::OFF_SIGINFO as u64;
     let ucontext_ptr = frame_rsp + crate::signal::OFF_UCONTEXT as u64;
+    // Phase 110 B.3 — stash the interrupted context's user shadow-stack pointer
+    // so sigreturn restores it (the handler runs on the same shadow stack,
+    // pushing below the saved SSP). No-op unless CET is active.
+    crate::task::scheduler::save_current_task_signal_ssp();
     unsafe {
         enter_signal_handler(
             handler_entry,
@@ -3844,6 +3848,11 @@ unsafe fn restore_and_enter_userspace(regs: &crate::signal::SavedUserRegs) -> ! 
     const PRIV_MASK: u64 =
         (1 << 12) | (1 << 13) | (1 << 14) | (1 << 17) | (1 << 19) | (1 << 20) | (1 << 21);
     let rflags = (regs.rflags & !PRIV_MASK) | 0x202;
+    // Phase 110 B.3 — restore the pre-signal user shadow-stack pointer stashed
+    // at delivery, so the interrupted context resumes with a matching SSP (the
+    // handler's shadow-stack frames are discarded). No-op unless CET is active.
+    // Done before the iretq trampoline, which reloads SSP from IA32_PL3_SSP.
+    crate::task::scheduler::restore_current_task_signal_ssp();
     unsafe { sigreturn_enter_userspace(regs, ss, cs, rflags) }
 }
 

@@ -1179,6 +1179,13 @@ static IDT: Lazy<PageIsolated<InterruptDescriptorTable>> = Lazy::new(|| {
         idt.general_protection_fault.set_handler_addr(VirtAddr::new(
             general_protection_fault_entry as *const () as u64,
         ));
+        // Phase 110 Track B.3 — #CP (Control-Protection, vector 21): a caught
+        // shadow-stack / CFI violation. Fires only on CET silicon; the naked
+        // stub + body kill the offending ring-3 process (Dell-only in practice,
+        // inert on QEMU). DPL stays 0 — #CP is a hardware fault, never an `int`.
+        idt.cp_protection_exception.set_handler_addr(VirtAddr::new(
+            control_protection_fault_entry as *const () as u64,
+        ));
     }
     // Phase 110 A.3b — #DF uses the paranoid KPTI naked stub (`double_fault_entry`
     // → `double_fault_body`). It runs on the DF IST stack, whose top page is
@@ -2054,6 +2061,54 @@ extern "C" fn general_protection_fault_body(frame: &mut TrapFrameErr) {
     _panic_print(format_args!(
         "[int] GPF error_code={:#x} (selector_idx={}, table={}, external={})\n",
         err, selector_idx, table, external
+    ));
+    panic_diag::dump_crash_context();
+    crate::trace::dump_trace_rings();
+    crate::hlt_loop();
+}
+
+/// Phase 110 Track B.3 — #CP (Control-Protection, vector 21) handler body.
+///
+/// A `#CP` fires when a hardware CFI check fails — for shadow stacks, a `RET`
+/// whose return address on the data stack disagrees with the shadow stack (a
+/// return-address overwrite the stack canary missed). It carries an error code
+/// whose low bits identify the sub-cause (1 = NEAR-RET, 2 = FAR-RET/IRET,
+/// 3 = ENDBR/missing-endbranch, etc.). m3OS enables only *user* shadow stacks,
+/// so a ring-3 `#CP` is a caught ROP/overwrite: kill the process (Linux
+/// delivers SIGSEGV/`SEGV_CPERR`). A ring-0 `#CP` is a kernel CFI bug — halt.
+///
+/// Only ever fires on CET silicon (QEMU models no CET), so this is Dell-only in
+/// practice; the stub + registration are inert on every QEMU boot.
+#[unsafe(no_mangle)]
+extern "C" fn control_protection_fault_body(frame: &mut TrapFrameErr) {
+    clac_on_irq_entry();
+    let err = frame.error_code;
+    if frame.from_user() {
+        let pid = crate::process::current_pid();
+        _panic_print(format_args!(
+            "[int] userspace #CP (CET control-protection): pid={} rip={:#x} rsp={:#x} err={:#x} \
+             (shadow-stack/CFI violation — return-address overwrite) — process killed\n",
+            pid, frame.rip, frame.rsp, err,
+        ));
+        panic_diag::dump_crash_context();
+        crate::trace::dump_trace_rings();
+        FAULT_KILL_PID.store(pid, Ordering::Relaxed);
+        // Redirect to the ring-0 kill trampoline on the current kernel stack
+        // (identical pattern to page_fault_body / general_protection_fault_body).
+        let kernel_rsp: u64;
+        unsafe {
+            core::arch::asm!("mov {}, rsp", out(reg) kernel_rsp);
+        }
+        frame.rip = fault_kill_trampoline as *const () as u64;
+        frame.cs = u64::from(gdt::kernel_code_selector().0);
+        frame.rflags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG.bits();
+        frame.rsp = kernel_rsp;
+        frame.ss = u64::from(gdt::kernel_data_selector().0);
+        return;
+    }
+    _panic_print(format_args!(
+        "[int] KERNEL #CP (control-protection): rip={:#x} rsp={:#x} err={:#x} — kernel CFI bug\n",
+        frame.rip, frame.rsp, err,
     ));
     panic_diag::dump_crash_context();
     crate::trace::dump_trace_rings();
@@ -3938,6 +3993,23 @@ core::arch::global_asm!(
     "mov rsp, r12",
     "kpti_exit_iretq_err",
     "",
+    // --- #CP (Control-Protection, vector 21; error code; Phase 110 B.3) --------
+    // Same shape as #GP: paranoid entry (a ring-3 #CP could in principle arrive
+    // while a trampoline holds the user CR3), the ring-3-only trampoline-stack
+    // copy, the error-code exit. Fires only on CET silicon (inert on QEMU).
+    ".global control_protection_fault_entry",
+    "control_protection_fault_entry:",
+    "kpti_save_gprs",
+    "kpti_paranoid_entry",
+    "kpti_entry_copy_if_user 136, 21",
+    "cld",
+    "mov rdi, rsp",
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call control_protection_fault_body",
+    "mov rsp, r12",
+    "kpti_exit_iretq_err",
+    "",
     // --- NMI (paranoid; IST stack; no error code) -----------------------------
     ".global nmi_entry",
     "nmi_entry:",
@@ -4012,6 +4084,7 @@ core::arch::global_asm!(
 unsafe extern "C" {
     fn page_fault_entry();
     fn general_protection_fault_entry();
+    fn control_protection_fault_entry();
     fn nmi_entry();
     fn double_fault_entry();
     fn keyboard_entry();
