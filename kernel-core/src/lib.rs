@@ -6,6 +6,7 @@ pub mod acpi;
 pub mod address_space;
 pub mod audio;
 pub mod buddy;
+pub mod cet;
 pub mod cred;
 pub mod cross_cpu_free;
 pub mod csprng;
