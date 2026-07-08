@@ -1488,7 +1488,7 @@ pub fn spawn_process_with_cr3(
     // Phase 110 A.3b part 5 — build the KPTI user half alongside the address
     // space (no-op while KPTI is inactive).
     let addr_space = Arc::new(AddressSpace::new(cr3));
-    addr_space.build_kpti_user_half(kstack_top);
+    addr_space.build_kpti_user_half();
     let proc = Process {
         pid,
         tid: pid,
@@ -1561,7 +1561,7 @@ pub fn spawn_process_with_cr3_and_fds(
     // Phase 110 A.3b part 5 — build the KPTI user half alongside the address
     // space (no-op while KPTI is inactive).
     let addr_space = Arc::new(AddressSpace::new(cr3));
-    addr_space.build_kpti_user_half(kstack_top);
+    addr_space.build_kpti_user_half();
     let proc = Process {
         pid,
         tid: pid,

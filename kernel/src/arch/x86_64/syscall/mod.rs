@@ -5669,13 +5669,9 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // Keep the old AddressSpace alive across the CR3 switch. The process table
     // replacement below drops its Arc, but this core still runs on the old CR3
     // until `Cr3::write(new_cr3)` completes.
-    let (_old_addr_space, proc_kstack_top) = {
+    let _old_addr_space = {
         let table = crate::process::PROCESS_TABLE.lock();
-        let entry = table.find(pid);
-        (
-            entry.and_then(|p| p.addr_space.as_ref().cloned()),
-            entry.map(|p| p.kernel_stack_top).unwrap_or(0),
-        )
+        table.find(pid).and_then(|p| p.addr_space.as_ref().cloned())
     };
     let old_as_ptr = _old_addr_space
         .as_ref()
@@ -5694,7 +5690,7 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // ring 3 without a user half while KPTI is active. The fresh page table
     // leaks on this path, like every other post-`new_process_page_table`
     // error return (bump allocator).
-    if !new_addr_space.build_kpti_user_half(proc_kstack_top) {
+    if !new_addr_space.build_kpti_user_half() {
         return NEG_ENOMEM;
     }
     let new_as_ptr = alloc::sync::Arc::as_ptr(&new_addr_space);
@@ -19554,22 +19550,13 @@ fn sys_clone_thread(
     };
 
     // Allocate a NEW kernel stack for the child thread.
-    let kstack_top = alloc_kernel_stack_pub();
-
-    // Phase 110 A.3b part 5 — the shared user half maps only the creating
-    // task's kstack top page; this thread's ring-3 interrupt frames push onto
-    // ITS kstack top on the user CR3, so map that page too (no-op while KPTI
-    // is inactive).
     //
-    // A.4 fail-closed: on mapping failure the thread must not start — its
-    // first ring-3 interrupt would push the CPU frame onto an unmapped kstack
-    // top on the user CR3 and escalate #PF → #DF, killing the whole thread
-    // group. Fail the clone cleanly instead (the freshly-allocated kstack
-    // leaks, like the other rare OOM error returns).
-    if !parent_addr_space.kpti_map_thread_kstack(kstack_top) {
-        const NEG_ENOMEM: u64 = (-12_i64) as u64;
-        return NEG_ENOMEM;
-    }
+    // Phase 110 hardening — no per-thread KPTI work is needed here anymore:
+    // ring-3 interrupt frames land on the per-CPU trampoline stack (already
+    // in the shared entry set), not on the thread's kstack top, so the
+    // pre-hardening `kpti_map_thread_kstack` call (and its ENOMEM
+    // fail-closed arm) is gone.
+    let kstack_top = alloc_kernel_stack_pub();
 
     // Determine TLS: if CLONE_SETTLS, use the provided tls value.
     let child_fs_base = if flags & CLONE_SETTLS != 0 {

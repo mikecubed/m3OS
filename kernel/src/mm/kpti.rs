@@ -46,17 +46,18 @@
 //! them on the user CR3 when an interrupt fires while ring 3 runs), and the IDT.
 //! The CPU reads GDT/IDT/TSS and switches to the IST top through the *active*
 //! paging when delivering a ring-3 → ring-0 interrupt, so all must be user-mapped
-//! or delivery itself triple-faults. [`build_user_half`] adds the two per-process
-//! bits: the shared user-mapping slots (`kernel_core::kpti::USER_PML4_SLOTS` —
-//! `PML4[0]` for image/brk/mmap and `PML4[255]` for the stack, the same
-//! sub-table frames the kernel half points at, so user mappings stay in sync)
-//! and this process's **kstack top page** — where the CPU pushes the interrupt
-//! frame on the user CR3 before the stub switches to the kernel CR3 (only the
-//! top page is exposed; the whole kstack reappears once on the kernel half).
+//! or delivery itself triple-faults. [`build_user_half`] adds the single
+//! per-process bit: the shared user-mapping slots
+//! (`kernel_core::kpti::USER_PML4_SLOTS` — `PML4[0]` for image/brk/mmap and
+//! `PML4[255]` for the stack, the same sub-table frames the kernel half points
+//! at, so user mappings stay in sync). The entry set itself is fully
+//! process-independent.
 //!
 //! The self-test builds a real user half via [`build_user_half`] over a
-//! synthetic kernel PML4, then (a) walks it and asserts no kernel-secret leaf
-//! and (b) round-trip-translates every entry-set page to prove it is reachable.
+//! synthetic kernel PML4, then (a) walks it and asserts no kernel-secret leaf,
+//! (b) round-trip-translates every entry-set page to prove it is reachable,
+//! and (c) asserts the pre-hardening per-task page (a kernel-stack top) is
+//! **not** reachable (`reason=kstack-reachable`).
 //!
 //! **Isolation status.** The A.3a caveat — GDT/IDT/TSS as ordinary statics
 //! exposing adjacent `.data` through the entry-set mappings — is **closed**
@@ -64,10 +65,13 @@
 //! are `PageIsolated` (`arch::x86_64::gdt::PageIsolated`: page-aligned,
 //! page-multiple-sized, so each owns its pages exclusively — the m3OS
 //! `cpu_entry_area`), and the self-test asserts their page alignment
-//! (`reason=entry-struct-alignment`). Remaining accepted surface: the kstack
-//! top page exposes ~4 KiB of this process's **own** kernel stack to itself —
-//! small, bounded, self-only; hardening it means a dedicated per-CPU
-//! trampoline stack (post-A.4 follow-up).
+//! (`reason=entry-struct-alignment`). The A.3b accepted surface — the kstack
+//! top page exposing ~4 KiB of the process's own kernel stack — is **also
+//! closed** (Phase 110 hardening, 18–21/n): TSS.RSP0 targets a dedicated
+//! per-CPU trampoline stack whose frames only ever hold ring-3 register
+//! state; the entry stubs copy them to the task kstack after the CR3 switch,
+//! the exit paths build their `iretq` frames on it, and no kernel-stack page
+//! is mapped into any user half.
 
 use alloc::vec::Vec;
 
@@ -380,8 +384,10 @@ fn build_synthetic_kernel_pml4() -> Option<(u64, Vec<u64>)> {
 /// the shared, core-independent `.text.kpti_entry` section and the IDT. A
 /// process may run on any core, so every online core's structures are included.
 ///
-/// Does **not** include the per-process bits (`PML4[0]` user PDPT, the process
-/// kstack top page) — those are added by [`build_user_half`] / the self-test.
+/// Does **not** include the per-process user-mapping slots (`PML4[0]` +
+/// `PML4[255]`) — those are shared verbatim by [`build_user_half`]. Since the
+/// trampoline-stack hardening this set is the ENTIRE kernel-side content of
+/// every user half (no per-task pages remain).
 fn collect_entry_pages() -> Option<Vec<(u64, u64, PageTableFlags)>> {
     let mut out: Vec<(u64, u64, PageTableFlags)> = Vec::new();
     // SAFETY: no other mapper is live here; get_mapper wraps the active
@@ -467,11 +473,16 @@ fn collect_entry_pages() -> Option<Vec<(u64, u64, PageTableFlags)>> {
 }
 
 /// Build a live per-process **user-half** PML4 for the kernel PML4 at
-/// `kernel_pml4_phys`, mapping the shared entry set, this process's kstack top
-/// page (`kstack_top_va`, where the CPU pushes an IRQ frame on the user CR3),
-/// and — shared with the kernel half — the user-mapping slots
-/// (`kernel_core::kpti::USER_PML4_SLOTS`: `PML4[0]` image/brk/mmap +
-/// `PML4[255]` stack).
+/// `kernel_pml4_phys`, mapping the shared entry set and — shared with the
+/// kernel half — the user-mapping slots (`kernel_core::kpti::USER_PML4_SLOTS`:
+/// `PML4[0]` image/brk/mmap + `PML4[255]` stack).
+///
+/// Since the trampoline-stack hardening the entry set is fully
+/// process-independent: ring-3 interrupt frames land on the per-CPU KPTI
+/// trampoline stack (its top page is in [`collect_entry_pages`]), so no
+/// per-task kstack page is mapped — the whole kernel-stack region
+/// (`PML4[257]`) is unreachable from every user CR3, and `CLONE_VM` threads
+/// need no per-thread map.
 ///
 /// Returns the user PML4 physical address, or `None` on allocation failure.
 /// A.4 publishes this per-core at dispatch (`smp::publish_kpti_cr3_pair`) and
@@ -479,20 +490,11 @@ fn collect_entry_pages() -> Option<Vec<(u64, u64, PageTableFlags)>> {
 ///
 /// # Safety
 /// `kernel_pml4_phys` must be a valid process kernel PML4 reachable through the
-/// direct map, and `kstack_top_va` a mapped kernel-stack top for this process.
-pub unsafe fn build_user_half(kernel_pml4_phys: u64, kstack_top_va: u64) -> Option<u64> {
+/// direct map.
+pub unsafe fn build_user_half(kernel_pml4_phys: u64) -> Option<u64> {
     let phys_off = phys_offset();
 
-    let mut entry_pages = collect_entry_pages()?;
-    // This process's kstack top page: RSP0 points here, so the CPU pushes the
-    // ring-3 → ring-0 interrupt frame onto it on the *user* CR3. Only the top
-    // page is exposed (the stub switches to the kernel CR3, which maps the whole
-    // kstack, before touching anything below it).
-    {
-        let kmapper = unsafe { super::paging::get_mapper() };
-        let top_page = (kstack_top_va - 1) & !0xFFF;
-        push_kernel_range(&kmapper, &mut entry_pages, top_page, top_page + 0x1000, RW)?;
-    }
+    let entry_pages = collect_entry_pages()?;
 
     // Allocate + zero the user PML4.
     let user_pml4 = frame_allocator::allocate_frame()?;
@@ -609,72 +611,20 @@ pub unsafe fn free_user_half(user_pml4_phys: u64) {
     frame_allocator::free_frame(user_pml4_phys);
 }
 
-/// Phase 110 A.3b part 5 — map one additional kernel-stack **top page** into
-/// an existing user half (a `CLONE_VM` thread's own kstack): the CPU pushes
-/// that thread's ring-3 interrupt frames onto *its* kstack top on the user
-/// CR3, so every thread's top page must be present, not just the page
-/// [`build_user_half`] mapped for the creating task.
-///
-/// Sub-tables created here are freed by [`free_user_half`]'s generic
-/// `PML4[1..512]` walk. The mapping only makes absent entries present, so it
-/// is safe while the half is live as a sibling thread's CR3 on another core
-/// (no shootdown needed); the *caller* must serialize concurrent mappers
-/// (`AddressSpace::kpti_map_thread_kstack` holds the page-table lock).
-///
-/// # Safety
-/// `user_pml4_phys` must be a user half built by [`build_user_half`] over this
-/// process's kernel PML4, and `kstack_top_va` a mapped kernel-stack top.
-pub unsafe fn map_kstack_top_into_user_half(user_pml4_phys: u64, kstack_top_va: u64) -> Option<()> {
-    let top_page = (kstack_top_va - 1) & !0xFFF;
-    let phys = {
-        // SAFETY: translation-only mapper over the live kernel CR3, dropped
-        // before the user-half mapper below is created (the A.1 aliasing rule).
-        let kmapper = unsafe { super::paging::get_mapper() };
-        kmapper.translate_addr(VirtAddr::new(top_page))?.as_u64()
-    };
-    let frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(PhysAddr::new(user_pml4_phys));
-    // SAFETY: caller serializes mappers over this user half.
-    let mut mapper = unsafe { mapper_for_frame(frame) };
-    let mut sink: Vec<u64> = Vec::new();
-    let res = {
-        let mut alloc = RecordingAlloc {
-            recorded: &mut sink,
-        };
-        // SAFETY: exclusive mapper (caller-serialized); valid frame from the
-        // live translation above.
-        unsafe { map_entry_page(&mut mapper, top_page, phys, RW, &mut alloc) }
-    };
-    match res {
-        Ok(()) => Some(()),
-        Err(_) => {
-            for f in &sink {
-                frame_allocator::free_frame(*f);
-            }
-            None
-        }
-    }
-}
-
 /// Build a real user-half PML4 via the production [`build_user_half`] over a
 /// synthetic kernel PML4, returning the arena for the caller to walk then free.
 ///
 /// This exercises the exact builder + free path A.4 activation uses (the shared
-/// entry set from `collect_entry_pages`, the shared user-mapping slots, the
-/// kstack top page, and `free_user_half`), rather than a bespoke test-only
-/// table.
+/// entry set from `collect_entry_pages`, the shared user-mapping slots, and
+/// `free_user_half`), rather than a bespoke test-only table.
 fn build_selftest_pair() -> Option<SelfTestArena> {
     // A synthetic kernel half with one user leaf per user-mapping slot
     // (PML4[0] image + PML4[255] stack).
     let (kernel_pml4_phys, owned_frames) = build_synthetic_kernel_pml4()?;
 
-    // A real, mapped kernel-stack top to stand in for the process kstack (its
-    // top page is what RSP0 points at / the CPU pushes an IRQ frame onto).
-    let kstack_top = crate::arch::x86_64::gdt::syscall_stack_top();
-
     // The production builder.
-    // SAFETY: kernel_pml4_phys is the synthetic half just built; kstack_top is a
-    // live mapped kernel stack top.
-    let user_pml4_phys = match unsafe { build_user_half(kernel_pml4_phys, kstack_top) } {
+    // SAFETY: kernel_pml4_phys is the synthetic half just built.
+    let user_pml4_phys = match unsafe { build_user_half(kernel_pml4_phys) } {
         Some(p) => p,
         None => {
             for f in &owned_frames {
@@ -684,38 +634,10 @@ fn build_selftest_pair() -> Option<SelfTestArena> {
         }
     };
 
-    // A.3b part 5 — exercise the CLONE_VM thread-kstack add path
-    // (`map_kstack_top_into_user_half`) against the just-built half. The page
-    // below the BSP syscall-stack top stands in for a second thread's kstack
-    // top: live-mapped, and not already in the entry set (the builder mapped
-    // only the top page). Its reachability is asserted by the round-trip below
-    // like every other entry-set page.
-    let thread_kstack_top = kstack_top - 0x1000;
-    if unsafe { map_kstack_top_into_user_half(user_pml4_phys, thread_kstack_top) }.is_none() {
-        unsafe { free_user_half(user_pml4_phys) };
-        for f in &owned_frames {
-            frame_allocator::free_frame(*f);
-        }
-        return None;
-    }
-
     // Recompute the entry-set page list (deterministic) for classification +
-    // reachability: the shared set + this half's kstack top page + the
-    // thread-add page.
-    let mut entry_pages = collect_entry_pages()?;
-    let top_page = (kstack_top - 1) & !0xFFF;
-    // SAFETY: translate through the live kernel map for the expected phys.
-    let (kstack_phys, thread_page_phys) = {
-        let kmapper = unsafe { super::paging::get_mapper() };
-        (
-            kmapper.translate_addr(VirtAddr::new(top_page))?.as_u64(),
-            kmapper
-                .translate_addr(VirtAddr::new((thread_kstack_top - 1) & !0xFFF))?
-                .as_u64(),
-        )
-    };
-    entry_pages.push((top_page, kstack_phys, RW));
-    entry_pages.push(((thread_kstack_top - 1) & !0xFFF, thread_page_phys, RW));
+    // reachability. Since the trampoline-stack hardening the set is fully
+    // process-independent — no per-task kstack page is added.
+    let entry_pages = collect_entry_pages()?;
 
     // The synthetic user leaves, resolved through the synthetic KERNEL half —
     // the user half must translate each to the same frame (shared sub-trees).
@@ -955,6 +877,15 @@ pub fn self_test() {
         }
     }
 
+    // Phase 110 hardening — negative round-trip: the page the pre-hardening
+    // design mapped per-process (the stand-in kstack top = the BSP
+    // syscall-stack top page) must now be UNREACHABLE from the user CR3.
+    // Ring-3 frames land on the per-CPU trampoline stack instead; the kernel
+    // stacks are kernel-CR3-only, closing the A.3b ~4 KiB self-leak.
+    let kstack_top_page = (crate::arch::x86_64::gdt::syscall_stack_top() - 1) & !0xFFF;
+    // SAFETY: user_pml4_phys is a valid, non-live PML4 read via direct map.
+    let kstack_reachable = unsafe { translate_in(arena.user_pml4_phys, kstack_top_page) }.is_some();
+
     // Free the throwaway pair before reporting (report is the observable point).
     let user_pml4_phys = arena.user_pml4_phys;
     let entry_page_count = arena.entry_pages.len();
@@ -971,6 +902,10 @@ pub fn self_test() {
         log::error!(
             "KPTI_SELFTEST:FAIL reason=user-slot-unreachable unreachable={user_unreachable} of {user_leaf_count}"
         );
+        return;
+    }
+    if kstack_reachable {
+        log::error!("KPTI_SELFTEST:FAIL reason=kstack-reachable page={kstack_top_page:#x}");
         return;
     }
 
