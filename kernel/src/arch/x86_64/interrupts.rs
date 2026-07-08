@@ -1553,6 +1553,29 @@ extern "C" fn page_fault_body(frame: &mut TrapFrameErr) {
         // page marked with BIT_9 (the CoW marker set by cow_clone_user_pages).
         let is_write = err.contains(PageFaultErrorCode::CAUSED_BY_WRITE);
         let is_present = err.contains(PageFaultErrorCode::PROTECTION_VIOLATION);
+
+        // Phase 110 hardening — KPTI top-level-slot sync (Linux vmalloc-fault
+        // analogue). MUST be the first recovery: if a USER_PML4_SLOTS entry
+        // was empty when this process's KPTI pair was built and the kernel
+        // half has since populated it, ring 3 faults on the user CR3 (P=0)
+        // while the kernel-half walk looks fine — and the demand/CoW paths
+        // below would see the page already mapped in the kernel half and
+        // return success WITHOUT fixing the user half, turning the wedge into
+        // a silent infinite #PF loop. Sync the divergent top-level slot into
+        // the user half and retry. Gated on `!is_present` (the wedge always
+        // presents as not-present from the user CR3) and no-op when KPTI is
+        // inactive. All current layouts pre-populate both user slots before
+        // the pair is built, so this fires essentially never — it is the
+        // safety net for any future layout that grows a user slot lazily.
+        if !is_present
+            && let Ok(fault_vaddr) = addr
+            && let Some(addr_space) = crate::process::current_addr_space()
+            && unsafe { addr_space.as_ref() }.kpti_sync_user_slot_on_fault(fault_vaddr.as_u64())
+        {
+            crate::task::scheduler::current_task_record_page_fault(false);
+            assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
+            return;
+        }
         if is_write
             && is_present
             && let Ok(fault_vaddr) = addr

@@ -141,6 +141,35 @@ impl AddressSpace {
         self.kpti_user_pml4.load(Ordering::Acquire)
     }
 
+    /// Phase 110 hardening — the `#PF`-time top-level-slot sync. On a
+    /// not-present ring-3 fault, re-copy the top-level `PML4` slot covering
+    /// `fault_va` from this space's kernel half into its live user half if
+    /// they diverged (a `USER_PML4_SLOTS` entry that was empty when the pair
+    /// was built and has since been populated in the kernel half). Returns
+    /// `true` if it repaired the slot (the caller should retry the faulting
+    /// instruction), `false` otherwise (no user half, not a syncable slot, or
+    /// already in sync — fall through to the normal fault handling).
+    ///
+    /// No-op (`false`) when no user half exists (KPTI inactive). Serialized
+    /// against other page-table mutators via the page-table lock; a
+    /// full-local-both-PCID flush follows a real repair (cheap — this fires
+    /// essentially never, and covers the paranoid case of a slot replaced
+    /// rather than filled).
+    pub fn kpti_sync_user_slot_on_fault(&self, fault_va: u64) -> bool {
+        let user = self.kpti_user_pml4.load(Ordering::Acquire);
+        if user == 0 {
+            return false;
+        }
+        let _guard = self.lock_page_tables();
+        // SAFETY: `pml4_phys` is this space's live kernel half and `user` its
+        // user half built over it; the page-table lock serializes writers.
+        let repaired = unsafe { kpti::sync_slot_raw(self.pml4_phys.as_u64(), user, fault_va) };
+        if repaired {
+            crate::smp::tlb::flush_local_all();
+        }
+        repaired
+    }
+
     pub fn activate_on_core(&self, core_id: u8) {
         self.active_on_cores
             .fetch_or(1u64 << core_id, Ordering::Release);

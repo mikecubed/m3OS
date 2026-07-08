@@ -93,6 +93,27 @@ pub fn may_clone_slot_into_user_half(idx: usize) -> bool {
     is_user_pml4_slot(idx)
 }
 
+/// Decide whether the `#PF`-time top-level-slot sync (the Linux
+/// vmalloc-fault analogue) may re-copy `PML4[idx]` from the kernel half into
+/// a live user half.
+///
+/// The sync exists for one latent wedge: a [`USER_PML4_SLOTS`] entry that was
+/// **empty** in the kernel half when the pair was built is cloned empty into
+/// the user half, and if the kernel half later populates it, every ring-3
+/// touch of that region faults on the user CR3 while the kernel-half walk
+/// looks fine — a silent infinite `#PF` loop (the fault handler's
+/// already-mapped fast paths return success without fixing the user half).
+///
+/// The admission rule is deliberately identical to
+/// [`may_clone_slot_into_user_half`]: only the declared user-mapping slots
+/// may ever be synced, so a fault at a *kernel* address (the direct map, the
+/// heap, the image) can never pull a kernel slot into a user half through
+/// this path — the sync cannot be turned into a KPTI bypass.
+#[inline]
+pub fn may_sync_slot_on_fault(idx: usize) -> bool {
+    is_user_pml4_slot(idx)
+}
+
 /// The KPTI walk invariant for the **user** PML4, expressed over a flat list of
 /// `(role, present_in_user_half)` observations a walker produces. Returns `Ok`
 /// iff every kernel-secret range (`KernelImage`/`KernelHeap`/`DirectMap`) is
@@ -166,6 +187,27 @@ mod tests {
         // slot, called out explicitly (the two most dangerous accidents).
         assert!(!may_clone_slot_into_user_half(KERNEL_IMAGE_PML4_SLOT));
         assert!(!may_clone_slot_into_user_half(256));
+    }
+
+    #[test]
+    fn slot_sync_admits_only_user_slots() {
+        // The #PF-time sync must be able to repair every declared user slot…
+        for idx in USER_PML4_SLOTS {
+            assert!(may_sync_slot_on_fault(idx));
+        }
+        // …and must NEVER admit a kernel slot — otherwise a crafted fault
+        // address could pull kernel mappings into a live user half and
+        // silently defeat KPTI (the vmalloc-fault analogue of the
+        // clone-the-direct-map accident).
+        for idx in 0..512 {
+            if USER_PML4_SLOTS.contains(&idx) {
+                continue;
+            }
+            assert!(!may_sync_slot_on_fault(idx), "PML4[{idx}] must not sync");
+        }
+        assert!(!may_sync_slot_on_fault(KERNEL_IMAGE_PML4_SLOT));
+        assert!(!may_sync_slot_on_fault(256)); // heap
+        assert!(!may_sync_slot_on_fault(257)); // kernel stacks
     }
 
     #[test]

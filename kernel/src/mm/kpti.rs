@@ -293,6 +293,10 @@ struct SelfTestArena {
     /// (The user-half PML4's own frames are freed via `free_user_half`.)
     owned_frames: Vec<u64>,
     user_pml4_phys: u64,
+    /// The synthetic **kernel** PML4 phys (owned via `owned_frames[0]`; kept
+    /// here so the slot-sync self-test arm can drive `sync_slot_raw` with both
+    /// halves).
+    kernel_pml4_phys: u64,
     /// Every entry-set page as `(kernel_va, expected_phys)` — used both to
     /// classify leaves as `EntrySet` during the walk and to round-trip-verify
     /// each page actually translates in the built user PML4.
@@ -611,6 +615,52 @@ pub unsafe fn free_user_half(user_pml4_phys: u64) {
     frame_allocator::free_frame(user_pml4_phys);
 }
 
+/// Phase 110 hardening — the `#PF`-time top-level-slot sync (Linux
+/// vmalloc-fault analogue). If the top-level `PML4` slot covering `fault_va`
+/// is a declared user-mapping slot whose entry differs between the kernel
+/// half and the (live) user half, copy the kernel-half entry into the user
+/// half and return `true`; otherwise return `false` (nothing to do — not a
+/// syncable slot, or already in sync).
+///
+/// This closes the latent wedge where a user slot **empty** at pair-build
+/// time (so cloned empty) is later populated in the kernel half: without the
+/// sync, ring 3 faults on the user CR3 forever while the kernel-half walk
+/// looks fine. The admission gate
+/// (`kernel_core::kpti::may_sync_slot_on_fault`) restricts this to the two
+/// user slots, so a fault at a kernel address can never pull a kernel slot
+/// into a user half.
+///
+/// Only a top-level entry is copied — the sub-tree it points at is the SAME
+/// frames the kernel half owns (the `USER_PML4_SLOTS` are shared by design),
+/// so this stays a single 8-byte publish, never a deep clone, and
+/// [`free_user_half`] still correctly skips these slots.
+///
+/// # Safety
+/// Both PML4s must be valid, reachable through the direct map, with no live
+/// `&mut` alias; the caller must serialize concurrent writers to the user
+/// PML4 (the `AddressSpace` page-table lock).
+pub unsafe fn sync_slot_raw(kernel_pml4_phys: u64, user_pml4_phys: u64, fault_va: u64) -> bool {
+    let slot = pml4_index(fault_va);
+    if !kernel_core::kpti::may_sync_slot_on_fault(slot) {
+        return false;
+    }
+    let phys_off = phys_offset();
+    // SAFETY: both PML4s are reachable through the direct map; we read the
+    // kernel entry and write the (caller-serialized) user entry.
+    unsafe {
+        let kern = &*((phys_off + kernel_pml4_phys) as *const PageTable);
+        let user = &mut *((phys_off + user_pml4_phys) as *mut PageTable);
+        // PageTableEntry is not PartialEq; compare the raw (addr, flags) pair.
+        let same =
+            user[slot].addr() == kern[slot].addr() && user[slot].flags() == kern[slot].flags();
+        if same {
+            return false;
+        }
+        user[slot] = kern[slot].clone();
+    }
+    true
+}
+
 /// Build a real user-half PML4 via the production [`build_user_half`] over a
 /// synthetic kernel PML4, returning the arena for the caller to walk then free.
 ///
@@ -652,6 +702,7 @@ fn build_selftest_pair() -> Option<SelfTestArena> {
     Some(SelfTestArena {
         owned_frames,
         user_pml4_phys,
+        kernel_pml4_phys,
         entry_pages: entry_pages
             .iter()
             .map(|(va, phys, _)| (*va, *phys))
@@ -886,6 +937,50 @@ pub fn self_test() {
     // SAFETY: user_pml4_phys is a valid, non-live PML4 read via direct map.
     let kstack_reachable = unsafe { translate_in(arena.user_pml4_phys, kstack_top_page) }.is_some();
 
+    // Phase 110 hardening — the `#PF`-time top-level-slot sync. Stale the
+    // user half's stack slot (`PML4[255]`, covering SELFTEST_USER_STACK_VA),
+    // simulating a slot that was empty at build time, then prove
+    // `sync_slot_raw` repairs it: after the clear the VA is unreachable; the
+    // first sync copies the kernel-half slot back (returns true) and makes it
+    // reachable again; a second sync is a no-op (returns false, in sync). This
+    // is exactly the wedge the live `page_fault_body` hook recovers.
+    let slot_sync_ok = {
+        let phys_off = phys_offset();
+        let slot = pml4_index(SELFTEST_USER_STACK_VA);
+        // Stale the user half's stack slot (as if it were empty at build
+        // time). The sync restores it below (kern[slot] == the cleared value's
+        // original), so the freed table is consistent; `free_user_half` skips
+        // this shared slot regardless.
+        // SAFETY: the throwaway user PML4 is valid, non-live, direct-map
+        // reachable, and solely owned here (not loaded in any CR3).
+        unsafe {
+            let user = &mut *((phys_off + arena.user_pml4_phys) as *mut PageTable);
+            user[slot].set_unused();
+        }
+        let unreachable_after_clear =
+            unsafe { translate_in(arena.user_pml4_phys, SELFTEST_USER_STACK_VA) }.is_none();
+        // SAFETY: both synthetic PML4s are valid, non-live, direct-map
+        // reachable; the self-test is single-threaded.
+        let first_sync = unsafe {
+            sync_slot_raw(
+                arena.kernel_pml4_phys,
+                arena.user_pml4_phys,
+                SELFTEST_USER_STACK_VA,
+            )
+        };
+        let reachable_after_sync =
+            unsafe { translate_in(arena.user_pml4_phys, SELFTEST_USER_STACK_VA) }.is_some();
+        // Second sync is a no-op: the halves now agree.
+        let second_sync = unsafe {
+            sync_slot_raw(
+                arena.kernel_pml4_phys,
+                arena.user_pml4_phys,
+                SELFTEST_USER_STACK_VA,
+            )
+        };
+        unreachable_after_clear && first_sync && reachable_after_sync && !second_sync
+    };
+
     // Free the throwaway pair before reporting (report is the observable point).
     let user_pml4_phys = arena.user_pml4_phys;
     let entry_page_count = arena.entry_pages.len();
@@ -906,6 +1001,10 @@ pub fn self_test() {
     }
     if kstack_reachable {
         log::error!("KPTI_SELFTEST:FAIL reason=kstack-reachable page={kstack_top_page:#x}");
+        return;
+    }
+    if !slot_sync_ok {
+        log::error!("KPTI_SELFTEST:FAIL reason=slot-sync");
         return;
     }
 
