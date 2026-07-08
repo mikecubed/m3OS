@@ -109,6 +109,21 @@
 - [x] `CLONE_VM` threads need no per-thread KPTI work (the pthread-heavy gates run on the shared entry set alone).
 - [x] The inactive lane (`mitigations=off` / `RDCL_NO`) is behaviourally unchanged (RSP0 stays the task kstack top; every new asm branch keys off `gs:[kpti_user_cr3] != 0`).
 
+### Post-A.5 hardening — `#PF`-slot sync + re-dispatch CR3 skip (22–23/n, PR #325)
+
+**File:** `kernel-core/src/kpti.rs`, `kernel/src/mm/{kpti,mod}.rs`, `kernel/src/arch/x86_64/interrupts.rs`
+**Symbol:** `kernel_core::kpti::may_sync_slot_on_fault`, `mm::kpti::sync_slot_raw`, `AddressSpace::kpti_sync_user_slot_on_fault`, `write_kernel_cr3` (re-dispatch skip)
+**Why it matters:** the two remaining "gotchas"/follow-ups the handoff flagged — a latent silent `#PF` loop, and a per-dispatch flush the same-address-space case never needs.
+
+**As-built — 22/n (`#PF`-time top-level-slot sync, the Linux vmalloc-fault analogue):** a `USER_PML4_SLOTS` entry empty in the kernel half when the pair is built is cloned empty into the user half; if the kernel half later populates it, ring 3 faults on the user CR3 forever — silently, because the demand/CoW fast paths see the page mapped in the kernel half and return success without touching the user half. `may_sync_slot_on_fault` (host-tested; admits ONLY the user slots, so a kernel-address fault can never pull a kernel slot in) gates `sync_slot_raw` (a single 8-byte top-level copy — the sub-tree is the shared frames `free_user_half` skips); `AddressSpace::kpti_sync_user_slot_on_fault` serializes it under the page-table lock + does a local both-PCID flush after a repair. The hook is the **first** recovery in `page_fault_body`'s ring-3 branch, gated on `!is_present` (must precede the demand/CoW chain or the already-mapped fast paths re-create the loop). The self-test's `slot-sync` arm stales `PML4[255]`, proves unreachable → sync repairs → second sync is a no-op. Fires essentially never today (all layouts pre-populate both slots).
+
+**As-built — 23/n (same-address-space re-dispatch CR3 skip):** `write_kernel_cr3` skips its flushing reload (and the PCID-lane `INVPCID Single(USER_PCID)`) when the currently loaded CR3 frame already equals the target. A live PML4 frame is never reused, so "current CR3 frame == target" ⟺ the same live address space, which has had every mapping mutation shot down on this core (sender-local `flush_local` + the cross-core IPI, both PCIDs) — nothing stale to flush; and no coherence path relies on the dispatch reload. A real switch always differs (execve fresh PML4 while old live; fork copies the table). Recovers the idle→same-task / repeated-same-task flush on every lane (orthogonal to the A.5 PCID no-flush entry/exit win).
+
+**Acceptance:**
+- [x] The `#PF` slot-sync admits only the declared user slots (host test `slot_sync_admits_only_user_slots`) and repairs a staled user slot at boot (self-test `slot-sync` arm); it precedes the demand/CoW fast paths so the wedge cannot re-form as a silent loop.
+- [x] The re-dispatch skip never elides a real address-space-switch flush (frame differs ⟹ not skipped) and preserves TLB coherence under contention (`cargo xtask test` incl. `munmap-tlb-smp`; `regression` ×2 back-to-back; `smp-smoke`-to-known-crash).
+- [x] Both are inert-equivalent on the inactive lane (no user half → sync no-ops; the skip is a pure `Cr3::read` compare on the plain `Cr3::write` path).
+
 ### A.6 — Bare-metal KPTI boot + Meltdown-PoC validation
 
 **Files:**
