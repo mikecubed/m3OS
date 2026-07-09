@@ -91,10 +91,14 @@ bare-metal-only. The Precision 5560 (Intel Tiger Lake) has both PCID and INVPCID
 and is Meltdown-susceptible with KPTI off, so it is the right target.
 
 - [ ] **A.6 — Meltdown PoC reject** (`Validated-on-HW`, never a bare "Complete").
-      Boot `M3OS_MITIGATIONS=full` on the Dell, run a ported public Meltdown PoC:
-      it must **leak** kernel memory with KPTI off (`M3OS_MITIGATIONS=off`) and
-      **fail** to leak with it on. Record the run (`run N, YYYY-MM-DD`) + the
-      capture path. This is the whole point of Track A — QEMU can never prove it.
+      PoC **scaffolded and shipping** as `/bin/meltdown-poc`
+      (`userspace/meltdown-poc`): flush+reload channel + mispredicted-branch
+      speculative kernel read + a known-user-byte calibration control. Boot
+      `M3OS_MITIGATIONS=full` on the Dell, run it: it must **leak** kernel memory
+      (`MELTDOWN_POC:LEAK`) with KPTI off (`M3OS_MITIGATIONS=off`) and **fail**
+      (`MELTDOWN_POC:NO-LEAK`) with it on. Tune the `const`s at the top of
+      `main.rs` per the CPU (see the runbook Block 0). Record the run
+      (`run N, YYYY-MM-DD`) + the capture path. QEMU can never prove it.
 - [ ] **A.5 — PCID scheme is live on real silicon.** Boot the default image and
       confirm the A.5 fallback flips to *active* on PCID hardware: the `[sec]`
       line reads `pcid(active=true supported=true)` (vs the QEMU
@@ -113,7 +117,13 @@ and is Meltdown-susceptible with KPTI off, so it is the right target.
       no-flush optimization (a documented A.5 follow-up: per-CPU last-CR3 cache)
       is the next lever. Also worth a same-boot A/B: temporarily force the
       fallback (mask PCID in `probe_pcid`) to measure the recovery the tags buy.
-- [ ] **B.3 — CET user shadow stacks are live on real silicon.** The whole B.3
+- [ ] **B.3 — CET user shadow stacks are live on real silicon.** ⚠️ **BLOCKED
+      (2026-07-09): CET enable black-screens the Dell at boot.** Bisected to the
+      CET path (F=CET-off boots, G=PCID-off/CET-on hangs); a `CR0.WP`-before-
+      `CR4.CET` fix was necessary but insufficient. Needs serial to read the
+      fault. Full analysis + next steps:
+      [2026-07-09 CET boot-hang handoff](./2026-07-09-cet-boot-hang-on-tiger-lake.md).
+      The rest of this item is the acceptance once it boots — The whole B.3
       substrate is dormant on QEMU (TCG models no CET); Tiger Lake has `CET_SS`,
       so the Dell is the only place the active path runs. Boot the default image
       and confirm: the `[sec]` line flips to `cet(active=true supported=true)`
@@ -129,12 +139,16 @@ and is Meltdown-susceptible with KPTI off, so it is the right target.
       unlike Linux's explicit copy), and **nested-signal** shadow-stack handling
       (the single-slot `cet_signal_ssp` covers non-nested; nesting needs the
       `RSTORSSP`-token path modeled in `kernel_core::cet::shadow_stack_restore_token`).
-- [ ] **B.3 — CET catches a real ROP/overwrite.** Port (or write) a tiny
-      return-address-overwrite PoC: with CET **on** it must fault `#CP` (the
-      `control_protection_fault_body` kill: `userspace #CP (CET control-protection)
-      … process killed`); with CET off (mask `CET_SS` in `probe_cet`) the same
-      overwrite returns into the planted address. `Validated-on-HW (run N, date)`,
-      the CFI analogue of the A.6 Meltdown PoC. Skip-with-reason under QEMU TCG.
+- [ ] **B.3 — CET catches a real ROP/overwrite.** PoC **scaffolded and
+      shipping** as `/bin/rop-cet-poc` (`userspace/rop-cet-poc`, built canary-off
+      via `-Zstack-protector=none`): its naked `vulnerable()` does a precise
+      return-address overwrite (`mov [rsp],rdi; ret`, asm-verified). With CET
+      **on** it must fault `#CP` (the `control_protection_fault_body` kill:
+      `userspace #CP (CET control-protection) … process killed`) and never print
+      `ROP_CET_POC:PWNED`; with CET off (mask `CET_SS` in `probe_cet`, or boot
+      `M3OS_MITIGATIONS=off`) the overwrite returns into the planted address →
+      `ROP_CET_POC:PWNED`. `Validated-on-HW (run N, date)`, the CFI analogue of
+      the A.6 Meltdown PoC. Skip-with-reason under QEMU TCG.
 
 ## Phase 111 — Remote Debugging (kgdb / ptrace on metal)
 

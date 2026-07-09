@@ -526,6 +526,14 @@ static PCID_SUPPORTED: Once<bool> = Once::new();
 /// [`kernel_core::kpti_pcid::pcid_supported`]. Both bits are `0` under QEMU TCG.
 pub fn probe_pcid() -> bool {
     *PCID_SUPPORTED.call_once(|| {
+        // Bench-bisection knob (Phase 110 Dell validation): `M3OS_MASK_PCID=1` at
+        // build time forces "PCID unsupported" (identical to QEMU TCG) so the
+        // CR4.PCIDE enable + tagged-CR3 + INVPCID paths stay off while KPTI+CET
+        // remain active — to isolate a PCID-vs-CET bring-up fault on real
+        // silicon. Default off; no effect on production builds.
+        if option_env!("M3OS_MASK_PCID").is_some() {
+            return false;
+        }
         let leaf1_ecx = cpuid_raw(1, 0).ecx;
         // Leaf 7 is guarded by the max-basic-leaf check (same trap as
         // `probe_smep_smap`): reading leaf 7 on a CPU whose max basic leaf is
@@ -605,6 +613,14 @@ static CET_ENABLED: AtomicBool = AtomicBool::new(false);
 /// [`kernel_core::cet::CetFeatures::from_leaf7`]. Both bits are `0` on QEMU TCG.
 pub fn probe_cet() -> kernel_core::cet::CetFeatures {
     *CET_FEATURES.call_once(|| {
+        // Bench-bisection knob (Phase 110 Dell validation): `M3OS_MASK_CET=1` at
+        // build time forces "no CET" (identical to QEMU TCG) so the CR4.CET +
+        // IA32_U_CET + shadow-stack paths stay off while KPTI+PCID remain active
+        // — to isolate a CET-vs-PCID bring-up fault on real silicon. Default off;
+        // no effect on production builds.
+        if option_env!("M3OS_MASK_CET").is_some() {
+            return kernel_core::cet::CetFeatures::from_leaf7(0, 0);
+        }
         if cpuid_raw(0, 0).eax < 0x07 {
             return kernel_core::cet::CetFeatures::from_leaf7(0, 0);
         }
@@ -641,13 +657,32 @@ pub fn cet_shstk_usable() -> bool {
 ///
 /// # Safety
 /// CR4 + the CET MSRs are privileged; ring 0, IRQs disabled or single-threaded.
-/// `CR0.WP` must be 1 (m3OS always has it) — the CPU `#GP`s on a `CR4.CET` set
-/// while `CR0.WP = 0`.
 pub unsafe fn enable_user_cet_if_supported(policy_on: bool) -> bool {
     use kernel_core::cet::{MSR_IA32_U_CET, compose_u_cet};
+    use x86_64::registers::control::{Cr0, Cr0Flags};
     if !policy_on || !cet_shstk_usable() {
         return false;
     }
+    // Bare-metal bring-up diagnostic (Phase 110 CET boot hang, Dell/Tiger Lake):
+    // serial-free POST squares that localize *which* CET-enable instruction hangs
+    // real silicon. Slots 32–35 (grid row 2) — the last square painted is the
+    // last step that completed, so the hang is in the instruction after it. No-op
+    // unless built with `M3OS_BRINGUP_DIAG=1` (see `crate::BRINGUP_DIAG`). The BSP
+    // reaches here first (before `boot_aps`), so on the hanging path only it
+    // paints these. See docs/handoffs/2026-07-09-cet-boot-hang-on-tiger-lake.md.
+    crate::post_marker(32); // entered CET enable (policy on + CET_SS usable)
+    // Intel SDM Vol 3A: setting `CR4.CET` while `CR0.WP = 0` raises `#GP(0)` —
+    // CET is architecturally tied to write-protect. QEMU TCG models no CET and
+    // never enforces this, so a `WP = 0` boot works there but `#GP`-hangs on real
+    // CET silicon (the Dell Precision 5560 black-screened at exactly this write).
+    // Nothing else in BSP boot guarantees `WP`, so ensure it on this core before
+    // touching `CR4.CET`. `WP` is per-core; every core enabling CET runs this.
+    unsafe {
+        if !Cr0::read().contains(Cr0Flags::WRITE_PROTECT) {
+            Cr0::update(|f| f.insert(Cr0Flags::WRITE_PROTECT));
+        }
+    }
+    crate::post_marker(33); // CR0.WP = 1 confirmed; next: mov cr4 (CR4.CET)
     let mut cr4: u64;
     unsafe {
         core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
@@ -655,9 +690,13 @@ pub unsafe fn enable_user_cet_if_supported(policy_on: bool) -> bool {
     cr4 |= kernel_core::cet::CR4_CET;
     unsafe {
         core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack));
+    }
+    crate::post_marker(34); // CR4.CET set OK; next: wrmsr IA32_U_CET
+    unsafe {
         // User shadow stacks on; WRUSS allowed (signal restore-token seeding).
         Msr::new(MSR_IA32_U_CET).write(compose_u_cet(true, true));
     }
+    crate::post_marker(35); // IA32_U_CET written — CET enable fully succeeded
     CET_ENABLED.store(true, Ordering::Release);
     true
 }

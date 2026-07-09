@@ -90,10 +90,12 @@ static POST_FB: spin::Once<PostFb> = spin::Once::new();
 /// POST squares, the `[timer] lapic_ticks_per_ms` framebuffer line, and init's
 /// AHCI-retry dots. **Default OFF.** These debugged the Phase 96 Tiger Lake
 /// early-boot hang and are invisible on a normal boot (the fb console overwrites
-/// the strip immediately), but they stay compiled out unless a future bare-metal
-/// bring-up needs them again — flip to `true` and rebuild. Same default-off-const
-/// idiom as `net::dhcp::FB_NET_HEARTBEAT` / the xhci driver's `VERBOSE_ENUM`.
-pub(crate) const BRINGUP_DIAG: bool = false;
+/// the strip immediately). Build with **`M3OS_BRINGUP_DIAG=1`** to turn them on
+/// for a bare-metal bring-up (e.g. the Phase 110 CET boot hang — the CET-enable
+/// sub-markers 32–35 in `enable_user_cet_if_supported` localize the faulting
+/// instruction with no serial). Same default-off idiom as
+/// `net::dhcp::FB_NET_HEARTBEAT` / the xhci driver's `VERBOSE_ENUM`.
+pub(crate) const BRINGUP_DIAG: bool = option_env!("M3OS_BRINGUP_DIAG").is_some();
 
 /// Record the framebuffer for `post_marker`. Called once at boot entry.
 fn post_fb_set(ptr: *mut u8, info: &bootloader_api::info::FrameBufferInfo) {

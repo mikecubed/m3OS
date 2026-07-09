@@ -62,10 +62,21 @@ compile. `M3OS_MITIGATIONS` and `M3OS_KERNEL_FEATURES` are **build-time**
 | E | **ptrace** | `M3OS_KERNEL_FEATURES=ptrace cargo xtask image` | Phase 111 native gdbserver arm |
 
 Each image lands at `target/x86_64-unknown-none/release/boot-uefi-m3os.img`
-(rename per posture before the next build). Flash with
-`scripts/phase-100-write-usb.sh /dev/sdX` (on the Dell, USB = `/dev/sda`; the
-NVMe system disk is `nvme0n1` — **do not** flash that). Direct fallback:
+(rename per posture before the next build). **All five (A–E) are pre-built and
+staged** at `target/dell-images/{A-default,B-mitigations-off,C-mitigations-full,
+D-kgdb,E-ptrace}.img` (19 MiB each, distinct kernels confirmed) — flash directly
+from there, no rebuild needed. Flash with `scripts/phase-100-write-usb.sh
+/dev/sdX` (on the Dell, USB = `/dev/sda`; the NVMe system disk is `nvme0n1` —
+**do not** flash that). Direct fallback:
 `sudo dd if=<img> of=/dev/sda bs=4M conv=fsync status=progress && sync`.
+
+> **CI de-risk done on the build host:** both PoCs ship in every image and have
+> QEMU run-to-completion gates (`cargo xtask meltdown-poc-smoke` /
+> `rop-cet-poc-smoke`, both PASS; behind `M3OS_SEC_POC_REGRESSION=1` in pre-push).
+> `rop-cet-poc` is asm-verified (`mov [rsp],rdi; ret`); `meltdown-poc` uses
+> `rdtsc` (not `rdtscp` — the default QEMU CPU faulted `rdtscp` in ring 3 into a
+> retry loop) and a `--smoke` fast mode for CI. The security arms (leak-reject,
+> `#CP`-kill) remain HW-only — that is what the bench is for.
 
 **Serial capture (pick one, wire it first):**
 - **AMT Serial-over-LAN** — the port-less path: Intel ME redirects COM1
@@ -80,14 +91,39 @@ NVMe system disk is `nvme0n1` — **do not** flash that). Direct fallback:
   (we lost two captures to this). m3OS `grep` is single-pattern fixed-string:
   `echo 'dmesg | grep sec' | ssh root@<ip> > sec.log`.
 
-**Artifacts to create before the bench (small userspace PoCs — see Block 2):**
-`meltdown-poc` and `rop-cet-poc`. Both are un-writable today; scaffold them as
-ring-3 binaries (workspace member + `bins` + ramdisk entry) so they ship in the
-image. If not ready, Block 1 (the posture boot) still stands alone.
+**Artifacts (scaffolded — now ship in every image):** `meltdown-poc` and
+`rop-cet-poc` are wired ring-3 binaries (`userspace/{meltdown-poc,rop-cet-poc}`,
+workspace member + `bins` + ramdisk entry) staged at `/bin/meltdown-poc` and
+`/bin/rop-cet-poc`. Run them by bare name from the shell. Notes for the bench:
+- `rop-cet-poc` ships **without** the stack canary (xtask builds it with
+  `-Zstack-protector=none`) so the overwrite reaches `ret` and trips CET, not
+  `__stack_chk_fail`. Its `vulnerable()` is a naked `mov [rsp],rdi; ret` — a
+  precise, deterministic return-address overwrite (verified at the asm level;
+  QEMU can't exercise CET, so determinism is the point). Sentinels:
+  `ROP_CET_POC:before`, then either the kernel `#CP` kill line (CET on) or
+  `ROP_CET_POC:PWNED` (CET off). `ROP_CET_POC:after-NOT-OVERWRITTEN` = regression.
+- `meltdown-poc` uses a flush+reload channel + a **mispredicted-branch**
+  speculative kernel read (m3OS has no catchable `SIGSEGV` and Tiger Lake has TSX
+  off, so the illegal read is squashed speculatively — never architecturally
+  faults, so the same binary runs safely under KPTI on **and** off). It first
+  runs a positive **control** (recover a known user byte — `channel=CALIBRATED`
+  is the on-CPU self-check that timing/thresholds are right), then leaks
+  `LEAK_LEN` bytes from the kernel base and prints `MELTDOWN_POC:LEAK` (KPTI off)
+  or `MELTDOWN_POC:NO-LEAK` (KPTI on). Expect to tune `TRIES` /
+  `CACHE_HIT_THRESHOLD` / `CONFIDENCE` / `KERNEL_TARGET_VA` at the bench (all
+  `const`s at the top of `main.rs`). Cannot be validated under QEMU (TCG models
+  no caches/speculation).
 
 ---
 
 ## Block 1 — the security posture boot (do this FIRST; it validates the most)
+
+> **⚠️ RUN 1 (2026-07-09) RESULT — partial.** KPTI + PCID **boot clean** on the
+> Dell (image `F-cet-masked` = KPTI+PCID, CET off, reaches login). **CET
+> black-screens the boot** — bisected to the CET enable; a `CR0.WP` fix was
+> insufficient; blocked on serial. Full analysis + next steps:
+> [2026-07-09 CET boot-hang handoff](./2026-07-09-cet-boot-hang-on-tiger-lake.md).
+> Resume here once CET boots.
 
 **Objective.** Prove KPTI, PCID, and CET all activate and the machine boots
 clean to a login on real Tiger Lake silicon — validating in one shot every
