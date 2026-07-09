@@ -303,7 +303,7 @@ pub fn format_wifi_status(status: &wifi_core::control::WifiStatus) -> String {
 /// UNADDRESSED classes and the Grimsdal caveat are always printed so a deferred
 /// class can never silently read as covered.
 pub fn format_mitigations(report: &kernel_core::spectre::MitigationReport) -> String {
-    use kernel_core::spectre::{MitigationLevel, Status};
+    use kernel_core::spectre::{IbrsMode, MitigationLevel, Status};
     let mut out = String::new();
 
     out.push_str("mitigations: level=");
@@ -333,9 +333,37 @@ pub fn format_mitigations(report: &kernel_core::spectre::MitigationReport) -> St
         out.push('\n');
     }
 
-    // Retpoline is compile-time-unconditional (B.1): reported separately from
-    // the runtime-gated KPTI/IBRS lines so a reader does not expect a switch.
-    out.push_str("  Spectre-v2 (retpoline): compiled-in (cannot disable at boot)\n");
+    // Spectre-v2 mechanism detail. Phase 110 B.3 fix #4: retpoline is now
+    // KERNEL-ONLY — userspace dropped `-Zretpoline` because a retpoline thunk's
+    // `ret` (returning to an overwritten data-stack target) mismatches the CET
+    // shadow stack and `#CP`s. Userspace Spectre-v2 is instead covered by eIBRS
+    // (set-once, all-rings) + IBPB (barrier on context switch), the standard
+    // posture on eIBRS silicon. Surface the runtime IBRS mode + IBPB so the
+    // reader can confirm userspace is actually covered (the per-vuln line above
+    // still summarises the class; these lines give the mechanism).
+    out.push_str("  Spectre-v2 (retpoline): kernel compiled-in (userspace uses eIBRS, below)\n");
+    out.push_str("  Spectre-v2 (IBRS): ");
+    out.push_str(match report.ibrs_mode {
+        IbrsMode::Enhanced => "eIBRS enhanced, set-once at boot — covers ring 3 (userspace)",
+        IbrsMode::Legacy => "legacy (kernel-entry toggle only — does NOT cover userspace)",
+        IbrsMode::None => "none (CPU does not enumerate IBRS)",
+    });
+    out.push_str("\n  Spectre-v2 (IBPB): ");
+    out.push_str(if report.ibpb_active {
+        "active (indirect-branch barrier on context switch)"
+    } else {
+        "inactive"
+    });
+    out.push('\n');
+    // Honesty: with userspace retpolines dropped, non-eIBRS silicon has NO
+    // userspace Spectre-v2 cover. Flag it loudly rather than let the "compiled-in
+    // retpoline" line imply protection that no longer applies to ring 3.
+    if !matches!(report.ibrs_mode, IbrsMode::Enhanced) {
+        out.push_str(
+            "  ⚠ Spectre-v2 (userspace): UNCOVERED — no eIBRS and userspace retpolines were \
+             dropped for CET; only eIBRS-capable silicon protects ring-3 indirect branches.\n",
+        );
+    }
 
     // Phase 90a C.2 — W^X policy version + PKU posture. The W^X enforcement
     // points are always active (Phase 75); the *version* reflects whether the

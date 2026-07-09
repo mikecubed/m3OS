@@ -438,7 +438,13 @@ fn mitigations_status_format_is_honest() {
     let r = format_mitigations(&report);
     assert!(r.contains("level=full"));
     assert!(r.contains("Meltdown: Vulnerable"));
-    assert!(r.contains("retpoline): compiled-in"));
+    // Phase 110 B.3 fix #4 — retpoline is now kernel-only; userspace uses eIBRS.
+    assert!(r.contains("retpoline): kernel compiled-in"));
+    // This report has IbrsMode::None, so the IBRS line reads `none` AND the
+    // honest userspace-Spectre-v2-uncovered warning must fire (retpolines were
+    // dropped from userspace with no eIBRS to replace them).
+    assert!(r.contains("Spectre-v2 (IBRS): none"));
+    assert!(r.contains("Spectre-v2 (userspace): UNCOVERED"));
     assert!(r.contains("UNADDRESSED"));
     // The honesty note must enumerate Spectre-v1 (report_map marks it
     // Status::Unaddressed) — the note is not an exhaustive list otherwise.
@@ -480,6 +486,19 @@ fn mitigations_status_format_is_honest() {
         ..report
     };
     assert!(format_mitigations(&report3).contains("Meltdown: Not affected"));
+
+    // Phase 110 B.3 fix #4 — eIBRS silicon (Tiger Lake): the IBRS line reads
+    // enhanced/covers-userspace and the userspace-uncovered warning must NOT
+    // fire (eIBRS covers ring-3 indirect branches after userspace retpolines
+    // were dropped for CET compatibility).
+    let report_eibrs = MitigationReport {
+        ibrs_mode: IbrsMode::Enhanced,
+        ..report
+    };
+    let re = format_mitigations(&report_eibrs);
+    assert!(re.contains("Spectre-v2 (IBRS): eIBRS enhanced"));
+    assert!(re.contains("covers ring 3"));
+    assert!(!re.contains("Spectre-v2 (userspace): UNCOVERED"));
 }
 
 /// Phase 90a C.2 — the W^X / PKU posture line renders all three boot states.
