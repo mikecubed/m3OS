@@ -139,8 +139,15 @@ pub(crate) fn post_marker(step: usize) {
     if x0 + SQ > fb.width || y0 + SQ > fb.height {
         return;
     }
-    // Distinct brightness per column (0x48, 0x70, 0x98, …) so neighbours differ.
-    let byte: u8 = 0x48u8.wrapping_add((col as u8).wrapping_mul(0x28));
+    // Always-bright per-column shade so neighbours differ AND no square is ever
+    // near-black/invisible against the cleared screen. The old `0x48 + col*0x28`
+    // ramp wrapped u8 to 0x00 at col 11 (pure black) and 0x10 at col 5 — those
+    // POST codes were unreadable on the Dell/Tiger Lake bring-up (e.g. apic
+    // marker 27 at col 11 vanished). Strong even/odd parity split (dim-bright vs
+    // bright, both clearly visible on black) plus a slow ramp keeps runs
+    // countable; the band is [0x80, 0xFC] — the floor stays well clear of black.
+    let c = col as u8;
+    let byte: u8 = 0x80 + (c & 1) * 0x60 + (c >> 1) * 0x04;
     let base = fb.base as *mut u8;
     for y in y0..y0 + SQ {
         // SAFETY: the bootloader mapped + rendered to this framebuffer before

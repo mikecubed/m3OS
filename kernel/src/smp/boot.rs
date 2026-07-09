@@ -492,6 +492,24 @@ pub fn boot_aps() {
 
 /// Rust entry point for APs, called from the trampoline.
 extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
+    // Phase 110 B.3 (Tiger Lake CET boot-hang fix) — set CR0.WP=1 BEFORE the CR4
+    // reload below. The BSP enables CR4.CET before `boot_aps`, so the `bsp_cr4`
+    // snapshot below carries bit 23 on real CET silicon. Intel SDM Vol 3A: a
+    // `mov cr4` that sets CR4.CET while CR0.WP=0 raises #GP(0). The trampoline
+    // enables paging but never sets CR0.WP, so without this every AP #GP-triple-
+    // faults the instant it loads the CET-bearing CR4 — the BSP comes up (its own
+    // `enable_user_cet_if_supported` sets WP first) but `boot_aps` then hangs
+    // forever waiting on the AP rendezvous (the Dell/Tiger Lake black screen: BSP
+    // CET markers 32–35 all paint, then marker 14 never does). WP=1 is
+    // CET-mandatory and the correct hardened baseline regardless. No-op on QEMU
+    // (no CET bit in the snapshot; WP=1 is harmless there).
+    unsafe {
+        use x86_64::registers::control::{Cr0, Cr0Flags};
+        if !Cr0::read().contains(Cr0Flags::WRITE_PROTECT) {
+            Cr0::update(|f| f.insert(Cr0Flags::WRITE_PROTECT));
+        }
+    }
+
     // Load BSP's CR4 value to match feature flags (PGE, OSXSAVE, etc.).  The
     // BSP set CR4.OSXSAVE during `kernel_main` (Phase 57e Track J) so this AP
     // observes it set immediately after the load.

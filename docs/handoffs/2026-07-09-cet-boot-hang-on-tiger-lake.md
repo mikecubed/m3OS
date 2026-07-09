@@ -3,13 +3,104 @@
 **Session:** 2026-07-09 Dell Precision 5560 (Intel Tiger Lake, has `CET_SS`).
 **Runbook this executes:** [2026-07-09 Dell validation session](./2026-07-09-dell-validation-session.md).
 **Branch:** `feat/phase-110-cet-shstk` (all changes below are **uncommitted** — see §6).
-**Status:** Block 0 pre-flight **complete + verified**. Bench hit a **CET-enable boot
-hang on real silicon**, bisected to the CET path; a first fix (`CR0.WP`) was
-necessary-but-insufficient. **Blocked on serial capture** to read the exact fault.
+**Status:** **ROOT-CAUSED + TWO FIXES LANDED (pending Dell re-flash confirmation).**
+Two distinct CET real-silicon bugs, both invisible to QEMU, found via the
+POST-square diagnostic: **(1)** the AP trampoline reloaded the BSP's CET-bearing
+`CR4` **without `CR0.WP`** → per-AP `#GP` triple-fault → `boot_aps` hang (decoded
+from **8 / 5 / 4** squares; fix in `smp/boot.rs`). **(2)** init (PID 1) is
+kernel-spawned via the fork trampoline with `cet_ssp = 0` and **nothing armed its
+shadow stack** → its first ring-3 `CALL` faults (found from `boot.jpeg`: boot now
+reaches marker 22 then stalls with no userspace; fix in `arch/x86_64/mod.rs`).
+SMP smoke + full boot smoke-test PASS; `A-default.img` + `I-cet-diag.img` rebuilt
+with both fixes. **Next: flash `A-default.img` → expect a full login.**
 
 ---
 
-## 1. TL;DR
+## 0. RESOLUTION (2026-07-09, this session) — read this first
+
+**The squares decoded the hang.** You reported the `I-cet-diag.img` POST strip as
+**8 squares on row 0, 5 on row 1, 4–5 on row 2** (row 2's 5th "unreadable because
+black"). Decoding needs two facts: (1) marker 6 (`fb console init`) **clears the
+screen**, wiping every square before it; (2) markers do **not** fire in slot order
+(`mm::init` paints 16–19, `apic::init` paints 24–28, CET paints 32–35, all
+interleaved with row 0). Tracing the real execution order, the squares that
+survive the clear on a hang right after mitigations are exactly:
+
+| Row | Count | Surviving markers | Meaning |
+|---|---|---|---|
+| 0 | **8** | 6,7,8,9,10,11,12,**13** | reached "mitigations + virtio-net done" |
+| 1 | **5** | 24,25,26,27,28 | APIC fully up (27 = col 11 = the pure-black square) |
+| 2 | **4** | 32,33,34,35 | **BSP CET enable fully succeeded** |
+
+8 / 5 / 4 matches perfectly. **All four CET markers painted ⇒ BSP CET works.** The
+hang is between marker 13 and 14 — in a release build that span is *nothing but*
+`smp::boot::boot_aps()`.
+
+**Root cause — AP inherits `CR4.CET` without `CR0.WP`.** The BSP enables `CR4.CET`
+*before* `boot_aps()`, so the trampoline's captured `DATA_CR4` snapshot carries
+bit 23. In `ap_entry` (`kernel/src/smp/boot.rs`) each AP does `mov cr4, bsp_cr4`,
+but the AP trampoline enables paging and **never sets `CR0.WP`**. Intel SDM Vol 3A:
+a `mov cr4` that sets `CR4.CET` while `CR0.WP=0` raises `#GP(0)`. With no real IDT
+at that trampoline stage the `#GP` triple-faults the AP → it never checks in →
+`boot_aps` spins forever on the rendezvous, so the BSP hangs waiting for dead APs.
+
+This explains everything the bisection saw: **F** (CET masked) boots because the
+snapshot has no CET bit; **G** (PCID masked, CET on) hangs because CET is still on;
+**H** (the BSP-only `CR0.WP` fix) still hung because the AP crashes in the
+trampoline reload *before* it ever reaches `enable_user_cet_if_supported`.
+
+**Fix (landed):** set `CR0.WP=1` in `ap_entry` **before** the `mov cr4, bsp_cr4`
+reload (mirrors the BSP's WP-before-CET precondition). WP=1 is CET-mandatory and
+the correct hardened baseline regardless; no-op on QEMU (no CET bit in the
+snapshot). SMP smoke (`-smp 2`, futex-heavy) PASS.
+
+**Also fixed (your request):** the POST-square colouring wrapped `u8` to `0x00`
+at col 11 (pure black, invisible) and `0x10` at col 5 — that's why row 1's marker
+27 vanished. Recoloured to an always-bright band `[0x80, 0xFC]` with even/odd
+parity split (`kernel/src/lib.rs::post_marker`). No square can be black now.
+
+### 0.1 SECOND bug (from `boot.jpeg`) — init's shadow stack was never armed
+
+Re-flashing `I-cet-diag.img` (fix #1 + readable colours) got **much** further —
+the photo shows **all of row 0's markers 6–15, row 1's 21+22 & 24–28, row 2's
+32–35, and the `[timer] lapic_ticks_per_ms=2409` line**. So boot cleared
+`boot_aps` (fix #1 works), ran the scheduler, ran kernel `init_task`, and reached
+`spawn_userspace_init()` (marker 22) — but then **stalled with zero userspace
+output** (no login banner, no compositor; the diagnostic screen stayed intact).
+
+**Root cause:** init (PID 1) is loaded by the kernel via the **fork trampoline**
+(`spawn_userspace_init` → `spawn_fork_task`) with `cet_ssp = 0`, and — unlike
+`execve` (which calls `setup_current_task_shadow_stack` at `syscall/mod.rs:5944`)
+and unlike `fork` (child inherits the parent's SSP + copied shadow-stack pages) —
+**nothing armed init's CET shadow stack.** With `IA32_U_CET.SH_STK_EN = 1` and
+`IA32_PL3_SSP = 0`, init's very first ring-3 `CALL` pushes a return address to a
+null SSP → `#PF`/`#CP` → init dies → the machine stalls exactly where the photo
+shows (marker 22, nothing after). QEMU never caught this (CET inactive there).
+
+**Fix #2 (landed):** in `enter_userspace_fork` (`kernel/src/arch/x86_64/mod.rs`),
+arm a shadow stack for any user task that reaches its first ring-3 entry with
+`cet_ssp == 0` — which is uniquely init. It runs in init's live CR3, so
+`setup_current_task_shadow_stack()` maps into and advances init's own address
+space exactly as the execve path does; fail-closed on frame exhaustion. Gated on
+`cet_active` (inert on QEMU; fork children have nonzero inherited SSPs → skipped).
+Full boot **smoke-test PASS**. Both images rebuilt with fixes #1 + #2.
+
+**What to do on the Dell next (should be quick):**
+1. Flash **`A-default.img`** (both fixes, no diag) → expect it to **boot all the
+   way to a login** (init now has a shadow stack, so userspace runs). That
+   confirms the two-part fix end to end.
+2. If it *still* stalls at userspace, flash **`I-cet-diag.img`** and look past
+   marker 22 — the next square/hang localizes any *further* CET userspace issue
+   (e.g. a later execve'd process, the compositor). Every square is now bright.
+3. Once it logs in: resume §4.5 / runbook Block 2 — confirm `[sec] …
+   cet(active=true supported=true)`, `m3ctl mitigations status` → `CET: enabled`,
+   then `rop-cet-poc` must `#CP`-kill (no `PWNED`).
+
+Everything below (§1–§7) is the pre-resolution record, kept for the audit trail.
+
+---
+
+## 1. TL;DR (pre-resolution — superseded by §0)
 
 Everything the build host can do is done and green (both PoCs authored + wired +
 QEMU run-to-completion smoke gates PASS; 8 posture/bisect images staged). On the
@@ -21,6 +112,12 @@ the CET user-shadow-stack enable** (`enable_user_cet_if_supported`,
 `CR4.CET` (Intel SDM requires it; QEMU never enforced it) — **did not resolve the
 hang**. Next session **must wire serial** (AMT SOL / USB-serial COM1) to read the
 fault (`#GP` vs `#PF` vs triple-fault + RIP); the fix is then likely small.
+
+> **Correction (§0):** the "CET enable itself hangs" reading was *mislocated*. BSP
+> CET enable actually succeeds (markers 32–35 all paint); the hang is the AP
+> trampoline reloading CET-bearing `CR4` without `CR0.WP`. Serial was **not**
+> needed — the POST squares localized it once decoded against the fb-clear + the
+> real marker firing order. See §0.
 
 ---
 
@@ -213,31 +310,39 @@ is committed yet. Changes:
  M Cargo.toml / Cargo.lock                # 2 new workspace members
  M docs/appendix/regression-gates.md      # gate section
  M docs/handoffs/2026-07-09-dell-validation-session.md   # Block 0 artifacts note
+ M docs/handoffs/2026-07-09-cet-boot-hang-on-tiger-lake.md  # §0 root-cause + fix (this doc)
  M docs/handoffs/next-dell-session.md     # A.6 / B.3 point at the shipped binaries
- M kernel/src/arch/x86_64/cpuid.rs        # CR0.WP-before-CR4.CET fix + mask knobs
+ M kernel/src/arch/x86_64/cpuid.rs        # BSP CR0.WP-before-CR4.CET fix + mask knobs
+ M kernel/src/smp/boot.rs                 # ***FIX #1***: AP CR0.WP before CET-bearing CR4 reload
+ M kernel/src/arch/x86_64/mod.rs          # ***FIX #2***: arm init's CET shadow stack in fork trampoline
+ M kernel/src/lib.rs                      # post_marker recolour (no black squares)
  M kernel/src/fs/ramdisk.rs               # embed the two PoCs
  M xtask/src/main.rs                      # bins + 2 smoke gates + rop rustflags
 ?? userspace/meltdown-poc/                # new crate
 ?? userspace/rop-cet-poc/                 # new crate
 ```
 
-The `CR0.WP` fix is correct and worth keeping even though it didn't fully resolve
-the hang (it's an architectural requirement for CET). The mask knobs are reusable
-bench tooling. Recommend committing all of this (the Block 0 work is done; the
-CET fix is a partial-but-correct step) so the next session starts from a clean
-tree and iterates only on the remaining CET-enable fault.
+The **`smp/boot.rs` AP `CR0.WP` fix is the boot-hang fix** (§0): the AP reloaded
+the BSP's CET-bearing `CR4` before setting `CR0.WP`, `#GP`-triple-faulting every
+AP. The BSP `CR0.WP` fix in `cpuid.rs` is still correct and necessary (the BSP's
+own CET-enable precondition). The `lib.rs` recolour makes every POST square
+visibly bright. The mask knobs are reusable bench tooling. Recommend committing
+all of this now — the tree is clean under `cargo xtask check`, SMP smoke PASSes,
+and the fixed images are staged. The only open item is the **Dell re-flash
+confirmation** (boot `A-default.img` → login).
 
 ---
 
 ## 7. One-paragraph orientation for the next agent
 
-Block 0 is done. The bench proved (via the F/G/H image bisect in §2) that the
-**CET user-shadow-stack enable** hangs the Dell at boot — the one Phase 110 path
-QEMU can't exercise. A `CR0.WP`-before-`CR4.CET` fix was correct but insufficient.
-You are **blind without serial**: wire AMT SOL / USB-serial (§4.1), boot
-`H-cetfix-default.img`, read the fault RIP around `mitigations::init_bsp`
-(`lib.rs:536`, between POST markers 12–13), and the fix follows. If serial is
-truly unavailable, use the `BRINGUP_DIAG` POST-square bisection (§4.2) — but first
-determine whether it's a **hard hang or a reboot loop** (does "jumping to kernel"
-recur?), because a triple-fault reset wipes the squares. All images, knobs, and
-the exact code sites are in §3 / §5.
+**Resolved — see §0.** The POST-square bisection (§4.2) *worked*: `I-cet-diag.img`
+read **8 / 5 / 4** squares, which (decoded against the fb-clear at marker 6 + the
+real, non-slot-order marker firing) pins the hang to **`smp::boot::boot_aps()`**,
+not the BSP CET enable — all four CET markers 32–35 painted, so BSP CET succeeds.
+Root cause: the AP trampoline reloads the BSP's CET-bearing `CR4` **without first
+setting `CR0.WP`** → `#GP(0)` → per-AP triple-fault → `boot_aps` hangs on the
+rendezvous. Fix landed in `ap_entry` (`kernel/src/smp/boot.rs`): set `CR0.WP=1`
+before the `mov cr4, bsp_cr4`. SMP smoke PASS; `A-default.img` + `I-cet-diag.img`
+rebuilt. Serial was never needed. **Only open item:** re-flash `A-default.img` on
+the Dell and confirm it boots to login (then resume the runbook Block 2). §1–§6
+below are the pre-resolution record.

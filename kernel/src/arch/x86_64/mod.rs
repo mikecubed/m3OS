@@ -177,6 +177,36 @@ pub unsafe fn enter_userspace_fork(
     // is set) panics with a zero scheduler RSP. Normal syscall/signal-return
     // boundaries handle deferred reschedules after the task has a stable
     // continuation.
+
+    // Phase 110 B.3 (Tiger Lake) — arm a CET user shadow stack for a user task
+    // that reaches its first ring-3 entry without one. Only PID 1 (init) does:
+    // it is kernel-spawned through this fork trampoline (`spawn_userspace_init`)
+    // with `cet_ssp = 0`, whereas `execve` arms its own fresh image
+    // (`setup_current_task_shadow_stack` before `enter_userspace`) and fork
+    // children inherit the parent's (nonzero) SSP + copied shadow-stack pages.
+    // Without this, on CET silicon init's first `CALL` pushes a return address
+    // to `IA32_PL3_SSP = 0` and faults — the Dell/Tiger Lake stall right after
+    // "exec'ing userspace PID 1" (POST marker 22, no userspace output). We run
+    // in init's live CR3 here, so `setup_current_task_shadow_stack` maps into and
+    // advances init's own address space exactly as the execve path does. Gated
+    // on `cet_active`, so it is inert on QEMU (and the `== 0` MSR read is skipped
+    // on a no-CET CPU, which would otherwise `#GP`).
+    if crate::mitigations::state().is_some_and(|s| s.cet_active)
+        && crate::task::scheduler::current_task_cet_ssp_live() == 0
+    {
+        // SAFETY: the fork trampoline runs in the target task's context with its
+        // CR3 live, immediately before the `iretq` to its ring 3.
+        if !unsafe { crate::arch::x86_64::cet::setup_current_task_shadow_stack() } {
+            // Frame exhaustion — fail closed rather than `iretq` into ring 3 with
+            // no shadow stack (the first `CALL` would fault). Kills only this
+            // process; for PID 1 that is a fatal boot condition either way.
+            crate::arch::x86_64::syscall::terminate_thread_group_and_exit(
+                crate::process::current_pid(),
+                -9,
+            );
+        }
+    }
+
     // Write to per-core ForkEntryCtx and pass pointer to assembly trampoline.
     let data =
         crate::smp::per_core() as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
