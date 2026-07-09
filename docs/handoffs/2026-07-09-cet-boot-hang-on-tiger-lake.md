@@ -2,16 +2,20 @@
 
 **Session:** 2026-07-09 Dell Precision 5560 (Intel Tiger Lake, has `CET_SS`).
 **Runbook this executes:** [2026-07-09 Dell validation session](./2026-07-09-dell-validation-session.md).
-**Branch:** `feat/phase-110-cet-shstk` (5 fixes committed this session).
-**Status:** ✅ **VALIDATED ON REAL SILICON — Phase 110 B.3 CET COMPLETE.**
-The Dell boots clean under CET to the greeter → login → compositor → terminal,
-and the security property is **proven**: `m3ctl mitigations status` reports
-`CET: enabled (user shadow stacks)`, `rop-cet-poc`'s return-address overwrite is
-`#CP`-killed (**no `PWNED`**; `dmesg` shows `[int] userspace #CP (CET
-control-protection): … process killed`). Five real-silicon CET bugs — none
-exercisable by QEMU (TCG models no CET) — were found and fixed this session; all
-are committed. Remaining Block-2 item: the **A.6 Meltdown A/B** (`meltdown-poc`
-leaks on `B-mitigations-off` / not on `A-default`) — the KPTI track, optional.
+**Branch:** `feat/phase-110-cet-shstk` (this session's fixes committed).
+**Status:** ✅ **VALIDATED ON REAL SILICON — Phase 110 B.3 CET COMPLETE. → next
+steps in §0.8.**
+The Dell boots clean under CET to the greeter → login → compositor → terminal →
+fork/exec, and the security property is **proven**: `m3ctl mitigations status`
+reports `CET: enabled (user shadow stacks)`, `rop-cet-poc`'s return-address
+overwrite is `#CP`-killed (**no `PWNED`**; `dmesg` shows the `#CP` kill). Also
+validated this session: **userspace Spectre-v2 via eIBRS** (`Spectre-v2 (IBRS):
+eIBRS enhanced … covers ring 3`, no `UNCOVERED` warning — the correct posture
+after fix #4 dropped userspace retpolines) and **Meltdown correctly not-applicable**
+(Tiger Lake `rdcl_no=true` → immune → KPTI off; `meltdown-poc`'s uniform-`0xdb`×16
+"leak" was a stuck-slot cache artifact, now hardened to report `NO-LEAK`). Five
+real-silicon CET bugs — none exercisable by QEMU (TCG models no CET) — were found
+and fixed; **top next step: open the PR to `main` (§0.8).**
 
 The Dell now boots to the **greeter, logs in, runs the compositor, the terminal,
 and fork/exec (shells, pipelines) — all under active CET**. Fix #4 (§0.5) — **userspace retpolines are incompatible with
@@ -188,8 +192,56 @@ After all five fixes, `A-default.img` on the Dell:
 
 That is the full positive proof: CET user shadow stacks are live AND actively
 reject a ROP-style return-address overwrite on real silicon — the exact property
-QEMU (no CET model) can never demonstrate. **Phase 110 B.3 is done.** The five
-fixes (§0.1–§0.6) are all committed on `feat/phase-110-cet-shstk`; ready for PR.
+QEMU (no CET model) can never demonstrate. **Phase 110 B.3 is done.**
+
+**Spectre-v2 / eIBRS (validated).** Dropping userspace `-Zretpoline` (fix #4)
+moved userspace Spectre-v2 onto **eIBRS**. Confirmed on the Dell: `m3ctl
+mitigations status` → `Spectre-v2 (IBRS): eIBRS enhanced, set-once at boot —
+covers ring 3 (userspace)`, and **no** `UNCOVERED` warning. So userspace indirect
+branches are protected by hardware eIBRS + IBPB (the standard eIBRS-silicon
+posture, matching Linux). The reporter was fixed this session to surface the IBRS
+mode explicitly + warn if eIBRS is absent (fix in `m3ctl`/`spectre` reporting).
+
+**Meltdown / A.6 (immune silicon — validated, PoC hardened).** Tiger Lake is
+`rdcl_no=true`, Meltdown-immune in hardware, so `mitigations=auto` correctly
+leaves **KPTI OFF** (`m3ctl` → `Meltdown: Not affected`). `meltdown-poc` initially
+false-flagged `LEAK bytes=16/16` — but recovered `0xdb`×16, a **uniform** byte =
+a stuck-hot cache-channel slot (untuned `CACHE_HIT_THRESHOLD` on real silicon),
+NOT memory. Fixed the PoC to require a **non-uniform** recovery; it now correctly
+prints `NO-LEAK (… stuck-slot cache artifact …)`. **No real Meltdown exposure.**
+NB: the "leak on B / no-leak on A" A/B *cannot* be shown on this CPU — both arms
+are no-leak because the silicon is immune; demonstrating a real leak needs
+Meltdown-**susceptible** silicon (pre-`rdcl_no` Intel).
+
+All session fixes are committed on `feat/phase-110-cet-shstk`; QEMU gates
+(`mitigations-status-smoke`, `meltdown-poc-smoke`, `rop-cet-poc-smoke`,
+`smp-smoke`, `smoke-test`) all PASS.
+
+### 0.8 NEXT STEPS (pick-up for the next session)
+
+1. **Open the PR** — `feat/phase-110-cet-shstk` → `main`. It's complete and
+   real-silicon-validated; ~11 commits (2f5a58bc … the reporter/gate fixes).
+   Nothing else blocks it.
+2. **Mark Phase 110 B.3 done in the roadmap/inventory** — the AGENTS.md CET
+   bullet says "dormant on QEMU / live on CET silicon"; add "validated on Tiger
+   Lake (rop-cet-poc `#CP`-kill)". Update `docs/roadmap/` Phase 110 status +
+   record the Dell run in `docs/handoffs/2026-07-09-dell-validation-session.md`
+   (the runbook this executed).
+3. **Decide the userspace-retpoline tradeoff (design call).** Fix #4 drops
+   `-Zretpoline` from userspace **unconditionally** — correct on eIBRS silicon
+   (Tiger Lake+), but a **non-eIBRS** CPU then has NO userspace Spectre-v2 cover
+   (the `m3ctl` `UNCOVERED` warning now surfaces this; QEMU/TCG shows it too, and
+   is not a security target). Options: accept it (CET deployment is eIBRS-class),
+   or build two userspace variants (retpoline for non-CET, eIBRS for CET). Not
+   blocking; document the decision.
+4. **(Optional) Meltdown leak demo** — if a *positive* Meltdown demonstration is
+   wanted, run `meltdown-poc` on Meltdown-susceptible silicon (or a QEMU/KVM CPU
+   model without `rdcl_no`) and, on that box, tune `CACHE_HIT_THRESHOLD`/`TRIES`
+   per the PoC header before trusting the kernel arm.
+5. **CET follow-ups already noted in code** (lower priority): nested-signal
+   shadow-stack handling still uses the single `Task::cet_signal_ssp` field
+   (§0.3 note) — single-level delivery is correct; deep nesting would want a
+   per-frame SSP or to rely purely on the WRUSS seeds.
 
 ### 0.6 fork must eagerly copy shadow-stack pages (FIXED)
 
