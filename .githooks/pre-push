@@ -405,6 +405,21 @@ if [ "${M3OS_ASLR_REGRESSION:-0}" = "1" ]; then
     cargo xtask stack-smash-smoke --timeout 240
 fi
 
+# Phase 110 Dell-validation PoCs — Meltdown (A.6) + CET/ROP (B.3) QEMU
+# run-to-completion gates. Gated behind M3OS_SEC_POC_REGRESSION=1 because they
+# boot the OS. QEMU TCG models no caches/speculation/CET, so these prove only
+# that /bin/meltdown-poc and /bin/rop-cet-poc load and run their novel code
+# paths without faulting/panicking; the actual leak-reject (A.6) and #CP-kill
+# (B.3) security arms are bare-metal-only (see docs/handoffs/2026-07-09-dell-
+# validation-session.md). Set on branches touching the two PoC binaries, the
+# CET/#CP handler, or the KPTI/PCID substrate.
+if [ "${M3OS_SEC_POC_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask meltdown-poc-smoke..."
+    cargo xtask meltdown-poc-smoke --timeout 240
+    echo "pre-push: running cargo xtask rop-cet-poc-smoke..."
+    cargo xtask rop-cet-poc-smoke --timeout 240
+fi
+
 # Phase 111 Track B — trap & debug-register substrate gate. Gated behind
 # M3OS_DEBUG_SUBSTRATE_REGRESSION=1 because it builds the kernel with the
 # `debug-substrate-test` feature and boots it: the boot-time self-test proves

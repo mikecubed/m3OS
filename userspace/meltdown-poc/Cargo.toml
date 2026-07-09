@@ -1,0 +1,11 @@
+[package]
+name = "meltdown-poc"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "meltdown-poc"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib" }
