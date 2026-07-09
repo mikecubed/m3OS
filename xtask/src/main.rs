@@ -2466,10 +2466,12 @@ fn build_userspace_bins() {
         // trips CET's shadow-stack check, rather than being caught first by
         // `__stack_chk_fail`. Override the userspace target's
         // `-Zstack-protector=strong` (from .cargo/config.toml) for this one
-        // crate; keep `-Zretpoline` for ABI coherence with the retpoline'd
-        // build-std. Env RUSTFLAGS replaces (not merges with) the config value.
+        // crate. NB: no `-Zretpoline` — userspace no longer uses retpolines (they
+        // are incompatible with CET shadow stacks; see .cargo/config.toml), and a
+        // lone retpolined binary would itself `#CP` on its indirect calls. Env
+        // RUSTFLAGS replaces (not merges with) the config value.
         if pkg == "rop-cet-poc" {
-            build_cmd.env("RUSTFLAGS", "-Zretpoline -Zstack-protector=none");
+            build_cmd.env("RUSTFLAGS", "-Zstack-protector=none");
         }
         let status = build_cmd
             .status()

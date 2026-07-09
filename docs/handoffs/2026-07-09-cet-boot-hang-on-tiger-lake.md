@@ -3,8 +3,12 @@
 **Session:** 2026-07-09 Dell Precision 5560 (Intel Tiger Lake, has `CET_SS`).
 **Runbook this executes:** [2026-07-09 Dell validation session](./2026-07-09-dell-validation-session.md).
 **Branch:** `feat/phase-110-cet-shstk` (all changes below are **uncommitted** — see §6).
-**Status:** **ROOT-CAUSED + THREE FIXES LANDED (pending Dell re-flash confirmation).**
-Three distinct CET real-silicon bugs, all invisible to QEMU: **(1)** the AP
+**Status:** **ROOT-CAUSED + FOUR FIXES LANDED (pending Dell re-flash confirmation).**
+Fix #4 (§0.5) is the big one — **userspace retpolines are incompatible with CET
+shadow stacks** (the on-screen freeze caught `xhci` `#CP`-ing on the `ret` inside
+`__llvm_retpoline_r11`); dropped `-Zretpoline` from the userspace build, CET
+silicon uses eIBRS instead. That was the dominant userspace crash cause
+(xhci/display_server/every indirect call). The earlier three: **(1)** the AP
 trampoline reloaded the BSP's CET-bearing `CR4` **without `CR0.WP`** → per-AP
 `#GP` triple-fault → `boot_aps` hang (decoded from **8 / 5 / 4** POST squares;
 fix in `smp/boot.rs`). **(2)** init (PID 1) is kernel-spawned via the fork
@@ -162,6 +166,46 @@ screen to be photographed. `I-cet-diag.img` rebuilt with it.
 3. If it *doesn't* freeze (no fatal fault — display_server exits cleanly), then
    the failure is not a fault (e.g. an IPC/registration issue) and we debug from
    the client-connect path instead.
+
+### 0.5 THE userspace root cause — retpolines are incompatible with CET (FIXED)
+
+The `I-cet-diag.img` on-screen freeze (§0.3) caught the real bug in one shot:
+```
+*** BRINGUP_DIAG HALT: userspace #CP fault ***
+pid=4 comm=xhci rip=0x214bc4 rsp=0x7fffffefcff00 err=0x1
+```
+`err=0x1` = **near-RET** shadow-stack mismatch, and `0x214bc4` maps (fixed
+non-PIE base `0x200000`) to the `ret` inside **`__llvm_retpoline_r11`** — the
+Spectre-v2 **retpoline thunk**.
+
+**Retpolines and CET shadow stacks are mutually exclusive.** A retpoline thunk is
+`call <n>; <n>: mov %r11,(%rsp); ret` — it OVERWRITES the return address the
+`call` pushed with the real indirect target (r11), then `ret`s. But the CET
+**shadow stack** still holds the `call`-pushed address, so that `ret` is a
+near-RET mismatch → `#CP`. Once user shadow stacks are live, **every indirect
+call through a retpoline `#CP`s** — so xhci_driver, display_server, and every
+other execve'd daemon that dispatches through a function pointer dies with signal
+11 (init survived because its early path took no such indirect call before the
+symptom). This also explains the empty boot.log (§0.4): xhci dies → no USB.
+
+Userspace was built with `-Zretpoline` (`.cargo/config.toml [target.x86_64-m3os]`).
+CET-capable silicon (Tiger Lake+) uses **eIBRS** as the hardware Spectre-v2
+mitigation instead, which the kernel enables at boot — retpolines are neither
+needed nor allowed there.
+
+**Fix #4 (landed):** drop `-Zretpoline` from the userspace target (kept the
+`-Zstack-protector=strong` canary); also removed it from the `rop-cet-poc`
+per-crate RUSTFLAGS override (a lone retpolined binary would itself `#CP`). The
+**kernel keeps** `-Zretpoline` — it has no *supervisor* shadow stack
+(`IA32_S_CET.SH_STK_EN=0`), so ring-0 retpoline `ret`s are never shadow-checked;
+the retpoline gate (kernel-only) still passes (2249 thunks). Verified:
+`xhci_driver` now has **0** retpoline thunks + 53 plain (CET-compatible) indirect
+calls; `cargo xtask check` + boot smoke-test PASS. All images rebuilt.
+
+> This was the dominant userspace blocker. Re-flash **`A-default.img`** → expect
+> display_server + the greeter to come up (indirect calls no longer `#CP`).
+> Follow-up to confirm on the Dell: eIBRS is actually active (`m3ctl mitigations
+> status` / the `[sec] … ibrs=` boot line) so userspace Spectre-v2 is covered.
 
 ### 0.4 BEST capture path — `boot.log` on a USB log partition (validated)
 
