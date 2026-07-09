@@ -1542,6 +1542,57 @@ fn clac_on_irq_entry() {
     unsafe { crate::arch::x86_64::cpuid::clear_ac_for_smap() };
 }
 
+/// Bring-up diagnostic (Phase 110 CET userspace bring-up): freeze the machine on
+/// the **first fatal ring-3 fault** with its class + pid + process name +
+/// RIP/RSP/err painted to the framebuffer, so a serial-less bench reads exactly
+/// which userspace instruction faulted (`_panic_print` goes to serial only,
+/// invisible on the Dell). Called ONLY at the process-killing fault sites, so
+/// ordinary demand-paging `#PF`s are unaffected. No-op unless built with
+/// `M3OS_BRINGUP_DIAG=1`. Halts (never returns) when it fires.
+fn bringup_freeze_on_user_fault(
+    kind: &str,
+    pid: crate::process::Pid,
+    rip: u64,
+    rsp: u64,
+    err: u64,
+) {
+    if !crate::BRINGUP_DIAG {
+        return;
+    }
+    // First fatal fault wins; guards re-entrancy if the fb write itself faults.
+    static FROZEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if FROZEN.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // Quiesce sibling cores (halt-NMI) so nothing repaints the framebuffer over
+    // the dump — otherwise a respawned display_server / compositor client on
+    // another core could overwrite it before it can be photographed.
+    crate::smp::panic_quiesce_aps();
+    // Best-effort process name — try_lock, since the faulting ring-3 task holds
+    // no kernel lock this normally succeeds; skip the name on contention.
+    let mut name = [0u8; 16];
+    let mut n = 0usize;
+    if let Some(table) = crate::process::PROCESS_TABLE.try_lock()
+        && let Some(proc) = table.find(pid)
+    {
+        for &b in proc.comm.iter() {
+            if b == 0 {
+                break;
+            }
+            name[n] = b;
+            n += 1;
+        }
+    }
+    let name = core::str::from_utf8(&name[..n]).unwrap_or("?");
+    crate::fb::diag_force_write_fmt(format_args!(
+        "\n*** BRINGUP_DIAG HALT: userspace {kind} fault ***\n\
+         pid={pid} comm={name} rip={rip:#x} rsp={rsp:#x} err={err:#x}\n\
+         (#CP=CET CFI/shadow-stack; map rip: nm <bin> + process load base)\n\
+         *** machine halted — photograph this line ***\n",
+    ));
+    crate::hlt_loop();
+}
+
 /// `#PF` body — Phase 110 A.3b moved this onto the KPTI-aware naked
 /// `page_fault_entry` stub, so it takes the full-GPR [`TrapFrameErr`] the stub
 /// captured (the CPU error code is `frame.error_code`) instead of an
@@ -1823,6 +1874,10 @@ extern "C" fn page_fault_body(frame: &mut TrapFrameErr) {
         }
         panic_diag::dump_crash_context();
         crate::trace::dump_trace_rings();
+        // Bring-up diagnostic: freeze on-screen (serial-free) before the kill.
+        // Reached only for a fatal (unhandled) ring-3 #PF — demand-paging faults
+        // resolve and return long before here.
+        bringup_freeze_on_user_fault("#PF", pid, frame.rip, frame.rsp, frame.error_code);
         // Store the PID for the trampoline. Safe: interrupts are disabled
         // during exception handling on a single CPU.
         FAULT_KILL_PID.store(pid, Ordering::Relaxed);
@@ -2034,6 +2089,8 @@ extern "C" fn general_protection_fault_body(frame: &mut TrapFrameErr) {
         ));
         panic_diag::dump_crash_context();
         crate::trace::dump_trace_rings();
+        // Bring-up diagnostic: freeze on-screen (serial-free) before the kill.
+        bringup_freeze_on_user_fault("#GP", pid, frame.rip, frame.rsp, err);
         // Store the PID and redirect to the kill trampoline (same pattern as
         // page_fault_body — no blocking allowed inside an ISR).
         FAULT_KILL_PID.store(pid, Ordering::Relaxed);
@@ -2092,6 +2149,8 @@ extern "C" fn control_protection_fault_body(frame: &mut TrapFrameErr) {
         ));
         panic_diag::dump_crash_context();
         crate::trace::dump_trace_rings();
+        // Bring-up diagnostic: freeze on-screen (serial-free) before the kill.
+        bringup_freeze_on_user_fault("#CP", pid, frame.rip, frame.rsp, err);
         FAULT_KILL_PID.store(pid, Ordering::Relaxed);
         // Redirect to the ring-0 kill trampoline on the current kernel stack
         // (identical pattern to page_fault_body / general_protection_fault_body).

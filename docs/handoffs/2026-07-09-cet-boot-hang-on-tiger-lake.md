@@ -128,6 +128,41 @@ target-feature gating. Gated on `cet_active` → inert on QEMU. `cargo xtask che
    `m3ctl mitigations status` → `CET: enabled`, then `rop-cet-poc` must
    `#CP`-kill (no `PWNED`) and `meltdown-poc` leak on B / no-leak on A.
 
+### 0.3 STILL failing — display_server down; added an on-screen fault dumper
+
+After fix #3 the greeter still fails, now reporting **`notifyd: display_server
+unavailable`** (and wallpaper) — those clients call `DisplayConnection::
+connect_auto()`, get `None`, and exit. So **display_server itself is down**
+(crashed or never registered), and every compositor client fails downstream. It
+is unclear whether fix #3 helped, regressed, or is orthogonal — and *all three
+fixes so far were code-analysis only* (QEMU can't exercise CET), so we are
+guessing. **We need the actual fault** (process, class, RIP).
+
+Blocker: the kernel fault handlers (`#CP`/`#PF`/`#GP`) print via `_panic_print`,
+which goes to **serial only** — invisible on the Dell — and the process is then
+killed + respawned, so any on-screen flash is overwritten.
+
+**New tool (landed): serial-free on-screen fault dumper.** Gated on
+`M3OS_BRINGUP_DIAG=1` (same knob as the POST squares). At the **fatal** ring-3
+fault sites only (so ordinary demand-paging `#PF`s are unaffected),
+`bringup_freeze_on_user_fault` (`interrupts.rs`): quiesces sibling cores
+(`panic_quiesce_aps` NMI), **reclaims the framebuffer** from display_server
+(`fb::diag_force_write_fmt` → `restore_console`), paints
+`*** BRINGUP_DIAG HALT: userspace <#CP|#PF|#GP> fault *** pid=… comm=… rip=…
+rsp=… err=…`, and **halts** — so the first fatal userspace fault freezes on
+screen to be photographed. `I-cet-diag.img` rebuilt with it.
+
+**What to do on the Dell next:**
+1. Flash **`I-cet-diag.img`**, let it reach the greeter failure. The machine
+   should **freeze with the `BRINGUP_DIAG HALT` line** naming the faulting
+   process (expect `comm=display_server` or similar), the fault class, and RIP.
+2. **Photograph it.** With `comm` + fault class we know the culprit and whether
+   it's CET (`#CP`) or a shadow-stack `#PF`; with the RIP + that binary's load
+   base we can map the exact instruction. Send it here.
+3. If it *doesn't* freeze (no fatal fault — display_server exits cleanly), then
+   the failure is not a fault (e.g. an IPC/registration issue) and we debug from
+   the client-connect path instead.
+
 Everything below (§1–§7) is the pre-resolution record, kept for the audit trail.
 
 ---
