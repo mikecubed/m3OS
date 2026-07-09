@@ -3,16 +3,19 @@
 **Session:** 2026-07-09 Dell Precision 5560 (Intel Tiger Lake, has `CET_SS`).
 **Runbook this executes:** [2026-07-09 Dell validation session](./2026-07-09-dell-validation-session.md).
 **Branch:** `feat/phase-110-cet-shstk` (all changes below are **uncommitted** — see §6).
-**Status:** **ROOT-CAUSED + TWO FIXES LANDED (pending Dell re-flash confirmation).**
-Two distinct CET real-silicon bugs, both invisible to QEMU, found via the
-POST-square diagnostic: **(1)** the AP trampoline reloaded the BSP's CET-bearing
-`CR4` **without `CR0.WP`** → per-AP `#GP` triple-fault → `boot_aps` hang (decoded
-from **8 / 5 / 4** squares; fix in `smp/boot.rs`). **(2)** init (PID 1) is
-kernel-spawned via the fork trampoline with `cet_ssp = 0` and **nothing armed its
-shadow stack** → its first ring-3 `CALL` faults (found from `boot.jpeg`: boot now
-reaches marker 22 then stalls with no userspace; fix in `arch/x86_64/mod.rs`).
-SMP smoke + full boot smoke-test PASS; `A-default.img` + `I-cet-diag.img` rebuilt
-with both fixes. **Next: flash `A-default.img` → expect a full login.**
+**Status:** **ROOT-CAUSED + THREE FIXES LANDED (pending Dell re-flash confirmation).**
+Three distinct CET real-silicon bugs, all invisible to QEMU: **(1)** the AP
+trampoline reloaded the BSP's CET-bearing `CR4` **without `CR0.WP`** → per-AP
+`#GP` triple-fault → `boot_aps` hang (decoded from **8 / 5 / 4** POST squares;
+fix in `smp/boot.rs`). **(2)** init (PID 1) is kernel-spawned via the fork
+trampoline with `cet_ssp = 0` and **nothing armed its shadow stack** → its first
+ring-3 `CALL` faults (found from `boot.jpeg`: boot reaches marker 22 then stalls
+with no userspace; fix in `arch/x86_64/mod.rs`).
+**(3)** CET signal delivery never seeded the shadow stack, so any handler's `RET`
+`#CP`'d — the greeter respawn loop; fix seeds `restorer` via `WRUSS` in
+`cet.rs`/`syscall/mod.rs`. SMP smoke + boot smoke-test PASS; `A-default.img` +
+`I-cet-diag.img` rebuilt with all three fixes. **Next: flash `A-default.img` →
+expect the greeter to stay up and log in.**
 
 ---
 
@@ -85,16 +88,45 @@ space exactly as the execve path does; fail-closed on frame exhaustion. Gated on
 `cet_active` (inert on QEMU; fork children have nonzero inherited SSPs → skipped).
 Full boot **smoke-test PASS**. Both images rebuilt with fixes #1 + #2.
 
-**What to do on the Dell next (should be quick):**
-1. Flash **`A-default.img`** (both fixes, no diag) → expect it to **boot all the
-   way to a login** (init now has a shadow stack, so userspace runs). That
-   confirms the two-part fix end to end.
-2. If it *still* stalls at userspace, flash **`I-cet-diag.img`** and look past
-   marker 22 — the next square/hang localizes any *further* CET userspace issue
-   (e.g. a later execve'd process, the compositor). Every square is now bright.
-3. Once it logs in: resume §4.5 / runbook Block 2 — confirm `[sec] …
-   cet(active=true supported=true)`, `m3ctl mitigations status` → `CET: enabled`,
-   then `rop-cet-poc` must `#CP`-kill (no `PWNED`).
+### 0.2 THIRD bug — signal handlers `#CP` on return (greeter respawn loop)
+
+With fixes #1 + #2, the Dell **booted to the graphical greeter** — but the
+greeter **respawn-looped** ("never properly launches, keeps exiting"). Root
+cause: the CET **signal-delivery** path saved/restored `IA32_PL3_SSP` but never
+**seeded the shadow stack**. The kernel enters a handler via `IRETQ`, which loads
+`SSP` but pushes nothing to the shadow stack, so the handler runs on the
+*interrupted* context's shadow stack. When the handler executes its final `RET`
+to the sigframe `pretcode` (`restorer` → `__restore_rt`), the data-stack return
+(`restorer`) is compared against the shadow-stack top (the interrupted function's
+return address) → mismatch → **`#CP`** → the process is killed. This kills *any*
+process whose signal handler **returns** — the greeter takes a signal early
+(SIGCHLD/SIGALRM/SIGWINCH) and dies on every launch. QEMU never caught it (CET
+inactive; the whole seam is `cet_active`-gated).
+
+**Fix #3 (landed):** at signal delivery (`deliver_user_signal`,
+`syscall/mod.rs`) call a new `cet::seed_signal_shadow_stack(restorer)` — it
+`WRUSS`-pushes `restorer` one slot below the live SSP and drops `IA32_PL3_SSP` by
+8, so the handler's final `RET` matches and unwinds `SSP` back naturally; the
+saved-SSP restore at `sigreturn` then discards the slot. `WRUSS` is emitted as
+raw bytes (`66 48 0F 38 F5 07` = `wrussq [rdi], rax`) to dodge any `+cet`
+target-feature gating. Gated on `cet_active` → inert on QEMU. `cargo xtask check`
++ boot smoke-test PASS (init's SIGCHLD reaping still works). Both images rebuilt.
+
+> **Known follow-up (not the greeter bug):** deeply *nested* signals still share
+> the single `Task::cet_signal_ssp` field. With seeding the shadow stack unwinds
+> correctly on its own, so single-level delivery is right; a robust nested
+> design would drop the explicit SSP restore and rely purely on the seeds (or
+> save a per-frame SSP). Rare; deferred.
+
+**What to do on the Dell next:**
+1. Flash **`A-default.img`** (fixes #1+#2+#3) → expect the **greeter to stay up
+   and log in**. That closes the CET userspace bring-up.
+2. If a *different* process still faults, the `#CP`/`#PF`/`#GP` handlers already
+   `_panic_print` the pid+RIP; catch the flash, or wire serial (§4.1) / add a
+   halt-on-first-userspace-fault diagnostic to freeze it on-screen.
+3. Once logged in: resume §4.5 / Block 2 — `cet(active=true supported=true)`,
+   `m3ctl mitigations status` → `CET: enabled`, then `rop-cet-poc` must
+   `#CP`-kill (no `PWNED`) and `meltdown-poc` leak on B / no-leak on A.
 
 Everything below (§1–§7) is the pre-resolution record, kept for the audit trail.
 
@@ -315,6 +347,8 @@ is committed yet. Changes:
  M kernel/src/arch/x86_64/cpuid.rs        # BSP CR0.WP-before-CR4.CET fix + mask knobs
  M kernel/src/smp/boot.rs                 # ***FIX #1***: AP CR0.WP before CET-bearing CR4 reload
  M kernel/src/arch/x86_64/mod.rs          # ***FIX #2***: arm init's CET shadow stack in fork trampoline
+ M kernel/src/arch/x86_64/cet.rs          # ***FIX #3***: seed_signal_shadow_stack (WRUSS restorer)
+ M kernel/src/arch/x86_64/syscall/mod.rs  # ***FIX #3***: call seed at signal delivery
  M kernel/src/lib.rs                      # post_marker recolour (no black squares)
  M kernel/src/fs/ramdisk.rs               # embed the two PoCs
  M xtask/src/main.rs                      # bins + 2 smoke gates + rop rustflags

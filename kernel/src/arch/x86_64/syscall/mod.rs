@@ -3030,6 +3030,16 @@ fn deliver_user_signal(
     // so sigreturn restores it (the handler runs on the same shadow stack,
     // pushing below the saved SSP). No-op unless CET is active.
     crate::task::scheduler::save_current_task_signal_ssp();
+    // Phase 110 B.3 — seed the handler's return address (`restorer`, the
+    // sigframe pretcode) onto the user shadow stack via WRUSS and drop
+    // IA32_PL3_SSP by 8. The handler is entered by IRETQ, which pushes nothing
+    // to the shadow stack, so without this its final `RET` to `restorer` would
+    // mismatch the shadow-stack top → `#CP` (kills any process whose signal
+    // handler returns — the Dell/Tiger Lake greeter respawn loop). No-op unless
+    // CET is active. `sigreturn` restores the saved SSP, discarding this slot.
+    unsafe {
+        crate::arch::x86_64::cet::seed_signal_shadow_stack(restorer);
+    }
     unsafe {
         enter_signal_handler(
             handler_entry,

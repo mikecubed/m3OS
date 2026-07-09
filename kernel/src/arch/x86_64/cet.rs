@@ -177,3 +177,56 @@ pub unsafe fn setup_current_task_shadow_stack() -> bool {
     unsafe { write_pl3_ssp(ssp) };
     true
 }
+
+/// Seed the current task's user shadow stack for **signal delivery**: push
+/// `ret_addr` (the sigframe `pretcode` — the address the handler `RET`s to, i.e.
+/// the `__restore_rt`/sigreturn trampoline) onto the shadow stack and lower
+/// `IA32_PL3_SSP` by 8 to point at it. Returns the new (lowered) SSP, or `0`
+/// when CET is inactive or the task has no shadow stack.
+///
+/// **Why this is load-bearing.** The kernel enters the handler with `IRETQ`,
+/// which loads `SSP` from `IA32_PL3_SSP` but pushes *nothing* onto the shadow
+/// stack. The handler runs on the interrupted context's shadow stack, so its
+/// final `RET` to `ret_addr` would compare the data-stack return (`ret_addr`)
+/// against a shadow-stack top holding the *interrupted* function's return
+/// address → mismatch → `#CP`, killing every process whose handler returns.
+/// Seeding `ret_addr` one slot below the live SSP makes that `RET` match; the
+/// handler's own calls nest below it and unwind back, and `sigreturn` restores
+/// the saved SSP ([`restore_task_ssp`]) discarding this slot.
+///
+/// Uses `WRUSS` (ring-0 write to a user shadow stack; requires `CR4.CET = 1`) —
+/// ordinary stores to a shadow-stack page (R/W=0) fault.
+///
+/// # Safety
+/// CET active; the current CR3 is this task's address space with a live user
+/// shadow stack at `IA32_PL3_SSP`; ring 0.
+pub unsafe fn seed_signal_shadow_stack(ret_addr: u64) -> u64 {
+    if !cet_active() {
+        return 0;
+    }
+    // SAFETY: gated on `cet_active`, so `IA32_PL3_SSP` exists; ring 0.
+    let ssp = unsafe { read_pl3_ssp() };
+    if ssp == 0 {
+        // No shadow stack armed for this task — nothing to seed; the handler
+        // runs with SSP=0 (no shadow-stack ops), matching the interrupted ctx.
+        return 0;
+    }
+    let new_ssp = ssp - 8;
+    // SAFETY: `WRUSS` writes 8 bytes to the user shadow stack at `new_ssp`, one
+    // 8-byte slot below the live SSP (free space — the shadow stack grows down,
+    // so `[base, SSP)` is unused and mapped). `new_ssp` inherits the SSP's
+    // 8-byte alignment. Ring 0 with `CR4.CET = 1` (guaranteed by `cet_active`),
+    // so `WRUSS` is permitted. Encoded as raw bytes to avoid any target-feature
+    // gating on the `wrussq` mnemonic: `66 48 0F 38 F5 07` = `wrussq [rdi], rax`
+    // (ModRM 0x07: reg=rax source, r/m=rdi destination).
+    unsafe {
+        core::arch::asm!(
+            ".byte 0x66, 0x48, 0x0F, 0x38, 0xF5, 0x07",
+            in("rdi") new_ssp,
+            in("rax") ret_addr,
+            options(nostack),
+        );
+        write_pl3_ssp(new_ssp);
+    }
+    new_ssp
+}
