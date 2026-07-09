@@ -114,8 +114,10 @@ pub fn restore_task_ssp(ssp: u64) {
 /// # Safety
 /// The current CR3 must be the target user address space, the page-table lock
 /// held, and `[base_va, base_va+size)` free of existing mappings. On failure
-/// the already-mapped pages stay linked (they are `USER_ACCESSIBLE` leaves,
-/// reclaimed with the abandoned page table); only the last frame is freed here.
+/// **all** pages mapped so far are rolled back (unmapped + their frames freed)
+/// before returning `None`, so a caller that keeps the address space alive on
+/// `ENOMEM` (the `CLONE_VM` thread path — the parent survives) does not leak
+/// user-mapped shadow-stack pages.
 pub unsafe fn map_user_shadow_stack(base_va: u64, size: u64) -> Option<u64> {
     use x86_64::{VirtAddr, structures::paging::PageTableFlags};
     debug_assert_eq!(base_va & 0xFFF, 0, "shadow-stack base must be page-aligned");
@@ -124,7 +126,11 @@ pub unsafe fn map_user_shadow_stack(base_va: u64, size: u64) -> Option<u64> {
 
     let mut va = base_va;
     while va < base_va + size {
-        let frame = crate::mm::frame_allocator::allocate_frame_zeroed()?;
+        let Some(frame) = crate::mm::frame_allocator::allocate_frame_zeroed() else {
+            // SAFETY: `[base_va, va)` is exactly the range mapped so far; lock held.
+            unsafe { unmap_shadow_stack_range(base_va, va) };
+            return None;
+        };
         // SAFETY: caller holds the page-table lock over the current (target)
         // CR3; the range is free; the flags are the shadow-stack leaf encoding
         // (intermediates are forced writable+user by the mapper, as CET
@@ -135,11 +141,41 @@ pub unsafe fn map_user_shadow_stack(base_va: u64, size: u64) -> Option<u64> {
         .is_err()
         {
             crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
+            // SAFETY: `[base_va, va)` is the successfully-mapped prefix; the
+            // just-allocated `frame` was freed above and never mapped, so it is
+            // not double-freed here. Lock held.
+            unsafe { unmap_shadow_stack_range(base_va, va) };
             return None;
         }
         va += 4096;
     }
     Some(base_va + size)
+}
+
+/// Unmap + free the 4 KiB pages in `[base_va, end_va)` from the **current** CR3.
+/// Rollback helper for a partial [`map_user_shadow_stack`] failure.
+///
+/// # Safety
+/// The current CR3 is the target address space, the page-table lock is held, and
+/// every page in `[base_va, end_va)` was mapped by this module (a fresh frame
+/// each), so unmapping + freeing them cannot double-free or drop a shared frame.
+unsafe fn unmap_shadow_stack_range(base_va: u64, end_va: u64) {
+    use x86_64::{
+        VirtAddr,
+        structures::paging::{Mapper, Page, Size4KiB},
+    };
+    // SAFETY: no other `OffsetPageTable` over this CR3 is alive here — the
+    // per-page mapping mappers were each dropped before this call.
+    let mut mapper = unsafe { crate::mm::paging::get_mapper() };
+    let mut v = base_va;
+    while v < end_va {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(v));
+        if let Ok((frame, flush)) = mapper.unmap(page) {
+            flush.flush();
+            crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
+        }
+        v += 4096;
+    }
 }
 
 /// Install a fresh CET user shadow stack for the **current** task and arm it:
@@ -206,12 +242,15 @@ pub unsafe fn seed_signal_shadow_stack(ret_addr: u64) -> u64 {
     }
     // SAFETY: gated on `cet_active`, so `IA32_PL3_SSP` exists; ring 0.
     let ssp = unsafe { read_pl3_ssp() };
-    if ssp == 0 {
-        // No shadow stack armed for this task — nothing to seed; the handler
-        // runs with SSP=0 (no shadow-stack ops), matching the interrupted ctx.
+    // Fail closed on a zero, misaligned, or too-small SSP. In normal operation
+    // the SSP is kernel-armed, 8-byte-aligned, and deep in the shadow-stack
+    // region — but a corrupted/unexpected `IA32_PL3_SSP` must NOT make the kernel
+    // `WRUSS` to `ssp-8` where that could underflow or hit a non-shadow-stack
+    // page (a ring-0 fault). Skipping the seed just leaves the handler unseeded
+    // (its `ret` `#CP`s → a clean userspace kill), never a ring-0 crash.
+    let Some(new_ssp) = ssp.checked_sub(8).filter(|_| ssp & 0x7 == 0) else {
         return 0;
-    }
-    let new_ssp = ssp - 8;
+    };
     // SAFETY: `WRUSS` writes 8 bytes to the user shadow stack at `new_ssp`, one
     // 8-byte slot below the live SSP (free space — the shadow stack grows down,
     // so `[base, SSP)` is unused and mapped). `new_ssp` inherits the SSP's

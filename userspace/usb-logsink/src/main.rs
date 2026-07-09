@@ -153,7 +153,10 @@ fn program_main(_args: &[&str]) -> i32 {
     //    `/boot.log`; a writable root returns > 0. A read-only root (the original
     //    diskless boot with a SEPARATE ext2 log partition) fails the probe and we
     //    fall back to the explicit `/mnt/usb0` mount.
-    let log_path: &[u8] = if snapshot_kmsg(&mut buf, ROOT_LOG_PATH) > 0 {
+    //    `snapshot_kmsg` returns the byte count on success (>= 0 — an empty ring
+    //    is a valid 0-byte snapshot) and a negative errno on failure, so a
+    //    NON-NEGATIVE result means the root write succeeded (writable root).
+    let log_path: &[u8] = if snapshot_kmsg(&mut buf, ROOT_LOG_PATH) >= 0 {
         write_str(
             STDOUT_FILENO,
             "usb-logsink: root is the writable USB volume — persisting to /boot.log\n",
