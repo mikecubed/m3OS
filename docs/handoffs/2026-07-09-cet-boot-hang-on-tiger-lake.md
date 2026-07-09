@@ -88,10 +88,11 @@ CET and never enforced the precondition — invisible until now. The fix ensures
 
 We cannot distinguish (a)–(d) without seeing the fault. That is the blocker.
 
-**Open question that changes the approach:** is H a **hard hang** or a **reboot
-loop**? Watch whether "jumping to kernel" reappears/cycles. A loop ⇒ triple-fault
-⇒ POST squares get wiped on reset (serial needed); a hang ⇒ POST squares persist
-(the non-serial diagnostic in §4.2 works).
+**Resolved (2026-07-09): it is a HARD HANG, not a reboot loop** — "jumping to
+kernel" does **not** recur; the screen stays black. So a triple-fault-reset is
+ruled out, and the **serial-free POST-square diagnostic in §4.2 is valid** (the
+painted squares persist through a hang). A diagnostic image is **already built**
+for exactly this — `I-cet-diag.img`, see §4.2.
 
 ---
 
@@ -108,15 +109,37 @@ base `0x10000000000`** (same idiom as the kgdb arm). That RIP names the faulting
 instruction (the `mov cr4`, the `wrmsr`, or a later RO write) and the fix follows
 directly.
 
-### 4.2 If serial is impossible this session — POST-square bisection (hang-only)
-Serial-free diagnostic already in-tree: set `BRINGUP_DIAG = true`
-(`kernel/src/lib.rs:96`) to paint numbered POST squares straight to the
-framebuffer (survives even before the fb console, and past a hang — **but not a
-reset**). Then add **fine-grained `post_marker(...)` calls *inside*
-`enable_user_cet_if_supported`**: one before the WP set, one before `mov cr4`, one
-before the `IA32_U_CET` wrmsr, one after. Rebuild + boot: the **last square
-painted localizes the faulting instruction** with no serial. (Only works if H is
-a hang, not a reboot loop — see §3.)
+### 4.2 Serial-free POST-square bisection — image ALREADY BUILT (`I-cet-diag.img`)
+Confirmed a hard hang (§3), so this works. The diagnostic is committed and an
+image is staged: **`target/dell-images/I-cet-diag.img`** = default posture (KPTI+
+PCID+CET, with the `CR0.WP` fix) built with `M3OS_BRINGUP_DIAG=1`, which turns on
+the `post_marker` POST squares (`kernel/src/lib.rs`, now env-gated) **plus**
+fine-grained CET-enable sub-markers (slots 32–35) in
+`enable_user_cet_if_supported`. Flash it (`scripts/phase-100-write-usb.sh --image
+target/dell-images/I-cet-diag.img /dev/sda`) and read the squares.
+
+**Grid:** 28-px squares, 16 per row, gap 8. Row 0 = slots 0–15 (top-level boot),
+row 1 = 16+, **row 2 = 32+ (the CET sub-steps)**. The **last square painted = the
+last step that completed; the hang is the instruction after it.** CET key:
+
+| Row-2 square | Means completed | Hang here ⇒ the fault is… |
+|---|---|---|
+| **32** | entered CET enable (policy on, `CET_SS` usable) | before WP — the `cet_shstk_usable` path / entry |
+| **33** | `CR0.WP = 1` set OK | the **`mov cr4` (CR4.CET) write** itself (`#GP`?) |
+| **34** | `CR4.CET` set OK | the **`wrmsr IA32_U_CET`** |
+| **35** | `IA32_U_CET` written — enable fully succeeded | a **later** CET-gated op (fault after mitigations, e.g. a WP=1-exposed ring-0 RO write, or first ring-3 `CALL`) |
+
+Expected on this hang: row 0 squares 0–12 (interrupts/SMP-per-core/XSAVE done),
+then some of 32–35, then nothing. If **32 alone** (no 33) → the WP set hangs (odd
+— it's just a `mov cr0`); if **32,33** (no 34) → the `CR4.CET` write still faults
+even with WP=1 (revisit the WP precondition / other CR4 constraints); if
+**32,33,34** (no 35) → the `IA32_U_CET` wrmsr; if **all of 32–35 paint** but boot
+still dies before the fb console text resumes → the fault is *after* CET enable
+(hypothesis 3b/3c — a WP=1-exposed RO write or a shadow-stack op), and you likely
+need serial after all to get its RIP.
+
+If you must rebuild diagnostic variants, the knob is `M3OS_BRINGUP_DIAG=1 cargo
+xtask image`; add/adjust `crate::post_marker(N)` calls (N ≥ 36 free) as needed.
 
 ### 4.3 Source-level bisection within the CET enable (build-time, no serial)
 If POST squares are inconclusive, split the enable into staged test images
@@ -151,10 +174,12 @@ leak on B / no-leak on A). PCID (A.5) and KPTI already validated as booting via 
 
 **Staged images — `target/dell-images/`:**
 `A-default`, `B-mitigations-off`, `C-mitigations-full`, `D-kgdb`, `E-ptrace`
-(Block 0 A–E), plus bisect images `F-cet-masked`, `G-pcid-masked`, and
-`H-cetfix-default`. Flash: `scripts/phase-100-write-usb.sh --image
-target/dell-images/<X>.img /dev/sda` (USB=`/dev/sda`; internal NVMe=`nvme0n1` —
-never flash that). Rebuild any with the commands in Block 0 / the mask knobs.
+(Block 0 A–E), plus bisect images `F-cet-masked`, `G-pcid-masked`,
+`H-cetfix-default`, and the **POST-square diagnostic `I-cet-diag`** (default
+posture + `CR0.WP` fix + `M3OS_BRINGUP_DIAG=1`; flash this next — see §4.2). Flash:
+`scripts/phase-100-write-usb.sh --image target/dell-images/<X>.img /dev/sda`
+(USB=`/dev/sda`; internal NVMe=`nvme0n1` — never flash that). Rebuild any with the
+commands in Block 0 / the mask knobs / `M3OS_BRINGUP_DIAG=1`.
 
 **Build-time bisect knobs (added this session, default-off, no production effect),
 `kernel/src/arch/x86_64/cpuid.rs`:**
