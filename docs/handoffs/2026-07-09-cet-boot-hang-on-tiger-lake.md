@@ -3,12 +3,12 @@
 **Session:** 2026-07-09 Dell Precision 5560 (Intel Tiger Lake, has `CET_SS`).
 **Runbook this executes:** [2026-07-09 Dell validation session](./2026-07-09-dell-validation-session.md).
 **Branch:** `feat/phase-110-cet-shstk` (all changes below are **uncommitted** — see §6).
-**Status:** **ROOT-CAUSED + FOUR FIXES LANDED (pending Dell re-flash confirmation).**
-Fix #4 (§0.5) is the big one — **userspace retpolines are incompatible with CET
-shadow stacks** (the on-screen freeze caught `xhci` `#CP`-ing on the `ret` inside
-`__llvm_retpoline_r11`); dropped `-Zretpoline` from the userspace build, CET
-silicon uses eIBRS instead. That was the dominant userspace crash cause
-(xhci/display_server/every indirect call). The earlier three: **(1)** the AP
+**Status:** **ROOT-CAUSED + FIVE FIXES LANDED (pending Dell re-flash confirmation).**
+The Dell now boots to the **greeter, logs in, runs the compositor, and (with fix
+#5) the terminal**. Fix #4 (§0.5) — **userspace retpolines are incompatible with
+CET shadow stacks** (dropped `-Zretpoline`, eIBRS instead) — was the dominant
+crash cause. Fix #5 (§0.6) — **fork must eagerly copy shadow-stack pages**, not
+share them (the `ion _Fork` `#CP`). The earlier three: **(1)** the AP
 trampoline reloaded the BSP's CET-bearing `CR4` **without `CR0.WP`** → per-AP
 `#GP` triple-fault → `boot_aps` hang (decoded from **8 / 5 / 4** POST squares;
 fix in `smp/boot.rs`). **(2)** init (PID 1) is kernel-spawned via the fork
@@ -166,6 +166,41 @@ screen to be photographed. `I-cet-diag.img` rebuilt with it.
 3. If it *doesn't* freeze (no fatal fault — display_server exits cleanly), then
    the failure is not a fault (e.g. an IPC/registration issue) and we debug from
    the client-connect path instead.
+
+### 0.6 fork must eagerly copy shadow-stack pages (FIXED)
+
+After the retpoline fix the Dell **reached the greeter, logged in, and ran the
+compositor** — but launching the terminal crashed. The freeze caught it:
+```
+*** BRINGUP_DIAG HALT: userspace #CP fault ***
+pid=38 comm=ion rip=0x66a0d9 rsp=0x7fffffef9f688 err=0x1
+```
+`0x66a0d9` is the `ret` at the end of **`_Fork`** (musl's fork) in the `ion`
+shell — `err=1` near-RET mismatch, no retpoline involved.
+
+**Root cause — fork *shared* the shadow-stack page instead of copying it.**
+`cow_clone_user_pages` CoW-marks *writable* pages (clear WRITABLE + BIT_9) and
+shares *non-writable* pages verbatim. A CET shadow-stack page is deliberately
+**non-writable** (WRITABLE=0, DIRTY=1) yet it *does* change (a `CALL` pushes a
+return address), so it fell into the "share verbatim" path → parent and child
+aliased one shadow-stack frame. CoW can't fix this either: a shadow-stack push
+does **not** trap on WRITABLE=0. So the parent's post-fork `CALL`/`RET` chain
+overwrote the shared frame, and when the child (or the returning parent) hit
+`_Fork`'s `ret`, the shadow-stack slot no longer matched the data-stack return →
+`#CP`. (The code even flagged it: *"The CoW-of-shadow-stack push interaction is a
+Dell-validation item."*)
+
+**Fix #5 (landed):** in `cow_clone_user_pages`, detect a shadow-stack leaf
+(`kernel_core::cet::is_shadow_stack_pte` && `!BIT_9`) and **eagerly copy** it —
+allocate a fresh frame, `copy_nonoverlapping` the parent's return-address chain,
+map the child to the new frame with the same shadow-stack encoding, leave the
+parent PTE untouched and unshared. Parent and child now have independent shadow
+stacks. Inert on QEMU (no page carries the encoding when CET is off). `cargo
+xtask check` + boot smoke-test (heavy fork/exec) PASS; images rebuilt.
+
+> Re-flash **`A-default.img`** → the terminal (and any fork+exec: shells, `ls`,
+> pipelines) should now run under CET. If a further process `#CP`s, the freeze
+> names it.
 
 ### 0.5 THE userspace root cause — retpolines are incompatible with CET (FIXED)
 

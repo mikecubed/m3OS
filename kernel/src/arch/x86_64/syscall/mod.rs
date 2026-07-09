@@ -6337,6 +6337,58 @@ unsafe fn cow_clone_user_pages(
                             continue;
                         }
 
+                        // Phase 110 B.3 (Dell/Tiger Lake CET fork fix) — a CET
+                        // user shadow-stack page (present, user, DIRTY, read-only,
+                        // and NOT a CoW/device page) must be EAGERLY COPIED into
+                        // the child, never shared or CoW'd. CoW's WRITABLE-clear
+                        // write-trap never fires on a shadow-stack push (a `CALL`
+                        // writes a read-only+DIRTY page by hardware design), so a
+                        // shared shadow stack lets the parent's post-fork CALL/RET
+                        // activity clobber the frame — the child's first `ret`
+                        // then finds a mismatched return address → `#CP` (the
+                        // `ion` `_Fork` near-RET `#CP` this bench hit). Give the
+                        // child its own frame with the parent's return-address
+                        // chain + the same shadow-stack encoding. `!BIT_9` excludes
+                        // a CoW page that merely happens to be non-writable+dirty
+                        // (from a *prior* fork of this same parent). No-op unless
+                        // CET is active (no page carries this encoding on QEMU).
+                        if kernel_core::cet::is_shadow_stack_pte(flags.bits())
+                            && !flags.contains(PageTableFlags::BIT_9)
+                        {
+                            let child_frame = crate::mm::frame_allocator::allocate_frame_zeroed()
+                                .ok_or(crate::mm::elf::ElfError::OutOfFrames)?;
+                            // Copy the parent's shadow-stack contents into the
+                            // child's fresh frame via the direct physical map.
+                            let src_ptr = (phys_off + src_phys.as_u64()) as *const u8;
+                            let dst_ptr =
+                                (phys_off + child_frame.start_address().as_u64()) as *mut u8;
+                            core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, 4096);
+                            let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(vaddr))
+                                .map_err(|_| {
+                                crate::mm::elf::ElfError::MappingFailed("invalid vaddr in fork")
+                            })?;
+                            let parent_flags = PageTableFlags::PRESENT
+                                | PageTableFlags::WRITABLE
+                                | PageTableFlags::USER_ACCESSIBLE;
+                            dst_mapper
+                                .map_to_with_table_flags(
+                                    page,
+                                    child_frame,
+                                    flags,
+                                    parent_flags,
+                                    &mut frame_alloc,
+                                )
+                                .map_err(|_| {
+                                    crate::mm::elf::ElfError::MappingFailed(
+                                        "map_to failed for shadow stack in fork",
+                                    )
+                                })?
+                                .ignore();
+                            // Parent PTE untouched, parent frame not shared/
+                            // refcounted — the two shadow stacks are independent.
+                            continue;
+                        }
+
                         let was_writable = flags.contains(PageTableFlags::WRITABLE);
 
                         // Compute child flags: if the page was writable, clear
