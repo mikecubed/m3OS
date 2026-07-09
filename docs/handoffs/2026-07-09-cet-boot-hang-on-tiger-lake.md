@@ -2,10 +2,19 @@
 
 **Session:** 2026-07-09 Dell Precision 5560 (Intel Tiger Lake, has `CET_SS`).
 **Runbook this executes:** [2026-07-09 Dell validation session](./2026-07-09-dell-validation-session.md).
-**Branch:** `feat/phase-110-cet-shstk` (all changes below are **uncommitted** — see §6).
-**Status:** **ROOT-CAUSED + FIVE FIXES LANDED (pending Dell re-flash confirmation).**
-The Dell now boots to the **greeter, logs in, runs the compositor, and (with fix
-#5) the terminal**. Fix #4 (§0.5) — **userspace retpolines are incompatible with
+**Branch:** `feat/phase-110-cet-shstk` (5 fixes committed this session).
+**Status:** ✅ **VALIDATED ON REAL SILICON — Phase 110 B.3 CET COMPLETE.**
+The Dell boots clean under CET to the greeter → login → compositor → terminal,
+and the security property is **proven**: `m3ctl mitigations status` reports
+`CET: enabled (user shadow stacks)`, `rop-cet-poc`'s return-address overwrite is
+`#CP`-killed (**no `PWNED`**; `dmesg` shows `[int] userspace #CP (CET
+control-protection): … process killed`). Five real-silicon CET bugs — none
+exercisable by QEMU (TCG models no CET) — were found and fixed this session; all
+are committed. Remaining Block-2 item: the **A.6 Meltdown A/B** (`meltdown-poc`
+leaks on `B-mitigations-off` / not on `A-default`) — the KPTI track, optional.
+
+The Dell now boots to the **greeter, logs in, runs the compositor, the terminal,
+and fork/exec (shells, pipelines) — all under active CET**. Fix #4 (§0.5) — **userspace retpolines are incompatible with
 CET shadow stacks** (dropped `-Zretpoline`, eIBRS instead) — was the dominant
 crash cause. Fix #5 (§0.6) — **fork must eagerly copy shadow-stack pages**, not
 share them (the `ion _Fork` `#CP`). The earlier three: **(1)** the AP
@@ -166,6 +175,21 @@ screen to be photographed. `I-cet-diag.img` rebuilt with it.
 3. If it *doesn't* freeze (no fatal fault — display_server exits cleanly), then
    the failure is not a fault (e.g. an IPC/registration issue) and we debug from
    the client-connect path instead.
+
+### 0.7 ✅ VALIDATION RESULT (2026-07-09, Dell/Tiger Lake) — CET B.3 CLOSED
+
+After all five fixes, `A-default.img` on the Dell:
+- boots clean under CET → greeter → **login** → compositor → **terminal** →
+  fork/exec (shells, pipelines) — no `#CP`/`#PF`/`#GP` crashes;
+- `m3ctl mitigations status` → **`CET: enabled (user shadow stacks)`**;
+- `rop-cet-poc` → the return-address overwrite is **`#CP`-killed** — segfaults
+  with **no `ROP_CET_POC:PWNED`**, and `dmesg` shows `[int] userspace #CP (CET
+  control-protection): … process killed`.
+
+That is the full positive proof: CET user shadow stacks are live AND actively
+reject a ROP-style return-address overwrite on real silicon — the exact property
+QEMU (no CET model) can never demonstrate. **Phase 110 B.3 is done.** The five
+fixes (§0.1–§0.6) are all committed on `feat/phase-110-cet-shstk`; ready for PR.
 
 ### 0.6 fork must eagerly copy shadow-stack pages (FIXED)
 
