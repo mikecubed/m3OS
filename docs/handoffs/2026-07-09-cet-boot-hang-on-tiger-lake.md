@@ -163,6 +163,43 @@ screen to be photographed. `I-cet-diag.img` rebuilt with it.
    the failure is not a fault (e.g. an IPC/registration issue) and we debug from
    the client-connect path instead.
 
+### 0.4 BEST capture path — `boot.log` on a USB log partition (validated)
+
+The cleanest way to read the fault on the serial-less Dell: the resident
+`usb-logsink` daemon snapshots the kernel dmesg ring (`/proc/kmsg`, which
+**includes every `_panic_print` fault line + RIP**) to a USB ext2 log partition
+every 3 s. Pull the stick, mount it on the host, read `boot.log`.
+
+**Recipe (validated end-to-end in QEMU — `boot.log` came out a real 28 KB file):**
+```
+# 1. Plain (NON-diag) graphical image — NOT the freeze build (the freeze halts
+#    usb-logsink before it can snapshot). Already staged as A-default.img.
+cargo xtask image
+cp target/x86_64-unknown-none/release/boot-uefi-m3os.img target/dell-images/A-default.img
+# 2. Splice a 128 MiB ext2 "log" partition after the ESP:
+scripts/build-usb-log-image.sh --boot target/dell-images/A-default.img \
+    --out target/dell-images/A-default-usb-log.img --logs-mb 128
+# 3. Flash the OUTPUT (…-usb-log.img, not A-default.img) and boot the Dell.
+#    Let it sit ~20-30 s in the greeter-fail loop (usb-logsink snapshots every 3 s).
+# 4. Power off, pull the stick, on the host read the 2nd (ext2) partition:
+sudo mount -o ro $(sudo losetup -Pf --show <stick-or-img>)p2 /mnt && cat /mnt/boot.log
+#    (or, no root: dd the p2 region out and `debugfs -R "cat /boot.log" p2.ext2`)
+```
+
+**Bug found + fixed en route (`userspace/usb-logsink`):** the `[ESP]+[ext2]`
+stick's blank log partition is now adopted by init as **root** (Phase 106
+last-resort USB-root adoption, added *after* the Phase 96 diskless design), so
+usb-logsink mounting `usb0` *again* at `/mnt/usb0` created a **dual mount of one
+device → two incoherent ext2 caches → a torn inode/dirent that never committed**
+(pulled stick showed a 0-byte `boot.log`). Fix: usb-logsink now probes whether
+root is the writable USB volume and, if so, writes `/boot.log` on that single
+existing mount; it falls back to the `/mnt/usb0` mount only on a read-only root
+(the original separate-log-partition case). Re-verified: `boot.log` commits.
+
+> Use **this** (`A-default-usb-log.img`) to capture the display_server fault as a
+> file. The on-screen freeze (§0.3, `I-cet-diag.img`) remains the fallback if the
+> USB storage stack itself won't come up on the Dell.
+
 Everything below (§1–§7) is the pre-resolution record, kept for the audit trail.
 
 ---
