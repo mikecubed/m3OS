@@ -17172,12 +17172,24 @@ fn mitigations_status_smoke_steps() -> Vec<SmokeStep> {
         input: "m3ctl mitigations status\n",
         label: "guest/mitigations: invoke m3ctl mitigations status",
     });
-    // D.3 reporter output (honest): the compiled-in retpoline line is distinct
-    // from the runtime-gated lines, and the UNADDRESSED classes are enumerated.
+    // D.3 reporter output (honest): the kernel-compiled-in retpoline line is
+    // distinct from the runtime-gated lines, and the UNADDRESSED classes are
+    // enumerated. Phase 110 B.3 fix #4 — userspace dropped -Zretpoline (CET
+    // incompatibility), so the line now reads "kernel compiled-in".
     steps.push(SmokeStep::Wait {
-        pattern: "retpoline): compiled-in",
+        pattern: "retpoline): kernel compiled-in",
         timeout_secs: 10,
-        label: "guest/mitigations: reporter prints the compiled-in retpoline line",
+        label: "guest/mitigations: reporter prints the kernel-only compiled-in retpoline line",
+    });
+    // Phase 110 B.3 fix #4 — the reporter surfaces the runtime IBRS mode. TCG
+    // enumerates no IBRS, so this reads `none`; the eIBRS form is bare-metal-only
+    // (Tiger Lake, validated on the Dell). The `UNCOVERED` warning correctly
+    // fires here because non-eIBRS silicon has no userspace Spectre-v2 cover
+    // after the retpoline drop (QEMU is not a security target).
+    steps.push(SmokeStep::Wait {
+        pattern: "Spectre-v2 (IBRS): none",
+        timeout_secs: 5,
+        label: "guest/mitigations: reporter surfaces the runtime IBRS mode (none on TCG)",
     });
     // Phase 110 A.4 — the reporter's Meltdown line reflects ACTUAL
     // enforcement (report_map overrides with kpti_active), so with KPTI live
