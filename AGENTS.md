@@ -19,7 +19,7 @@ Capabilities now present in the tree:
 - **Audio**: ring-3 `ac97` + `hda` drivers behind a `driver_ipc::audio` seam; `audio_server` mixer (32-ch DMX→S16LE) forwards PCM over `sys_shm`. See `docs/roadmap/README.md`.
 - **Terminal**: `term` emulator, full termios/line-discipline, UTF-8 + TTF/Nerd Font glyphs, ncurses + less/htop/tmux ports. See `docs/roadmap/README.md`.
 - **Dynamic linking & a real `libc.so`**: Rust `ld-musl-x86_64.so.1` loader (PT_INTERP, dlopen/dlsym, PLT lazy resolve) + upstream musl 1.2.5 `libc.so`; enables dynamically-linked C and Python. See `docs/roadmap/README.md`.
-- **CPU hardening**: SMEP/SMAP, Spectre-v2 retpoline + `IA32_SPEC_CTRL`, KPTI (Meltdown) + PCID, W^X v2 via x86 PKU (`pkey_alloc`/`pkey_mprotect`), CET user shadow stacks (`kernel_core::cet`; dormant on QEMU / live on CET silicon), AES-NI in userspace. See `docs/roadmap/README.md`.
+- **CPU hardening**: SMEP/SMAP, Spectre-v2 retpoline + `IA32_SPEC_CTRL`, KPTI (Meltdown) + PCID, W^X v2 via x86 PKU (`pkey_alloc`/`pkey_mprotect`), CET user shadow stacks (`kernel_core::cet`; dormant on QEMU / live on CET silicon — Tiger Lake-validated incl. nested-signal delivery), AES-NI in userspace. See `docs/roadmap/README.md`.
 
 > **Phase history is NOT maintained here.** For the detailed per-phase record (Phase 55a → 76d and onward) and the full workspace/source layout, read `docs/roadmap/README.md` and `docs/appendix/codebase-map.md`. Read the relevant phase doc under `docs/roadmap/` before changing a subsystem.
 

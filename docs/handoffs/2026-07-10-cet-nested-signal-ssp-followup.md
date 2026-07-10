@@ -5,18 +5,19 @@
 **Depends on:** [2026-07-09 CET bring-up — RESOLVED](./2026-07-09-cet-boot-hang-on-tiger-lake.md)
 (Fix #3 seeds the signal-delivery shadow stack; §0.3 "Known follow-up" + §0.8
 step 5 flagged *this exact* nesting limitation as deferred).
-**Status:** 🟢 **FIX VALIDATED ON REAL SILICON (2026-07-10, run 2).** After a
-clean re-flash, `/bin/nested-sig-cet-poc` **PASSES** on the Dell (image C, CET
-active) — no `#CP`. The RDSSP-based fix on `fix/cet-nested-signal-ssp` → **PR
-#328** (source the user SSP from the live `RDSSP` register, MSR fallback, at the
-seed + `sigreturn`; drop the single-slot `Task::cet_signal_ssp`) is correct on HW.
-**The earlier "identical failures" (run 1/1b) were a stale image booting** — the
-flash wasn't landing on the USB the Dell actually booted (the `#CP` line lacked
-the `[CET-DIAG]` marker, proving an un-instrumented old kernel was running). A
-clean re-flash fixed that and the PoC passed. **Remaining close-out:** (a) HW
-regression sweep — `fork-cet-poc` PASS + `rop-cet-poc` `#CP`-kill on the same
-image; (b) revert the TEMP `[CET-DIAG]` instrumentation (commit `12338eb2`) and
-rebuild the clean image; (c) the independent perf A/B.
+**Status:** ✅ **FIXED + VALIDATED ON REAL SILICON (2026-07-10).** On the Dell
+(image C, CET active): `/bin/nested-sig-cet-poc` **PASSES** (no `#CP`),
+`/bin/fork-cet-poc` **PASSES**, and `/bin/rop-cet-poc` still **`#CP`-kills**
+(seg-faults, no `PWNED`) — the fix works and neither the fork-CoW nor the ROP
+defense regressed. The RDSSP-based fix (`fix/cet-nested-signal-ssp` → **PR #328**:
+source the user SSP from the live `RDSSP` register, MSR fallback, at the seed +
+`sigreturn`; drop the single-slot `Task::cet_signal_ssp`) is correct on HW. The
+earlier "identical failures" (runs 1/1b) were a **stale image booting** (the `#CP`
+line lacked the `[CET-DIAG]` marker → un-instrumented old kernel); a clean
+re-flash fixed it. The TEMP instrumentation is **reverted** (PR #328 ships only
+the fix + `nested-sig-cet-poc-smoke` gate); the clean image is staged at
+`target/dell-images/C-mitigations-full-nestfix.img` (sha256 `ae823d8e…`).
+**Only independent item left: the perf A/B (Block 3), unrelated to this fix.**
 PoC: `/bin/nested-sig-cet-poc` (`userspace/nested-sig-cet-poc`).
 
 ---
@@ -134,6 +135,16 @@ landing on the USB the Dell actually booted (not the internal NVMe, which the
 operator ruled out; flashing was done from this build host). **A clean re-flash
 resolved it: run 2 → `NESTED_SIG_POC:PASS`, no `#CP`.**
 
+**Run-2 regression sweep (same image, all pass):**
+- `/bin/nested-sig-cet-poc` → **PASS** (the fix; both handlers nested + returned).
+- `/bin/fork-cet-poc` → **PASS** (fork CoW-of-shadow-stack unaffected).
+- `/bin/rop-cet-poc` → **seg-fault / `#CP`-kill**, no `PWNED` (ROP defense intact).
+
+So the fix is correct on HW and single-level signal delivery + the other CET
+defenses are unregressed. The TEMP `[CET-DIAG]` instrumentation was reverted after
+this run and the clean image rebuilt (`C-mitigations-full-nestfix.img`, sha256
+`ae823d8e…`, 0 `CET-DIAG` occurrences).
+
 **Lesson for next time — verify the running kernel before trusting a result.**
 `nested-sig-cet-poc; dmesg | grep CET-DIAG` on the diagnostic image must print
 `[CET-DIAG]` lines; an **empty grep ⇒ a stale image is booting** (re-flash /
@@ -209,33 +220,16 @@ PoC binaries + run-2 docs). Both are open; merge #327 then #328 (or #328 direct 
 `main` — it carries the kernel fix + the new gate). See *Fix landed* above for the
 full change list.
 
-**Only remaining task — re-validate on the Dell (bench-only; QEMU can't).**
+**✅ Dell re-validation — DONE (2026-07-10).** `nested-sig-cet-poc` PASS +
+`fork-cet-poc` PASS + `rop-cet-poc` `#CP`-kill on image C, all after a clean
+re-flash (see *Dell re-validation* above). Nothing left to validate for this fix.
+Merge PR #328 (kernel fix + `nested-sig-cet-poc-smoke` gate; the TEMP
+instrumentation was already reverted). Clean image staged at
+`target/dell-images/C-mitigations-full-nestfix.img` (sha256 `ae823d8e…`).
 
-**Fixed image C is BUILT + STAGED** (2026-07-10, off `fix/cet-nested-signal-ssp`
-@ `fe31d1be`): `target/dell-images/C-mitigations-full-nestfix.img`
-(sha256 `6fdc5787e4154fe13d192c0446df7b51c0a03d7fa94a24599975b4639192dbc5`;
-distinct from the pre-fix `C-mitigations-full.img` @ `5c2340ef…`). No rebuild
-needed — flash this file.
-
-1. **Flash** (USB = `/dev/sda` on the Dell; the NVMe system disk is `nvme0n1` —
-   **never** flash that). The script refuses partitions / the root disk / non-
-   removable disks and asks to confirm:
-   ```
-   scripts/phase-100-write-usb.sh --image target/dell-images/C-mitigations-full-nestfix.img /dev/sda
-   ```
-   (Direct fallback: `sudo dd if=target/dell-images/C-mitigations-full-nestfix.img of=/dev/sda bs=4M conv=fsync status=progress && sync`.)
-2. Boot the Dell, log in, run `/bin/nested-sig-cet-poc` → **expect
-   `NESTED_SIG_POC:PASS`** (no `#CP`). The pre-fix build `#CP`-killed the nested
-   handler's `ret` (`pid=45 rip=0x2014b3`); the fix should make it a clean PASS.
-   Read the line ordering (`outer-entered → inner-entered → inner-returning →
-   outer-resumed → after → PASS`) to confirm true nesting.
-3. Regression-check the other CET PoCs on the same image: `/bin/fork-cet-poc` must
-   stay `FORK_CET_POC:PASS`, `rop-cet-poc` must still `#CP`-kill (no `PWNED`), and
-   a normal login/compositor/terminal session must still work (single-level signal
-   delivery unchanged). If any faults, the freeze dumper (`M3OS_BRINGUP_DIAG=1`)
-   names the pid/RIP.
-4. **Record the result here** (promote status 🟡 → ✅ on PASS, or reopen with the
-   captured fault on `#CP`).
+> **If you ever re-run this on the Dell:** flash the file above, and **before
+> trusting any result** verify the running kernel is the one you flashed — a
+> stale image booting is what made runs 1/1b look like the fix had failed.
 
 **Independent open item — Block 3 perf A/B.** Needs the `off` baseline: build
 image B (`M3OS_MITIGATIONS=off cargo xtask image`), run `/bin/perf-bench` on it,
