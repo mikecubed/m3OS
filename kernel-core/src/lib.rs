@@ -24,6 +24,7 @@ pub mod font;
 pub mod fs;
 pub mod gdb_rsp;
 pub mod hda;
+pub mod i2c;
 pub mod init;
 pub mod input;
 pub mod installer;
