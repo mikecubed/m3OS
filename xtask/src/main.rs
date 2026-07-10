@@ -1244,6 +1244,24 @@ fn main() {
                 });
             cmd_stack_smash_smoke(&smoke_args);
         }
+        Some("meltdown-poc-smoke") => {
+            let smoke_args = parse_smoke_boot_args("meltdown-poc-smoke", &args[2..])
+                .unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_meltdown_poc_smoke(&smoke_args);
+        }
+        Some("rop-cet-poc-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("rop-cet-poc-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_rop_cet_poc_smoke(&smoke_args);
+        }
         Some("debug-substrate-smoke") => {
             let smoke_args = parse_smoke_boot_args("debug-substrate-smoke", &args[2..])
                 .unwrap_or_else(|err| {
@@ -1252,6 +1270,15 @@ fn main() {
                     std::process::exit(1);
                 });
             cmd_debug_substrate_smoke(&smoke_args);
+        }
+        Some("kpti-selftest-smoke") => {
+            let smoke_args = parse_smoke_boot_args("kpti-selftest-smoke", &args[2..])
+                .unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_kpti_selftest_smoke(&smoke_args);
         }
         Some("kgdb-smoke") => {
             let smoke_args =
@@ -1970,7 +1997,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|debug [--fresh] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|argon2-smoke [--timeout <secs>] [--display]|aslr-smoke [--timeout <secs>] [--display]|stack-smash-smoke [--timeout <secs>] [--display]|debug-substrate-smoke [--timeout <secs>] [--display]|kgdb-smoke [--timeout <secs>] [--display]|ptrace-smoke [--timeout <secs>] [--display]|ptrace-gdbserver-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|debug [--fresh] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|argon2-smoke [--timeout <secs>] [--display]|aslr-smoke [--timeout <secs>] [--display]|stack-smash-smoke [--timeout <secs>] [--display]|meltdown-poc-smoke [--timeout <secs>] [--display]|rop-cet-poc-smoke [--timeout <secs>] [--display]|debug-substrate-smoke [--timeout <secs>] [--display]|kpti-selftest-smoke [--timeout <secs>] [--display]|kgdb-smoke [--timeout <secs>] [--display]|ptrace-smoke [--timeout <secs>] [--display]|ptrace-gdbserver-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm.\n\
      USB passthrough: --usb-passthrough <vid:pid> (e.g. `--usb-passthrough 0bda:8156`) passes a physical USB device into the guest's emulated xHCI (qemu-xhci,id=xhci_pt). The QEMU process must have access to the USB device node — add a udev rule granting the user/group read-write on the device, or run with sudo. The device is claimed from the host kernel while QEMU runs and is released on exit."
@@ -2073,6 +2100,12 @@ fn build_userspace_bins() {
         // Phase 110 Track B — ASLR + stack-canary probes.
         ("aslr-probe", "aslr-probe", false),
         ("stack-smash", "stack-smash", false),
+        // Phase 110 Dell-validation PoCs — Meltdown reject (A.6) + CET/ROP (B.3).
+        // rop-cet-poc ships WITHOUT the stack canary (see the RUSTFLAGS override
+        // below) so its deliberate return-address overwrite reaches `ret` and
+        // trips CET, rather than being caught first by `__stack_chk_fail`.
+        ("meltdown-poc", "meltdown-poc", false),
+        ("rop-cet-poc", "rop-cet-poc", false),
         // Phase 111 Track D — ptrace tracer/tracee smoke.
         ("ptrace-test", "ptrace-test", false),
         // Phase 111 Track D.3 — native gdbserver (links kernel-core → alloc) + debuggee.
@@ -2426,9 +2459,21 @@ fn build_userspace_bins() {
         ];
         build_args.extend_from_slice(extra_features);
 
-        let status = Command::new(env!("CARGO"))
-            .current_dir(&root)
-            .args(&build_args)
+        let mut build_cmd = Command::new(env!("CARGO"));
+        build_cmd.current_dir(&root).args(&build_args);
+        // Phase 110 B.3 — the ROP/CET PoC must ship WITHOUT the userspace stack
+        // canary so its deliberate return-address overwrite reaches `ret` and
+        // trips CET's shadow-stack check, rather than being caught first by
+        // `__stack_chk_fail`. Override the userspace target's
+        // `-Zstack-protector=strong` (from .cargo/config.toml) for this one
+        // crate. NB: no `-Zretpoline` — userspace no longer uses retpolines (they
+        // are incompatible with CET shadow stacks; see .cargo/config.toml), and a
+        // lone retpolined binary would itself `#CP` on its indirect calls. Env
+        // RUSTFLAGS replaces (not merges with) the config value.
+        if pkg == "rop-cet-poc" {
+            build_cmd.env("RUSTFLAGS", "-Zstack-protector=none");
+        }
+        let status = build_cmd
             .status()
             .unwrap_or_else(|_| panic!("failed to build userspace binary {bin}"));
 
@@ -17073,14 +17118,20 @@ fn cmd_session_restart_smoke(args: &SmokeBootArgs) {
 // ---------------------------------------------------------------------------
 //
 // Boots the default image and asserts, at RUNTIME on a real boot:
-//   1. the boot mitigation policy snapshot logged (D.2/A.6) and the A.4
-//      GLOBAL-bit guard reported 0 (the `[sec] mitigations=... global_kernel_ptes=0`
-//      line — `global_kernel_ptes=0` uniquely identifies it);
+//   1. the boot mitigation policy snapshot logged (D.2/A.6), Phase 110 A.4
+//      KPTI **activation** (`kpti(policy=true active=true)` — QEMU TCG reports
+//      `rdcl_no=false`, so the default `auto` build enforces KPTI on every
+//      boot now that `KPTI_WIRED` is true), and the A.4 GLOBAL-bit guard
+//      reported 0 — all on the single `[sec] mitigations=...` line;
 //   2. `m3ctl mitigations status` prints the honest reporter output (D.3):
-//      the per-vuln Meltdown line, the compiled-in retpoline line, and the
-//      UNADDRESSED enumeration.
-// KPTI-independent (default boot, `kpti_active=false`), so this validates the
-// Spectre-v2 + config + reporter layer without needing KPTI activation.
+//      Meltdown as `Mitigation: PTI` (the reporter overrides Meltdown with the
+//      ACTUAL kpti_active, so this asserts enforcement, not policy), the
+//      compiled-in retpoline line, and the UNADDRESSED enumeration.
+// The `auto` policy on the TCG lane is KPTI-equivalent to `full` (both reduce
+// to `kpti_policy=true` when `rdcl_no=false`), so this default lane satisfies
+// the Phase 110 A.4 "assert active=true" acceptance without an env rebuild.
+// The `off` / `RDCL_NO` deactivation arms stay host-tested (kernel-core
+// spectre::report_map tests).
 
 /// Smoke step list for `cargo xtask mitigations-status-smoke`.
 fn mitigations_status_smoke_steps() -> Vec<SmokeStep> {
@@ -17090,15 +17141,28 @@ fn mitigations_status_smoke_steps() -> Vec<SmokeStep> {
             timeout_secs: 30,
             label: "guest/mitigations: kernel first message",
         },
-        // D.2 (policy snapshot) + A.4 (GLOBAL guard) + A.6 (policy decision):
-        // the `[sec] mitigations=...` line ends with `global_kernel_ptes=N`,
-        // so matching `global_kernel_ptes=0` asserts the whole line printed
-        // and the guard found zero GLOBAL kernel PTEs. Checked BEFORE any Send
+        // D.2 (policy snapshot) + Phase 110 A.4 (KPTI activation + GLOBAL
+        // guard) + Phase 110 A.5 (PCID posture) + Phase 110 B.3 (CET posture):
+        // the `[sec] mitigations=...` line ends with `kpti(policy=… active=…)
+        // pcid(active=… supported=…) cet(active=… supported=…)
+        // global_kernel_ptes=N`, so matching the combined tail asserts (a) the
+        // whole line printed, (b) KPTI is ENFORCING this boot (active=true —
+        // the A.4 flip; TCG reports `rdcl_no=false` so the default `auto` build
+        // activates), (c) the A.5 PCID scheme is on its **fallback** — QEMU TCG
+        // advertises neither PCID nor INVPCID, so `pcid(active=false
+        // supported=false)` and the kernel runs the full-flush path (the
+        // PCID-active arm is bare-metal-only, validated on the Dell), (d) the
+        // B.3 CET scheme is **not-supported** — TCG models no CET, so
+        // `cet(active=false supported=false)` and the shadow-stack path is
+        // inert (the CET-active arm is bare-metal-only, validated on the Dell),
+        // and (e) the guard found zero GLOBAL kernel PTEs (none survive the CR3
+        // switch). One pattern because all facts live on the same line and the
+        // serial Wait cursor advances past each match. Checked BEFORE any Send
         // (which drains the serial buffer).
         SmokeStep::Wait {
-            pattern: "global_kernel_ptes=0",
+            pattern: "kpti(policy=true active=true) pcid(active=false supported=false) cet(active=false supported=false) global_kernel_ptes=0",
             timeout_secs: 90,
-            label: "guest/mitigations: boot policy logged + A.4 GLOBAL guard = 0",
+            label: "guest/mitigations: boot policy + A.4 KPTI active + A.5 PCID fallback + B.3 CET not-supported + GLOBAL guard = 0",
         },
     ];
     // Log into sh0 so the next Send lands at a shell prompt.
@@ -17108,17 +17172,32 @@ fn mitigations_status_smoke_steps() -> Vec<SmokeStep> {
         input: "m3ctl mitigations status\n",
         label: "guest/mitigations: invoke m3ctl mitigations status",
     });
-    // D.3 reporter output (honest): the compiled-in retpoline line is distinct
-    // from the runtime-gated lines, and the UNADDRESSED classes are enumerated.
+    // D.3 reporter output (honest): the kernel-compiled-in retpoline line is
+    // distinct from the runtime-gated lines, and the UNADDRESSED classes are
+    // enumerated. Phase 110 B.3 fix #4 — userspace dropped -Zretpoline (CET
+    // incompatibility), so the line now reads "kernel compiled-in".
     steps.push(SmokeStep::Wait {
-        pattern: "retpoline): compiled-in",
+        pattern: "retpoline): kernel compiled-in",
         timeout_secs: 10,
-        label: "guest/mitigations: reporter prints the compiled-in retpoline line",
+        label: "guest/mitigations: reporter prints the kernel-only compiled-in retpoline line",
     });
+    // Phase 110 B.3 fix #4 — the reporter surfaces the runtime IBRS mode. TCG
+    // enumerates no IBRS, so this reads `none`; the eIBRS form is bare-metal-only
+    // (Tiger Lake, validated on the Dell). The `UNCOVERED` warning correctly
+    // fires here because non-eIBRS silicon has no userspace Spectre-v2 cover
+    // after the retpoline drop (QEMU is not a security target).
     steps.push(SmokeStep::Wait {
-        pattern: "Meltdown:",
+        pattern: "Spectre-v2 (IBRS): none",
         timeout_secs: 5,
-        label: "guest/mitigations: reporter prints the Meltdown per-vuln line",
+        label: "guest/mitigations: reporter surfaces the runtime IBRS mode (none on TCG)",
+    });
+    // Phase 110 A.4 — the reporter's Meltdown line reflects ACTUAL
+    // enforcement (report_map overrides with kpti_active), so with KPTI live
+    // it must read `Mitigation: PTI`, never `Vulnerable`.
+    steps.push(SmokeStep::Wait {
+        pattern: "Meltdown: Mitigation: PTI",
+        timeout_secs: 5,
+        label: "guest/mitigations: reporter shows Meltdown mitigated by PTI (KPTI enforcing)",
     });
     steps.push(SmokeStep::Wait {
         pattern: "UNADDRESSED",
@@ -17134,6 +17213,22 @@ fn mitigations_status_smoke_steps() -> Vec<SmokeStep> {
         pattern: "W^X: v1 (PKU absent)",
         timeout_secs: 5,
         label: "guest/mitigations: reporter prints the W^X v1 / PKU-absent line (no-PKU lane)",
+    });
+    // Phase 110 A.5 — with KPTI enforcing but the CPU lacking PCID/INVPCID (the
+    // default QEMU TCG lane), the reporter prints the fallback PCID posture line
+    // (the `active (kernel/user PCID, no-flush)` form is bare-metal-only).
+    steps.push(SmokeStep::Wait {
+        pattern: "KPTI PCID: fallback (full TLB flush; no PCID/INVPCID)",
+        timeout_secs: 5,
+        label: "guest/mitigations: reporter prints the A.5 KPTI-PCID fallback line",
+    });
+    // Phase 110 B.3 — QEMU TCG models no CET, so the reporter prints the
+    // not-supported CET posture line (the `enabled (user shadow stacks)` form
+    // is bare-metal-only, validated on the Dell).
+    steps.push(SmokeStep::Wait {
+        pattern: "CET: not-supported",
+        timeout_secs: 5,
+        label: "guest/mitigations: reporter prints the B.3 CET not-supported line",
     });
     steps
 }
@@ -17421,6 +17516,96 @@ fn cmd_debug_substrate_smoke(args: &SmokeBootArgs) {
     println!(
         "debug-substrate-smoke: PASSED ({elapsed}s) — #BP RIP-fixup, RFLAGS.TF \
          single-step (1 #DB), and DR7 arm/disarm all verified in kernel context"
+    );
+}
+
+/// Phase 110 Track A.1 — `kpti-selftest-smoke`: boot the **stock** kernel and
+/// assert the KPTI user-half self-test passes. The self-test (in
+/// `kernel/src/mm/kpti.rs`, run unconditionally in `init_bsp`) builds a real
+/// user PML4 — a synthetic user page + the minimal entry set (PerCoreData, the
+/// `syscall_entry` text page, an entry stack) — walks it, and feeds the result
+/// to `kernel_core::kpti::check_user_half_invariant`, emitting `KPTI_SELFTEST:`.
+/// The gate asserts `PASS` (and no `FAIL`), proving on QEMU — which cannot
+/// exercise Meltdown itself — that the pair builder maps only the user lower
+/// half + entry set, with no kernel image / heap / kstack / direct-map leaf
+/// reachable from the user CR3. No special kernel feature: the sentinel prints
+/// on every boot. Since Phase 110 A.4 (`KPTI_WIRED = true`) the same boot also
+/// runs KPTI **live** (default `auto` + TCG `rdcl_no=false` → active), so
+/// reaching the login prompt after the sentinel additionally proves the live
+/// CR3 trampoline boots; the self-test's throwaway pair stays the isolation
+/// proof (built + walked + freed, never loaded).
+fn cmd_kpti_selftest_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let ovmf = find_ovmf();
+    let qemu_args = session_smoke_qemu_args(&uefi_image, &ovmf, args.display);
+    println!(
+        "kpti-selftest-smoke: launching QEMU (timeout {}s)",
+        args.timeout_secs
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut buf = String::new();
+    let mut hist = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let step = std::time::Duration::from_secs(args.timeout_secs.min(180));
+
+    // The sentinel prints early in boot (right after the `[sec] mitigations`
+    // line). Wait for a `KPTI_SELFTEST:` line, then assert on history.
+    let result = wait_for_serial_pattern(
+        &rx,
+        &mut buf,
+        &mut hist,
+        "KPTI_SELFTEST:",
+        step,
+        global_start,
+        global_timeout,
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let clean = strip_ansi(&hist);
+    if let Err(msg) = result {
+        eprintln!("kpti-selftest-smoke: FAILED (self-test never ran)\n{msg}");
+        std::process::exit(1);
+    }
+    if clean.contains("KPTI_SELFTEST:FAIL") || clean.contains("KPTI_SELFTEST:SKIP") {
+        for l in clean.lines().filter(|l| l.contains("KPTI_SELFTEST:")) {
+            eprintln!("  {l}");
+        }
+        eprintln!("kpti-selftest-smoke: FAILED — self-test did not PASS");
+        std::process::exit(1);
+    }
+    if !clean.contains("KPTI_SELFTEST:PASS") {
+        eprintln!("kpti-selftest-smoke: FAILED — missing KPTI_SELFTEST:PASS sentinel");
+        std::process::exit(1);
+    }
+    let elapsed = global_start.elapsed().as_secs();
+    println!(
+        "kpti-selftest-smoke: PASSED ({elapsed}s) — KPTI user-half pair builder maps \
+         only the user lower half + entry set; no kernel-secret leaf reachable from user CR3"
     );
 }
 
@@ -17894,6 +18079,180 @@ fn cmd_stack_smash_smoke(args: &SmokeBootArgs) {
             let _ = child.kill();
             let _ = child.wait();
             eprintln!("stack-smash-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 110 A.6 — `meltdown-poc-smoke`: QEMU run-to-completion check for the
+/// Meltdown PoC. QEMU TCG models no caches or speculation, so the *security*
+/// arm (leak with KPTI off, no-leak with it on) is bare-metal-only — see the
+/// 2026-07-09 Dell runbook Block 2a. This gate only proves `/bin/meltdown-poc`
+/// loads (including its ~1 MiB flush+reload channel BSS) and runs the channel
+/// primitives, the calibration control, and the mispredicted-branch speculative
+/// gadget **without faulting or panicking**. The speculative kernel read never
+/// architecturally retires, so it cannot fault here regardless of KPTI posture.
+/// Runs with `--smoke` (a tiny iteration count) so it completes fast under TCG,
+/// where every `rdtscp`/`clflush`/fence is a slow emulated helper — the bench
+/// run uses no flag and the full statistical iteration count. Pass = the whole
+/// PoC reaches `MELTDOWN_POC:done` (start → control → leak arm → verdict).
+fn meltdown_poc_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Send {
+        input: "meltdown-poc --smoke\n",
+        label: "meltdown-poc: run the flush+reload PoC (fast smoke mode)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "MELTDOWN_POC:start",
+        timeout_secs: 20,
+        label: "meltdown-poc: PoC started (ELF loaded, channel BSS mapped)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "MELTDOWN_POC:done",
+        fail_prefixes: &["meltdown-poc: PANIC"],
+        timeout_secs: 90,
+        label: "meltdown-poc: channel + control + speculative gadget ran to completion without a fault",
+        exit_code_on_fail: 1,
+    });
+    steps
+}
+
+/// Phase 110 A.6 — `meltdown-poc-smoke` gate (see [`meltdown_poc_smoke_steps`]).
+fn cmd_meltdown_poc_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let ovmf = find_ovmf();
+    let qemu_args = session_smoke_qemu_args(&uefi_image, &ovmf, args.display);
+    let steps = meltdown_poc_smoke_steps();
+    println!(
+        "meltdown-poc-smoke: launching QEMU (timeout {}s)",
+        args.timeout_secs
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "meltdown-poc-smoke: PASSED ({} steps in {elapsed}s) — the Meltdown \
+                 PoC loaded and ran channel + control + speculative gadget without a \
+                 fault (leak-vs-no-leak is the bare-metal-only arm; see the Dell runbook)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("meltdown-poc-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 110 B.3 — `rop-cet-poc-smoke`: QEMU run-to-completion check for the
+/// CET/ROP PoC. QEMU TCG models no CET, so the *security* arm (a `#CP` kill on
+/// the overwritten `ret`) is bare-metal-only — see the Dell runbook Block 2b.
+/// Under QEMU the same precise return-address overwrite instead succeeds and
+/// transfers to `pwned()`, which is itself proof the overwrite *mechanism* works
+/// end to end: `ROP_CET_POC:before` then `ROP_CET_POC:PWNED`. A
+/// `ROP_CET_POC:after-NOT-OVERWRITTEN` line would mean the `ret` returned
+/// normally (the overwrite missed) — a real regression.
+fn rop_cet_poc_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Send {
+        input: "rop-cet-poc\n",
+        label: "rop-cet-poc: run the return-address-overwrite PoC",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "ROP_CET_POC:before",
+        timeout_secs: 10,
+        label: "rop-cet-poc: PoC started",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "ROP_CET_POC:PWNED",
+        fail_prefixes: &["ROP_CET_POC:after-NOT-OVERWRITTEN"],
+        timeout_secs: 15,
+        label: "rop-cet-poc: overwrite transfers to pwned() (the #CP arm is HW-only)",
+        exit_code_on_fail: 1,
+    });
+    steps
+}
+
+/// Phase 110 B.3 — `rop-cet-poc-smoke` gate (see [`rop_cet_poc_smoke_steps`]).
+fn cmd_rop_cet_poc_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let ovmf = find_ovmf();
+    let qemu_args = session_smoke_qemu_args(&uefi_image, &ovmf, args.display);
+    let steps = rop_cet_poc_smoke_steps();
+    println!(
+        "rop-cet-poc-smoke: launching QEMU (timeout {}s)",
+        args.timeout_secs
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "rop-cet-poc-smoke: PASSED ({} steps in {elapsed}s) — the \
+                 return-address overwrite transferred to pwned() (the #CP kill is \
+                 the bare-metal-only CET arm; see the Dell runbook)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("rop-cet-poc-smoke: FAILED\n{msg}");
             std::process::exit(1);
         }
     }

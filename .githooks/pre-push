@@ -405,6 +405,21 @@ if [ "${M3OS_ASLR_REGRESSION:-0}" = "1" ]; then
     cargo xtask stack-smash-smoke --timeout 240
 fi
 
+# Phase 110 Dell-validation PoCs — Meltdown (A.6) + CET/ROP (B.3) QEMU
+# run-to-completion gates. Gated behind M3OS_SEC_POC_REGRESSION=1 because they
+# boot the OS. QEMU TCG models no caches/speculation/CET, so these prove only
+# that /bin/meltdown-poc and /bin/rop-cet-poc load and run their novel code
+# paths without faulting/panicking; the actual leak-reject (A.6) and #CP-kill
+# (B.3) security arms are bare-metal-only (see docs/handoffs/2026-07-09-dell-
+# validation-session.md). Set on branches touching the two PoC binaries, the
+# CET/#CP handler, or the KPTI/PCID substrate.
+if [ "${M3OS_SEC_POC_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask meltdown-poc-smoke..."
+    cargo xtask meltdown-poc-smoke --timeout 240
+    echo "pre-push: running cargo xtask rop-cet-poc-smoke..."
+    cargo xtask rop-cet-poc-smoke --timeout 240
+fi
+
 # Phase 111 Track B — trap & debug-register substrate gate. Gated behind
 # M3OS_DEBUG_SUBSTRATE_REGRESSION=1 because it builds the kernel with the
 # `debug-substrate-test` feature and boots it: the boot-time self-test proves
@@ -415,6 +430,18 @@ fi
 if [ "${M3OS_DEBUG_SUBSTRATE_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask debug-substrate-smoke..."
     cargo xtask debug-substrate-smoke --timeout 240
+fi
+
+# Phase 110 Track A.1 — KPTI user-half self-test gate. Gated behind
+# M3OS_KPTI_REGRESSION=1. Boots the stock kernel and asserts the boot-time KPTI
+# self-test PASSES: it builds a real user PML4 (synthetic user page + the
+# minimal entry set), walks it, and proves via kernel_core::kpti that no kernel
+# image / heap / kstack / direct-map leaf is reachable from the user CR3 — the
+# Meltdown-isolation invariant QEMU cannot exercise directly. Set on branches
+# touching kernel/src/mm/kpti.rs, new_process_page_table, or the KPTI entry set.
+if [ "${M3OS_KPTI_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask kpti-selftest-smoke..."
+    cargo xtask kpti-selftest-smoke --timeout 240
 fi
 
 # Phase 111 Track C — in-kernel GDB stub (kgdb) gate. Gated behind

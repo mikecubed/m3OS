@@ -9,7 +9,10 @@
 //! reach scheduler / SMP / pipe internals.
 
 #![no_std]
-#![feature(abi_x86_interrupt)]
+// Phase 110 A.3b — the `abi_x86_interrupt` feature was dropped once every
+// interrupt/exception vector became a naked-asm entry stub (KPTI needs to own
+// the `iretq` for the CR3 exit switch), so no `extern "x86-interrupt"` fn
+// remains in the kernel.
 #![cfg_attr(test, feature(custom_test_frameworks))]
 #![cfg_attr(test, test_runner(crate::testing::test_runner))]
 #![cfg_attr(test, reexport_test_harness_main = "test_main")]
@@ -87,10 +90,12 @@ static POST_FB: spin::Once<PostFb> = spin::Once::new();
 /// POST squares, the `[timer] lapic_ticks_per_ms` framebuffer line, and init's
 /// AHCI-retry dots. **Default OFF.** These debugged the Phase 96 Tiger Lake
 /// early-boot hang and are invisible on a normal boot (the fb console overwrites
-/// the strip immediately), but they stay compiled out unless a future bare-metal
-/// bring-up needs them again — flip to `true` and rebuild. Same default-off-const
-/// idiom as `net::dhcp::FB_NET_HEARTBEAT` / the xhci driver's `VERBOSE_ENUM`.
-pub(crate) const BRINGUP_DIAG: bool = false;
+/// the strip immediately). Build with **`M3OS_BRINGUP_DIAG=1`** to turn them on
+/// for a bare-metal bring-up (e.g. the Phase 110 CET boot hang — the CET-enable
+/// sub-markers 32–35 in `enable_user_cet_if_supported` localize the faulting
+/// instruction with no serial). Same default-off idiom as
+/// `net::dhcp::FB_NET_HEARTBEAT` / the xhci driver's `VERBOSE_ENUM`.
+pub(crate) const BRINGUP_DIAG: bool = option_env!("M3OS_BRINGUP_DIAG").is_some();
 
 /// Record the framebuffer for `post_marker`. Called once at boot entry.
 fn post_fb_set(ptr: *mut u8, info: &bootloader_api::info::FrameBufferInfo) {
@@ -134,8 +139,15 @@ pub(crate) fn post_marker(step: usize) {
     if x0 + SQ > fb.width || y0 + SQ > fb.height {
         return;
     }
-    // Distinct brightness per column (0x48, 0x70, 0x98, …) so neighbours differ.
-    let byte: u8 = 0x48u8.wrapping_add((col as u8).wrapping_mul(0x28));
+    // Always-bright per-column shade so neighbours differ AND no square is ever
+    // near-black/invisible against the cleared screen. The old `0x48 + col*0x28`
+    // ramp wrapped u8 to 0x00 at col 11 (pure black) and 0x10 at col 5 — those
+    // POST codes were unreadable on the Dell/Tiger Lake bring-up (e.g. apic
+    // marker 27 at col 11 vanished). Strong even/odd parity split (dim-bright vs
+    // bright, both clearly visible on black) plus a slow ramp keeps runs
+    // countable; the band is [0x80, 0xFC] — the floor stays well clear of black.
+    let c = col as u8;
+    let byte: u8 = 0x80 + (c & 1) * 0x60 + (c >> 1) * 0x04;
     let base = fb.base as *mut u8;
     for y in y0..y0 + SQ {
         // SAFETY: the bootloader mapped + rendered to this framebuffer before
@@ -531,6 +543,47 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     // (see the `mitigations` module — m3OS has no kernel boot cmdline).
     x86_64::instructions::interrupts::without_interrupts(|| {
         crate::mitigations::init_bsp();
+        // Phase 110 Track A.1 — prove the KPTI user-half PML4 builder maps only
+        // the user lower half + minimal entry set, and no kernel-secret leaf, on
+        // real hardware page tables (QEMU cannot exercise Meltdown itself). A
+        // throwaway pair, built + walked + freed; emits a `KPTI_SELFTEST:`
+        // sentinel. Inert w.r.t. the live CR3 (a throwaway table, never loaded).
+        crate::mm::kpti::self_test();
+        // Phase 110 Track A.4 — the BSP's early `syscall::init()` predates the
+        // mitigations policy decision and installed the non-KPTI stub; now that
+        // `kpti_active` is known, re-select LSTAR (`syscall_entry_kpti` when
+        // active). APs and the S3-resume path self-select. No userspace exists
+        // yet, so this cannot race a live SYSCALL.
+        arch::x86_64::syscall::reinstall_lstar();
+        // Phase 110 Track A.5 — enable CR4.PCIDE on the BSP once KPTI is active
+        // and the CPU has PCID + INVPCID (no-op on every QEMU lane). Must run
+        // BEFORE `boot_aps()` captures the BSP's CR4 into the trampoline's
+        // `DATA_CR4`, so every AP inherits PCIDE and the tagged CR3 loads (gated
+        // on the same `pcid_active`) never `#GP` on a core without the bit. The
+        // BSP has no PCID-tagged CR3 in flight yet (still on the boot PML4,
+        // `PCID = 0`), so enabling PCIDE here is safe.
+        let pcide = unsafe {
+            arch::x86_64::cpuid::enable_pcid_if_kpti_active(
+                crate::mitigations::state().is_some_and(|s| s.kpti_active),
+            )
+        };
+        if pcide {
+            log::info!("[sec] CR4.PCIDE enabled (KPTI PCID TLB-cost recovery active)");
+        }
+        // Phase 110 Track B.3 — enable CET user shadow stacks on the BSP when
+        // the CPU supports CET_SS and the policy is on (no-op on every QEMU
+        // lane — TCG models no CET). Like PCIDE, must run BEFORE `boot_aps()`
+        // captures the BSP's CR4 into the trampoline's `DATA_CR4` so every AP
+        // inherits `CR4.CET`; each AP re-asserts `IA32_U_CET` (per-core MSR)
+        // in `mitigations::init_ap`.
+        let cet = unsafe {
+            arch::x86_64::cpuid::enable_user_cet_if_supported(
+                crate::mitigations::state().is_some_and(|s| s.cet_active),
+            )
+        };
+        if cet {
+            log::info!("[sec] CR4.CET enabled (CET user shadow stacks active)");
+        }
     });
 
     // Phase 103 Track E: probe HWP and opt in on the BSP (IA32_PM_ENABLE is

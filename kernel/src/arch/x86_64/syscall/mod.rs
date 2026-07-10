@@ -1134,6 +1134,14 @@ global_asm!(
     ".equ OFF_STACK_TOP,           {off_stack_top}",
     ".equ OFF_USER_RSP,            {off_user_rsp}",
     ".equ OFF_ARG3,                {off_arg3}",
+    // Phase 110 Track A.2 (KPTI) — per-core CR3-pair slots read by the
+    // trampoline. All live in `PerCoreData`, which the user PML4's minimal
+    // entry set maps at its kernel VA, so every `gs:[…]` access below is valid
+    // on EITHER CR3 (m3OS never executes `swapgs`; GS_BASE is PerCoreData in
+    // both rings).
+    ".equ OFF_KPTI_KERNEL_CR3,     {off_kpti_kernel_cr3}",
+    ".equ OFF_KPTI_USER_CR3,       {off_kpti_user_cr3}",
+    ".equ OFF_KPTI_SCRATCH,        {off_kpti_scratch}",
     // Phase 57e Bug #3 fix — pointer-to-task-snapshot indirection.
     ".equ OFF_TASK_SNAPSHOT_PTR,   {off_task_snapshot_ptr}",
     // Field offsets within `TaskSyscallSnapshot` (target of the indirection).
@@ -1152,6 +1160,49 @@ global_asm!(
     ".equ SNAP_USER_RFLAGS, {snap_user_rflags}",
     ".equ SNAP_USER_RSP,    {snap_user_rsp}",
 
+    // -----------------------------------------------------------------------
+    // KPTI entry-text section (Phase 110 Track A.2).
+    //
+    // Everything between `kpti_entry_text_start` and `kpti_entry_text_end` is
+    // the instructions a syscall may execute while the USER CR3 is (or may
+    // be) live: the two entry stubs, the shared body, and the sysret tail.
+    // The user PML4's minimal entry set maps this whole range (r-x, ring-0
+    // only) at its kernel VA — mapping the shared body too costs nothing
+    // secret-wise (entry text is not a secret; Linux maps all of
+    // `.entry.text` the same way) and keeps the section a single contiguous,
+    // page-aligned unit. The `.balign 4096` on both ends guarantees no
+    // unrelated kernel text shares a page with it, so mapping the range into
+    // the user half never leaks neighbouring code.
+    //
+    // The section is emitted exactly once (this block); `mm::kpti` maps
+    // `[kpti_entry_text_start, kpti_entry_text_end)` into every user PML4 and
+    // the boot self-test asserts both stubs live inside it.
+    // -----------------------------------------------------------------------
+    ".section .text.kpti_entry, \"ax\"",
+    ".balign 4096",
+    ".global kpti_entry_text_start",
+    "kpti_entry_text_start:",
+
+    // --- KPTI SYSCALL entry (LSTAR target when `kpti_active`) ---
+    //
+    // At entry the USER CR3 is live. SYSCALL auto-switches nothing (no stack,
+    // no CR3), so unlike the IRQ path no trampoline stack is needed — the stub
+    // owns the whole sequence. Until the `mov cr3` below, it may touch ONLY
+    // `gs:[…]` slots (PerCoreData is in the user half) and registers: no
+    // kernel stack, no kernel globals. `rax` (the syscall number) is the one
+    // scratch register spilled across the CR3 load; the arg registers
+    // rdi/rsi/rdx/r10/r8/r9 and rcx/r11 (user RIP/RFLAGS) pass through
+    // untouched, preserving the syscall ABI contract.
+    ".global syscall_entry_kpti",
+    "syscall_entry_kpti:",
+    "mov gs:[OFF_USER_RSP], rsp",
+    "mov gs:[OFF_KPTI_SCRATCH], rax",
+    "mov rax, gs:[OFF_KPTI_KERNEL_CR3]",
+    "mov cr3, rax", // → kernel CR3; the full kernel map (and kstacks) now visible
+    "mov rax, gs:[OFF_KPTI_SCRATCH]",
+    "jmp .Lsyscall_entry_common",
+
+    // --- Non-KPTI SYSCALL entry (LSTAR target when KPTI is inactive) ---
     ".global syscall_entry",
     "syscall_entry:",
     // At entry (from ring 3 via SYSCALL):
@@ -1164,6 +1215,7 @@ global_asm!(
 
     // --- Switch to per-core kernel stack ---
     "mov gs:[OFF_USER_RSP], rsp",
+    ".Lsyscall_entry_common:",
     "mov rsp, gs:[OFF_STACK_TOP]",
     "cld",
 
@@ -1289,13 +1341,50 @@ global_asm!(
     "pop r11", // user RFLAGS
     "pop rcx", // user RIP
 
+    // --- KPTI-aware sysret tail (Phase 110 Track A.2) ---
+    //
+    // The body is shared between both entry stubs, so the tail re-derives the
+    // posture from `gs:[OFF_KPTI_USER_CR3]`: non-zero exactly when this core
+    // dispatched the current task with KPTI active (the same slot the entry
+    // stub's kernel-CR3 twin came from), zero otherwise — kernel threads, or a
+    // whole boot with KPTI inactive (`mitigations=off` / `auto` on `RDCL_NO`
+    // silicon), where the cost is two gs-moves and one never-taken branch.
+    // Reading the slot (not a saved register) also keeps `execve` correct: it
+    // retargets the per-core pair mid-syscall, and the tail must return on
+    // the NEW address space's user CR3. IF is already masked (`cli` above),
+    // so nothing can preempt between the CR3 switch and `sysretq`; NMI is the
+    // one exception and is handled by the paranoid save/restore path (A.3).
+    //
+    // `rax` holds the syscall return value and `rcx`/`r11` the user RIP/
+    // RFLAGS, so the user-CR3 load spills `rax` through the scratch slot —
+    // PerCoreData is mapped on both CR3s, making the post-switch reads
+    // (`scratch`, `user_rsp`) valid on the user CR3.
+    "mov gs:[OFF_KPTI_SCRATCH], rax",
+    "mov rax, gs:[OFF_KPTI_USER_CR3]",
+    "test rax, rax",
+    "jz .Lsysret_cr3_done",
+    "mov cr3, rax", // → user CR3; kernel map gone, entry set + user half remain
+    ".Lsysret_cr3_done:",
+    "mov rax, gs:[OFF_KPTI_SCRATCH]",
+
     // --- Restore user RSP and return ---
     "mov rsp, gs:[OFF_USER_RSP]",
     "sysretq",
 
+    // Page-align the end so the mapped range [start, end) contains only this
+    // section's code + padding, never a neighbouring function.
+    ".balign 4096",
+    ".global kpti_entry_text_end",
+    "kpti_entry_text_end:",
+    // Return to the normal text section for any later module-level asm.
+    ".text",
+
     off_stack_top         = const crate::smp::offsets::SYSCALL_STACK_TOP,
     off_user_rsp          = const crate::smp::offsets::SYSCALL_USER_RSP,
     off_arg3              = const crate::smp::offsets::SYSCALL_ARG3,
+    off_kpti_kernel_cr3   = const crate::smp::offsets::KPTI_KERNEL_CR3,
+    off_kpti_user_cr3     = const crate::smp::offsets::KPTI_USER_CR3,
+    off_kpti_scratch      = const crate::smp::offsets::KPTI_SCRATCH,
     off_task_snapshot_ptr = const crate::smp::offsets::CURRENT_SYSCALL_SNAPSHOT_PTR,
     snap_user_rbx    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RBX,
     snap_user_rbp    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RBP,
@@ -1312,6 +1401,65 @@ global_asm!(
     snap_user_rflags = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RFLAGS,
     snap_user_rsp    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RSP,
 );
+
+// ---------------------------------------------------------------------------
+// KPTI entry-text section bounds + LSTAR stub selection (Phase 110 Track A.2)
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    /// Start of the page-aligned `.text.kpti_entry` section (see the
+    /// `global_asm!` block above).
+    fn kpti_entry_text_start();
+    /// One-past-the-end of the section (page-aligned by the trailing
+    /// `.balign`).
+    fn kpti_entry_text_end();
+    /// The CR3-switching SYSCALL stub — LSTAR target when KPTI is active.
+    fn syscall_entry_kpti();
+}
+
+/// `[start, end)` VA range of the `.text.kpti_entry` section: the only kernel
+/// text the KPTI user PML4 maps (both SYSCALL stubs + shared body + sysret
+/// tail). Both bounds are page-aligned; `mm::kpti` maps exactly this range
+/// into the user half's minimal entry set.
+pub fn kpti_entry_text_range() -> (u64, u64) {
+    (
+        kpti_entry_text_start as *const () as u64,
+        kpti_entry_text_end as *const () as u64,
+    )
+}
+
+/// The two SYSCALL entry stub addresses `(non_kpti, kpti)` — exposed so the
+/// KPTI boot self-test can assert both live inside
+/// [`kpti_entry_text_range`].
+pub fn syscall_entry_stub_addrs() -> (u64, u64) {
+    unsafe extern "C" {
+        fn syscall_entry();
+    }
+    (
+        syscall_entry as *const () as u64,
+        syscall_entry_kpti as *const () as u64,
+    )
+}
+
+/// The SYSCALL entry stub matching this boot's KPTI posture: the CR3
+/// trampoline when `kpti_active`, the direct stub otherwise.
+///
+/// Live since A.4 (`KPTI_WIRED = true`): APs run `mitigations::init_ap()`
+/// before `syscall::init_ap()` and the S3 resume path re-runs `init()` after
+/// the (static) policy decision, so both pick the right stub here; only the
+/// BSP's early `init()` predates `mitigations::init_bsp()` and gets the
+/// explicit [`reinstall_lstar`] from `lib.rs` right after the policy decision.
+fn lstar_target() -> VirtAddr {
+    let kpti_active = crate::mitigations::state().is_some_and(|s| s.kpti_active);
+    if kpti_active {
+        VirtAddr::new(syscall_entry_kpti as *const () as u64)
+    } else {
+        unsafe extern "C" {
+            fn syscall_entry();
+        }
+        VirtAddr::new(syscall_entry as *const () as u64)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Syscall number constants (x86_64 Linux ABI + m3OS custom range)
@@ -2878,6 +3026,20 @@ fn deliver_user_signal(
     //    ignore RSI/RDX — Linux likewise always sets them for rt_sigframe.
     let siginfo_ptr = frame_rsp + crate::signal::OFF_SIGINFO as u64;
     let ucontext_ptr = frame_rsp + crate::signal::OFF_UCONTEXT as u64;
+    // Phase 110 B.3 — stash the interrupted context's user shadow-stack pointer
+    // so sigreturn restores it (the handler runs on the same shadow stack,
+    // pushing below the saved SSP). No-op unless CET is active.
+    crate::task::scheduler::save_current_task_signal_ssp();
+    // Phase 110 B.3 — seed the handler's return address (`restorer`, the
+    // sigframe pretcode) onto the user shadow stack via WRUSS and drop
+    // IA32_PL3_SSP by 8. The handler is entered by IRETQ, which pushes nothing
+    // to the shadow stack, so without this its final `RET` to `restorer` would
+    // mismatch the shadow-stack top → `#CP` (kills any process whose signal
+    // handler returns — the Dell/Tiger Lake greeter respawn loop). No-op unless
+    // CET is active. `sigreturn` restores the saved SSP, discarding this slot.
+    unsafe {
+        crate::arch::x86_64::cet::seed_signal_shadow_stack(restorer);
+    }
     unsafe {
         enter_signal_handler(
             handler_entry,
@@ -3659,6 +3821,19 @@ pub(super) fn sys_sigreturn(user_rsp: u64) -> ! {
     unsafe { restore_and_enter_userspace(&regs) }
 }
 
+unsafe extern "C" {
+    /// The sigreturn full-register-restore ring-3 trampoline. Phase 110 A.3b
+    /// part 3: the asm lives in the user-mapped `.text.kpti_exit` section
+    /// (`interrupts.rs`, bottom) so it can flip to the user CR3 immediately
+    /// before its `iretq`.
+    fn sigreturn_enter_userspace(
+        regs: *const crate::signal::SavedUserRegs,
+        ss: u64,
+        cs: u64,
+        rflags: u64,
+    ) -> !;
+}
+
 /// Enter ring 3 with a full set of restored registers from a sigframe.
 ///
 /// Restores all GPRs then uses `iretq` to return to the interrupted
@@ -3675,57 +3850,20 @@ unsafe fn restore_and_enter_userspace(regs: &crate::signal::SavedUserRegs) -> ! 
     crate::task::scheduler::assert_preempt_count_zero_at_user_return();
     // Phase 57d G.4: consume deferred reschedule at every user-return boundary.
     crate::task::scheduler::check_deferred_preempt_at_user_return();
-    unsafe {
-        use core::arch::asm;
-        // We need to restore all GPRs.  The simplest approach: push the iretq
-        // frame first, then load all GPRs from the struct, then iretq.
-        //
-        // We save the struct pointer in a register, set up the iretq frame,
-        // then load all registers from the struct.
-        let ss = u64::from(crate::arch::x86_64::gdt::user_data_selector().0);
-        let cs = u64::from(crate::arch::x86_64::gdt::user_code_selector().0);
-        // Sanitize rflags: clear all privileged/reserved bits that could cause
-        // #GP during iretq, then force IF (bit 9) and reserved bit 1.
-        // Cleared: IOPL (12-13), NT (14), VM (17), VIF (19), VIP (20), ID (21).
-        const PRIV_MASK: u64 =
-            (1 << 12) | (1 << 13) | (1 << 14) | (1 << 17) | (1 << 19) | (1 << 20) | (1 << 21);
-        let rflags = (regs.rflags & !PRIV_MASK) | 0x202;
-
-        asm!(
-            // Build the iretq frame on the kernel stack.
-            "push {ss}",
-            "push {user_rsp}",
-            "push {rflags}",
-            "push {cs}",
-            "push {user_rip}",
-            // Now restore all GPRs from the SavedUserRegs struct.
-            // r14 holds the pointer to the struct (chosen because we restore it last-ish).
-            "mov r15, [r14 + 120]",  // r15 offset
-            "mov r13, [r14 + 104]",  // r13
-            "mov r12, [r14 + 96]",   // r12
-            "mov r11, [r14 + 88]",   // r11
-            "mov r10, [r14 + 80]",   // r10
-            "mov r9, [r14 + 72]",    // r9
-            "mov r8, [r14 + 64]",    // r8
-            "mov rbp, [r14 + 48]",   // rbp
-            "mov rbx, [r14 + 8]",    // rbx
-            "mov rdx, [r14 + 24]",   // rdx
-            "mov rsi, [r14 + 32]",   // rsi
-            "mov rdi, [r14 + 40]",   // rdi
-            "mov rcx, [r14 + 16]",   // rcx
-            "mov rax, [r14 + 0]",    // rax
-            // Restore r14 last (it was our pointer register).
-            "mov r14, [r14 + 112]",  // r14
-            "iretq",
-            ss       = in(reg) ss,
-            user_rsp = in(reg) regs.rsp,
-            rflags   = in(reg) rflags,
-            cs       = in(reg) cs,
-            user_rip = in(reg) regs.rip,
-            in("r14") regs as *const crate::signal::SavedUserRegs as u64,
-            options(noreturn)
-        )
-    }
+    let ss = u64::from(crate::arch::x86_64::gdt::user_data_selector().0);
+    let cs = u64::from(crate::arch::x86_64::gdt::user_code_selector().0);
+    // Sanitize rflags: clear all privileged/reserved bits that could cause
+    // #GP during iretq, then force IF (bit 9) and reserved bit 1.
+    // Cleared: IOPL (12-13), NT (14), VM (17), VIF (19), VIP (20), ID (21).
+    const PRIV_MASK: u64 =
+        (1 << 12) | (1 << 13) | (1 << 14) | (1 << 17) | (1 << 19) | (1 << 20) | (1 << 21);
+    let rflags = (regs.rflags & !PRIV_MASK) | 0x202;
+    // Phase 110 B.3 — restore the pre-signal user shadow-stack pointer stashed
+    // at delivery, so the interrupted context resumes with a matching SSP (the
+    // handler's shadow-stack frames are discarded). No-op unless CET is active.
+    // Done before the iretq trampoline, which reloads SSP from IA32_PL3_SSP.
+    crate::task::scheduler::restore_current_task_signal_ssp();
+    unsafe { sigreturn_enter_userspace(regs, ss, cs, rflags) }
 }
 
 fn encode_rt_sigaction(action: crate::process::SignalAction) -> [u8; 32] {
@@ -5083,6 +5221,15 @@ pub(super) fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         crate::process::make_fork_ctx(child_pid, user_rip, user_rsp),
         "fork-child",
     );
+    // Phase 110 B.3 — the fork child inherits the parent's shadow-stack pointer:
+    // the child's copied address space includes the parent's shadow-stack pages
+    // (mapped like every other user page), so the same SSP value points into
+    // the child's copy. No-op unless CET is active (`live` reads 0 on QEMU).
+    // (The CoW-of-shadow-stack push interaction is a Dell-validation item.)
+    let parent_ssp = crate::task::scheduler::current_task_cet_ssp_live();
+    if parent_ssp != 0 {
+        crate::task::scheduler::set_task_cet_ssp_by_tid(child_pid, parent_ssp);
+    }
 
     if let Some(parent_exec_path) = current_exec_path_for_debug()
         && is_interactive_debug_exec_path(parent_exec_path.as_str())
@@ -5547,9 +5694,6 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // For the in-kernel (boot-window) source this is a cheap no-op drop.
     drop(exec_stream);
 
-    // Close file descriptors with FD_CLOEXEC set.
-    crate::process::close_cloexec_fds(pid);
-
     // Keep the old AddressSpace alive across the CR3 switch. The process table
     // replacement below drops its Arc, but this core still runs on the old CR3
     // until `Cr3::write(new_cr3)` completes.
@@ -5564,7 +5708,23 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let new_addr_space = alloc::sync::Arc::new(crate::mm::AddressSpace::new(
         x86_64::PhysAddr::new(new_cr3.start_address().as_u64()),
     ));
+    // Phase 110 A.3b part 5 — execve replaces the kernel PML4, so the KPTI
+    // user half is rebuilt against it (the process keeps its kstack). No-op
+    // while KPTI is inactive; the old half dies with the old Arc's Drop.
+    //
+    // A.4 fail-closed: this runs BEFORE the destructive steps below
+    // (close_cloexec_fds / PROCESS_TABLE commit), so an allocation failure
+    // surfaces as a clean ENOMEM to the caller — the process must never reach
+    // ring 3 without a user half while KPTI is active. The fresh page table
+    // leaks on this path, like every other post-`new_process_page_table`
+    // error return (bump allocator).
+    if !new_addr_space.build_kpti_user_half() {
+        return NEG_ENOMEM;
+    }
     let new_as_ptr = alloc::sync::Arc::as_ptr(&new_addr_space);
+
+    // Close file descriptors with FD_CLOEXEC set.
+    crate::process::close_cloexec_fds(pid);
 
     // Update the process entry with the new CR3 and entry point.
     // Reset brk/mmap state since the address space is completely replaced.
@@ -5647,7 +5807,6 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // Switch to the new page table and enter ring 3.
     // SAFETY: new_cr3 is valid, entry and user_rsp are within it.
     unsafe {
-        use x86_64::registers::control::{Cr3, Cr3Flags};
         // Read kstack/fs_base from PROCESS_TABLE first; these don't depend
         // on CR3 and we want them in scope for `set_current_user_return`
         // which we run BEFORE `Cr3::write` (Bug #5 fix below).
@@ -5712,7 +5871,19 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             addr_space_gen: new_addr_space.generation(),
         });
 
-        Cr3::write(new_cr3, Cr3Flags::empty());
+        // Address-space switch to the fresh execve image: `write_kernel_cr3`
+        // flushes both KPTI PCIDs under the A.5 scheme, else a plain flushing
+        // write (A.4 behavior).
+        crate::mm::write_kernel_cr3(new_cr3.start_address().as_u64());
+        // Phase 110 A.4 — retarget the per-core KPTI pair at the same moment:
+        // this syscall returns to ring 3 on the NEW image, so the sysret tail /
+        // exit trampolines (which read `gs:[kpti_user_cr3]`, not a saved flag —
+        // exactly for this mid-syscall retarget) must load the rebuilt user
+        // half. No-op while KPTI is inactive.
+        crate::smp::publish_kpti_cr3_pair(
+            new_cr3.start_address().as_u64(),
+            new_addr_space.kpti_user_pml4(),
+        );
         if crate::smp::is_per_core_ready() {
             let pc = crate::smp::per_core();
             let core_id = pc.core_id;
@@ -5772,6 +5943,20 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                 }
                 ptrace_park_and_resume();
             }
+        }
+        // Phase 110 B.3 — install this fresh image's CET user shadow stack and
+        // arm IA32_PL3_SSP before the iretq into ring 3 (no-op unless CET is
+        // active). Fail-closed: on frame exhaustion a CET-active core would
+        // fault the image's first CALL (shadow-stack push to a null SSP), so
+        // kill the exec rather than enter ring 3 unarmed. On QEMU this is an
+        // unconditional `true` (cet_active=false), so the path is inert.
+        // SAFETY: the new CR3 is live and this is the execing task's context.
+        if !crate::arch::x86_64::cet::setup_current_task_shadow_stack() {
+            // The new image is already committed (CR3 switched, table replaced),
+            // so there is no clean ENOMEM return; terminate the process instead
+            // (same fail-closed shape as the fork trampoline's missing-user-half
+            // kill). Diverges — never falls through to `enter_userspace`.
+            terminate_thread_group_and_exit(pid, -9);
         }
         crate::arch::x86_64::enter_userspace(loaded.entry, user_rsp)
     }
@@ -6152,6 +6337,58 @@ unsafe fn cow_clone_user_pages(
                             continue;
                         }
 
+                        // Phase 110 B.3 (Dell/Tiger Lake CET fork fix) — a CET
+                        // user shadow-stack page (present, user, DIRTY, read-only,
+                        // and NOT a CoW/device page) must be EAGERLY COPIED into
+                        // the child, never shared or CoW'd. CoW's WRITABLE-clear
+                        // write-trap never fires on a shadow-stack push (a `CALL`
+                        // writes a read-only+DIRTY page by hardware design), so a
+                        // shared shadow stack lets the parent's post-fork CALL/RET
+                        // activity clobber the frame — the child's first `ret`
+                        // then finds a mismatched return address → `#CP` (the
+                        // `ion` `_Fork` near-RET `#CP` this bench hit). Give the
+                        // child its own frame with the parent's return-address
+                        // chain + the same shadow-stack encoding. `!BIT_9` excludes
+                        // a CoW page that merely happens to be non-writable+dirty
+                        // (from a *prior* fork of this same parent). No-op unless
+                        // CET is active (no page carries this encoding on QEMU).
+                        if kernel_core::cet::is_shadow_stack_pte(flags.bits())
+                            && !flags.contains(PageTableFlags::BIT_9)
+                        {
+                            let child_frame = crate::mm::frame_allocator::allocate_frame_zeroed()
+                                .ok_or(crate::mm::elf::ElfError::OutOfFrames)?;
+                            // Copy the parent's shadow-stack contents into the
+                            // child's fresh frame via the direct physical map.
+                            let src_ptr = (phys_off + src_phys.as_u64()) as *const u8;
+                            let dst_ptr =
+                                (phys_off + child_frame.start_address().as_u64()) as *mut u8;
+                            core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, 4096);
+                            let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(vaddr))
+                                .map_err(|_| {
+                                crate::mm::elf::ElfError::MappingFailed("invalid vaddr in fork")
+                            })?;
+                            let parent_flags = PageTableFlags::PRESENT
+                                | PageTableFlags::WRITABLE
+                                | PageTableFlags::USER_ACCESSIBLE;
+                            dst_mapper
+                                .map_to_with_table_flags(
+                                    page,
+                                    child_frame,
+                                    flags,
+                                    parent_flags,
+                                    &mut frame_alloc,
+                                )
+                                .map_err(|_| {
+                                    crate::mm::elf::ElfError::MappingFailed(
+                                        "map_to failed for shadow stack in fork",
+                                    )
+                                })?
+                                .ignore();
+                            // Parent PTE untouched, parent frame not shared/
+                            // refcounted — the two shadow stacks are independent.
+                            continue;
+                        }
+
                         let was_writable = flags.contains(PageTableFlags::WRITABLE);
 
                         // Compute child flags: if the page was writable, clear
@@ -6259,14 +6496,26 @@ pub fn init() {
     )
     .expect("STAR MSR write failed: segment selector layout mismatch");
 
-    unsafe extern "C" {
-        fn syscall_entry();
-    }
-    LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
+    LStar::write(lstar_target());
     SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG | RFlags::ALIGNMENT_CHECK);
     unsafe {
         Efer::update(|flags| *flags |= EferFlags::SYSTEM_CALL_EXTENSIONS);
     }
+}
+
+/// Phase 110 A.4 — re-select the LSTAR target after the mitigations policy
+/// decision.
+///
+/// The BSP's [`init`] runs before `mitigations::init_bsp()` (the SYSCALL MSRs
+/// must exist early in boot), so it installs the non-KPTI stub; once
+/// `kpti_active` is decided this re-install swaps in `syscall_entry_kpti`
+/// when active (and is a same-value rewrite otherwise). APs (`init_ap` runs
+/// after `mitigations::init_ap`, with the BSP's policy snapshot long
+/// published) and the S3-resume re-`init()` self-select via [`lstar_target`]
+/// and do not need this. No ring-3 code exists yet at the call site, so the
+/// swap cannot race a live SYSCALL.
+pub fn reinstall_lstar() {
+    LStar::write(lstar_target());
 }
 
 /// Initialize SYSCALL MSRs on an AP core.
@@ -6284,10 +6533,7 @@ pub fn init_ap() {
     )
     .expect("STAR MSR write failed on AP");
 
-    unsafe extern "C" {
-        fn syscall_entry();
-    }
-    LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
+    LStar::write(lstar_target());
     SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG | RFlags::ALIGNMENT_CHECK);
     unsafe {
         Efer::update(|flags| *flags |= EferFlags::SYSTEM_CALL_EXTENSIONS);
@@ -19398,6 +19644,12 @@ fn sys_clone_thread(
     };
 
     // Allocate a NEW kernel stack for the child thread.
+    //
+    // Phase 110 hardening — no per-thread KPTI work is needed here anymore:
+    // ring-3 interrupt frames land on the per-CPU trampoline stack (already
+    // in the shared entry set), not on the thread's kstack top, so the
+    // pre-hardening `kpti_map_thread_kstack` call (and its ENOMEM
+    // fail-closed arm) is gone.
     let kstack_top = alloc_kernel_stack_pub();
 
     // Determine TLS: if CLONE_SETTLS, use the provided tls value.
@@ -19410,6 +19662,33 @@ fn sys_clone_thread(
     // Determine clear_child_tid.
     let child_clear_tid = if flags & CLONE_CHILD_CLEARTID != 0 {
         child_tidptr
+    } else {
+        0
+    };
+
+    // Phase 110 B.3 — a CLONE_VM thread starts with a fresh call stack, so it
+    // needs its OWN empty shadow stack (unlike a fork child, which inherits the
+    // parent's). Allocate + map it in the shared address space (the parent's
+    // live CR3 IS the shared AS) BEFORE spawning, so frame exhaustion fails the
+    // clone cleanly (ENOMEM) rather than starting a thread that faults its
+    // first CALL on a CET-active core. No-op unless CET is active (QEMU).
+    let child_ssp = if crate::mitigations::state().is_some_and(|s| s.cet_active) {
+        let base = parent_addr_space.alloc_shadow_stack_va();
+        let _guard = parent_addr_space.lock_page_tables();
+        // SAFETY: the parent's live CR3 is the shared address space; lock held;
+        // the bumped region is fresh.
+        match unsafe {
+            crate::arch::x86_64::cet::map_user_shadow_stack(
+                base,
+                crate::arch::x86_64::cet::USER_SHADOW_STACK_SIZE,
+            )
+        } {
+            Some(top) => top,
+            None => {
+                const NEG_ENOMEM: u64 = (-12_i64) as u64;
+                return NEG_ENOMEM;
+            }
+        }
     } else {
         0
     };
@@ -19518,6 +19797,11 @@ fn sys_clone_thread(
         crate::process::make_fork_ctx_for_thread(child_pid, user_rip, child_stack),
         "clone-thread",
     );
+    // Arm the new thread's shadow-stack pointer (restored into IA32_PL3_SSP at
+    // its first dispatch). No-op when CET is inactive (child_ssp == 0).
+    if child_ssp != 0 {
+        crate::task::scheduler::set_task_cet_ssp_by_tid(child_pid, child_ssp);
+    }
 
     log::debug!("[p{}] clone_thread → child tid {}", parent_pid, child_pid);
     child_pid as u64

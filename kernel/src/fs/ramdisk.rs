@@ -84,6 +84,9 @@ static EXIT0_ELF: &[u8] = generated_initrd_asset!("exit0");
 // Phase 110 Track B — ASLR + stack-canary probes.
 static ASLR_PROBE_ELF: &[u8] = generated_initrd_asset!("aslr-probe");
 static STACK_SMASH_ELF: &[u8] = generated_initrd_asset!("stack-smash");
+// Phase 110 Dell-validation PoCs — Meltdown reject (A.6) + CET/ROP (B.3).
+static MELTDOWN_POC_ELF: &[u8] = generated_initrd_asset!("meltdown-poc");
+static ROP_CET_POC_ELF: &[u8] = generated_initrd_asset!("rop-cet-poc");
 // Phase 111 Track D — ptrace tracer/tracee smoke.
 static PTRACE_TEST_ELF: &[u8] = generated_initrd_asset!("ptrace-test");
 // Phase 111 Track D.3 — native gdbserver + its debuggee.
@@ -549,6 +552,18 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "stack-smash",
         RamdiskNode::File {
             content: STACK_SMASH_ELF,
+        },
+    ),
+    (
+        "meltdown-poc",
+        RamdiskNode::File {
+            content: MELTDOWN_POC_ELF,
+        },
+    ),
+    (
+        "rop-cet-poc",
+        RamdiskNode::File {
+            content: ROP_CET_POC_ELF,
         },
     ),
     (

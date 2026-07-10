@@ -2902,6 +2902,72 @@ pub fn reset_current_task_fpu_state() {
     }
 }
 
+/// Phase 110 Track B.3 — record the current task's CET shadow-stack pointer so
+/// the next dispatch restores it. Called by
+/// `cet::setup_current_task_shadow_stack` after installing a fresh shadow stack
+/// (execve / clone). No-op if there is no current task.
+pub fn set_current_task_cet_ssp(ssp: u64) {
+    if let Some(idx) = get_current_task_idx() {
+        let mut sched = scheduler_lock();
+        if idx < sched.tasks.len() {
+            sched.tasks[idx].cet_ssp = ssp;
+        }
+    }
+}
+
+/// Phase 110 Track B.3 — set the CET shadow-stack pointer of the task with
+/// `tid` (used to arm a just-spawned fork child / clone thread before its first
+/// dispatch, which restores `cet_ssp` into `IA32_PL3_SSP`). No-op if not found.
+pub fn set_task_cet_ssp_by_tid(tid: u32, ssp: u64) {
+    let mut sched = scheduler_lock();
+    if let Some(task) = sched.tasks.iter_mut().find(|t| t.pid == tid) {
+        task.cet_ssp = ssp;
+    }
+}
+
+/// Phase 110 Track B.3 — the current task's live `IA32_PL3_SSP`, for a fork
+/// child to inherit (the child's copied address space includes the parent's
+/// shadow-stack pages, so the same SSP value points into the child's copy).
+/// Returns 0 when CET is inactive (QEMU) — a harmless inherited value.
+pub fn current_task_cet_ssp_live() -> u64 {
+    crate::arch::x86_64::cet::read_task_ssp_live()
+}
+
+/// Phase 110 Track B.3 — at signal delivery, stash the current task's live
+/// user `IA32_PL3_SSP` (the interrupted context's shadow-stack pointer) so
+/// `sigreturn` can restore it. No-op when CET is inactive.
+pub fn save_current_task_signal_ssp() {
+    if !crate::mitigations::state().is_some_and(|s| s.cet_active) {
+        return;
+    }
+    let ssp = crate::arch::x86_64::cet::read_task_ssp_live();
+    if let Some(idx) = get_current_task_idx() {
+        let mut sched = scheduler_lock();
+        if idx < sched.tasks.len() {
+            sched.tasks[idx].cet_signal_ssp = ssp;
+        }
+    }
+}
+
+/// Phase 110 Track B.3 — at `sigreturn`, restore the shadow-stack pointer
+/// stashed at signal delivery into `IA32_PL3_SSP`, discarding the handler's
+/// shadow-stack frames so the interrupted context resumes with a matching SSP.
+/// No-op when CET is inactive.
+pub fn restore_current_task_signal_ssp() {
+    if !crate::mitigations::state().is_some_and(|s| s.cet_active) {
+        return;
+    }
+    let saved = get_current_task_idx().and_then(|idx| {
+        let sched = scheduler_lock();
+        sched.get_task(idx).map(|t| t.cet_signal_ssp)
+    });
+    if let Some(ssp) = saved
+        && ssp != 0
+    {
+        crate::arch::x86_64::cet::restore_task_ssp(ssp);
+    }
+}
+
 /// Phase 86f Track B.1 — save the current task's live hardware FPU state into
 /// its `XSaveArea` and then call `f` with the raw bytes.
 ///
@@ -5536,18 +5602,11 @@ pub fn run() -> ! {
                     .unwrap_or_default();
 
                 if let Some(urs) = urs {
-                    // Restore CR3 from task-owned state.
+                    // Restore CR3 from task-owned state. Address-space switch:
+                    // `write_kernel_cr3` flushes both KPTI PCIDs when the A.5
+                    // scheme is active, else a plain flushing `Cr3::write`.
                     if urs.cr3_phys != 0 {
-                        unsafe {
-                            use x86_64::{
-                                PhysAddr,
-                                registers::control::{Cr3, Cr3Flags},
-                                structures::paging::{PhysFrame, Size4KiB},
-                            };
-                            let frame: PhysFrame<Size4KiB> =
-                                PhysFrame::containing_address(PhysAddr::new(urs.cr3_phys));
-                            Cr3::write(frame, Cr3Flags::empty());
-                        }
+                        crate::mm::write_kernel_cr3(urs.cr3_phys);
                         #[cfg(debug_assertions)]
                         {
                             let (loaded_frame, _) = x86_64::registers::control::Cr3::read();
@@ -5558,6 +5617,21 @@ pub fn run() -> ! {
                                 core_id
                             );
                         }
+                        // Phase 110 A.4 — publish the KPTI CR3 pair alongside
+                        // the CR3 restore (no-op while KPTI is inactive). The
+                        // user half must come from the SAME address space as
+                        // `urs.cr3_phys`: mid-execve the PROCESS_TABLE already
+                        // holds the new space while urs still has the old CR3,
+                        // so the filter publishes user=0 for that transient —
+                        // harmless, because `kpti_user_cr3` is only consumed
+                        // at a ring-3 transition and the task is mid-syscall
+                        // in ring 0 until execve republishes the matched pair.
+                        let user_half = new_as_guard
+                            .as_deref()
+                            .filter(|a| a.pml4_phys().as_u64() == urs.cr3_phys)
+                            .map(|a| a.kpti_user_pml4())
+                            .unwrap_or(0);
+                        crate::smp::publish_kpti_cr3_pair(urs.cr3_phys, user_half);
                     }
                     // Restore kernel stack top (TSS.RSP0 + per-core SYSCALL_STACK_TOP).
                     if urs.kernel_stack_top != 0 {
@@ -5582,28 +5656,30 @@ pub fn run() -> ! {
                     // Fallback for tasks that have not yet entered syscall_handler
                     // (e.g. freshly forked children before first dispatch).
                     // Read from PROCESS_TABLE as the legacy path.
-                    let (cr3_phys, kstack, fs) = {
+                    let (cr3_phys, kstack, fs, kpti_user_half) = {
                         let table = crate::process::PROCESS_TABLE.lock();
                         match table.find(pid) {
                             Some(p) => (
                                 p.addr_space.as_ref().map(|a| a.pml4_phys()),
                                 p.kernel_stack_top,
                                 p.fs_base,
+                                p.addr_space
+                                    .as_ref()
+                                    .map(|a| a.kpti_user_pml4())
+                                    .unwrap_or(0),
                             ),
-                            None => (None, 0, 0),
+                            None => (None, 0, 0, 0),
                         }
                     };
                     if let Some(cr3) = cr3_phys {
-                        unsafe {
-                            use x86_64::{
-                                PhysAddr,
-                                registers::control::{Cr3, Cr3Flags},
-                                structures::paging::{PhysFrame, Size4KiB},
-                            };
-                            let frame: PhysFrame<Size4KiB> =
-                                PhysFrame::containing_address(PhysAddr::new(cr3.as_u64()));
-                            Cr3::write(frame, Cr3Flags::empty());
-                        }
+                        // Address-space switch (both KPTI PCIDs flushed under the
+                        // A.5 scheme; plain flushing write otherwise).
+                        crate::mm::write_kernel_cr3(cr3.as_u64());
+                        // Phase 110 A.4 — publish the KPTI CR3 pair with the
+                        // CR3 load; cr3 and the user half were read from the
+                        // same PROCESS_TABLE entry, so the pair is consistent
+                        // by construction. No-op while KPTI is inactive.
+                        crate::smp::publish_kpti_cr3_pair(cr3.as_u64(), kpti_user_half);
                     }
                     if kstack != 0 {
                         crate::smp::set_current_core_kernel_stack(kstack);
@@ -5687,6 +5763,7 @@ pub fn run() -> ! {
             _task_preempt_frame_ptr,
             task_fpu_state_ptr,
             task_syscall_snapshot_ptr,
+            task_cet_ssp,
         ) = {
             let sched = scheduler_lock();
             if let Some(task) = sched.get_task(_task_idx) {
@@ -5716,6 +5793,7 @@ pub fn run() -> ! {
                         .map(|area| area.as_ref() as *const XSaveArea)
                         .unwrap_or(core::ptr::null()),
                     task.syscall_snapshot.get(),
+                    task.cet_ssp,
                 )
             } else {
                 (
@@ -5724,6 +5802,7 @@ pub fn run() -> ! {
                     core::ptr::null(),
                     core::ptr::null(),
                     core::ptr::null_mut(),
+                    0u64,
                 )
             }
         };
@@ -5802,6 +5881,10 @@ pub fn run() -> ! {
         if !task_fpu_state_ptr.is_null() {
             unsafe { restore_fpu_state(&*task_fpu_state_ptr) };
         }
+        // Phase 110 B.3 — restore this task's user shadow-stack pointer
+        // alongside the FPU state (identical per-task-CPU-state lifecycle).
+        // No-op unless CET is active (QEMU: never touches the MSR).
+        crate::arch::x86_64::cet::restore_task_ssp(task_cet_ssp);
 
         // Switch to the task.
         //
@@ -5906,6 +5989,13 @@ pub fn run() -> ! {
                         unsafe { save_fpu_state(area.as_mut()) };
                     }
                     let task = &mut sched.tasks[sidx];
+                    // Phase 110 B.3 — save this task's user shadow-stack pointer
+                    // alongside the FPU state (same lifecycle): the live
+                    // IA32_PL3_SSP still holds the outgoing task's user SSP here
+                    // (hardware preserved it from that task's kernel entry, and
+                    // no new task's SSP has been loaded yet). No-op unless CET
+                    // is active (QEMU: never reads the MSR).
+                    crate::arch::x86_64::cet::save_task_ssp(&mut task.cet_ssp);
                     task.saved_rsp = saved_rsp;
                     // E.1 epilogue: clear on_cpu AFTER saved_rsp is durably written.
                     // The Release ordering ensures that a concurrent waker observing

@@ -35,13 +35,21 @@ const MITIGATIONS_DEFAULT: &str = match option_env!("M3OS_MITIGATIONS") {
     None => "auto",
 };
 
-/// `true` once Track A (KPTI) is wired into the page-table / trampoline path.
-/// Until then KPTI cannot enforce regardless of policy, so [`MitigationState`]
-/// reports `kpti_active = false` and the reporter honestly shows Meltdown as
-/// `Vulnerable` (or `Not affected` on `RDCL_NO` silicon) — a half-built KPTI
-/// can never read as `Mitigated`. Flipped to `true` by the KPTI landing PR,
-/// which also adds the actual enable on the `kpti_policy` path.
-const KPTI_WIRED: bool = false;
+/// `true` since Phase 110 A.4: Track A (KPTI) is fully wired into the
+/// page-table / trampoline path — per-process user-half PML4s
+/// (`AddressSpace::build_kpti_user_half`, A.3b), the LSTAR-selected
+/// `syscall_entry_kpti` stub + KPTI-aware sysret tail (A.2), naked entry/exit
+/// CR3 switches on every ring-3-reachable vector incl. the NMI/`#DF` paranoid
+/// path (A.3b), all four ring0→ring3 exit trampolines (A.3b part 3), and the
+/// per-core CR3-pair publish at every dispatch locus (A.4). `kpti_active =
+/// kpti_policy && KPTI_WIRED` therefore reflects real enforcement: `auto`
+/// activates on Meltdown-susceptible silicon — QEMU TCG reports
+/// `rdcl_no=false`, so **every default QEMU boot runs the CR3 trampoline** —
+/// and deactivates under `off` or `auto` + `RDCL_NO`. The activation itself is
+/// the A.4 trio: this flag, the BSP LSTAR re-install after [`init_bsp`]
+/// (`lib.rs`; APs and the S3-resume path self-select via `lstar_target`), and
+/// `smp::publish_kpti_cr3_pair` going live (it no-ops while inactive).
+const KPTI_WIRED: bool = true;
 
 /// The boot-populated mitigation snapshot. Immutable after [`init_bsp`].
 #[derive(Clone, Copy, Debug)]
@@ -59,10 +67,28 @@ pub struct MitigationState {
     pub kpti_policy: bool,
     /// KPTI **actually enforcing** this boot — the reporter's source of truth.
     pub kpti_active: bool,
+    /// Phase 110 A.5 — the KPTI PCID scheme is **active** this boot: KPTI is
+    /// enforcing AND the CPU advertises both PCID and INVPCID
+    /// ([`cpuid::probe_pcid`]), so `CR4.PCIDE` is enabled and the CR3-write loci
+    /// tag the kernel/user halves with distinct PCIDs + the no-flush bit. On
+    /// every QEMU lane (TCG advertises neither bit) this is `false` and the
+    /// kernel runs the A.4 full-flush fallback. The single gate consulted by
+    /// `smp::publish_kpti_cr3_pair`, `mm::write_kernel_cr3`, and the SMP
+    /// shootdown to decide whether to emit PCID-tagged CR3 loads.
+    pub pcid_active: bool,
     /// IBPB **enabled** this boot: when `true`, an IBPB is issued on every
     /// cross-process switch. Set once from policy + CPU features at boot — this
     /// is a configuration flag, not a counter of barriers actually issued.
     pub ibpb_active: bool,
+    /// Phase 110 Track B.3 — CET **shadow stacks are supported** in CPUID
+    /// (`CET_SS`, [`cpuid::cet_shstk_usable`]). `false` on every QEMU lane
+    /// (TCG models no CET); `true` on the Dell Tiger Lake.
+    pub cet_present: bool,
+    /// Phase 110 Track B.3 — CET user shadow stacks are **active** this boot:
+    /// supported AND the policy is on (`!off`), so `CR4.CET` + `IA32_U_CET`
+    /// were set and each new task gets a shadow stack. The single gate the
+    /// per-task shadow-stack setup + the reporter consult. `false` on QEMU.
+    pub cet_active: bool,
     /// Guarded raw `CPUID.07H.0:EDX` (for the D.3 report wire).
     pub leaf7_edx: u32,
     /// Guarded raw `IA32_ARCH_CAPABILITIES` (for the D.3 report wire).
@@ -98,11 +124,34 @@ pub fn init_bsp() -> &'static MitigationState {
             MitigationLevel::Full => true,
             MitigationLevel::Auto => !features.rdcl_no,
         };
-        // KPTI can only enforce once Track A is wired. (When it is, this same
-        // path will perform the enable and set `kpti_active` to the result.)
+        // Phase 110 A.4 — KPTI enforcement. The wired substrate (A.1–A.3b)
+        // activates through three consumers of this flag, all downstream of
+        // this snapshot: `lstar_target()` selects `syscall_entry_kpti` (the
+        // BSP re-installs LSTAR right after this returns; APs and the S3
+        // resume path run their `syscall::init*` after the policy decision),
+        // `AddressSpace::build_kpti_user_half` builds the per-process user
+        // half at every address-space birth, and `smp::publish_kpti_cr3_pair`
+        // publishes the per-core CR3 pair at every dispatch locus (it no-ops
+        // while inactive, keeping every entry/exit switch never-taken).
         let kpti_active = kpti_policy && KPTI_WIRED;
 
+        // Phase 110 A.5 — PCID TLB-cost recovery is active iff KPTI enforces AND
+        // the CPU has both PCID + INVPCID. `enable_pcid_if_kpti_active` (called
+        // right after this returns on the BSP, per-AP via the CR4 trampoline
+        // copy, and on S3 resume) sets `CR4.PCIDE` under the same condition, so
+        // this flag and the live register agree. False on every QEMU lane.
+        let pcid_active = kpti_active && cpuid::probe_pcid();
+
         let ibpb_active = !off && features.ibrs_ibpb;
+
+        // Phase 110 Track B.3 — CET user shadow stacks. Policy: on unless
+        // `mitigations=off` (a userspace CFI hardening, not tied to Meltdown —
+        // like ASLR/canaries, `auto` and `full` both enable it). Active iff the
+        // CPU advertises CET_SS. `enable_user_cet_if_supported` (BSP before
+        // `boot_aps`, per-AP, S3 resume) sets `CR4.CET` under the same
+        // condition, so this flag and the live register agree. False on QEMU.
+        let cet_present = cpuid::cet_shstk_usable();
+        let cet_active = !off && cet_present;
 
         // Track A.4 — KPTI GLOBAL-bit guard. m3OS marks no kernel PTE GLOBAL, so
         // this must be 0; a nonzero count means a future CR4.PGE optimization
@@ -125,13 +174,16 @@ pub fn init_bsp() -> &'static MitigationState {
             ibrs_mode,
             kpti_policy,
             kpti_active,
+            pcid_active,
             ibpb_active,
+            cet_present,
+            cet_active,
             leaf7_edx,
             arch_caps,
         };
 
         log::info!(
-            "[sec] mitigations={:?}{} ibrs={:?} ibpb={} stibp_avail={} rdcl_no={} kpti(policy={} active={}) global_kernel_ptes={}",
+            "[sec] mitigations={:?}{} ibrs={:?} ibpb={} stibp_avail={} rdcl_no={} kpti(policy={} active={}) pcid(active={} supported={}) cet(active={} supported={}) global_kernel_ptes={}",
             state.level,
             if state.level_recognized { "" } else { " (unrecognized→auto)" },
             state.ibrs_mode,
@@ -140,6 +192,10 @@ pub fn init_bsp() -> &'static MitigationState {
             state.features.rdcl_no,
             state.kpti_policy,
             state.kpti_active,
+            state.pcid_active,
+            cpuid::probe_pcid(),
+            state.cet_active,
+            state.cet_present,
             global_kernel_ptes,
         );
         state
@@ -159,6 +215,16 @@ pub fn init_ap() {
             cpuid::enable_ibrs();
         }
     }
+    // Phase 110 Track B.3 — CET. `CR4.CET` is inherited from the BSP via the
+    // trampoline's captured `DATA_CR4`, but `IA32_U_CET` is a **per-core** MSR
+    // that the AP boots with cleared — so re-assert the user-shadow-stack
+    // enable on this core. No-op unless CET is active (QEMU: never).
+    if state.cet_active {
+        // SAFETY: BSP already proved `CET_SS`; ring 0 AP boot context.
+        unsafe {
+            cpuid::enable_user_cet_if_supported(true);
+        }
+    }
 }
 
 /// The boot snapshot, or `None` before [`init_bsp`].
@@ -175,6 +241,16 @@ pub fn mitigations_off() -> bool {
         .get()
         .map(|s| matches!(s.level, MitigationLevel::Off))
         .unwrap_or(false)
+}
+
+/// Whether the KPTI PCID scheme is active this boot (Phase 110 A.5): the single
+/// gate `smp::publish_kpti_cr3_pair`, `mm::write_kernel_cr3`, and the SMP
+/// shootdown consult before emitting PCID-tagged / no-flush CR3 loads. `false`
+/// before [`init_bsp`] and on every QEMU lane (no PCID/INVPCID). Cheap (one
+/// `Once` read) — safe on the dispatch hot path.
+#[inline]
+pub fn pcid_active() -> bool {
+    STATE.get().map(|s| s.pcid_active).unwrap_or(false)
 }
 
 /// Whether IBPB should be issued on cross-process switches (C.3): the feature
@@ -274,6 +350,9 @@ pub fn report() -> MitigationReport {
             wx_v2,
             pku_present,
             pku_active,
+            pcid_active: s.pcid_active,
+            cet_present: s.cet_present,
+            cet_active: s.cet_active,
         },
         None => MitigationReport {
             level: MitigationLevel::Auto,
@@ -286,6 +365,9 @@ pub fn report() -> MitigationReport {
             wx_v2,
             pku_present,
             pku_active,
+            pcid_active: false,
+            cet_present: cpuid::cet_shstk_usable(),
+            cet_active: false,
         },
     }
 }

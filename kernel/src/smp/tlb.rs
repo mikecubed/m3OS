@@ -14,7 +14,74 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use kernel_core::kpti_pcid::{KERNEL_PCID, USER_PCID};
+
 use super::ipi;
+
+// ---------------------------------------------------------------------------
+// Phase 110 Track A.5 — PCID-aware local TLB invalidation
+// ---------------------------------------------------------------------------
+//
+// Under the KPTI PCID scheme each process's kernel and user halves are tagged
+// with distinct PCIDs ([`KERNEL_PCID`]/[`USER_PCID`]). A plain `invlpg` only
+// invalidates the *current* PCID's entry for an address (plus globals), so a
+// mapping visible in both halves — every user page lives in the shared
+// `PML4[0]`/`PML4[255]` slots — that is mutated while running on the kernel
+// PCID would leave a stale translation under the user PCID, re-faulting forever
+// on the CoW/demand path (and, cross-core, letting a stale user translation
+// survive a shootdown). So every user-reachable invalidation must cover **both**
+// PCIDs; `INVPCID` targets a specific, possibly non-current, PCID.
+//
+// When the scheme is inactive (`mitigations::pcid_active() == false` — every
+// QEMU lane, and any boot without KPTI) these fall back to the exact pre-A.5
+// `invlpg` / CR3-reload, so the behavior is byte-identical to Phase 110 A.4.
+
+/// Invalidate `vaddr` in this core's TLB across both KPTI PCIDs when the PCID
+/// scheme is active, else a single `invlpg`.
+#[inline]
+pub fn flush_local(vaddr: u64) {
+    if crate::mitigations::pcid_active() {
+        use x86_64::VirtAddr;
+        use x86_64::instructions::tlb::{InvPcidCommand, Pcid, flush_pcid};
+        let va = VirtAddr::new(vaddr);
+        // SAFETY: INVPCID is enabled (probe_pcid gates PCIDE on INVPCID
+        // support); PCIDs are the fixed <= 4095 constants.
+        unsafe {
+            flush_pcid(InvPcidCommand::Address(
+                va,
+                Pcid::new(KERNEL_PCID).expect("KERNEL_PCID in range"),
+            ));
+            flush_pcid(InvPcidCommand::Address(
+                va,
+                Pcid::new(USER_PCID).expect("USER_PCID in range"),
+            ));
+        }
+    } else {
+        x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(vaddr));
+    }
+}
+
+/// Full local TLB flush across all PCIDs when the PCID scheme is active, else a
+/// CR3 reload. Used by the large-range shootdown path where per-page `invlpg`
+/// is more expensive than one sweep. `INVPCID` type "all" invalidates every
+/// PCID (m3OS marks no page global, so all-vs-all-except-global is equivalent).
+#[inline]
+pub fn flush_local_all() {
+    if crate::mitigations::pcid_active() {
+        use x86_64::instructions::tlb::{InvPcidCommand, flush_pcid};
+        // SAFETY: INVPCID enabled under the PCID scheme (see `flush_local`).
+        unsafe {
+            flush_pcid(InvPcidCommand::All);
+        }
+    } else {
+        let (frame, flags) = x86_64::registers::control::Cr3::read();
+        // SAFETY: reloading the current CR3 with its current flags is a
+        // well-defined full-TLB flush (non-global) on this core.
+        unsafe {
+            x86_64::registers::control::Cr3::write(frame, flags);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shootdown request (shared state)
@@ -331,8 +398,8 @@ pub fn tlb_shootdown(addr: u64) {
     'critical: {
         let _lock = SHOOTDOWN_LOCK.lock();
 
-        // Always invalidate locally.
-        x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(addr));
+        // Always invalidate locally (both KPTI PCIDs when the scheme is active).
+        flush_local(addr);
 
         // Snapshot recipients in a single predicate walk. We capture both the
         // recipient `apic_id` (so the send loop calls `send_nmi()` directly,
@@ -422,18 +489,14 @@ pub fn tlb_shootdown_range(addr_space: &crate::mm::AddressSpace, start: u64, end
         let page_count = aligned_end.saturating_sub(aligned_start).div_ceil(4096);
         let use_cr3_reload = page_count > INVLPG_THRESHOLD;
 
-        // Local flush first.
+        // Local flush first (both KPTI PCIDs when the scheme is active).
         if use_cr3_reload {
-            // Full TLB flush via CR3 reload.
-            let (frame, flags) = x86_64::registers::control::Cr3::read();
-            unsafe {
-                x86_64::registers::control::Cr3::write(frame, flags);
-            }
+            flush_local_all();
         } else {
             // Per-page invlpg.
             let mut addr = aligned_start;
             while addr < aligned_end {
-                x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(addr));
+                flush_local(addr);
                 addr += 4096;
             }
         }
@@ -526,16 +589,13 @@ pub fn tlb_shootdown_range_kernel(start: u64, end: u64) {
         let page_count = aligned_end.saturating_sub(aligned_start).div_ceil(4096);
         let use_cr3_reload = page_count > INVLPG_THRESHOLD;
 
-        // Local flush first.
+        // Local flush first (both KPTI PCIDs when the scheme is active).
         if use_cr3_reload {
-            let (frame, flags) = x86_64::registers::control::Cr3::read();
-            unsafe {
-                x86_64::registers::control::Cr3::write(frame, flags);
-            }
+            flush_local_all();
         } else {
             let mut addr = aligned_start;
             while addr < aligned_end {
-                x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(addr));
+                flush_local(addr);
                 addr += 4096;
             }
         }
@@ -617,15 +677,14 @@ pub fn handle_tlb_shootdown_ipi() {
     let end = SHOOTDOWN_RANGE_END.load(Ordering::Acquire);
 
     if start == 0 && end == 0 {
-        // Legacy single-address shootdown.
+        // Legacy single-address shootdown (both KPTI PCIDs when active — a
+        // remote core must drop the target ASID's translation under whichever
+        // PCID it cached it, not just the PCID it happens to be running now).
         let addr = SHOOTDOWN_ADDR.load(Ordering::Acquire);
-        x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(addr));
+        flush_local(addr);
     } else if SHOOTDOWN_USE_CR3_RELOAD.load(Ordering::Acquire) {
-        // Large range: full TLB flush via CR3 reload.
-        let (frame, flags) = x86_64::registers::control::Cr3::read();
-        unsafe {
-            x86_64::registers::control::Cr3::write(frame, flags);
-        }
+        // Large range: full TLB flush (all PCIDs when the scheme is active).
+        flush_local_all();
     } else {
         // Small range: per-page invlpg. Align so every page intersecting
         // [start, end) is invalidated, mirroring tlb_shootdown_range.
@@ -633,7 +692,7 @@ pub fn handle_tlb_shootdown_ipi() {
         let aligned_end = end.saturating_add(4096 - 1) & !(4096 - 1);
         let mut addr = aligned_start;
         while addr < aligned_end {
-            x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(addr));
+            flush_local(addr);
             addr += 4096;
         }
     }

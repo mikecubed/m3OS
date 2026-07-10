@@ -504,6 +504,220 @@ pub fn cr4_smap_enabled() -> bool {
     cr4 & (1 << 21) != 0
 }
 
+// ---------------------------------------------------------------------------
+// Phase 110 Track A.5 — PCID / INVPCID (KPTI TLB-cost recovery)
+// ---------------------------------------------------------------------------
+//
+// KPTI switches CR3 twice per syscall/IRQ. With PCID (`CR4.PCIDE`) the
+// entry/exit trampolines can load the kernel/user half **no-flush** (distinct
+// PCIDs tag the two halves), recovering the bulk of the ~30 % naive-KPTI cost.
+// The pure bit-layout/gate logic is host-tested in `kernel_core::kpti_pcid`;
+// this file performs the privileged probe + `CR4.PCIDE` write, gated on both
+// the PCID and INVPCID CPUID bits so a CPU lacking either never `#GP`s and runs
+// the A.4 full-flush fallback. QEMU TCG advertises neither bit, so on every CI
+// lane `probe_pcid()` is `false` and `CR4.PCIDE` stays 0 — the scheme is live
+// only on bare metal (validated on the Dell).
+
+static PCID_SUPPORTED: Once<bool> = Once::new();
+
+/// Probe whether the KPTI PCID scheme is usable: **both** `CPUID.01H:ECX[17]`
+/// (PCID) and `CPUID.07H.0:EBX[10]` (INVPCID) present. Idempotent — first call
+/// wins. The gate decision is the host-tested
+/// [`kernel_core::kpti_pcid::pcid_supported`]. Both bits are `0` under QEMU TCG.
+pub fn probe_pcid() -> bool {
+    *PCID_SUPPORTED.call_once(|| {
+        // Bench-bisection knob (Phase 110 Dell validation): `M3OS_MASK_PCID=1` at
+        // build time forces "PCID unsupported" (identical to QEMU TCG) so the
+        // CR4.PCIDE enable + tagged-CR3 + INVPCID paths stay off while KPTI+CET
+        // remain active — to isolate a PCID-vs-CET bring-up fault on real
+        // silicon. Default off; no effect on production builds.
+        if option_env!("M3OS_MASK_PCID").is_some() {
+            return false;
+        }
+        let leaf1_ecx = cpuid_raw(1, 0).ecx;
+        // Leaf 7 is guarded by the max-basic-leaf check (same trap as
+        // `probe_smep_smap`): reading leaf 7 on a CPU whose max basic leaf is
+        // < 7 returns the highest leaf's data, which could spuriously set the
+        // INVPCID bit and enable an unsupported feature.
+        let leaf7_ebx = if cpuid_raw(0, 0).eax >= 0x07 {
+            cpuid_raw(0x07, 0).ebx
+        } else {
+            0
+        };
+        kernel_core::kpti_pcid::pcid_supported(leaf1_ecx, leaf7_ebx)
+    })
+}
+
+/// Enable `CR4.PCIDE` (bit 17) on the **current** core when the CPU supports the
+/// PCID scheme AND KPTI is active this boot. Returns whether PCIDE is now set.
+///
+/// `CR4.PCIDE` may be set only while `CR3[11:0] == 0` (Intel SDM Vol. 3A
+/// §4.10.1) — true at every call site (the kernel runs on a page-aligned boot /
+/// process PML4 with no PCID yet), so no explicit CR3 scrub is needed. Enabling
+/// PCIDE changes how `mov cr3` interprets bits 11:0 and 63, so the kernel only
+/// enables it once every CR3-write locus is PCID-aware (Phase 110 A.5). No-op
+/// unless [`probe_pcid`] holds — so on QEMU/CI it never runs and the CR3 writes
+/// keep loading `PCID = 0` with a plain flush (the A.4 fallback).
+///
+/// Must run on the BSP **before** `smp::boot::boot_aps()` so the trampoline's
+/// captured `DATA_CR4` carries the bit and every AP inherits it, and on the S3
+/// resume path (the machine reset clears CR4).
+///
+/// # Safety
+/// CR4 is a privileged register; ring 0, IRQs disabled or single-threaded.
+pub unsafe fn enable_pcid_if_kpti_active(kpti_active: bool) -> bool {
+    if !kpti_active || !probe_pcid() {
+        return false;
+    }
+    let mut cr4: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+    }
+    cr4 |= 1 << 17; // CR4.PCIDE
+    unsafe {
+        core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack));
+    }
+    true
+}
+
+/// True if `CR4.PCIDE` (bit 17) is currently set on this core.
+pub fn cr4_pcide_enabled() -> bool {
+    let cr4: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+    }
+    cr4 & (1 << 17) != 0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 110 Track B.3 — CET user shadow stacks
+// ---------------------------------------------------------------------------
+//
+// CET shadow stacks are a hardware CFI layer: CALL pushes the return address to
+// a protected shadow stack, RET checks it, and a mismatch (a return-address
+// overwrite the canary missed) faults #CP before control transfers. The pure
+// bit-layout/decode logic is host-tested in `kernel_core::cet`; this file does
+// the privileged probe + `CR4.CET`/`IA32_U_CET` writes, gated on the CET_SS
+// CPUID bit so a CPU without it never `#GP`s. QEMU TCG does not model CET, so
+// on every CI lane `probe_cet()` is `false`, `CR4.CET` stays 0, and the whole
+// shadow-stack path is inert (validated active on the Dell Tiger Lake).
+
+static CET_FEATURES: Once<kernel_core::cet::CetFeatures> = Once::new();
+static CET_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Probe the CET feature surface: `CPUID.07H.0:ECX[7]` (CET_SS) + `:EDX[20]`
+/// (CET_IBT), guarded by the max-basic-leaf check (the `probe_smep_smap` trap —
+/// reading leaf 7 on a CPU whose max basic leaf is `< 7` returns a lower leaf's
+/// data, which could spuriously set the CET bit and enable an unsupported
+/// feature). Idempotent — first call wins. Decode is the host-tested
+/// [`kernel_core::cet::CetFeatures::from_leaf7`]. Both bits are `0` on QEMU TCG.
+pub fn probe_cet() -> kernel_core::cet::CetFeatures {
+    *CET_FEATURES.call_once(|| {
+        // Bench-bisection knob (Phase 110 Dell validation): `M3OS_MASK_CET=1` at
+        // build time forces "no CET" (identical to QEMU TCG) so the CR4.CET +
+        // IA32_U_CET + shadow-stack paths stay off while KPTI+PCID remain active
+        // — to isolate a CET-vs-PCID bring-up fault on real silicon. Default off;
+        // no effect on production builds.
+        if option_env!("M3OS_MASK_CET").is_some() {
+            return kernel_core::cet::CetFeatures::from_leaf7(0, 0);
+        }
+        if cpuid_raw(0, 0).eax < 0x07 {
+            return kernel_core::cet::CetFeatures::from_leaf7(0, 0);
+        }
+        let leaf7 = cpuid_raw(0x07, 0);
+        kernel_core::cet::CetFeatures::from_leaf7(leaf7.ecx, leaf7.edx)
+    })
+}
+
+/// True when the kernel may enable user shadow stacks: the architectural
+/// `CET_SS` bit is set ([`kernel_core::cet::CetFeatures::shstk_usable`]).
+/// The single predicate every downstream CET consumer (per-task shadow-stack
+/// alloc, the `#CP` handler's relevance, the reporter) must consult. `false`
+/// on QEMU TCG.
+pub fn cet_shstk_usable() -> bool {
+    probe_cet().shstk_usable()
+}
+
+/// Enable CET user shadow stacks on the **current** core when the CPU supports
+/// `CET_SS` AND the CET policy is on this boot. Sets `CR4.CET` (bit 23) and
+/// `IA32_U_CET.SH_STK_EN` (+ `WR_SHSTK_EN`, so the signal path may seed a
+/// restore token onto the user shadow stack via `WRUSS`). Leaves `IA32_S_CET`
+/// untouched — **no** supervisor (kernel) shadow stack. Returns whether CET is
+/// now enabled on this core.
+///
+/// `IA32_PL3_SSP` is left 0 here; each task's shadow stack is armed at first
+/// entry to ring 3 (Track B.3 3/n) — with `SH_STK_EN` set but `PL3_SSP = 0` a
+/// task that never gets a shadow stack simply performs no shadow-stack ops
+/// until one is installed.
+///
+/// Must run on the BSP **before** `smp::boot::boot_aps()` so the trampoline's
+/// captured `DATA_CR4` carries `CR4.CET` and every AP inherits it, and again on
+/// the S3 resume path (the machine reset clears CR4 + the CET MSRs). No-op
+/// unless [`cet_shstk_usable`] holds — so on QEMU/CI it never runs.
+///
+/// # Safety
+/// CR4 + the CET MSRs are privileged; ring 0, IRQs disabled or single-threaded.
+pub unsafe fn enable_user_cet_if_supported(policy_on: bool) -> bool {
+    use kernel_core::cet::{MSR_IA32_U_CET, compose_u_cet};
+    use x86_64::registers::control::{Cr0, Cr0Flags};
+    if !policy_on || !cet_shstk_usable() {
+        return false;
+    }
+    // Bare-metal bring-up diagnostic (Phase 110 CET boot hang, Dell/Tiger Lake):
+    // serial-free POST squares that localize *which* CET-enable instruction hangs
+    // real silicon. Slots 32–35 (grid row 2) — the last square painted is the
+    // last step that completed, so the hang is in the instruction after it. No-op
+    // unless built with `M3OS_BRINGUP_DIAG=1` (see `crate::BRINGUP_DIAG`). The BSP
+    // reaches here first (before `boot_aps`), so on the hanging path only it
+    // paints these. See docs/handoffs/2026-07-09-cet-boot-hang-on-tiger-lake.md.
+    crate::post_marker(32); // entered CET enable (policy on + CET_SS usable)
+    // Intel SDM Vol 3A: setting `CR4.CET` while `CR0.WP = 0` raises `#GP(0)` —
+    // CET is architecturally tied to write-protect. QEMU TCG models no CET and
+    // never enforces this, so a `WP = 0` boot works there but `#GP`-hangs on real
+    // CET silicon (the Dell Precision 5560 black-screened at exactly this write).
+    // Nothing else in BSP boot guarantees `WP`, so ensure it on this core before
+    // touching `CR4.CET`. `WP` is per-core; every core enabling CET runs this.
+    unsafe {
+        if !Cr0::read().contains(Cr0Flags::WRITE_PROTECT) {
+            Cr0::update(|f| f.insert(Cr0Flags::WRITE_PROTECT));
+        }
+    }
+    crate::post_marker(33); // CR0.WP = 1 confirmed; next: mov cr4 (CR4.CET)
+    let mut cr4: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+    }
+    cr4 |= kernel_core::cet::CR4_CET;
+    unsafe {
+        core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack));
+    }
+    crate::post_marker(34); // CR4.CET set OK; next: wrmsr IA32_U_CET
+    unsafe {
+        // User shadow stacks on; WRUSS allowed (signal restore-token seeding).
+        Msr::new(MSR_IA32_U_CET).write(compose_u_cet(true, true));
+    }
+    crate::post_marker(35); // IA32_U_CET written — CET enable fully succeeded
+    CET_ENABLED.store(true, Ordering::Release);
+    true
+}
+
+/// True if `CR4.CET` (bit 23) is currently set on this core (a live-register
+/// audit for the per-core boot log, like [`cr4_pcide_enabled`]).
+pub fn cr4_cet_enabled() -> bool {
+    let cr4: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+    }
+    cr4 & kernel_core::cet::CR4_CET != 0
+}
+
+/// True once [`enable_user_cet_if_supported`] set `CR4.CET` on at least one core
+/// this boot (CET is active). `false` on a no-CET CPU. Mirrors [`ospke_enabled`].
+#[inline]
+pub fn cet_enabled() -> bool {
+    CET_ENABLED.load(Ordering::Acquire)
+}
+
 /// True if `EFLAGS.AC` (bit 18) is currently set on this core.
 pub fn eflags_ac_set() -> bool {
     use x86_64::registers::rflags::{self, RFlags};

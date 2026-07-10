@@ -327,6 +327,32 @@ pub fn enter_sleep_s3() -> i64 {
     // controllers (PICs masked + LAPIC/IOAPIC/timer — calibrations are
     // Once-cached from boot and stable across S3).
     crate::mitigations::init_bsp();
+    // Phase 110 A.5 — the machine reset cleared CR4, so re-enable CR4.PCIDE on
+    // the BSP (no-op on QEMU / when KPTI is inactive). Must precede
+    // `resume_reboot_aps` so the re-`boot_aps` CR4 capture carries the bit and
+    // resumed APs inherit it; a resumed process's first tagged CR3 load then
+    // finds PCIDE set. The KPTI user halves and CR3-pair slots survive S3 in
+    // RAM, so `pcid_active` is unchanged across the cycle.
+    unsafe {
+        let pcide = crate::arch::x86_64::cpuid::enable_pcid_if_kpti_active(
+            crate::mitigations::state().is_some_and(|s| s.kpti_active),
+        );
+        if pcide {
+            log::info!("[suspend] CR4.PCIDE re-enabled after resume");
+        }
+    }
+    // Phase 110 B.3 — the reset cleared CR4.CET + the CET MSRs, so re-enable CET
+    // user shadow stacks on the BSP (no-op on QEMU / when CET is inactive).
+    // Like PCIDE, precede `resume_reboot_aps` so the CR4 capture carries CET;
+    // each resumed AP re-asserts IA32_U_CET in `mitigations::init_ap`.
+    unsafe {
+        let cet = crate::arch::x86_64::cpuid::enable_user_cet_if_supported(
+            crate::mitigations::state().is_some_and(|s| s.cet_active),
+        );
+        if cet {
+            log::info!("[suspend] CR4.CET re-enabled after resume");
+        }
+    }
     crate::arch::x86_64::cpufreq::init_bsp();
     unsafe {
         crate::arch::x86_64::interrupts::init_pics();
@@ -389,6 +415,13 @@ extern "C" fn resume_entry(_unused: *mut core::ffi::c_void) -> ! {
     // GS bases (the per-core pointer) were wiped with the MSRs — restore
     // before anything touches `per_core()`.
     crate::smp::restore_bsp_gs_base();
+    // Phase 110 A.5 — the KPTI CR3-pair slots survived S3 in RAM with the
+    // PCID no-flush bit (bit 63) set, but the reset cleared CR4.PCIDE. Zero
+    // them now (gs is valid) so a paranoid NMI/#DF in the window before PCIDE
+    // is re-enabled skips its CR3 load instead of #GP'ing on a bit-63 value;
+    // the first post-resume dispatch republishes the tagged pair. No-op on the
+    // inactive lane (slots already 0).
+    crate::smp::clear_kpti_cr3_slots();
     crate::arch::x86_64::syscall::init();
     crate::arch::x86_64::pat::init();
     // SAFETY: same call the BSP boot and every AP entry make — sets this

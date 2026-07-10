@@ -1,6 +1,7 @@
-use core::arch::global_asm;
-
 pub mod apic;
+// Phase 110 Track B.3 — CET user shadow stacks (per-task shadow-stack setup,
+// IA32_PL3_SSP save/restore, the #CP handler seam).
+pub mod cet;
 pub mod cpufreq;
 pub mod cpuid;
 // Phase 111 Track B — trap & debug-register substrate (#DB/#BP dispatch,
@@ -43,11 +44,15 @@ pub unsafe fn enable_interrupts() {
     }
 }
 
-/// Transfer execution to ring 3 (userspace).
-///
-/// Not used in Phase 6 (kernel-thread IPC demo) — will be re-enabled in
-/// Phase 7+ when multi-process userspace is introduced.
-#[allow(dead_code)]
+unsafe extern "C" {
+    /// The execve initial-entry ring-3 trampoline. Phase 110 A.3b part 3: the
+    /// asm lives in the user-mapped `.text.kpti_exit` section
+    /// (`interrupts.rs`, bottom) so it can flip to the user CR3 immediately
+    /// before its `iretq`.
+    fn execve_enter_userspace(rip: u64, rsp: u64, cs: u64, ss: u64) -> !;
+}
+
+/// Transfer execution to ring 3 (userspace) — the execve initial-entry path.
 ///
 /// Uses `iretq` to atomically switch to user code segment, user stack, and
 /// the given entry point with interrupts enabled (RFLAGS.IF = 1).
@@ -70,54 +75,11 @@ pub unsafe fn enter_userspace(entry: u64, user_stack_top: u64) -> ! {
     // the new image has ever run. Timer IRQ-return preemption can reschedule
     // the task immediately after ring 3 starts.
     unsafe {
-        use core::arch::asm;
-        asm!(
-            "push {ss}",
-            "push {rsp}",
-            "push {rflags}",
-            "push {cs}",
-            "push {rip}",
-            "iretq",
-            ss     = in(reg) u64::from(gdt::user_data_selector().0),
-            rsp    = in(reg) user_stack_top,
-            rflags = const 0x202u64,
-            cs     = in(reg) u64::from(gdt::user_code_selector().0),
-            rip    = in(reg) entry,
-            options(noreturn)
-        )
-    }
-}
-
-/// Enter ring 3 at `rip` with `rsp` as the stack pointer and `rax` as the
-/// return value visible to userspace code (used by `fork` to return 0 to
-/// the child).
-///
-/// # Safety
-/// Same requirements as [`enter_userspace`].  `rax` is placed in RAX before
-/// `iretq` so the child sees it as its syscall return value.
-#[allow(dead_code)]
-pub unsafe fn enter_userspace_with_retval(rip: u64, rsp: u64, rax: u64) -> ! {
-    // Phase 57b D.3: assert preempt_count == 0 before iretq to ring 3.
-    crate::task::scheduler::assert_preempt_count_zero_at_user_return();
-    // Phase 57d G.4: consume deferred reschedule at this user-return boundary.
-    crate::task::scheduler::check_deferred_preempt_at_user_return();
-    unsafe {
-        use core::arch::asm;
-        asm!(
-            "push {ss}",
-            "push {rsp_val}",
-            "push {rflags}",
-            "push {cs}",
-            "push {rip_val}",
-            "mov rax, {rax_val}",
-            "iretq",
-            ss      = in(reg) u64::from(gdt::user_data_selector().0),
-            rsp_val = in(reg) rsp,
-            rflags  = const 0x202u64,
-            cs      = in(reg) u64::from(gdt::user_code_selector().0),
-            rip_val = in(reg) rip,
-            rax_val = in(reg) rax,
-            options(noreturn)
+        execve_enter_userspace(
+            entry,
+            user_stack_top,
+            u64::from(gdt::user_code_selector().0),
+            u64::from(gdt::user_data_selector().0),
         )
     }
 }
@@ -174,46 +136,12 @@ impl ForkEntryCtx {
 // FORK_ENTRY_CTX has moved to PerCoreData (Phase 35).
 // The fork_enter_userspace assembly reads it via gs-relative addressing.
 
-// Assembly trampoline: reads ForkEntryCtx from a pointer (rdi), restores ALL
-// registers, then IRETs to ring 3.
-global_asm!(
-    ".global fork_enter_userspace",
-    "fork_enter_userspace:",
-    // On entry: rdi = pointer to ForkEntryCtx (SysV calling convention).
-    "mov rax, rdi",
-    // Restore callee-saved registers.
-    "mov rbx, [rax + 16]",
-    "mov rbp, [rax + 24]",
-    "mov r12, [rax + 32]",
-    "mov r13, [rax + 40]",
-    "mov r14, [rax + 48]",
-    "mov r15, [rax + 56]",
-    // Restore caller-saved registers (syscall-preserved).
-    "mov rsi, [rax + 88]",
-    "mov rdx, [rax + 96]",
-    "mov r8,  [rax + 104]",
-    "mov r9,  [rax + 112]",
-    "mov r10, [rax + 120]",
-    // Build IRET frame: SS, RSP, RFLAGS, CS, RIP
-    "mov rcx, [rax + 64]", // ss
-    "push rcx",
-    "push [rax + 8]", // user RSP
-    // Use saved user RFLAGS (sanitized: ensure IF is set, clear IOPL/VM/RF).
-    "mov rcx, [rax + 128]", // user RFLAGS
-    "or  rcx, 0x200",       // ensure IF (interrupt enable) is set
-    "and ecx, 0x000ED7FF",  // clear IOPL, VM, RF, reserved bits
-    "push rcx",
-    "mov rcx, [rax + 72]", // cs
-    "push rcx",
-    "push [rax]", // user RIP
-    // Restore rdi AFTER we're done using rax as base (rdi is offset 80).
-    "mov rdi, [rax + 80]",
-    // RAX = 0 (fork child return value).
-    "xor eax, eax",
-    "iretq",
-);
-
 unsafe extern "C" {
+    /// The fork-child ring-3 entry trampoline. Phase 110 A.3b part 3: the asm
+    /// lives in the user-mapped `.text.kpti_exit` section (`interrupts.rs`,
+    /// bottom) so it can flip to the user CR3 immediately before its `iretq`.
+    /// Restores ALL syscall-preserved registers from the `ForkEntryCtx` and
+    /// enters ring 3 with RAX = 0 (the child's fork return value).
     fn fork_enter_userspace(ctx: *const ForkEntryCtx) -> !;
 }
 
@@ -249,6 +177,36 @@ pub unsafe fn enter_userspace_fork(
     // is set) panics with a zero scheduler RSP. Normal syscall/signal-return
     // boundaries handle deferred reschedules after the task has a stable
     // continuation.
+
+    // Phase 110 B.3 (Tiger Lake) — arm a CET user shadow stack for a user task
+    // that reaches its first ring-3 entry without one. Only PID 1 (init) does:
+    // it is kernel-spawned through this fork trampoline (`spawn_userspace_init`)
+    // with `cet_ssp = 0`, whereas `execve` arms its own fresh image
+    // (`setup_current_task_shadow_stack` before `enter_userspace`) and fork
+    // children inherit the parent's (nonzero) SSP + copied shadow-stack pages.
+    // Without this, on CET silicon init's first `CALL` pushes a return address
+    // to `IA32_PL3_SSP = 0` and faults — the Dell/Tiger Lake stall right after
+    // "exec'ing userspace PID 1" (POST marker 22, no userspace output). We run
+    // in init's live CR3 here, so `setup_current_task_shadow_stack` maps into and
+    // advances init's own address space exactly as the execve path does. Gated
+    // on `cet_active`, so it is inert on QEMU (and the `== 0` MSR read is skipped
+    // on a no-CET CPU, which would otherwise `#GP`).
+    if crate::mitigations::state().is_some_and(|s| s.cet_active)
+        && crate::task::scheduler::current_task_cet_ssp_live() == 0
+    {
+        // SAFETY: the fork trampoline runs in the target task's context with its
+        // CR3 live, immediately before the `iretq` to its ring 3.
+        if !unsafe { crate::arch::x86_64::cet::setup_current_task_shadow_stack() } {
+            // Frame exhaustion — fail closed rather than `iretq` into ring 3 with
+            // no shadow stack (the first `CALL` would fault). Kills only this
+            // process; for PID 1 that is a fatal boot condition either way.
+            crate::arch::x86_64::syscall::terminate_thread_group_and_exit(
+                crate::process::current_pid(),
+                -9,
+            );
+        }
+    }
+
     // Write to per-core ForkEntryCtx and pass pointer to assembly trampoline.
     let data =
         crate::smp::per_core() as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;

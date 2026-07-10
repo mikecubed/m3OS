@@ -6,6 +6,7 @@ pub mod dma;
 pub mod elf;
 pub mod frame_allocator;
 pub mod heap;
+pub mod kpti;
 pub mod memory_map;
 pub mod paging;
 pub mod pkey;
@@ -44,6 +45,20 @@ use x86_64::{
 /// still pins the holder against 57d/57e voluntary or full preemption.
 pub struct AddressSpace {
     pml4_phys: PhysAddr,
+    /// Phase 110 A.3b part 5 — the KPTI **user-half** PML4 for this address
+    /// space (0 = none built). Built by [`AddressSpace::build_kpti_user_half`]
+    /// at process creation / execve when KPTI is active; A.4's dispatch prep
+    /// publishes it to `gs:[kpti_user_cr3]` for the entry/exit stubs to load
+    /// as the ring-3 CR3. Freed by `Drop` via [`kpti::free_user_half`].
+    kpti_user_pml4: AtomicU64,
+    /// Phase 110 Track B.3 — next free base VA for a CET user shadow stack in
+    /// this address space. A simple bump allocator in `PML4[255]` (a
+    /// `USER_PML4_SLOTS` slot, so shadow-stack pages are reachable on the KPTI
+    /// user CR3): the main thread (execve) takes the first slot, each
+    /// `CLONE_VM` thread the next. `0` means "not yet initialized" — set to
+    /// [`crate::arch::x86_64::cet::SHSTK_REGION_BASE`] lazily. Only touched when
+    /// CET is active.
+    cet_shstk_next: AtomicU64,
     generation: AtomicU64,
     active_on_cores: AtomicU64,
     page_table_lock: spin::Mutex<()>,
@@ -80,14 +95,106 @@ impl AddressSpace {
     pub fn new(pml4_phys: PhysAddr) -> Self {
         Self {
             pml4_phys,
+            kpti_user_pml4: AtomicU64::new(0),
+            cet_shstk_next: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             active_on_cores: AtomicU64::new(0),
             page_table_lock: spin::Mutex::new(()),
         }
     }
 
+    /// Phase 110 Track B.3 — reserve the next CET shadow-stack base VA in this
+    /// address space (a bump allocator in `PML4[255]`). Lazily initializes the
+    /// cursor to [`crate::arch::x86_64::cet::SHSTK_REGION_BASE`]. Each call
+    /// returns a distinct, `SHSTK_STRIDE`-separated base so per-thread shadow
+    /// stacks never overlap. Only called when CET is active.
+    pub fn alloc_shadow_stack_va(&self) -> u64 {
+        use crate::arch::x86_64::cet::{SHSTK_REGION_BASE, SHSTK_STRIDE};
+        // Initialize the cursor on first use (0 = uninitialized).
+        let _ = self.cet_shstk_next.compare_exchange(
+            0,
+            SHSTK_REGION_BASE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.cet_shstk_next
+            .fetch_add(SHSTK_STRIDE, Ordering::AcqRel)
+    }
+
     pub fn pml4_phys(&self) -> PhysAddr {
         self.pml4_phys
+    }
+
+    /// Phase 110 A.3b part 5 — build + attach the KPTI user-half PML4 for this
+    /// address space.
+    ///
+    /// Since the trampoline-stack hardening (18–21/n) the user half is fully
+    /// **process-independent** apart from the shared `USER_PML4_SLOTS`: ring-3
+    /// interrupt frames land on the per-CPU trampoline stack (already in the
+    /// shared entry set), so no per-task kstack page — and no per-thread
+    /// `CLONE_VM` map — is needed.
+    ///
+    /// No-op (returning `true`) while KPTI is inactive (`mitigations=off` /
+    /// `auto` on `RDCL_NO` silicon) — that path adds zero per-process
+    /// overhead.
+    /// Returns `false` on allocation failure (logged); A.4 fails closed on it:
+    /// `execve` returns `ENOMEM` before its destructive steps, and the
+    /// fork-child trampoline kills the child rather than entering ring 3
+    /// unisolated (the exit stubs skip the CR3 switch on `user_cr3 == 0`).
+    pub fn build_kpti_user_half(&self) -> bool {
+        if !crate::mitigations::state().is_some_and(|s| s.kpti_active) {
+            return true;
+        }
+        // SAFETY: `pml4_phys` is this process's live kernel PML4, per the
+        // constructor contracts of every call site (spawn/fork/execve).
+        match unsafe { kpti::build_user_half(self.pml4_phys.as_u64()) } {
+            Some(user) => {
+                self.kpti_user_pml4.store(user, Ordering::Release);
+                true
+            }
+            None => {
+                log::error!(
+                    "kpti: build_user_half failed for pml4={:#x} (out of frames?)",
+                    self.pml4_phys.as_u64()
+                );
+                false
+            }
+        }
+    }
+
+    /// The KPTI user-half PML4 physical address (0 = none built). A.4's
+    /// dispatch prep publishes this to `gs:[kpti_user_cr3]`.
+    pub fn kpti_user_pml4(&self) -> u64 {
+        self.kpti_user_pml4.load(Ordering::Acquire)
+    }
+
+    /// Phase 110 hardening — the `#PF`-time top-level-slot sync. On a
+    /// not-present ring-3 fault, re-copy the top-level `PML4` slot covering
+    /// `fault_va` from this space's kernel half into its live user half if
+    /// they diverged (a `USER_PML4_SLOTS` entry that was empty when the pair
+    /// was built and has since been populated in the kernel half). Returns
+    /// `true` if it repaired the slot (the caller should retry the faulting
+    /// instruction), `false` otherwise (no user half, not a syncable slot, or
+    /// already in sync — fall through to the normal fault handling).
+    ///
+    /// No-op (`false`) when no user half exists (KPTI inactive). Serialized
+    /// against other page-table mutators via the page-table lock; a
+    /// full-local-both-PCID flush follows a real repair (cheap — this fires
+    /// essentially never, and covers the paranoid case of a slot replaced
+    /// rather than filled).
+    pub fn kpti_sync_user_slot_on_fault(&self, fault_va: u64) -> bool {
+        let user = self.kpti_user_pml4.load(Ordering::Acquire);
+        if user == 0 {
+            return false;
+        }
+        let _guard = self.lock_page_tables();
+        // SAFETY: `pml4_phys` is this space's live kernel half and `user` its
+        // user half built over it; the page-table lock serializes writers.
+        let repaired = unsafe { kpti::sync_slot_raw(self.pml4_phys.as_u64(), user, fault_va) };
+        if repaired {
+            crate::smp::tlb::flush_local_all();
+        }
+        repaired
     }
 
     pub fn activate_on_core(&self, core_id: u8) {
@@ -132,6 +239,27 @@ impl AddressSpace {
     }
 }
 
+/// Phase 110 A.3b part 5 — the KPTI user half is freed with the
+/// `AddressSpace`, not with the kernel PML4: `free_process_page_table` (called
+/// manually at the teardown sites) only knows the kernel half, while the last
+/// `Arc<AddressSpace>` drop is the natural end-of-life for the pair.
+/// [`kpti::free_user_half`] frees only the private entry-set sub-tables and
+/// the user PML4 frame itself — never the shared user-mapping slots
+/// (`kernel_core::kpti::USER_PML4_SLOTS`, owned by the kernel half) nor any
+/// leaf page — so the ordering relative to
+/// `free_process_page_table(kernel_pml4)` is immaterial.
+impl Drop for AddressSpace {
+    fn drop(&mut self) {
+        let user = *self.kpti_user_pml4.get_mut();
+        if user != 0 {
+            // SAFETY: the last Arc reference is gone, so no core can have this
+            // user half loaded as its CR3 (execve/exit switch away before
+            // dropping the process's Arc).
+            unsafe { kpti::free_user_half(user) };
+        }
+    }
+}
+
 static PHYS_OFFSET: Once<u64> = Once::new();
 
 /// Physical address of the kernel's original PML4 (set once during mm::init).
@@ -155,6 +283,87 @@ pub fn kernel_pml4_phys() -> u64 {
     *KERNEL_PML4_PHYS.get().expect("mm not initialized")
 }
 
+/// Load a **kernel-half** PML4 as this core's CR3 across an address-space
+/// boundary (scheduler dispatch, `execve`, `fork`, restore-to-kernel).
+///
+/// This is the single PCID-aware CR3-write locus (Phase 110 A.5). `pml4_phys`
+/// is the (page-aligned) kernel half — the full map the kernel runs on. The
+/// caller publishes the KPTI CR3 pair separately via
+/// [`crate::smp::publish_kpti_cr3_pair`] right after.
+///
+/// * **PCID scheme active** — load the frame under [`KERNEL_PCID`] with a
+///   *flushing* `mov cr3` (drops the previous occupant's kernel-half entries,
+///   which reuse the same global PCID), then `INVPCID` the [`USER_PCID`] to drop
+///   the previous occupant's user-half entries too (a CR3 load only affects the
+///   PCID it loads, and the exit trampolines about to run will load the user
+///   half **no-flush**). This is the "flush both PCIDs of the target ASID" the
+///   charter requires, applied at the switch-in.
+/// * **PCID scheme inactive** (every QEMU lane / no-KPTI) — a plain
+///   `Cr3::write(frame, empty())` with `PCID = 0`, byte-identical to Phase 84.
+///
+/// ## Same-address-space re-dispatch skip (Phase 110 hardening)
+///
+/// When the CR3 already loaded on this core points at the **same** kernel PML4
+/// frame we are about to load, the flushing reload (and, on the PCID lane, the
+/// `INVPCID Single(USER_PCID)`) is a provable no-op and is skipped. Rationale:
+/// for CR3 to currently hold frame `F`, the address space whose PML4 is `F`
+/// must be live on this core right now — so `F` cannot have been freed and
+/// reallocated to a different space (a live PML4 frame is never reused), i.e.
+/// "current CR3 frame == target" ⟺ "the very same live address space." An
+/// address space active on this core has every mapping mutation shot down here
+/// (sender-local `flush_local` + the cross-core TLB-shootdown IPI, both PCIDs),
+/// so there is nothing stale to flush; and no coherence path relies on the
+/// dispatch reload (demand paging skips shootdowns by the not-present rule;
+/// munmap/mprotect/CoW issue their own). On the PCID lane the skipped
+/// `INVPCID USER_PCID` only matters on a *cross-process* switch (dropping the
+/// prior occupant's user-PCID-2 entries) — which a same-frame re-dispatch is
+/// not. This fires on idle→same-task and repeated same-task dispatch; a real
+/// address-space switch always has a differing frame (execve allocates a fresh
+/// PML4 while the old is still live; fork copies the table) and is never
+/// skipped.
+///
+/// # Safety-adjacent contract
+/// Must run in ring 0 with the target address space's page tables live. When
+/// the scheme is active, `CR4.PCIDE` must already be set on this core (the
+/// `enable_pcid_if_kpti_active` calls guarantee it precedes any dispatch).
+pub fn write_kernel_cr3(pml4_phys: u64) {
+    use x86_64::{
+        PhysAddr,
+        registers::control::{Cr3, Cr3Flags},
+        structures::paging::PhysFrame,
+    };
+    let aligned = pml4_phys & !kernel_core::kpti_pcid::PCID_MASK;
+    let frame =
+        PhysFrame::from_start_address(PhysAddr::new(aligned)).expect("kernel PML4 unaligned");
+    // Same-address-space re-dispatch: the flushing reload would be a no-op
+    // (see the doc comment). `Cr3::read` masks off the PCID/flags, so the
+    // comparison is frame-vs-frame on both lanes.
+    if Cr3::read().0.start_address().as_u64() == aligned {
+        return;
+    }
+    if crate::mitigations::pcid_active() {
+        use kernel_core::kpti_pcid::{KERNEL_PCID, USER_PCID};
+        use x86_64::instructions::tlb::{InvPcidCommand, Pcid, flush_pcid};
+        // SAFETY: ring 0; CR4.PCIDE is enabled under the active scheme; the
+        // frame is a live kernel PML4 and the PCIDs are the fixed <= 4095
+        // constants.
+        unsafe {
+            // Flushing load of the kernel half (drops the old KERNEL_PCID
+            // entries), then invalidate the user PCID so the exit trampoline's
+            // no-flush user load cannot resurrect the old process's user pages.
+            Cr3::write_pcid(frame, Pcid::new(KERNEL_PCID).expect("KERNEL_PCID in range"));
+            flush_pcid(InvPcidCommand::Single(
+                Pcid::new(USER_PCID).expect("USER_PCID in range"),
+            ));
+        }
+    } else {
+        // SAFETY: ring 0; `frame` is a live kernel PML4.
+        unsafe {
+            Cr3::write(frame, Cr3Flags::empty());
+        }
+    }
+}
+
 /// Switch CR3 back to the kernel's original page table.
 ///
 /// Called from process-exit paths (syscall handlers, fault trampolines) that
@@ -168,18 +377,17 @@ pub fn kernel_pml4_phys() -> u64 {
 /// where re-entrancy is not a concern.  Only callable from ring 0 (Cr3::write
 /// is a privileged operation).
 pub fn restore_kernel_cr3() {
-    use x86_64::{
-        PhysAddr,
-        registers::control::{Cr3, Cr3Flags},
-        structures::paging::PhysFrame,
-    };
     let phys = *KERNEL_PML4_PHYS.get().expect("mm not initialized");
-    // SAFETY: phys is the bootloader's PML4 frame — always valid.
-    unsafe {
-        let frame =
-            PhysFrame::from_start_address(PhysAddr::new(phys)).expect("kernel PML4 unaligned");
-        Cr3::write(frame, Cr3Flags::empty());
-    }
+    // Load the boot PML4 as the kernel half (PCID-tagged + both-PCID flush when
+    // the A.5 scheme is active; a plain flushing `Cr3::write` otherwise).
+    write_kernel_cr3(phys);
+    // Phase 110 A.4 — this core now runs pure kernel context on the boot PML4:
+    // retarget the per-core KPTI pair so the paranoid NMI/#DF entry (which
+    // loads `kpti_kernel_cr3` whenever non-zero) never chases the process PML4
+    // this core just switched away from — the exit paths that call us free it
+    // next — and so the exit stubs stay inert (`user_cr3 = 0`) until the next
+    // user dispatch publishes a real pair. No-op while KPTI is inactive.
+    crate::smp::publish_kpti_cr3_pair(phys, 0);
 }
 
 /// Phase 84 Track A.4 — KPTI `GLOBAL`-bit guard.

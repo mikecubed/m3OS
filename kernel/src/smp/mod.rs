@@ -166,7 +166,15 @@ impl Iterator for IsrWakeDrain<'_> {
 /// Each core has one of these, initialized during BSP init or AP bootstrap.
 /// The `gs_base` MSR points to this struct so that `per_core()` can retrieve
 /// it in O(1) without MMIO.
-#[repr(C)]
+///
+/// `align(4096)` (Phase 110 A.3b part 4): every core's `PerCoreData` is mapped
+/// whole into every KPTI user half (the entry asm reads `gs:[…]` before the
+/// CR3 switch — no swapgs in m3OS), so the Box allocation must own its pages
+/// exclusively; page alignment + page-multiple size (Rust rounds size up to
+/// alignment) keep adjacent heap data out of the mapped pages. Field offsets
+/// are unchanged (`repr(C)` layout is alignment-independent), and the
+/// `smp::offsets` constants are `offset_of!`-computed so they track anyway.
+#[repr(C, align(4096))]
 pub struct PerCoreData {
     /// Self-pointer at offset 0 — reserved for future `gs:[0]` access.
     /// Currently unused: `per_core()` reads `IA32_GS_BASE` via `rdmsr`.
@@ -369,9 +377,12 @@ pub struct PerCoreData {
     //
     // Read by the KPTI entry/exit asm via `gs:[OFFSET]` (valid on EITHER CR3
     // because the PerCoreData page is in the user-PML4 minimal entry set). Set
-    // by the scheduler on dispatch when `kpti_active`. All zero / unused when
-    // KPTI is inactive (the default boot path installs the non-KPTI stubs and
-    // never reads these).
+    // via `publish_kpti_cr3_pair` at every dispatch locus when `kpti_active`
+    // (Phase 110 A.4). All zero when KPTI is inactive (`mitigations=off` /
+    // `auto` on `RDCL_NO` silicon: the non-KPTI SYSCALL stub is installed and
+    // every other reader keys off the zero — the paranoid NMI/`#DF` path in
+    // particular loads `kpti_kernel_cr3` whenever it is non-zero, which is why
+    // the publish helper must stay a no-op on inactive boots).
     /// Kernel-half PML4 phys for the active task (the CR3 to load on ring-3→0).
     pub kpti_kernel_cr3: u64,
     /// User-half PML4 phys for the active task (the CR3 to load on 0→ring-3).
@@ -380,6 +391,27 @@ pub struct PerCoreData {
     /// (the SYSCALL path has no free GPR at entry; this lives in the user
     /// minimal set so it is writable on the user CR3).
     pub kpti_scratch: u64,
+    /// Second scratch slot for the KPTI exit path (Phase 110 hardening): the
+    /// ring-3 exit copies the 5-word `iretq` frame from the task kstack to the
+    /// per-CPU trampoline stack after all GPRs are restored, so it needs TWO
+    /// spill slots (`rax` shuttle + `rbx` destination pointer). Like
+    /// `kpti_scratch`, only used with IF=0 on the owning core.
+    pub kpti_scratch2: u64,
+    /// Top VA of this core's KPTI interrupt trampoline stack (Phase 110
+    /// hardening — the m3OS `cpu_entry_area` entry stack). When KPTI is
+    /// active, TSS.RSP0 points here (NOT at the task kstack), so the CPU
+    /// pushes every ring-3 interrupt frame onto it on the *user* CR3; the
+    /// entry stub then switches CR3 and copies the frame to the real task
+    /// kstack. The exit path builds its `iretq` frame here symmetrically.
+    /// Only the **top page** is mapped into user halves (the pages below are
+    /// kernel-only spillover for a should-never-happen ring-0 fault while
+    /// `rsp` is on this stack); frames only ever hold ring-3 register state,
+    /// never kernel secrets. Allocated once per core
+    /// ([`alloc_kpti_tramp_stack`]) and — like the GDT/TSS — **never freed or
+    /// re-allocated** (every user half maps it at its live address; S3 resume
+    /// reuses it in place). Nonzero on every boot lane, consumed only when
+    /// KPTI is active.
+    pub kpti_tramp_top: u64,
 }
 
 // Safety: PerCoreData is only accessed by its owning core (via gs_base) or
@@ -421,6 +453,59 @@ impl PerCoreData {
         });
         crate::task::scheduler::preempt_enable();
         result
+    }
+
+    /// Phase 110 Track A.3 (KPTI) — `[(base_va, size)]` of this core's
+    /// interrupt-delivery structures the user-half entry set must map: its
+    /// `PerCoreData`, its GDT, and its TSS. The CPU reads the GDT/TSS through
+    /// the *active* paging when delivering a ring-3 → ring-0 interrupt on this
+    /// core, and the KPTI entry asm reads `gs:` (this `PerCoreData`) before the
+    /// CR3 switch — so all three of *this core's* structures must be present in
+    /// the user PML4 of any process that may run here. BSP (`gdt_ptr`/`tss_ptr`
+    /// null) falls back to the global `gdt.rs` GDT/TSS.
+    pub fn entry_struct_extents(&self) -> [(u64, u64); 3] {
+        let pcd = (
+            self as *const PerCoreData as u64,
+            core::mem::size_of::<PerCoreData>() as u64,
+        );
+        let gdt = if self.gdt_ptr.is_null() {
+            crate::arch::x86_64::gdt::gdt_extent()
+        } else {
+            (
+                self.gdt_ptr as u64,
+                core::mem::size_of::<GlobalDescriptorTable>() as u64,
+            )
+        };
+        let tss = if self.tss_ptr.is_null() {
+            crate::arch::x86_64::gdt::tss_extent()
+        } else {
+            (
+                self.tss_ptr as u64,
+                core::mem::size_of::<TaskStateSegment>() as u64,
+            )
+        };
+        [pcd, gdt, tss]
+    }
+
+    /// Phase 110 Track A.3b (KPTI) — this core's NMI and #DF IST stack tops
+    /// (`interrupt_stack_table[NMI_IST_INDEX]`, `[DOUBLE_FAULT_IST_INDEX]`).
+    ///
+    /// The paranoid NMI/#DF stubs run on these IST stacks; the CPU switches RSP
+    /// to the IST top and pushes the trap frame there on the *active* (user) CR3
+    /// before the stub can switch, so the user-half entry set must map each
+    /// stack's top page. BSP (`tss_ptr` null) falls back to the global TSS.
+    pub fn ist_top_pages(&self) -> [u64; 2] {
+        if self.tss_ptr.is_null() {
+            crate::arch::x86_64::gdt::bsp_ist_tops()
+        } else {
+            // SAFETY: `tss_ptr` points at this core's live TSS (set at AP init);
+            // we only read the IST table entries (VirtAddr values).
+            let tss = unsafe { &*self.tss_ptr };
+            [
+                tss.interrupt_stack_table[NMI_IST_INDEX as usize].as_u64(),
+                tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize].as_u64(),
+            ]
+        }
     }
 }
 
@@ -862,6 +947,131 @@ pub mod offsets {
     pub const KPTI_KERNEL_CR3: usize = core::mem::offset_of!(PerCoreData, kpti_kernel_cr3);
     pub const KPTI_USER_CR3: usize = core::mem::offset_of!(PerCoreData, kpti_user_cr3);
     pub const KPTI_SCRATCH: usize = core::mem::offset_of!(PerCoreData, kpti_scratch);
+    pub const KPTI_SCRATCH2: usize = core::mem::offset_of!(PerCoreData, kpti_scratch2);
+    pub const KPTI_TRAMP_TOP: usize = core::mem::offset_of!(PerCoreData, kpti_tramp_top);
+}
+
+/// Size of each core's KPTI interrupt trampoline stack
+/// ([`PerCoreData::kpti_tramp_top`]): one user-mapped top page (all trampoline
+/// traffic fits in its top ~200 bytes) plus one kernel-only spillover page so
+/// a should-never-happen ring-0 fault taken while `rsp` is on this stack can
+/// still reach its diagnostic/panic path without immediately corrupting a
+/// neighbouring allocation.
+pub const KPTI_TRAMP_STACK_SIZE: usize = 4096 * 2;
+
+/// Allocate one core's KPTI interrupt trampoline stack and return its top VA.
+///
+/// A raw page-aligned, whole-page `alloc_zeroed` rather than
+/// `Box<PageIsolated<…>>`: the isolation guarantee is identical (page-aligned
+/// and page-multiple, so the allocation owns its pages exclusively and the
+/// user-half mapping of the top page leaks no neighbouring heap data), and the
+/// raw path avoids materialising the 8 KiB array on the boot stack in debug
+/// builds (the `trace_ring` lesson). Deliberately never freed on the success
+/// path — user halves map the top page at this address for the life of every
+/// process, so it must be address-stable forever (the GDT/TSS discipline).
+fn alloc_kpti_tramp_stack() -> u64 {
+    let layout = core::alloc::Layout::from_size_align(KPTI_TRAMP_STACK_SIZE, 4096)
+        .expect("static layout is valid");
+    // SAFETY: layout is non-zero-sized; the kernel heap is initialized before
+    // any per-core data is built.
+    let base = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    assert!(
+        !base.is_null(),
+        "KPTI trampoline stack allocation failed (out of kernel heap at core init)"
+    );
+    base as u64 + KPTI_TRAMP_STACK_SIZE as u64
+}
+
+/// Phase 110 Track A.4 — publish this core's KPTI CR3 pair for the task it is
+/// about to run (or has just switched to).
+///
+/// `kernel_cr3` must be the PML4 this core's CR3 was just loaded with (the
+/// full kernel map); `user_cr3` the task's KPTI user-half PML4, or 0 for
+/// kernel threads / the boot PML4 (every exit stub skips its CR3 switch on 0).
+/// Call sites: the scheduler dispatch prep, the fork-child trampoline, execve's
+/// mid-syscall retarget, and `restore_kernel_cr3` (which republishes the boot
+/// PML4 so the slot never dangles at a dying process's soon-freed PML4 — the
+/// paranoid NMI/`#DF` entry loads `kpti_kernel_cr3` whenever it is non-zero).
+///
+/// No-op unless KPTI is **active** this boot: while inactive the slots must
+/// stay 0, precisely so that paranoid load never happens.
+///
+/// Tearing: an NMI can land between the two stores, but each value is
+/// individually valid at every call site (both PML4s are live), the paranoid
+/// path consumes only `kpti_kernel_cr3`, and `kpti_user_cr3` is only consumed
+/// at a ring-3 transition — which cannot occur mid-publish (the publishing
+/// code path itself stands between the stores and any user return).
+pub fn publish_kpti_cr3_pair(kernel_cr3: u64, user_cr3: u64) {
+    let Some(state) = crate::mitigations::state() else {
+        return;
+    };
+    if !state.kpti_active || !is_per_core_ready() {
+        return;
+    }
+    // Phase 110 A.5 — when the PCID scheme is active, bake the fixed
+    // kernel/user PCIDs + the no-flush bit into the published slot values. The
+    // entry/exit trampolines load these verbatim (`mov cr3, gs:[…]`), so a
+    // syscall/IRQ kernel↔user round trip within one process is no-flush: the
+    // two halves' entries coexist under distinct PCIDs and neither is dropped.
+    // The `user_cr3 == 0` kernel-thread sentinel stays 0 (never no-flush: the
+    // exit stubs skip the switch on 0). While the scheme is inactive the slots
+    // carry the raw page-aligned frames exactly as in A.4 (PCID = 0, and bit 63
+    // clear — mandatory, since a `mov cr3` with bit 63 set `#GP`s when
+    // CR4.PCIDE = 0).
+    let (kernel_val, user_val) = if state.pcid_active {
+        use kernel_core::kpti_pcid::{kernel_cr3 as tag_kernel, user_cr3 as tag_user};
+        let user_val = if user_cr3 == 0 {
+            0
+        } else {
+            tag_user(user_cr3, true)
+        };
+        // A 0 kernel value (published by `restore_kernel_cr3`'s successor is
+        // always the real boot PML4, so `kernel_cr3` here is nonzero) is passed
+        // through untagged for safety; every real caller passes a live PML4.
+        let kernel_val = if kernel_cr3 == 0 {
+            0
+        } else {
+            tag_kernel(kernel_cr3, true)
+        };
+        (kernel_val, user_val)
+    } else {
+        (kernel_cr3, user_cr3)
+    };
+    let pc = per_core() as *const PerCoreData as *mut PerCoreData;
+    // SAFETY: PerCoreData is only written by its owning core; volatile so the
+    // `gs:`-relative asm readers always see the stores.
+    unsafe {
+        core::ptr::write_volatile(&raw mut (*pc).kpti_kernel_cr3, kernel_val);
+        core::ptr::write_volatile(&raw mut (*pc).kpti_user_cr3, user_val);
+    }
+}
+
+/// Zero this core's KPTI CR3-pair slots (`kpti_kernel_cr3`/`kpti_user_cr3`/
+/// `kpti_scratch`).
+///
+/// Used on the **BSP S3-resume** path (Phase 110 A.5). The slots survive S3 in
+/// RAM holding **PCID-tagged** values (bit 63 = no-flush set), but the machine
+/// reset cleared `CR4.PCIDE`. Until the resume path re-enables PCIDE, a `mov
+/// cr3` of a bit-63 value `#GP`s — so a paranoid NMI/`#DF` landing in that
+/// window (which loads `kpti_kernel_cr3` whenever nonzero) would fault. Zeroing
+/// makes the paranoid path skip its CR3 load (`test rax,rax; jz`) until the
+/// first post-resume dispatch republishes the tagged pair with PCIDE back on.
+/// The AP re-boot path (`init_ap_per_core`) already zeroes these before an AP's
+/// IDT loads, so only the BSP needs this; safe on the inactive lane too (the
+/// slots are already 0). Requires `gs` (per-core base) restored first.
+pub fn clear_kpti_cr3_slots() {
+    if !is_per_core_ready() {
+        return;
+    }
+    let pc = per_core() as *const PerCoreData as *mut PerCoreData;
+    // SAFETY: PerCoreData is only written by its owning core; volatile so the
+    // `gs:`-relative asm readers observe the zeroing before any interrupt.
+    unsafe {
+        core::ptr::write_volatile(&raw mut (*pc).kpti_kernel_cr3, 0);
+        core::ptr::write_volatile(&raw mut (*pc).kpti_user_cr3, 0);
+        core::ptr::write_volatile(&raw mut (*pc).kpti_scratch, 0);
+        core::ptr::write_volatile(&raw mut (*pc).kpti_scratch2, 0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -984,6 +1194,8 @@ pub fn init_bsp_per_core() {
         kpti_kernel_cr3: 0,
         kpti_user_cr3: 0,
         kpti_scratch: 0,
+        kpti_scratch2: 0,
+        kpti_tramp_top: alloc_kpti_tramp_stack(),
     }));
 
     // Fill self-pointer and store in global array.
@@ -1024,6 +1236,82 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         "core_id {} exceeds MAX_CORES",
         core_id
     );
+
+    // Phase 110 A.4 — S3-resume re-boot: REUSE the existing allocation.
+    // Every KPTI user half maps this core's PerCoreData / GDT / TSS / IST-top
+    // pages at their pre-suspend addresses, so re-allocating here would leave
+    // every pre-suspend process's user half pointing at the OLD frames — the
+    // first ring-3 interrupt delivered on this core would then read an
+    // unmapped GDT/TSS through the user CR3 and escalate #PF → #DF (new IST
+    // top also unmapped) → triple fault. (Observed live: `suspend-smoke` died
+    // waiting for `POWERD:resume` the first boot after the A.4 flip.) RAM is
+    // preserved across S3, so the GDT/TSS contents, the IST/kstack pool
+    // slots, and the LAPIC fields are all still valid; only the
+    // dispatch-transient fields are reset to their fresh-boot values. The
+    // owned caches (run_queue, page cache, slab magazines, ISR wake queue)
+    // are deliberately kept — the previous fresh-Box path leaked their
+    // contents on every resume. Field writes go through the raw pointer (the
+    // AP is parked and not executing; the BSP is the only accessor here —
+    // same exclusivity the cold-boot pre-SIPI writes rely on).
+    let existing = unsafe { PER_CORE_DATA[core_id as usize] };
+    if !existing.is_null() {
+        unsafe {
+            debug_assert_eq!((*existing).core_id, core_id);
+            (*existing).apic_id = apic_id;
+            (*existing).is_online.store(false, Ordering::Release);
+            (*existing)
+                .ipi_recv_log_budget
+                .store(1024, Ordering::Release);
+            (*existing).reschedule.store(false, Ordering::Release);
+            (*existing).current_task_idx.store(-1, Ordering::Release);
+            (*existing)
+                .current_task_ptr
+                .store(core::ptr::null_mut(), Ordering::Release);
+            (*existing).syscall_user_rsp = 0;
+            (*existing).syscall_arg3 = 0;
+            *(*existing).current_syscall_snapshot_ptr.get() = core::ptr::null_mut();
+            (*existing).current_pid.store(0, Ordering::Release);
+            (*existing).current_addrspace = core::ptr::null();
+            (*existing).fork_entry_ctx = crate::arch::x86_64::ForkEntryCtx::ZERO;
+            (*existing)
+                .holds_scheduler_lock
+                .store(false, Ordering::Release);
+            (*existing)
+                .preempt_resched_pending
+                .store(false, Ordering::Release);
+            (*existing).current_preempt_count_ptr.store(
+                &SCHED_PREEMPT_COUNT_DUMMY[core_id as usize] as *const AtomicI32 as *mut AtomicI32,
+                Ordering::Release,
+            );
+            (*existing).kpti_kernel_cr3 = 0;
+            (*existing).kpti_user_cr3 = 0;
+            (*existing).kpti_scratch = 0;
+            (*existing).kpti_scratch2 = 0;
+            // `kpti_tramp_top` is deliberately KEPT: like the GDT/TSS, every
+            // pre-suspend user half maps the trampoline stack's top page at
+            // its live address, so it must never be re-allocated across S3.
+            // Dispatch retargets RSP0 before any ring-3 return; reset it to
+            // the boot value for parity with the fresh path anyway.
+            (*(*existing).tss_ptr).privilege_stack_table[0] =
+                VirtAddr::new((*existing).kernel_stack_top);
+            // The pre-suspend `ltr` marked this GDT's TSS descriptor BUSY
+            // (type 0xB), and `ltr` on a busy descriptor #GPs — the AP
+            // re-boot runs `per_core_gdt_init` (which `ltr`s) BEFORE loading
+            // its IDT, so that #GP is a guaranteed triple fault. Clear the
+            // busy bit (descriptor bit 41), exactly like the BSP's
+            // `gdt::reinit_after_resume` does for its own TSS.
+            let gdt_words = (*existing).gdt_ptr as *mut u64;
+            let tss_entry = gdt_words.add((*existing).gdt_tss.index() as usize);
+            tss_entry.write_volatile(tss_entry.read_volatile() & !(1u64 << 41));
+        }
+        log::info!(
+            "[smp] AP core_id={} apic_id={} per-core data reused for resume (stack_top={:#x})",
+            core_id,
+            apic_id,
+            unsafe { (*existing).kernel_stack_top },
+        );
+        return existing;
+    }
     // Pool slots are 32 KiB each — larger than `SYSCALL_STACK_SIZE` (16 KiB)
     // and `DOUBLE_FAULT_STACK_SIZE` (20 KiB), so the stacks fit comfortably
     // and the unused portion below `top` is harmless. The NMI IST stack
@@ -1035,19 +1323,29 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
     let double_fault_stack_top = crate::task::kstack::alloc_leaked_top();
     let nmi_stack_top = crate::task::kstack::alloc_leaked_top();
 
-    // Allocate and configure TSS.
-    let tss = Box::into_raw(Box::new({
+    // Allocate and configure TSS. Page-isolated (`PageIsolated`, Phase 110
+    // A.3b part 4): this TSS (and the GDT below) is mapped into every KPTI
+    // user half at its live address, so a plain heap Box — which shares its
+    // page with arbitrary neighbouring allocations — would leak adjacent heap
+    // data to ring 3. The wrapper gives the allocation exclusive, page-aligned
+    // pages; the raw pointer to the inner value is what `tss_ptr`/`gdt_ptr`
+    // store (leaked deliberately — per-core structures live forever).
+    let tss_iso = Box::into_raw(Box::new(crate::arch::x86_64::gdt::PageIsolated({
         let mut tss = TaskStateSegment::new();
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
             VirtAddr::new(double_fault_stack_top);
         tss.interrupt_stack_table[NMI_IST_INDEX as usize] = VirtAddr::new(nmi_stack_top);
         tss.privilege_stack_table[0] = VirtAddr::new(kernel_stack_top);
         tss
-    }));
+    })));
+    let tss: *mut TaskStateSegment = unsafe { core::ptr::addr_of_mut!((*tss_iso).0) };
 
     // Pre-allocate GDT on the BSP so the AP doesn't need heap access.
     let tss_ref: &'static TaskStateSegment = unsafe { &*tss };
-    let gdt = Box::into_raw(Box::new(GlobalDescriptorTable::new()));
+    let gdt_iso = Box::into_raw(Box::new(crate::arch::x86_64::gdt::PageIsolated(
+        GlobalDescriptorTable::new(),
+    )));
+    let gdt: *mut GlobalDescriptorTable = unsafe { core::ptr::addr_of_mut!((*gdt_iso).0) };
     let (gdt_code, gdt_data, gdt_tss) = unsafe {
         let gdt_ref = &mut *gdt;
         let code = gdt_ref.append(Descriptor::kernel_code_segment());
@@ -1109,6 +1407,8 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         kpti_kernel_cr3: 0,
         kpti_user_cr3: 0,
         kpti_scratch: 0,
+        kpti_scratch2: 0,
+        kpti_tramp_top: alloc_kpti_tramp_stack(),
     }));
 
     unsafe {
@@ -1159,8 +1459,29 @@ pub unsafe fn per_core_gdt_init(data: &PerCoreData) {
 ///
 /// Called when switching to a userspace process to set the kernel stack
 /// used on ring-3 → ring-0 transitions.
+///
+/// **Phase 110 hardening — the KPTI redirect.** When KPTI is active, RSP0
+/// permanently targets this core's trampoline-stack top
+/// ([`PerCoreData::kpti_tramp_top`]) rather than the passed task kstack top:
+/// ring-3 interrupt frames are pushed there on the *user* CR3 and the entry
+/// stub copies them to the real kstack after its CR3 switch, so the task
+/// kstack no longer needs a user-half mapping. The caller still publishes the
+/// task kstack top to `gs:[SYSCALL_STACK_TOP]` (via
+/// `set_per_core_syscall_stack_top`, always alongside this call) — that slot
+/// is the copy destination and the SYSCALL-path stack, and stays per-task.
+/// This function is the single RSP0 choke point for every dispatch locus
+/// (scheduler dispatch both branches, the fork-child trampoline, execve), so
+/// the redirect here covers every ring-3 return; boot-time init sites write
+/// RSP0 directly but always before the first dispatch. While KPTI is
+/// inactive the passed value is used verbatim — the pre-hardening behaviour.
 pub fn set_current_core_kernel_stack(rsp0: u64) {
     let data = per_core();
+    let rsp0 =
+        if crate::mitigations::state().is_some_and(|s| s.kpti_active) && data.kpti_tramp_top != 0 {
+            data.kpti_tramp_top
+        } else {
+            rsp0
+        };
     if data.tss_ptr.is_null() {
         // BSP uses the existing gdt.rs TSS — delegate to the old path.
         unsafe { crate::arch::x86_64::gdt::set_kernel_stack(rsp0) };
@@ -1210,6 +1531,22 @@ pub(super) unsafe fn release_failed_ap(core_id: u8) {
     let dead_ptr = unsafe { PER_CORE_DATA[core_id as usize] };
     if dead_ptr.is_null() {
         return;
+    }
+    // Reclaim the KPTI trampoline stack (safe here: the AP never came online,
+    // so no user half was ever built while its slot was populated — the
+    // entry-set collector only walks populated PER_CORE_DATA slots, and this
+    // one is nulled below before any process can be created).
+    let tramp_top = unsafe { (*dead_ptr).kpti_tramp_top };
+    if tramp_top != 0 {
+        let layout = core::alloc::Layout::from_size_align(KPTI_TRAMP_STACK_SIZE, 4096)
+            .expect("static layout is valid");
+        // SAFETY: allocated by `alloc_kpti_tramp_stack` with this exact layout.
+        unsafe {
+            alloc::alloc::dealloc(
+                (tramp_top - KPTI_TRAMP_STACK_SIZE as u64) as *mut u8,
+                layout,
+            )
+        };
     }
     // Reclaim the Box that `init_ap_per_core` allocated.
     drop(unsafe { Box::from_raw(dead_ptr) });
@@ -1337,29 +1674,38 @@ pub fn suspend_park_and_release_aps() -> bool {
         );
         // Reboot whichever APs did park (they are offline in hlt); the
         // stragglers never stopped. resume_reboot_aps re-derives the
-        // APIC map and re-runs boot_aps, which skips online cores via
-        // its own is_online wait... simplest safe cleanup: release the
-        // acked cores and reboot everything through the normal path.
+        // APIC map and re-runs boot_aps; the acked cores' per-core state
+        // is KEPT (see the A.4 note below) and re-inited in place by
+        // `init_ap_per_core`.
         let acked = SUSPEND_PARK_ACK.load(Ordering::Acquire);
         for core in 1..count {
             if acked & (1u64 << core) != 0 && get_core_data(core).is_some() {
                 crate::task::scheduler::detach_core_for_suspend(core);
-                unsafe { release_failed_ap(core) };
             }
         }
         resume_reboot_aps();
         return false;
     }
 
-    // Migrate stranded work + retire idle tasks, then free per-core state.
+    // Migrate stranded work + retire idle tasks. Phase 110 A.4: the per-core
+    // state is deliberately NOT freed any more (this used to
+    // `release_failed_ap` each core) — every KPTI user half maps each core's
+    // PerCoreData / GDT / TSS / IST-top pages at their live addresses, so the
+    // old free-and-reallocate across the S3 cycle left every pre-suspend
+    // process's user half pointing at the OLD frames, and the first ring-3
+    // interrupt on a resumed AP triple-faulted (unmapped GDT through the user
+    // CR3 → #PF → #DF → unmapped IST top). The parked cores keep their
+    // allocations (RAM is preserved across S3, so the addresses and contents
+    // stay valid); `init_ap_per_core` re-inits them in place on the resume
+    // re-boot. `set_core_count(1)` still hides the parked slots from the load
+    // balancer, and `is_online=false` gates every IPI targeter.
     for core in 1..count {
         if get_core_data(core).is_some() {
             crate::task::scheduler::detach_core_for_suspend(core);
-            unsafe { release_failed_ap(core) };
         }
     }
     set_core_count(1);
-    log::info!("[suspend] APs parked and released");
+    log::info!("[suspend] APs parked (per-core state kept for the resume re-boot)");
     true
 }
 

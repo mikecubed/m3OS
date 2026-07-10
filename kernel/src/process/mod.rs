@@ -1485,6 +1485,10 @@ pub fn spawn_process_with_cr3(
 ) -> Pid {
     let kstack_top = alloc_kernel_stack();
     let pid = alloc_pid();
+    // Phase 110 A.3b part 5 — build the KPTI user half alongside the address
+    // space (no-op while KPTI is inactive).
+    let addr_space = Arc::new(AddressSpace::new(cr3));
+    addr_space.build_kpti_user_half();
     let proc = Process {
         pid,
         tid: pid,
@@ -1492,7 +1496,7 @@ pub fn spawn_process_with_cr3(
         clear_child_tid: 0,
         ppid,
         state: ProcessState::Ready,
-        addr_space: Some(Arc::new(AddressSpace::new(cr3))),
+        addr_space: Some(addr_space),
         kernel_stack_top: kstack_top,
         entry_point,
         user_stack_top,
@@ -1554,6 +1558,10 @@ pub fn spawn_process_with_cr3_and_fds(
     let kstack_top = alloc_kernel_stack();
     let pid = alloc_pid();
     let pgid = if inherit_pgid != 0 { inherit_pgid } else { pid };
+    // Phase 110 A.3b part 5 — build the KPTI user half alongside the address
+    // space (no-op while KPTI is inactive).
+    let addr_space = Arc::new(AddressSpace::new(cr3));
+    addr_space.build_kpti_user_half();
     let proc = Process {
         pid,
         tid: pid,
@@ -1561,7 +1569,7 @@ pub fn spawn_process_with_cr3_and_fds(
         clear_child_tid: 0,
         ppid,
         state: ProcessState::Ready,
-        addr_space: Some(Arc::new(AddressSpace::new(cr3))),
+        addr_space: Some(addr_space),
         kernel_stack_top: kstack_top,
         entry_point,
         user_stack_top,
@@ -2159,13 +2167,18 @@ pub fn fork_child_trampoline() -> ! {
     // Store PID in the current task so the scheduler can restore it on re-dispatch.
     crate::task::set_current_task_pid(ctx.pid);
 
-    // Look up page table root and kernel stack for this process.
-    let (cr3_phys, kstack_top) = {
+    // Look up page table root, kernel stack, and KPTI user half for this
+    // process.
+    let (cr3_phys, kstack_top, kpti_user_half) = {
         let table = PROCESS_TABLE.lock();
         let p = table.find(ctx.pid).expect("fork child: process not found");
         (
             p.addr_space.as_ref().map(|a| a.pml4_phys()),
             p.kernel_stack_top,
+            p.addr_space
+                .as_ref()
+                .map(|a| a.kpti_user_pml4())
+                .unwrap_or(0),
         )
     };
 
@@ -2192,16 +2205,29 @@ pub fn fork_child_trampoline() -> ! {
 
     // If the child has its own page table, switch CR3.
     if let Some(cr3) = cr3_phys {
-        unsafe {
-            use x86_64::{
-                PhysAddr,
-                registers::control::{Cr3, Cr3Flags},
-                structures::paging::{PhysFrame, Size4KiB},
-            };
-            let frame: PhysFrame<Size4KiB> =
-                PhysFrame::containing_address(PhysAddr::new(cr3.as_u64()));
-            Cr3::write(frame, Cr3Flags::empty());
+        // Phase 110 A.4 — fail closed: a user process must never enter ring 3
+        // without its KPTI user half while KPTI is active (the exit stub skips
+        // the CR3 switch on `user_cr3 == 0`, which would silently run ring 3
+        // on the full kernel map). `build_kpti_user_half` can only have failed
+        // on frame-allocator exhaustion at spawn; kill the child like a fatal
+        // fault instead of entering ring 3 unisolated. This is the first-entry
+        // choke point for every process that does not go through execve (init
+        // and fork children), so together with execve's pre-commit ENOMEM no
+        // unisolated ring-3 entry exists.
+        if kpti_user_half == 0 && crate::mitigations::state().is_some_and(|s| s.kpti_active) {
+            log::error!(
+                "[fork] pid {} has no KPTI user half (frame exhaustion at spawn?) — \
+                 killing instead of entering ring 3 unisolated",
+                ctx.pid
+            );
+            crate::arch::x86_64::syscall::terminate_thread_group_and_exit(ctx.pid, -9);
         }
+        // Address-space switch into the child (both KPTI PCIDs flushed under
+        // the A.5 scheme; plain flushing write otherwise).
+        crate::mm::write_kernel_cr3(cr3.as_u64());
+        // Phase 110 A.4 — publish the KPTI CR3 pair for the entry/exit stubs
+        // before the ring-3 entry below (no-op while KPTI is inactive).
+        crate::smp::publish_kpti_cr3_pair(cr3.as_u64(), kpti_user_half);
     }
 
     // Enter ring 3 at the parent's post-fork RIP with rax=0 (child return value)

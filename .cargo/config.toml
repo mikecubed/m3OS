@@ -22,14 +22,24 @@ runner = "cargo xtask runner"
 rustflags = ["-Zretpoline"]
 
 [target.x86_64-m3os]
-# -Zretpoline: Spectre-v2 (see the kernel target note above).
+# Phase 110 B.3 — userspace is built WITHOUT -Zretpoline. A retpoline thunk
+# (`__llvm_retpoline_r11`) does `call <n>; <n>: mov %r11,(%rsp); ret`: the `ret`
+# returns to the *overwritten* data-stack address (the real indirect target in
+# r11) while the CET **shadow stack** still holds the address the `call` pushed
+# → a near-RET mismatch → `#CP` on EVERY indirect call once user shadow stacks
+# are live (the Dell/Tiger Lake `xhci` #CP at `__llvm_retpoline_r11+0x14`).
+# Retpolines and CET shadow stacks are mutually exclusive; CET-capable silicon
+# (Tiger Lake+) instead uses **eIBRS** as the hardware Spectre-v2 mitigation,
+# which the kernel enables at boot. (The kernel target KEEPS -Zretpoline: it has
+# no *supervisor* shadow stack — `IA32_S_CET.SH_STK_EN=0` — so its retpoline
+# `ret`s are never shadow-stack-checked.)
 # Phase 110 B.2 — -Zstack-protector=strong emits a stack canary for every
 # userspace function with a stack buffer; the `__stack_chk_guard`/
 # `__stack_chk_fail` runtime symbols live in `syscall-lib::stack_protector`
 # (linked by every m3os binary). Scoped to the userspace target only — the
 # ring-0 kernel (x86_64-unknown-none) has no such runtime and must not carry
 # canaries in its IRQ/exception handlers.
-rustflags = ["-Zretpoline", "-Zstack-protector=strong"]
+rustflags = ["-Zstack-protector=strong"]
 
 [alias]
 xtask = "run --package xtask --target x86_64-unknown-linux-gnu --"

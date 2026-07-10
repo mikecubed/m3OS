@@ -430,11 +430,21 @@ fn mitigations_status_format_is_honest() {
         wx_v2: false,
         pku_present: false,
         pku_active: false,
+        pcid_active: false,
+        // No-CET boot (the default lane): not-supported.
+        cet_present: false,
+        cet_active: false,
     };
     let r = format_mitigations(&report);
     assert!(r.contains("level=full"));
     assert!(r.contains("Meltdown: Vulnerable"));
-    assert!(r.contains("retpoline): compiled-in"));
+    // Phase 110 B.3 fix #4 — retpoline is now kernel-only; userspace uses eIBRS.
+    assert!(r.contains("retpoline): kernel compiled-in"));
+    // This report has IbrsMode::None, so the IBRS line reads `none` AND the
+    // honest userspace-Spectre-v2-uncovered warning must fire (retpolines were
+    // dropped from userspace with no eIBRS to replace them).
+    assert!(r.contains("Spectre-v2 (IBRS): none"));
+    assert!(r.contains("Spectre-v2 (userspace): UNCOVERED"));
     assert!(r.contains("UNADDRESSED"));
     // The honesty note must enumerate Spectre-v1 (report_map marks it
     // Status::Unaddressed) — the note is not an exhaustive list otherwise.
@@ -442,13 +452,32 @@ fn mitigations_status_format_is_honest() {
     assert!(r.contains("Grimsdal"));
     // Phase 90a C.2 — the no-PKU boot prints the v1 / PKU-absent W^X line.
     assert!(r.contains("W^X: v1 (PKU absent)"));
+    // Phase 110 A.5 — KPTI is NOT enforcing here, so no PCID line is printed.
+    assert!(!r.contains("KPTI PCID:"));
+    // Phase 110 B.3 — the no-CET boot prints the not-supported CET line.
+    assert!(r.contains("CET: not-supported"));
 
     // KPTI enforcing → Meltdown reads "Mitigation: PTI".
     let report2 = MitigationReport {
         kpti_active: true,
         ..report
     };
-    assert!(format_mitigations(&report2).contains("Meltdown: Mitigation: PTI"));
+    let r2 = format_mitigations(&report2);
+    assert!(r2.contains("Meltdown: Mitigation: PTI"));
+    // Phase 110 A.5 — KPTI enforcing without PCID (the default QEMU lane) prints
+    // the fallback PCID posture line.
+    assert!(r2.contains("KPTI PCID: fallback (full TLB flush; no PCID/INVPCID)"));
+
+    // KPTI enforcing WITH the PCID scheme (bare-metal PCID silicon) prints the
+    // active posture line instead.
+    let report_pcid = MitigationReport {
+        kpti_active: true,
+        pcid_active: true,
+        ..report
+    };
+    assert!(
+        format_mitigations(&report_pcid).contains("KPTI PCID: active (kernel/user PCID, no-flush)")
+    );
 
     // RDCL_NO silicon → "Not affected" regardless of kpti_active.
     let report3 = MitigationReport {
@@ -457,6 +486,19 @@ fn mitigations_status_format_is_honest() {
         ..report
     };
     assert!(format_mitigations(&report3).contains("Meltdown: Not affected"));
+
+    // Phase 110 B.3 fix #4 — eIBRS silicon (Tiger Lake): the IBRS line reads
+    // enhanced/covers-userspace and the userspace-uncovered warning must NOT
+    // fire (eIBRS covers ring-3 indirect branches after userspace retpolines
+    // were dropped for CET compatibility).
+    let report_eibrs = MitigationReport {
+        ibrs_mode: IbrsMode::Enhanced,
+        ..report
+    };
+    let re = format_mitigations(&report_eibrs);
+    assert!(re.contains("Spectre-v2 (IBRS): eIBRS enhanced"));
+    assert!(re.contains("covers ring 3"));
+    assert!(!re.contains("Spectre-v2 (userspace): UNCOVERED"));
 }
 
 /// Phase 90a C.2 — the W^X / PKU posture line renders all three boot states.
@@ -475,6 +517,9 @@ fn mitigations_status_wx_pku_line() {
         wx_v2: false,
         pku_present: false,
         pku_active: false,
+        pcid_active: false,
+        cet_present: false,
+        cet_active: false,
     };
 
     // No-PKU boot (the default TCG lane): v1, PKU absent.
@@ -496,6 +541,46 @@ fn mitigations_status_wx_pku_line() {
         ..base
     };
     assert!(format_mitigations(&inactive).contains("W^X: v1 (PKU present, inactive)"));
+}
+
+/// Phase 110 B.3 — the CET posture line renders all three boot states.
+#[test]
+fn mitigations_status_cet_line() {
+    use kernel_core::spectre::{IbrsMode, MitigationLevel, MitigationReport};
+
+    let base = MitigationReport {
+        level: MitigationLevel::Auto,
+        level_recognized: true,
+        kpti_active: false,
+        ibpb_active: false,
+        ibrs_mode: IbrsMode::None,
+        leaf7_edx: 0,
+        arch_caps: 0,
+        wx_v2: false,
+        pku_present: false,
+        pku_active: false,
+        pcid_active: false,
+        cet_present: false,
+        cet_active: false,
+    };
+
+    // No-CET boot (the default TCG lane): not-supported.
+    assert!(format_mitigations(&base).contains("CET: not-supported"));
+
+    // CET silicon, policy on (the Dell): enabled.
+    let active = MitigationReport {
+        cet_present: true,
+        cet_active: true,
+        ..base
+    };
+    assert!(format_mitigations(&active).contains("CET: enabled (user shadow stacks)"));
+
+    // CET silicon but mitigations=off: supported, inactive.
+    let inactive = MitigationReport {
+        cet_present: true,
+        ..base
+    };
+    assert!(format_mitigations(&inactive).contains("CET: supported, inactive"));
 }
 
 // ---------------------------------------------------------------------------

@@ -61,6 +61,12 @@ const MNT: &[u8] = b"/mnt\0";
 const MNT_USB0: &[u8] = b"/mnt/usb0\0";
 const FSTYPE_EXT2: &[u8] = b"ext2\0";
 const LOG_PATH: &[u8] = b"/mnt/usb0/boot.log\0";
+/// Log path when the writable USB ext2 is already the root mount (init adopted
+/// `usb0.block` as `/`, e.g. the `[ESP]+[ext2]` stick). Writing here avoids a
+/// SECOND mount of the same device at `/mnt/usb0` — two ext2 caches over one
+/// block device corrupt each other (torn inode/dirent), so the snapshot never
+/// commits to disk. See `program_main`.
+const ROOT_LOG_PATH: &[u8] = b"/boot.log\0";
 const KMSG_PATH: &[u8] = b"/proc/kmsg\0";
 
 /// Snapshot the full `/proc/kmsg` ring into `/mnt/usb0/boot.log`. Returns the
@@ -75,7 +81,7 @@ const KMSG_PATH: &[u8] = b"/proc/kmsg\0";
 /// `/mnt/usbN` mounts — it returns `EROFS` — so the residual exposure is a
 /// write failure during the final contiguous rewrite, which is surfaced as a
 /// negative errno rather than mistaken for success.)
-fn snapshot_kmsg(buf: &mut [u8]) -> isize {
+fn snapshot_kmsg(buf: &mut [u8], log_path: &[u8]) -> isize {
     let kfd = open(KMSG_PATH, O_RDONLY, 0);
     if kfd < 0 {
         return kfd;
@@ -97,7 +103,7 @@ fn snapshot_kmsg(buf: &mut [u8]) -> isize {
     close(kfd as i32);
 
     // 2. Only now overwrite boot.log with the complete in-memory snapshot.
-    let lfd = open(LOG_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+    let lfd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
     if lfd < 0 {
         return lfd;
     }
@@ -135,40 +141,62 @@ fn program_main(_args: &[&str]) -> i32 {
         return 0;
     }
 
-    // 2. Ensure the mount point exists.
-    let _ = mkdir(MNT, 0o755);
-    let _ = mkdir(MNT_USB0, 0o755);
+    let mut buf = vec![0u8; 8192];
 
-    // 3. Mount the ext2 log partition. Retry — the usb-storage block-server loop
-    //    must be servicing requests before the mount's superblock read succeeds,
-    //    and on a GPT boot stick the kernel probes the partition table first.
-    let mut mounted = false;
-    for _ in 0..40 {
-        if mount(DEV_USB0.as_ptr(), MNT_USB0.as_ptr(), FSTYPE_EXT2.as_ptr()) == 0 {
-            mounted = true;
-            break;
-        }
-        let _ = nanosleep_for(0, 250_000_000); // 250 ms
-    }
-    if !mounted {
+    // 2. Choose the log destination. PREFER the root filesystem when init has
+    //    already adopted the writable USB ext2 as `/` (the `[ESP]+[ext2]` stick,
+    //    where the blank log partition becomes root via the Phase 106 last-resort
+    //    root adoption). Writing to that single existing mount avoids a SECOND
+    //    mount of `usb0` at `/mnt/usb0` — two ext2 caches over one block device
+    //    corrupt each other (a torn inode/dirent that never commits, so the
+    //    pulled stick shows a 0-byte boot.log). Probe by snapshotting straight to
+    //    `/boot.log`; a writable root returns > 0. A read-only root (the original
+    //    diskless boot with a SEPARATE ext2 log partition) fails the probe and we
+    //    fall back to the explicit `/mnt/usb0` mount.
+    //    `snapshot_kmsg` returns the byte count on success (>= 0 — an empty ring
+    //    is a valid 0-byte snapshot) and a negative errno on failure, so a
+    //    NON-NEGATIVE result means the root write succeeded (writable root).
+    let log_path: &[u8] = if snapshot_kmsg(&mut buf, ROOT_LOG_PATH) >= 0 {
         write_str(
             STDOUT_FILENO,
-            "usb-logsink: could not mount /mnt/usb0 (no ext2 log partition?) — exiting\n",
+            "usb-logsink: root is the writable USB volume — persisting to /boot.log\n",
         );
-        return 0;
-    }
-    write_str(
-        STDOUT_FILENO,
-        "usb-logsink: /mnt/usb0 mounted — persisting kernel log to /mnt/usb0/boot.log\n",
-    );
+        ROOT_LOG_PATH
+    } else {
+        // Read-only root: mount the separate ext2 log partition at /mnt/usb0.
+        // Retry — the usb-storage block-server loop must be servicing requests
+        // before the superblock read succeeds, and on a GPT boot stick the kernel
+        // probes the partition table first.
+        let _ = mkdir(MNT, 0o755);
+        let _ = mkdir(MNT_USB0, 0o755);
+        let mut mounted = false;
+        for _ in 0..40 {
+            if mount(DEV_USB0.as_ptr(), MNT_USB0.as_ptr(), FSTYPE_EXT2.as_ptr()) == 0 {
+                mounted = true;
+                break;
+            }
+            let _ = nanosleep_for(0, 250_000_000); // 250 ms
+        }
+        if !mounted {
+            write_str(
+                STDOUT_FILENO,
+                "usb-logsink: could not mount /mnt/usb0 (no ext2 log partition?) — exiting\n",
+            );
+            return 0;
+        }
+        write_str(
+            STDOUT_FILENO,
+            "usb-logsink: /mnt/usb0 mounted — persisting kernel log to /mnt/usb0/boot.log\n",
+        );
+        LOG_PATH
+    };
 
-    // 4. Periodically snapshot the dmesg ring to the drive. Overwrite each time
+    // 3. Periodically snapshot the dmesg ring to the drive. Overwrite each time
     //    (the ring is the source of truth and is bounded), fsync so a power-off
     //    or freeze still leaves the latest snapshot on disk.
-    let mut buf = vec![0u8; 8192];
     let mut announced = false;
     loop {
-        let n = snapshot_kmsg(&mut buf);
+        let n = snapshot_kmsg(&mut buf, log_path);
         if n > 0 && !announced {
             announced = true;
             write_str(STDOUT_FILENO, "usb-logsink: boot.log written\n");

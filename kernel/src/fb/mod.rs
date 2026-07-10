@@ -1189,6 +1189,22 @@ pub fn write_fmt(args: core::fmt::Arguments) {
     let _ = FbWriter.write_fmt(args);
 }
 
+/// Bring-up diagnostic (Phase 110 CET userspace bring-up): force the framebuffer
+/// console back from a graphical owner and write `args`. `write_fmt` is a no-op
+/// once `display_server` yields the console ([`CONSOLE_YIELDED`]), which hides a
+/// kernel-side userspace-fault dump on a serial-less panel. This reclaims the
+/// console (clearing the screen) so the write lands, then writes. Only for the
+/// `BRINGUP_DIAG` halt-on-fault path — it steals the console, so the caller must
+/// be about to halt. Safe from a userspace-fault handler: the faulting ring-3
+/// task holds no kernel lock, so `restore_console`'s `CONSOLE.lock()` cannot
+/// deadlock.
+pub fn diag_force_write_fmt(args: core::fmt::Arguments) {
+    if CONSOLE_YIELDED.load(Ordering::Acquire) {
+        restore_console();
+    }
+    write_fmt(args);
+}
+
 // ---------------------------------------------------------------------------
 // Phase 47: framebuffer info helpers and console yield/restore
 // ---------------------------------------------------------------------------

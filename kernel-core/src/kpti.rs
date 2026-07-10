@@ -2,10 +2,11 @@
 //!
 //! KPTI splits each process's single PML4 into a **pair**:
 //! * the **kernel** PML4 — the full map (unchanged from today's
-//!   `new_process_page_table`: user lower-half `PML4[0]` + the cloned kernel
-//!   half `PML4[1..512]`), used while ring 0 runs;
-//! * the **user** PML4 — `PML4[0]` (user pages) plus a **minimal entry set**
-//!   (the syscall/IRQ trampoline text, the IDT, the GDT/TSS, the per-CPU entry
+//!   `new_process_page_table`), used while ring 0 runs;
+//! * the **user** PML4 — the user-mapping slots ([`USER_PML4_SLOTS`]: the
+//!   image/brk/mmap slot `PML4[0]` and the stack slot `PML4[255]`, shared
+//!   verbatim with the kernel half) plus a **minimal entry set** (the
+//!   syscall/IRQ trampoline text, the IDT, the GDT/TSS, the per-CPU entry
 //!   stack + per-core data), and *nothing else* of the kernel. The user-mode
 //!   CR3 points here, so the CPU cannot even speculatively reach kernel
 //!   `.text` / heap / the physical direct map → Meltdown is defeated.
@@ -20,9 +21,9 @@
 //! **4 KiB-page granularity through fresh lower-level tables**, never by
 //! cloning a whole kernel `PML4[i]` slot — cloning `PML4[256]` (the direct map)
 //! would re-expose all of physical memory and silently defeat KPTI. So a
-//! kernel top-level slot is legal in the user half **only** for `PML4[0]`
-//! (user) and for slots that hold *exclusively* entry-set pages via private
-//! sub-tables.
+//! kernel top-level slot is legal in the user half **only** for the
+//! user-mapping slots ([`USER_PML4_SLOTS`]) and for slots that hold
+//! *exclusively* entry-set pages via private sub-tables.
 
 /// Role of a kernel virtual range, for the user-half admission decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,14 +50,68 @@ impl KernelRange {
     }
 }
 
+/// PML4 slot of the kernel image: the PIE base is relocated by a fixed 1 TiB
+/// (`0x100_0000_0000` → bits 39..47 = 2), making it the lower canonical
+/// half's **single kernel occupant**. Everything else the kernel owns (heap
+/// `PML4[256]`, kernel stacks `PML4[257]`, the physical direct map) lives in
+/// the upper half.
+pub const KERNEL_IMAGE_PML4_SLOT: usize = 2;
+
+/// The top-level slots that carry **user** mappings in the m3OS VA layout —
+/// the slots the user half shares verbatim with the kernel half so user
+/// mappings created after the pair is built (mmap/brk growth, demand-paged
+/// stack) stay in sync automatically:
+///
+/// - `PML4[0]` — the ELF image + brk (from `USER_VADDR_MIN` `0x20_0000`) and
+///   the anonymous-mmap region (`ANON_MMAP_BASE` `0x20_0000_0000` + ASLR,
+///   still far below the 512 GiB slot boundary).
+/// - `PML4[255]` — the user stack (`ELF_STACK_TOP` `0x7FFF_FF00_0000` minus
+///   the ASLR jitter, plus its demand-page window).
+///
+/// A user region moving to (or a new one appearing in) any other slot MUST be
+/// added here, or processes touching it fault-loop on the user CR3 (its
+/// mapping exists only in the kernel half). The sub-tree of each shared slot
+/// must already exist in the kernel half when the pair is built — true today:
+/// the ELF loader maps image + stack before any `AddressSpace` is created.
+pub const USER_PML4_SLOTS: [usize; 2] = [0, 255];
+
+/// Whether `PML4[idx]` is one of the user-mapping slots ([`USER_PML4_SLOTS`]).
+#[inline]
+pub fn is_user_pml4_slot(idx: usize) -> bool {
+    USER_PML4_SLOTS.contains(&idx)
+}
+
 /// Decide whether a whole top-level `PML4[idx]` slot may be **cloned verbatim**
-/// into the user half. Only `PML4[0]` (the user lower half) qualifies — every
-/// kernel slot must be rebuilt at page granularity (see module docs), so this
-/// returns `false` for all `idx >= 1`. Guards against the classic
+/// into the user half. Only the user-mapping slots ([`USER_PML4_SLOTS`])
+/// qualify — sharing them is the point of the pair (one set of user page
+/// tables, two views). Every kernel slot must instead be rebuilt at page
+/// granularity (see module docs), so this returns `false` for the kernel
+/// image slot and the whole upper half. Guards against the classic
 /// "clone the direct-map slot" KPTI no-op.
 #[inline]
 pub fn may_clone_slot_into_user_half(idx: usize) -> bool {
-    idx == 0
+    is_user_pml4_slot(idx)
+}
+
+/// Decide whether the `#PF`-time top-level-slot sync (the Linux
+/// vmalloc-fault analogue) may re-copy `PML4[idx]` from the kernel half into
+/// a live user half.
+///
+/// The sync exists for one latent wedge: a [`USER_PML4_SLOTS`] entry that was
+/// **empty** in the kernel half when the pair was built is cloned empty into
+/// the user half, and if the kernel half later populates it, every ring-3
+/// touch of that region faults on the user CR3 while the kernel-half walk
+/// looks fine — a silent infinite `#PF` loop (the fault handler's
+/// already-mapped fast paths return success without fixing the user half).
+///
+/// The admission rule is deliberately identical to
+/// [`may_clone_slot_into_user_half`]: only the declared user-mapping slots
+/// may ever be synced, so a fault at a *kernel* address (the direct map, the
+/// heap, the image) can never pull a kernel slot into a user half through
+/// this path — the sync cannot be turned into a KPTI bypass.
+#[inline]
+pub fn may_sync_slot_on_fault(idx: usize) -> bool {
+    is_user_pml4_slot(idx)
 }
 
 /// The KPTI walk invariant for the **user** PML4, expressed over a flat list of
@@ -110,13 +165,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_user_slot_may_be_cloned() {
-        assert!(may_clone_slot_into_user_half(0));
-        for idx in 1..512 {
+    fn only_user_slots_may_be_cloned() {
+        for idx in USER_PML4_SLOTS {
+            assert!(
+                may_clone_slot_into_user_half(idx),
+                "PML4[{idx}] carries user mappings and must be shared with the user half — \
+                 omitting it fault-loops every process that touches the region on the user CR3"
+            );
+        }
+        for idx in 0..512 {
+            if USER_PML4_SLOTS.contains(&idx) {
+                continue;
+            }
             assert!(
                 !may_clone_slot_into_user_half(idx),
                 "PML4[{idx}] (a kernel slot) must NOT be cloned verbatim into the user half — \
                  cloning e.g. the direct-map slot silently defeats KPTI"
+            );
+        }
+        // The lower half's single kernel occupant and the upper half's first
+        // slot, called out explicitly (the two most dangerous accidents).
+        assert!(!may_clone_slot_into_user_half(KERNEL_IMAGE_PML4_SLOT));
+        assert!(!may_clone_slot_into_user_half(256));
+    }
+
+    #[test]
+    fn slot_sync_admits_only_user_slots() {
+        // The #PF-time sync must be able to repair every declared user slot…
+        for idx in USER_PML4_SLOTS {
+            assert!(may_sync_slot_on_fault(idx));
+        }
+        // …and must NEVER admit a kernel slot — otherwise a crafted fault
+        // address could pull kernel mappings into a live user half and
+        // silently defeat KPTI (the vmalloc-fault analogue of the
+        // clone-the-direct-map accident).
+        for idx in 0..512 {
+            if USER_PML4_SLOTS.contains(&idx) {
+                continue;
+            }
+            assert!(!may_sync_slot_on_fault(idx), "PML4[{idx}] must not sync");
+        }
+        assert!(!may_sync_slot_on_fault(KERNEL_IMAGE_PML4_SLOT));
+        assert!(!may_sync_slot_on_fault(256)); // heap
+        assert!(!may_sync_slot_on_fault(257)); // kernel stacks
+    }
+
+    #[test]
+    fn user_slots_are_lower_half_and_exclude_the_kernel_image() {
+        for idx in USER_PML4_SLOTS {
+            assert!(idx < 256, "user mappings live in the lower canonical half");
+            assert_ne!(
+                idx, KERNEL_IMAGE_PML4_SLOT,
+                "the kernel image slot can never carry user mappings"
             );
         }
     }

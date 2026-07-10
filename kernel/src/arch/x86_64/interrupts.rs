@@ -43,19 +43,21 @@
 //! 3 is the rule that class of bug violated. Every handler below
 //! relies on at least one of the three lock disciplines it enumerates.
 
-use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use kernel_core::input::{ScancodeRouter, ScancodeSink};
 use spin::{Lazy, Mutex};
 use x86_64::VirtAddr;
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::structures::idt::{InterruptDescriptorTable, PageFaultErrorCode};
 
 use crate::panic_diag;
 use crate::serial::_panic_print;
 
 use super::gdt;
-use super::preempt_trap_frame::{PreemptTrapFrameKernel, PreemptTrapFrameUser};
+use super::gdt::PageIsolated;
+use super::preempt_trap_frame::{
+    PreemptTrapFrameKernel, PreemptTrapFrameUser, TrapFrame, TrapFrameErr,
+};
 
 // ---------------------------------------------------------------------------
 // APIC / PIC mode flag
@@ -70,35 +72,21 @@ pub static USING_APIC: AtomicBool = AtomicBool::new(false);
 // Phase 57b D.3 — IRQ-return-to-ring-3 preempt_count assertion
 // ---------------------------------------------------------------------------
 
-/// Phase 57b D.3 — IRQ-return-to-ring-3 wrapper around
-/// [`crate::task::scheduler::assert_preempt_count_zero_at_user_return`].
+/// Phase 57b D.3 — IRQ-return-to-ring-3 preempt_count assertion, keyed off the
+/// raw code-segment selector the naked entry stubs carry in their frame
+/// (`frame.cs`). Phase 110 A.3b converted every ring-3-reachable handler to a
+/// naked stub, so this raw-CS form is now the only variant.
 ///
-/// Called at the end of every `extern "x86-interrupt"` handler that may
-/// have interrupted ring 3 — the body returns via `iretq` to user mode
-/// when this branch is taken, and we want the same `preempt_count == 0`
-/// invariant the syscall-return path enforces.
+/// Called at the end of every handler that may have interrupted ring 3 — the
+/// body returns via `iretq` to user mode when this branch is taken, and we want
+/// the same `preempt_count == 0` invariant the syscall-return path enforces.
 ///
-/// The assertion is gated on `stack_frame.code_segment.rpl() ==
-/// PrivilegeLevel::Ring3` because under Phase 57d kernel-mode will hold
-/// `preempt_count > 0` while inside spinlock-protected critical
-/// sections — an IPI / IRQ that interrupted such a section would
-/// (correctly) see a non-zero count and must not panic.  The "return to
-/// ring 3" check distinguishes the two cases.
-///
-/// In Phase 57b nothing raises `preempt_count` yet (Tracks F and G are
-/// future waves), so even unconditionally checking would pass — the
-/// gate is in place from day one to keep the assertion future-correct
-/// once F.1 wires `IrqSafeMutex::lock` into `preempt_disable`.
-///
-/// The check itself is a `debug_assert!` inside the helper; release
-/// builds compile out the entire body via `cfg(debug_assertions)`.
-#[inline]
-fn assert_preempt_count_zero_on_return_to_user(stack_frame: &InterruptStackFrame) {
-    assert_preempt_count_zero_on_return_to_user_cs(stack_frame.code_segment.0 as u64);
-}
-
-/// Raw-CS variant for the naked-entry paths (#BP/#DB), whose frames carry the
-/// selector as a plain `u64` rather than an `InterruptStackFrame`.
+/// The assertion is gated on `(cs & 3) == 3` because kernel-mode may hold
+/// `preempt_count > 0` inside a spinlock-protected critical section — an IPI /
+/// IRQ that interrupted such a section would (correctly) see a non-zero count
+/// and must not panic. The "return to ring 3" check distinguishes the two cases.
+/// The check itself is a `debug_assert!` inside the callee; release builds
+/// compile out the body via `cfg(debug_assertions)`.
 #[inline]
 fn assert_preempt_count_zero_on_return_to_user_cs(cs: u64) {
     // Phase 57e Bug #9 — clamp preempt_count to 0 at user-return in release
@@ -218,7 +206,7 @@ fn fault_recovery_stack_top(core_id: usize) -> u64 {
 ///
 /// Mirrors the ring-3 fault-kill redirect, but points RSP at the per-core
 /// recovery stack rather than the current (exhausted) kernel stack.
-fn try_recover_kstack_overflow(stack_frame: &mut InterruptStackFrame) -> bool {
+fn try_recover_kstack_overflow(frame: &mut TrapFrameErr) -> bool {
     if !crate::smp::is_per_core_ready() {
         return false;
     }
@@ -241,19 +229,17 @@ fn try_recover_kstack_overflow(stack_frame: &mut InterruptStackFrame) -> bool {
         pid, core,
     ));
     let recovery_top = fault_recovery_stack_top(core);
-    // SAFETY: rewrite the interrupt return frame while interrupts are disabled
-    // (exception entry cleared IF). IRETQ will load RSP = recovery stack so the
-    // kill trampoline runs on a clean stack, not the overflowed one. Same shape
-    // as the ring-3 redirect in `page_fault_handler`.
-    unsafe {
-        stack_frame.as_mut().update(|f| {
-            f.instruction_pointer = VirtAddr::new(fault_kill_trampoline as *const () as u64);
-            f.code_segment = gdt::kernel_code_selector();
-            f.cpu_flags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG;
-            f.stack_pointer = VirtAddr::new(recovery_top);
-            f.stack_segment = gdt::kernel_data_selector();
-        });
-    }
+    // Rewrite the on-stack iretq frame while interrupts are disabled (exception
+    // entry cleared IF). IRETQ will load RSP = recovery stack so the kill
+    // trampoline runs on a clean stack, not the overflowed one. Redirecting to a
+    // ring-0 CS means the naked stub's exit switch keeps the kernel CR3 (no
+    // user-CR3 flip on a kernel-target return). Same shape as the ring-3 redirect
+    // in `page_fault_body`.
+    frame.rip = fault_kill_trampoline as *const () as u64;
+    frame.cs = u64::from(gdt::kernel_code_selector().0);
+    frame.rflags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG.bits();
+    frame.rsp = recovery_top;
+    frame.ss = u64::from(gdt::kernel_data_selector().0);
     true
 }
 
@@ -534,7 +520,9 @@ pub fn resolve_cow_fault(vaddr: u64) -> bool {
     {
         tlb_shootdown_range_from_fault_context(unsafe { addr_space.as_ref() }, vaddr, vaddr + 4096);
     } else {
-        x86_64::instructions::tlb::flush(VirtAddr::new(vaddr));
+        // Phase 110 A.5 — both KPTI PCIDs (the CoW'd user page is visible in the
+        // user half too, so a kernel-PCID-only invlpg would loop the fault).
+        crate::smp::tlb::flush_local(vaddr);
     }
     if let Some(old_phys) = old_phys_to_free {
         crate::mm::frame_allocator::free_frame(old_phys);
@@ -1148,7 +1136,12 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
 // IDT
 // ---------------------------------------------------------------------------
 
-static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
+// Page-isolated (`PageIsolated`, Phase 110 A.3b part 4): the IDT is mapped
+// into every KPTI user half (the CPU reads the gate through the *active*
+// paging on interrupt delivery), so it must own its page exclusively. An
+// `InterruptDescriptorTable` is exactly 4096 bytes (256 × 16), so the wrapper
+// pads nothing — it only pins the page boundary.
+static IDT: Lazy<PageIsolated<InterruptDescriptorTable>> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
 
     // CPU exceptions.
@@ -1175,12 +1168,32 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
         idt.debug
             .set_handler_addr(VirtAddr::new(db_entry as *const () as u64));
     }
-    idt.page_fault.set_handler_fn(page_fault_handler);
-    idt.general_protection_fault
-        .set_handler_fn(general_protection_fault_handler);
+    // Phase 110 A.3b — #PF and #GP use naked KPTI-aware entry stubs (they run
+    // demand paging / diagnostics that need the full kernel map, so they must
+    // switch to the kernel CR3 on entry and, if returning to ring 3, back to the
+    // user CR3 before `iretq`). The bodies are `page_fault_body` /
+    // `general_protection_fault_body`, taking `&mut TrapFrameErr`.
+    unsafe {
+        idt.page_fault
+            .set_handler_addr(VirtAddr::new(page_fault_entry as *const () as u64));
+        idt.general_protection_fault.set_handler_addr(VirtAddr::new(
+            general_protection_fault_entry as *const () as u64,
+        ));
+        // Phase 110 Track B.3 — #CP (Control-Protection, vector 21): a caught
+        // shadow-stack / CFI violation. Fires only on CET silicon; the naked
+        // stub + body kill the offending ring-3 process (Dell-only in practice,
+        // inert on QEMU). DPL stays 0 — #CP is a hardware fault, never an `int`.
+        idt.cp_protection_exception.set_handler_addr(VirtAddr::new(
+            control_protection_fault_entry as *const () as u64,
+        ));
+    }
+    // Phase 110 A.3b — #DF uses the paranoid KPTI naked stub (`double_fault_entry`
+    // → `double_fault_body`). It runs on the DF IST stack, whose top page is
+    // user-mapped by `mm::kpti` so a #DF that escalates while ring 3 is on the
+    // user CR3 can still push its frame.
     unsafe {
         idt.double_fault
-            .set_handler_fn(double_fault_handler)
+            .set_handler_addr(VirtAddr::new(double_fault_entry as *const () as u64))
             .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
     }
     // NMI (vector 2) — used as the cross-core TLB shootdown delivery
@@ -1202,9 +1215,11 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     // (`invlpg`/CR3-reload + atomic decrement — fault-free), so it never
     // re-enables NMI mid-handler and cannot nest on the shared IST stack. See
     // `docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md`.
+    // Phase 110 A.3b — NMI uses the paranoid KPTI naked stub (`nmi_entry` →
+    // `nmi_body`) on its own IST stack (top page user-mapped by `mm::kpti`).
     unsafe {
         idt.non_maskable_interrupt
-            .set_handler_fn(nmi_handler)
+            .set_handler_addr(VirtAddr::new(nmi_entry as *const () as u64))
             .set_stack_index(gdt::NMI_IST_INDEX);
     }
 
@@ -1214,57 +1229,77 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
         idt[InterruptIndex::Timer as u8]
             .set_handler_addr(VirtAddr::new(timer_entry as *const () as u64));
     }
-    idt[InterruptIndex::Keyboard as u8].set_handler_fn(keyboard_handler);
-    // Vector 34 (`InterruptIndex::VirtioNet`) is reserved but no longer
-    // installed — Phase 55 C.5 migrated virtio-net to the HAL IRQ contract
-    // (allocated from the device-IRQ bank at `DEVICE_IRQ_VECTOR_BASE`).
-    idt[InterruptIndex::Serial as u8].set_handler_fn(serial_handler);
-    idt[InterruptIndex::Mouse as u8].set_handler_fn(mouse_handler);
-    // Phase 101 D.2 — ACPI SCI (routed on demand by sys_acpi_sci_subscribe).
-    idt[InterruptIndex::Sci as u8].set_handler_fn(sci_handler);
-
-    // APIC spurious interrupt vector — must NOT send EOI.
-    idt[InterruptIndex::Spurious as u8].set_handler_fn(spurious_handler);
-
-    // SMP IPI vectors (Phase 25).
+    // Phase 110 Track A.3b — the ring-3-reachable maskable IRQ / IPI vectors
+    // now use naked-asm entry stubs (`*_entry`) in the page-aligned
+    // `.text.kpti_irq_entry` section so each can switch to the kernel CR3 on
+    // entry and back to the user CR3 immediately before its `iretq` — an
+    // `extern "x86-interrupt"` handler cannot, because the compiler owns the
+    // `iretq` (see the module-level A.3b block). While KPTI is inactive
+    // (`mitigations=off`, or `auto` on `RDCL_NO` silicon) every switch is a
+    // never-taken branch (`kpti_user_cr3 == 0`), behaviourally identical to
+    // the old `set_handler_fn` install; since A.4 the default QEMU boot
+    // (`auto`, `rdcl_no=false`) runs the switches live on every gate.
     unsafe {
+        idt[InterruptIndex::Keyboard as u8]
+            .set_handler_addr(VirtAddr::new(keyboard_entry as *const () as u64));
+        // Vector 34 (`InterruptIndex::VirtioNet`) is reserved but no longer
+        // installed — Phase 55 C.5 migrated virtio-net to the HAL IRQ contract
+        // (allocated from the device-IRQ bank at `DEVICE_IRQ_VECTOR_BASE`).
+        idt[InterruptIndex::Serial as u8]
+            .set_handler_addr(VirtAddr::new(serial_entry as *const () as u64));
+        idt[InterruptIndex::Mouse as u8]
+            .set_handler_addr(VirtAddr::new(mouse_entry as *const () as u64));
+        // Phase 101 D.2 — ACPI SCI (routed on demand by sys_acpi_sci_subscribe).
+        idt[InterruptIndex::Sci as u8]
+            .set_handler_addr(VirtAddr::new(sci_entry as *const () as u64));
+        // APIC spurious interrupt vector — must NOT send EOI.
+        idt[InterruptIndex::Spurious as u8]
+            .set_handler_addr(VirtAddr::new(spurious_entry as *const () as u64));
+
+        // SMP IPI vectors (Phase 25).
         idt[crate::smp::ipi::IPI_RESCHEDULE]
             .set_handler_addr(VirtAddr::new(reschedule_ipi_entry as *const () as u64));
+        idt[crate::smp::ipi::IPI_TLB_SHOOTDOWN]
+            .set_handler_addr(VirtAddr::new(tlb_shootdown_ipi_entry as *const () as u64));
+        idt[crate::smp::ipi::IPI_CACHE_DRAIN]
+            .set_handler_addr(VirtAddr::new(cache_drain_ipi_entry as *const () as u64));
     }
-    idt[crate::smp::ipi::IPI_TLB_SHOOTDOWN].set_handler_fn(tlb_shootdown_ipi_handler);
-    idt[crate::smp::ipi::IPI_CACHE_DRAIN].set_handler_fn(cache_drain_ipi_handler);
 
     // Phase 55 C.3: device MSI / MSI-X vector stubs.
     // Each stub dispatches through DEVICE_IRQ_TABLE; callers register
-    // handlers at runtime via `register_device_irq`.
-    let bank: &[(u8, extern "x86-interrupt" fn(InterruptStackFrame))] = &[
-        (DEVICE_IRQ_VECTOR_BASE, device_irq_stub_0),
-        (DEVICE_IRQ_VECTOR_BASE + 1, device_irq_stub_1),
-        (DEVICE_IRQ_VECTOR_BASE + 2, device_irq_stub_2),
-        (DEVICE_IRQ_VECTOR_BASE + 3, device_irq_stub_3),
-        (DEVICE_IRQ_VECTOR_BASE + 4, device_irq_stub_4),
-        (DEVICE_IRQ_VECTOR_BASE + 5, device_irq_stub_5),
-        (DEVICE_IRQ_VECTOR_BASE + 6, device_irq_stub_6),
-        (DEVICE_IRQ_VECTOR_BASE + 7, device_irq_stub_7),
-        (DEVICE_IRQ_VECTOR_BASE + 8, device_irq_stub_8),
-        (DEVICE_IRQ_VECTOR_BASE + 9, device_irq_stub_9),
-        (DEVICE_IRQ_VECTOR_BASE + 10, device_irq_stub_10),
-        (DEVICE_IRQ_VECTOR_BASE + 11, device_irq_stub_11),
-        (DEVICE_IRQ_VECTOR_BASE + 12, device_irq_stub_12),
-        (DEVICE_IRQ_VECTOR_BASE + 13, device_irq_stub_13),
-        (DEVICE_IRQ_VECTOR_BASE + 14, device_irq_stub_14),
-        (DEVICE_IRQ_VECTOR_BASE + 15, device_irq_stub_15),
+    // handlers at runtime via `register_device_irq`. Phase 110 A.3b: naked
+    // KPTI-aware entry stubs (`device_irq_entry_N`), same rationale as above.
+    let bank: [unsafe extern "C" fn(); DEVICE_IRQ_VECTOR_COUNT as usize] = [
+        device_irq_entry_0,
+        device_irq_entry_1,
+        device_irq_entry_2,
+        device_irq_entry_3,
+        device_irq_entry_4,
+        device_irq_entry_5,
+        device_irq_entry_6,
+        device_irq_entry_7,
+        device_irq_entry_8,
+        device_irq_entry_9,
+        device_irq_entry_10,
+        device_irq_entry_11,
+        device_irq_entry_12,
+        device_irq_entry_13,
+        device_irq_entry_14,
+        device_irq_entry_15,
     ];
-    for (vec, stub) in bank {
-        idt[*vec].set_handler_fn(*stub);
+    for (off, stub) in bank.iter().enumerate() {
+        unsafe {
+            idt[DEVICE_IRQ_VECTOR_BASE + off as u8]
+                .set_handler_addr(VirtAddr::new(*stub as *const () as u64));
+        }
     }
 
-    idt
+    PageIsolated(idt)
 });
 
 /// Load the IDT.
 pub fn init() {
-    IDT.load();
+    IDT.0.load();
 }
 
 // ---------------------------------------------------------------------------
@@ -1285,112 +1320,12 @@ pub fn init() {
 // loads the interrupted task's r12 from the frame slot — the scratch value
 // in the live register is overwritten by the pop, which is correct.
 
-global_asm!(
-    // -----------------------------------------------------------------------
-    // Shared macros: GPR save / restore used by both stubs.
-    // -----------------------------------------------------------------------
-    ".macro save_gprs_all",
-    "push r15",
-    "push r14",
-    "push r13",
-    "push r12",
-    "push r11",
-    "push r10",
-    "push r9",
-    "push r8",
-    "push rbp",
-    "push rdi",
-    "push rsi",
-    "push rdx",
-    "push rcx",
-    "push rbx",
-    "push rax",
-    ".endm",
-    "",
-    ".macro restore_gprs_all",
-    "pop rax",
-    "pop rbx",
-    "pop rcx",
-    "pop rdx",
-    "pop rsi",
-    "pop rdi",
-    "pop rbp",
-    "pop r8",
-    "pop r9",
-    "pop r10",
-    "pop r11",
-    "pop r12",
-    "pop r13",
-    "pop r14",
-    "pop r15",
-    ".endm",
-    "",
-    // -----------------------------------------------------------------------
-    // timer_entry
-    // -----------------------------------------------------------------------
-    ".global timer_entry",
-    "timer_entry:",
-    // CS is at [rsp+8] on both ring-0 (3-field frame: rip/cs/rflags) and
-    // ring-3 (5-field frame: rip/cs/rflags/rsp/ss) IRQ entries.
-    "test QWORD PTR [rsp+8], 3",
-    "jnz .Ltimer_user",
-    "",
-    // --- Kernel path --------------------------------------------------------
-    ".Ltimer_kernel:",
-    "save_gprs_all",
-    // After 15 pushes, rsp = &gprs[0].
-    // interrupted RSP = rsp + 15*8 + 3*8 = rsp + 144.
-    "lea rsi, [rsp + 144]", // arg2: captured_kernel_rsp
-    "cld",
-    "mov rdi, rsp", // arg1: &PreemptTrapFrameKernel
-    "mov r12, rsp", // save pre-alignment rsp (r12 is callee-saved)
-    "and rsp, -16", // align to 16 bytes for SysV call ABI
-    "call timer_handler_kernel",
-    "mov rsp, r12", // restore (pop r12 below loads original r12 from frame)
-    "restore_gprs_all",
-    "iretq",
-    "",
-    // --- User path ----------------------------------------------------------
-    ".Ltimer_user:",
-    "save_gprs_all",
-    // After 15 GPR pushes + 5 CPU-pushed fields = 160 bytes.
-    // If TSS.RSP0 is 16-aligned, 160 ≡ 0 (mod 16) → already aligned.
-    "cld",
-    "mov rdi, rsp", // arg1: &mut PreemptTrapFrameUser
-    "call timer_handler_user",
-    "restore_gprs_all",
-    "iretq",
-    "",
-    // -----------------------------------------------------------------------
-    // reschedule_ipi_entry
-    // -----------------------------------------------------------------------
-    ".global reschedule_ipi_entry",
-    "reschedule_ipi_entry:",
-    "test QWORD PTR [rsp+8], 3",
-    "jnz .Lrescheduleipi_user",
-    "",
-    // --- Kernel path --------------------------------------------------------
-    ".Lrescheduleipi_kernel:",
-    "save_gprs_all",
-    "lea rsi, [rsp + 144]",
-    "cld",
-    "mov rdi, rsp",
-    "mov r12, rsp",
-    "and rsp, -16",
-    "call reschedule_ipi_handler_kernel",
-    "mov rsp, r12",
-    "restore_gprs_all",
-    "iretq",
-    "",
-    // --- User path ----------------------------------------------------------
-    ".Lrescheduleipi_user:",
-    "save_gprs_all",
-    "cld",
-    "mov rdi, rsp",
-    "call reschedule_ipi_handler_user",
-    "restore_gprs_all",
-    "iretq",
-);
+// Phase 110 Track A.3b — `timer_entry` and `reschedule_ipi_entry` moved into the
+// page-aligned `.text.kpti_irq_entry` section (bottom of this file) so they are
+// user-mapped and gain the KPTI entry/exit CR3 discipline. They keep their
+// ring-aware two-path shape (user path → `*_handler_user`, kernel path →
+// `*_handler_kernel` with the captured kernel RSP); the CR3 switch is applied
+// only on the user path (a ring-0 interruption is already on the kernel CR3).
 
 // ---------------------------------------------------------------------------
 // Phase 57d C.2 — preempt_resume_to_user
@@ -1408,40 +1343,13 @@ global_asm!(
 // Called from the scheduler dispatch loop (D.3) with IRQs disabled.
 // Never returns.
 
+// Phase 110 A.3b part 3 — `preempt_resume_to_user` moved into the page-aligned,
+// user-mapped `.text.kpti_exit` section (bottom of this file) so it can flip to
+// the user CR3 in the instruction before its `iretq`. `dispatch_preempted_and_resume`
+// stays here in plain `.text`: it builds the `switch_context` frame on the
+// scheduler stack and `jmp`s to `preempt_resume_to_user`, but never touches the
+// user CR3 itself.
 core::arch::global_asm!(
-    ".global preempt_resume_to_user",
-    "preempt_resume_to_user:",
-    // Build the iretq frame on the current (scheduler) stack.
-    // iretq pops: rip, cs, rflags, rsp, ss — push in reverse (ss first).
-    "mov rax, [rdi + 152]", // ss
-    "push rax",
-    "mov rax, [rdi + 144]", // rsp (user-mode stack pointer)
-    "push rax",
-    "mov rax, [rdi + 136]", // rflags
-    "push rax",
-    "mov rax, [rdi + 128]", // cs
-    "push rax",
-    "mov rax, [rdi + 120]", // rip
-    "push rax",
-    // Restore GPRs — all except rax and rdi (rdi is still our frame pointer).
-    "mov rbx, [rdi + 8]",
-    "mov rcx, [rdi + 16]",
-    "mov rdx, [rdi + 24]",
-    "mov rsi, [rdi + 32]",
-    "mov rbp, [rdi + 48]",
-    "mov r8,  [rdi + 56]",
-    "mov r9,  [rdi + 64]",
-    "mov r10, [rdi + 72]",
-    "mov r11, [rdi + 80]",
-    "mov r12, [rdi + 88]",
-    "mov r13, [rdi + 96]",
-    "mov r14, [rdi + 104]",
-    "mov r15, [rdi + 112]",
-    // Restore rax, then rdi last (pointer becomes invalid after this).
-    "mov rax, [rdi + 0]",
-    "mov rdi, [rdi + 40]",
-    "iretq",
-    //
     // ---------------------------------------------------------------------------
     // Phase 57d D.3 (fix) — dispatch_preempted_and_resume
     //
@@ -1568,83 +1476,15 @@ unsafe extern "C" {
 // Phase 111 Track C.2 — full-GPR #BP / #DB entry stubs
 // ---------------------------------------------------------------------------
 //
-// Same shape as the preempt stubs above (save all 15 GPRs before any Rust
-// prologue runs, r15 first → rax last so rax lands at `gprs[0]`), but with NO
-// user/kernel asm split: in 64-bit mode the CPU pushes the full 5-field iretq
-// frame (`rip/cs/rflags/rsp/ss`) unconditionally — SS:RSP is pushed even
-// without a privilege change (Intel SDM Vol 3A §6.14.2) — so one
-// `DebugTrapFrame` layout serves both rings and the ring test happens in Rust
-// (`frame.cs & 3`).
-//
-// Alignment: an error-code-less exception leaves rsp ≡ 8 (mod 16) at entry
-// (CPU aligns to 16 then pushes 40 bytes); 15 GPR pushes keep that parity, so
-// we re-align with the same r12 trick as the preempt kernel path (`pop r12`
-// after the call restores the interrupted r12 from the frame slot).
-//
-// Distinct macro names from the preempt block: each `global_asm!` invocation
-// is its own assembly unit, but keeping the names unique avoids any doubt.
-
-global_asm!(
-    ".macro dbg_save_gprs",
-    "push r15",
-    "push r14",
-    "push r13",
-    "push r12",
-    "push r11",
-    "push r10",
-    "push r9",
-    "push r8",
-    "push rbp",
-    "push rdi",
-    "push rsi",
-    "push rdx",
-    "push rcx",
-    "push rbx",
-    "push rax",
-    ".endm",
-    "",
-    ".macro dbg_restore_gprs",
-    "pop rax",
-    "pop rbx",
-    "pop rcx",
-    "pop rdx",
-    "pop rsi",
-    "pop rdi",
-    "pop rbp",
-    "pop r8",
-    "pop r9",
-    "pop r10",
-    "pop r11",
-    "pop r12",
-    "pop r13",
-    "pop r14",
-    "pop r15",
-    ".endm",
-    "",
-    ".global bp_entry",
-    "bp_entry:",
-    "dbg_save_gprs",
-    "cld",
-    "mov rdi, rsp", // arg1: &mut DebugTrapFrame
-    "mov r12, rsp", // save pre-alignment rsp (callee-saved across the call)
-    "and rsp, -16",
-    "call bp_trap_handler",
-    "mov rsp, r12",
-    "dbg_restore_gprs",
-    "iretq",
-    "",
-    ".global db_entry",
-    "db_entry:",
-    "dbg_save_gprs",
-    "cld",
-    "mov rdi, rsp",
-    "mov r12, rsp",
-    "and rsp, -16",
-    "call db_trap_handler",
-    "mov rsp, r12",
-    "dbg_restore_gprs",
-    "iretq",
-);
+// Phase 110 A.3b moved `bp_entry` / `db_entry` into the page-aligned
+// `.text.kpti_irq_entry` section (bottom of this file) so they are user-mapped
+// and gain the KPTI entry/exit CR3 discipline — a ring-3 `int3` (ptrace) or
+// single-step (`RFLAGS.TF`) enters on the user CR3 like any other ring-3 trap.
+// They keep the Track C.2 shape: save all 15 GPRs before any Rust prologue runs
+// (r15 first → rax last so rax lands at `gprs[0]`), NO user/kernel asm split
+// (the CPU pushes the full 5-field iretq frame unconditionally in long mode, so
+// one `DebugTrapFrame`/`TrapFrame` layout serves both rings and the ring test
+// happens in Rust via `frame.cs & 3`), and the r12 re-align trick.
 
 unsafe extern "C" {
     fn bp_entry();
@@ -1702,19 +1542,98 @@ fn clac_on_irq_entry() {
     unsafe { crate::arch::x86_64::cpuid::clear_ac_for_smap() };
 }
 
-extern "x86-interrupt" fn page_fault_handler(
-    mut stack_frame: InterruptStackFrame,
-    err: PageFaultErrorCode,
+/// Bring-up diagnostic (Phase 110 CET userspace bring-up): freeze the machine on
+/// the **first fatal ring-3 fault** with its class + pid + process name +
+/// RIP/RSP/err painted to the framebuffer, so a serial-less bench reads exactly
+/// which userspace instruction faulted (`_panic_print` goes to serial only,
+/// invisible on the Dell). Called ONLY at the process-killing fault sites, so
+/// ordinary demand-paging `#PF`s are unaffected. No-op unless built with
+/// `M3OS_BRINGUP_DIAG=1`. Halts (never returns) when it fires.
+fn bringup_freeze_on_user_fault(
+    kind: &str,
+    pid: crate::process::Pid,
+    rip: u64,
+    rsp: u64,
+    err: u64,
 ) {
+    if !crate::BRINGUP_DIAG {
+        return;
+    }
+    // First fatal fault wins; guards re-entrancy if the fb write itself faults.
+    static FROZEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if FROZEN.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // Quiesce sibling cores (halt-NMI) so nothing repaints the framebuffer over
+    // the dump — otherwise a respawned display_server / compositor client on
+    // another core could overwrite it before it can be photographed.
+    crate::smp::panic_quiesce_aps();
+    // Best-effort process name — try_lock, since the faulting ring-3 task holds
+    // no kernel lock this normally succeeds; skip the name on contention.
+    let mut name = [0u8; 16];
+    let mut n = 0usize;
+    if let Some(table) = crate::process::PROCESS_TABLE.try_lock()
+        && let Some(proc) = table.find(pid)
+    {
+        for &b in proc.comm.iter() {
+            if b == 0 {
+                break;
+            }
+            name[n] = b;
+            n += 1;
+        }
+    }
+    let name = core::str::from_utf8(&name[..n]).unwrap_or("?");
+    crate::fb::diag_force_write_fmt(format_args!(
+        "\n*** BRINGUP_DIAG HALT: userspace {kind} fault ***\n\
+         pid={pid} comm={name} rip={rip:#x} rsp={rsp:#x} err={err:#x}\n\
+         (#CP=CET CFI/shadow-stack; map rip: nm <bin> + process load base)\n\
+         *** machine halted — photograph this line ***\n",
+    ));
+    crate::hlt_loop();
+}
+
+/// `#PF` body — Phase 110 A.3b moved this onto the KPTI-aware naked
+/// `page_fault_entry` stub, so it takes the full-GPR [`TrapFrameErr`] the stub
+/// captured (the CPU error code is `frame.error_code`) instead of an
+/// `InterruptStackFrame`. Redirects (the ring-3 fault-kill and the kstack-overflow
+/// recovery) rewrite `frame` in place; the stub's exit switch re-reads
+/// `frame.cs`, so a redirect to a ring-0 trampoline returns on the kernel CR3.
+#[unsafe(no_mangle)]
+extern "C" fn page_fault_body(frame: &mut TrapFrameErr) {
     clac_on_irq_entry();
+    let err = PageFaultErrorCode::from_bits_truncate(frame.error_code);
     let addr = x86_64::registers::control::Cr2::read();
 
     // Check if the fault came from ring 3 (user mode).
-    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+    if frame.from_user() {
         // P17-T031: detect CoW faults — a write to a present, non-writable
         // page marked with BIT_9 (the CoW marker set by cow_clone_user_pages).
         let is_write = err.contains(PageFaultErrorCode::CAUSED_BY_WRITE);
         let is_present = err.contains(PageFaultErrorCode::PROTECTION_VIOLATION);
+
+        // Phase 110 hardening — KPTI top-level-slot sync (Linux vmalloc-fault
+        // analogue). MUST be the first recovery: if a USER_PML4_SLOTS entry
+        // was empty when this process's KPTI pair was built and the kernel
+        // half has since populated it, ring 3 faults on the user CR3 (P=0)
+        // while the kernel-half walk looks fine — and the demand/CoW paths
+        // below would see the page already mapped in the kernel half and
+        // return success WITHOUT fixing the user half, turning the wedge into
+        // a silent infinite #PF loop. Sync the divergent top-level slot into
+        // the user half and retry. Gated on `!is_present` (the wedge always
+        // presents as not-present from the user CR3) and no-op when KPTI is
+        // inactive. All current layouts pre-populate both user slots before
+        // the pair is built, so this fires essentially never — it is the
+        // safety net for any future layout that grows a user slot lazily.
+        if !is_present
+            && let Ok(fault_vaddr) = addr
+            && let Some(addr_space) = crate::process::current_addr_space()
+            && unsafe { addr_space.as_ref() }.kpti_sync_user_slot_on_fault(fault_vaddr.as_u64())
+        {
+            crate::task::scheduler::current_task_record_page_fault(false);
+            assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
+            return;
+        }
         if is_write
             && is_present
             && let Ok(fault_vaddr) = addr
@@ -1730,7 +1649,7 @@ extern "x86-interrupt" fn page_fault_handler(
                 // require the disk-backed mmap path which is not yet
                 // wired; the major counter stays at 0 in practice today.
                 crate::task::scheduler::current_task_record_page_fault(false);
-                assert_preempt_count_zero_on_return_to_user(&stack_frame);
+                assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
                 return;
             }
             // OOM or no-longer-CoW mapping — fall through to other handlers / kill.
@@ -1755,7 +1674,7 @@ extern "x86-interrupt" fn page_fault_handler(
                 && demand_map_user_page(fault_addr_u64, 0x3)
             // PROT_READ|PROT_WRITE
             {
-                assert_preempt_count_zero_on_return_to_user(&stack_frame);
+                assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
                 return;
             }
         }
@@ -1765,7 +1684,7 @@ extern "x86-interrupt" fn page_fault_handler(
         if !is_present && let Ok(fault_vaddr) = addr {
             let fault_addr_u64 = fault_vaddr.as_u64();
             if demand_map_vma_page(fault_addr_u64, is_write) {
-                assert_preempt_count_zero_on_return_to_user(&stack_frame);
+                assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
                 return;
             }
         }
@@ -1828,12 +1747,12 @@ extern "x86-interrupt" fn page_fault_handler(
                             crate::process::current_pid(),
                             key,
                             fault_vaddr.as_u64(),
-                            stack_frame.instruction_pointer.as_u64(),
+                            frame.rip,
                             n,
                         ));
                     }
                     crate::task::scheduler::current_task_record_page_fault(false);
-                    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+                    assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
                     return;
                 }
             }
@@ -1893,13 +1812,15 @@ extern "x86-interrupt" fn page_fault_handler(
                         "[pf] spurious write-fault recovered: pid={} addr={:#x} rip={:#x} (#{}) ",
                         crate::process::current_pid(),
                         fault_vaddr.as_u64(),
-                        stack_frame.instruction_pointer.as_u64(),
+                        frame.rip,
                         n + 1,
                     );
                 }
-                x86_64::instructions::tlb::flush(VirtAddr::new(fault_vaddr.as_u64()));
+                // Phase 110 A.5 — both KPTI PCIDs (this user page is mapped in
+                // the user half; a kernel-PCID-only invlpg would re-loop).
+                crate::smp::tlb::flush_local(fault_vaddr.as_u64());
                 crate::task::scheduler::current_task_record_page_fault(false);
-                assert_preempt_count_zero_on_return_to_user(&stack_frame);
+                assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
                 return;
             } else if leaf_writable && leaf_user {
                 // Leaf grants write+user but an intermediate does not — the
@@ -1912,7 +1833,7 @@ extern "x86-interrupt" fn page_fault_handler(
                         "[pf] non-writable intermediate (would loop): pid={} addr={:#x} rip={:#x} p4={:#x} p3={:#x} p2={:#x} p1={:#x}\n",
                         crate::process::current_pid(),
                         fault_vaddr.as_u64(),
-                        stack_frame.instruction_pointer.as_u64(),
+                        frame.rip,
                         levels[0],
                         levels[1],
                         levels[2],
@@ -1926,15 +1847,9 @@ extern "x86-interrupt" fn page_fault_handler(
         let pid = crate::process::current_pid();
         _panic_print(format_args!(
             "[int] userspace page fault: pid={} addr={:?} err={:?} rip={:#x} — process killed\n",
-            pid,
-            addr,
-            err,
-            stack_frame.instruction_pointer.as_u64()
+            pid, addr, err, frame.rip
         ));
-        _panic_print(format_args!(
-            "[int] RSP={:#x}\n",
-            stack_frame.stack_pointer.as_u64()
-        ));
+        _panic_print(format_args!("[int] RSP={:#x}\n", frame.rsp));
         // Phase 57e diag: not-present userspace faults on what should be a
         // mapped code/data page are the same shape as the kernel slab UAF;
         // dump the PTE walk to localise the missing-PTE level.
@@ -1959,29 +1874,28 @@ extern "x86-interrupt" fn page_fault_handler(
         }
         panic_diag::dump_crash_context();
         crate::trace::dump_trace_rings();
+        // Bring-up diagnostic: freeze on-screen (serial-free) before the kill.
+        // Reached only for a fatal (unhandled) ring-3 #PF — demand-paging faults
+        // resolve and return long before here.
+        bringup_freeze_on_user_fault("#PF", pid, frame.rip, frame.rsp, frame.error_code);
         // Store the PID for the trampoline. Safe: interrupts are disabled
         // during exception handling on a single CPU.
         FAULT_KILL_PID.store(pid, Ordering::Relaxed);
-        // Redirect the interrupted context to fault_kill_trampoline, which
-        // runs in ring 0 outside interrupt context where locking is safe.
-        // SAFETY: we modify the interrupt return frame while interrupts are
-        // disabled. The trampoline is a valid kernel function pointer.
-        // We must also set RSP to the current kernel stack (not the user RSP
-        // that was saved in the frame), otherwise IRET would pop the user RSP
-        // and the trampoline would run with an unmapped stack → GPF.
+        // Redirect the interrupted context to fault_kill_trampoline, which runs
+        // in ring 0 outside interrupt context where locking is safe. Set RSP to
+        // the current kernel stack (not the user RSP saved in the frame),
+        // otherwise IRETQ would pop the user RSP and the trampoline would run on
+        // an unmapped stack → GPF. Redirecting to a ring-0 CS also makes the
+        // naked stub's exit switch keep the kernel CR3 (no user-CR3 flip).
         let kernel_rsp: u64;
         unsafe {
             core::arch::asm!("mov {}, rsp", out(reg) kernel_rsp);
         }
-        unsafe {
-            stack_frame.as_mut().update(|f| {
-                f.instruction_pointer = VirtAddr::new(fault_kill_trampoline as *const () as u64);
-                f.code_segment = gdt::kernel_code_selector();
-                f.cpu_flags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG;
-                f.stack_pointer = VirtAddr::new(kernel_rsp);
-                f.stack_segment = gdt::kernel_data_selector();
-            });
-        }
+        frame.rip = fault_kill_trampoline as *const () as u64;
+        frame.cs = u64::from(gdt::kernel_code_selector().0);
+        frame.rflags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG.bits();
+        frame.rsp = kernel_rsp;
+        frame.ss = u64::from(gdt::kernel_data_selector().0);
         return;
     }
 
@@ -1991,11 +1905,7 @@ extern "x86-interrupt" fn page_fault_handler(
     // from production builds (feature-gated).
     #[cfg(feature = "smep-smap-test")]
     if let Some(recovery_rip) = crate::arch::x86_64::smap_test::take_expected_fault_recovery() {
-        unsafe {
-            stack_frame.as_mut().update(|f| {
-                f.instruction_pointer = VirtAddr::new(recovery_rip);
-            });
-        }
+        frame.rip = recovery_rip;
         return;
     }
 
@@ -2014,10 +1924,7 @@ extern "x86-interrupt" fn page_fault_handler(
     {
         _panic_print(format_args!(
             "[int] RECURSIVE KERNEL PAGE FAULT on core {} — cascade halted (cr2={:?} rip={:#x} err={:?})\n",
-            core_idx,
-            addr,
-            stack_frame.instruction_pointer.as_u64(),
-            err,
+            core_idx, addr, frame.rip, err,
         ));
         crate::hlt_loop();
     }
@@ -2032,10 +1939,10 @@ extern "x86-interrupt" fn page_fault_handler(
     // dumps below cascade. (`#PF` so it greps distinctly from the verbose line.)
     _panic_print(format_args!(
         "[int] KERNEL #PF rip={:#x} cr2={:#x} err={:#x} rsp={:#x}\n",
-        stack_frame.instruction_pointer.as_u64(),
+        frame.rip,
         addr.as_ref().map_or(u64::MAX, |v| v.as_u64()),
         err.bits(),
-        stack_frame.stack_pointer.as_u64(),
+        frame.rsp,
     ));
 
     // Kernel-stack overflow: the fault address is inside a kstack guard page.
@@ -2053,17 +1960,17 @@ extern "x86-interrupt" fn page_fault_handler(
             "[int] KERNEL STACK OVERFLOW: kstack slot {} guard page hit at {:#x} (rip={:#x})\n",
             slot,
             fault_va.as_u64(),
-            stack_frame.instruction_pointer.as_u64(),
+            frame.rip,
         ));
         // Phase 95 diag: stash slot + faulting RSP so the recovery trampoline can
         // print the recursion backtrace on its CLEAN stack (dumping here would
         // re-overflow). One compact store each — no risk of re-crossing the guard.
         KSTACK_OVF_SLOT.store(slot, Ordering::Relaxed);
-        KSTACK_OVF_RSP.store(stack_frame.stack_pointer.as_u64(), Ordering::Relaxed);
+        KSTACK_OVF_RSP.store(frame.rsp, Ordering::Relaxed);
         // Track D: if attributable to a userspace task, redirect to the kill
         // trampoline on the per-core recovery stack and return (IRETQ). The core
         // survives and keeps scheduling other tasks.
-        if try_recover_kstack_overflow(&mut stack_frame) {
+        if try_recover_kstack_overflow(frame) {
             return;
         }
         // Genuine kernel/idle-context overflow — a real kernel bug. Halt this
@@ -2073,8 +1980,8 @@ extern "x86-interrupt" fn page_fault_handler(
     }
 
     _panic_print(format_args!(
-        "[int] kernel page fault: addr={:?} err={:?}\n{:?}\n",
-        addr, err, stack_frame
+        "[int] kernel page fault: addr={:?} err={:?} rip={:#x} cs={:#x} rflags={:#x} rsp={:#x}\n",
+        addr, err, frame.rip, frame.cs, frame.rflags, frame.rsp,
     ));
     let (cr3_frame, _) = x86_64::registers::control::Cr3::read_raw();
     _panic_print(format_args!(
@@ -2133,54 +2040,31 @@ fn maybe_redirect_group_exit_trampoline_user(frame: &mut PreemptTrapFrameUser) {
     frame.ss = u64::from(gdt::kernel_data_selector().0);
 }
 
-extern "x86-interrupt" fn general_protection_fault_handler(
-    mut stack_frame: InterruptStackFrame,
-    _err: u64,
-) {
-    // Capture the user's callee-saved GPRs IMMEDIATELY, before any Rust
-    // code can clobber them. With the `x86-interrupt` calling convention,
-    // these still hold the user's values at the first instruction of the
-    // handler body (caller-saved regs are spilled by the entry stub but
-    // callee-saved are preserved across the Rust call boundary).
-    // `panic_diag::capture_registers` runs deeper in the call chain, so
-    // r12-r15 there reflect kernel state, not the user's view.
-    let user_r12: u64;
-    let user_r13: u64;
-    let user_r14: u64;
-    let user_r15: u64;
-    let user_rbx: u64;
-    let user_rbp: u64;
-    unsafe {
-        core::arch::asm!(
-            "mov {0}, rbx",
-            "mov {1}, rbp",
-            "mov {2}, r12",
-            "mov {3}, r13",
-            "mov {4}, r14",
-            "mov {5}, r15",
-            out(reg) user_rbx,
-            out(reg) user_rbp,
-            out(reg) user_r12,
-            out(reg) user_r13,
-            out(reg) user_r14,
-            out(reg) user_r15,
-            options(nostack, preserves_flags),
-        );
-    }
-    // Clear AC AFTER the user-GPR capture above (a `call` would preserve the
-    // callee-saved regs being snapshotted, but keep the snapshot asm strictly
-    // first to be safe), so SMAP enforces for the rest of the handler. See M1.
+/// `#GP` body — Phase 110 A.3b moved this onto the KPTI-aware naked
+/// `general_protection_fault_entry` stub. The stub's `kpti_save_gprs` already
+/// captured the user's GPRs into `frame.gprs` before any Rust prologue ran, so
+/// the old inline-asm callee-saved snapshot is gone (`frame.gprs[i]` order:
+/// `[rax, rbx, rcx, rdx, rsi, rdi, rbp, r8, r9, r10, r11, r12, r13, r14, r15]`).
+/// The error code is `frame.error_code`.
+#[unsafe(no_mangle)]
+extern "C" fn general_protection_fault_body(frame: &mut TrapFrameErr) {
     clac_on_irq_entry();
+    let err = frame.error_code;
     // Check if the fault came from ring 3.
-    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+    if frame.from_user() {
         let pid = crate::process::current_pid();
         _panic_print(format_args!(
-            "[int] userspace GPF: pid={} — process killed\n{:?}\n",
-            pid, stack_frame
+            "[int] userspace GPF: pid={} rip={:#x} cs={:#x} rflags={:#x} rsp={:#x} — process killed\n",
+            pid, frame.rip, frame.cs, frame.rflags, frame.rsp,
         ));
         _panic_print(format_args!(
             "[int] user GPRs at fault: rbx={:#018x} rbp={:#018x} r12={:#018x} r13={:#018x} r14={:#018x} r15={:#018x}\n",
-            user_rbx, user_rbp, user_r12, user_r13, user_r14, user_r15
+            frame.gprs[1],
+            frame.gprs[6],
+            frame.gprs[11],
+            frame.gprs[12],
+            frame.gprs[13],
+            frame.gprs[14],
         ));
         if crate::smp::is_per_core_ready() {
             let task_idx = crate::smp::per_core()
@@ -2196,41 +2080,94 @@ extern "x86-interrupt" fn general_protection_fault_handler(
                 ));
             }
         }
-        let selector_idx = _err >> 3;
-        let table = (_err >> 1) & 3;
-        let external = _err & 1;
+        let selector_idx = err >> 3;
+        let table = (err >> 1) & 3;
+        let external = err & 1;
         _panic_print(format_args!(
             "[int] GPF error_code={:#x} (selector_idx={}, table={}, external={})\n",
-            _err, selector_idx, table, external
+            err, selector_idx, table, external
         ));
         panic_diag::dump_crash_context();
         crate::trace::dump_trace_rings();
+        // Bring-up diagnostic: freeze on-screen (serial-free) before the kill.
+        bringup_freeze_on_user_fault("#GP", pid, frame.rip, frame.rsp, err);
         // Store the PID and redirect to the kill trampoline (same pattern as
-        // page_fault_handler — no blocking allowed inside an ISR).
+        // page_fault_body — no blocking allowed inside an ISR).
         FAULT_KILL_PID.store(pid, Ordering::Relaxed);
-        // SAFETY: same as page_fault_handler above.
+        // Run the kill trampoline on the current kernel stack, NOT the user RSP
+        // saved in the frame. Redirecting to a ring-0 CS means the stub's exit
+        // switch keeps the kernel CR3 (no user-CR3 flip on a kernel return).
         let kernel_rsp: u64;
         unsafe {
             core::arch::asm!("mov {}, rsp", out(reg) kernel_rsp);
         }
-        unsafe {
-            stack_frame.as_mut().update(|f| {
-                f.instruction_pointer = VirtAddr::new(fault_kill_trampoline as *const () as u64);
-                f.code_segment = gdt::kernel_code_selector();
-                f.cpu_flags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG;
-                f.stack_pointer = VirtAddr::new(kernel_rsp);
-                f.stack_segment = gdt::kernel_data_selector();
-            });
-        }
+        frame.rip = fault_kill_trampoline as *const () as u64;
+        frame.cs = u64::from(gdt::kernel_code_selector().0);
+        frame.rflags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG.bits();
+        frame.rsp = kernel_rsp;
+        frame.ss = u64::from(gdt::kernel_data_selector().0);
         return;
     }
-    _panic_print(format_args!("[int] GPF: {:?}\n", stack_frame));
-    let selector_idx = _err >> 3;
-    let table = (_err >> 1) & 3;
-    let external = _err & 1;
+    _panic_print(format_args!(
+        "[int] GPF (ring 0): rip={:#x} cs={:#x} rflags={:#x} rsp={:#x}\n",
+        frame.rip, frame.cs, frame.rflags, frame.rsp,
+    ));
+    let selector_idx = err >> 3;
+    let table = (err >> 1) & 3;
+    let external = err & 1;
     _panic_print(format_args!(
         "[int] GPF error_code={:#x} (selector_idx={}, table={}, external={})\n",
-        _err, selector_idx, table, external
+        err, selector_idx, table, external
+    ));
+    panic_diag::dump_crash_context();
+    crate::trace::dump_trace_rings();
+    crate::hlt_loop();
+}
+
+/// Phase 110 Track B.3 — #CP (Control-Protection, vector 21) handler body.
+///
+/// A `#CP` fires when a hardware CFI check fails — for shadow stacks, a `RET`
+/// whose return address on the data stack disagrees with the shadow stack (a
+/// return-address overwrite the stack canary missed). It carries an error code
+/// whose low bits identify the sub-cause (1 = NEAR-RET, 2 = FAR-RET/IRET,
+/// 3 = ENDBR/missing-endbranch, etc.). m3OS enables only *user* shadow stacks,
+/// so a ring-3 `#CP` is a caught ROP/overwrite: kill the process (Linux
+/// delivers SIGSEGV/`SEGV_CPERR`). A ring-0 `#CP` is a kernel CFI bug — halt.
+///
+/// Only ever fires on CET silicon (QEMU models no CET), so this is Dell-only in
+/// practice; the stub + registration are inert on every QEMU boot.
+#[unsafe(no_mangle)]
+extern "C" fn control_protection_fault_body(frame: &mut TrapFrameErr) {
+    clac_on_irq_entry();
+    let err = frame.error_code;
+    if frame.from_user() {
+        let pid = crate::process::current_pid();
+        _panic_print(format_args!(
+            "[int] userspace #CP (CET control-protection): pid={} rip={:#x} rsp={:#x} err={:#x} \
+             (shadow-stack/CFI violation — return-address overwrite) — process killed\n",
+            pid, frame.rip, frame.rsp, err,
+        ));
+        panic_diag::dump_crash_context();
+        crate::trace::dump_trace_rings();
+        // Bring-up diagnostic: freeze on-screen (serial-free) before the kill.
+        bringup_freeze_on_user_fault("#CP", pid, frame.rip, frame.rsp, err);
+        FAULT_KILL_PID.store(pid, Ordering::Relaxed);
+        // Redirect to the ring-0 kill trampoline on the current kernel stack
+        // (identical pattern to page_fault_body / general_protection_fault_body).
+        let kernel_rsp: u64;
+        unsafe {
+            core::arch::asm!("mov {}, rsp", out(reg) kernel_rsp);
+        }
+        frame.rip = fault_kill_trampoline as *const () as u64;
+        frame.cs = u64::from(gdt::kernel_code_selector().0);
+        frame.rflags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG.bits();
+        frame.rsp = kernel_rsp;
+        frame.ss = u64::from(gdt::kernel_data_selector().0);
+        return;
+    }
+    _panic_print(format_args!(
+        "[int] KERNEL #CP (control-protection): rip={:#x} rsp={:#x} err={:#x} — kernel CFI bug\n",
+        frame.rip, frame.rsp, err,
     ));
     panic_diag::dump_crash_context();
     crate::trace::dump_trace_rings();
@@ -2250,10 +2187,10 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 /// kstack/heap data pointers are GiBs away and filtered out. Boyer–Moore
 /// majority voting finds the most-repeated address in O(1) space; the printed
 /// `delta` (addr − anchor) resolves offline via
-/// `addr2line -e kernel $((<elf vaddr of double_fault_handler> + delta))`.
+/// `addr2line -e kernel $((<elf vaddr of double_fault_body> + delta))`.
 fn dump_kstack_overflow_backtrace(slot: usize, faulting_rsp: u64) {
     let (usable_base, top) = crate::task::kstack::slot_usable_bounds(slot);
-    let anchor = double_fault_handler as *const () as u64;
+    let anchor = double_fault_body as *const () as u64;
     const WINDOW: u64 = 16 * 1024 * 1024;
     let is_text = |v: u64| -> bool {
         let d = v.wrapping_sub(anchor) as i64;
@@ -2365,7 +2302,13 @@ fn dump_kstack_overflow_backtrace(slot: usize, faulting_rsp: u64) {
     }
 }
 
-extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame, _err: u64) -> ! {
+/// `#DF` body — Phase 110 A.3b moved this onto the KPTI-aware **paranoid** naked
+/// `double_fault_entry` stub (IST stack; can interrupt either ring, so the stub
+/// saves/restores the entry CR3 rather than ring-testing). Takes the full-GPR
+/// [`TrapFrameErr`] (the CPU pushes a 0 error code for #DF). `-> !`: never
+/// returns to the stub (halts or hands off to `fault_kill_trampoline`).
+#[unsafe(no_mangle)]
+extern "C" fn double_fault_body(frame: &mut TrapFrameErr) -> ! {
     // Track D: a #DF whose faulting context's RSP sits in a kstack guard page is
     // a kernel-stack overflow that *escalated* — the guard-page #PF couldn't push
     // its frame onto the exhausted stack, so it double-faulted. We are now on the
@@ -2373,7 +2316,7 @@ extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame,
     // we can run the kill path directly (no stack switch needed) and reschedule,
     // converting a previously-fatal #DF into a SIGSEGV of the offending process.
     // See docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md.
-    let faulting_rsp = stack_frame.stack_pointer.as_u64();
+    let faulting_rsp = frame.rsp;
     if let Some(slot) = crate::task::kstack::classify_guard_page_fault(faulting_rsp)
         && crate::smp::is_per_core_ready()
     {
@@ -2395,11 +2338,11 @@ extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame,
         }
     }
 
-    _panic_print(format_args!("[int] DOUBLE FAULT: {:?}\n", stack_frame));
     _panic_print(format_args!(
-        "[int] IST RSP={:#x}\n",
-        stack_frame.stack_pointer.as_u64()
+        "[int] DOUBLE FAULT: rip={:#x} cs={:#x} rflags={:#x} rsp={:#x}\n",
+        frame.rip, frame.cs, frame.rflags, frame.rsp,
     ));
+    _panic_print(format_args!("[int] IST RSP={:#x}\n", frame.rsp));
     panic_diag::dump_crash_context();
     crate::trace::dump_trace_rings();
     crate::hlt_loop();
@@ -3128,7 +3071,8 @@ fn ps2_drain_all_bytes() {
     }
 }
 
-extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
+#[unsafe(no_mangle)]
+extern "C" fn keyboard_body(frame: &mut TrapFrame) {
     clac_on_irq_entry(); // SMAP enforce in-ISR when interrupted from ring 3 (M1)
     super::ps2::IRQ1_ENTRIES.fetch_add(1, Ordering::Relaxed);
     ps2_drain_all_bytes();
@@ -3141,7 +3085,7 @@ extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
                 .notify_end_of_interrupt(InterruptIndex::Keyboard as u8);
         }
     }
-    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+    assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
 }
 
 // ---------------------------------------------------------------------------
@@ -3163,7 +3107,8 @@ extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
 /// asserted enable bits is what de-asserts the level-triggered line before
 /// the EOI — without it the SCI would re-fire in a storm until the ring-3
 /// `acpid` serviced the event.
-extern "x86-interrupt" fn sci_handler(stack_frame: InterruptStackFrame) {
+#[unsafe(no_mangle)]
+extern "C" fn sci_body(frame: &mut TrapFrame) {
     clac_on_irq_entry();
     let _ = crate::acpi::sci::sci_demux();
     if USING_APIC.load(Ordering::Relaxed) {
@@ -3174,10 +3119,11 @@ extern "x86-interrupt" fn sci_handler(stack_frame: InterruptStackFrame) {
                 .notify_end_of_interrupt(InterruptIndex::Sci as u8);
         }
     }
-    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+    assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
 }
 
-extern "x86-interrupt" fn mouse_handler(stack_frame: InterruptStackFrame) {
+#[unsafe(no_mangle)]
+extern "C" fn mouse_body(frame: &mut TrapFrame) {
     clac_on_irq_entry(); // SMAP enforce in-ISR when interrupted from ring 3 (M1)
     super::ps2::IRQ12_ENTRIES.fetch_add(1, Ordering::Relaxed);
     // Both kbd and mouse bytes drain through the same helper — see the
@@ -3193,16 +3139,17 @@ extern "x86-interrupt" fn mouse_handler(stack_frame: InterruptStackFrame) {
                 .notify_end_of_interrupt(InterruptIndex::Mouse as u8);
         }
     }
-    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+    assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
 }
 
 // ---------------------------------------------------------------------------
 // APIC spurious interrupt handler
 // ---------------------------------------------------------------------------
 
-extern "x86-interrupt" fn spurious_handler(stack_frame: InterruptStackFrame) {
+#[unsafe(no_mangle)]
+extern "C" fn spurious_body(frame: &mut TrapFrame) {
     // Spurious interrupt (vector 0xFF) — no EOI must be sent.
-    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+    assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
 }
 
 // ---------------------------------------------------------------------------
@@ -3268,10 +3215,11 @@ pub unsafe extern "C" fn reschedule_ipi_handler_kernel(
 ///
 /// Invalidates a specific page on this core's TLB. The target address and
 /// synchronization are managed by the TLB shootdown request in `smp::tlb`.
-extern "x86-interrupt" fn tlb_shootdown_ipi_handler(stack_frame: InterruptStackFrame) {
+#[unsafe(no_mangle)]
+extern "C" fn tlb_shootdown_ipi_body(frame: &mut TrapFrame) {
     crate::smp::tlb::handle_tlb_shootdown_ipi();
     super::apic::lapic_eoi();
-    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+    assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
 }
 
 /// NMI handler — services TLB shootdown requests via NMI delivery.
@@ -3305,7 +3253,14 @@ extern "x86-interrupt" fn tlb_shootdown_ipi_handler(stack_frame: InterruptStackF
 ///
 /// NMI does **not** require `lapic_eoi()` — NMI is delivered out of
 /// band of the LAPIC ISR/IRR machinery.
-extern "x86-interrupt" fn nmi_handler(_stack_frame: InterruptStackFrame) {
+/// `NMI` body — Phase 110 A.3b moved this onto the KPTI-aware **paranoid** naked
+/// `nmi_entry` stub. NMI is the cross-core TLB-shootdown receiver and fires
+/// regardless of ring or CR3 (including inside another stub's brief user-CR3
+/// window), so the stub cannot ring-test: it saves the entry CR3, switches to
+/// the kernel CR3, and restores the saved CR3 on exit (Linux `paranoid_entry`).
+/// `frame` is unused today (kept for parity / future register inspection).
+#[unsafe(no_mangle)]
+extern "C" fn nmi_body(_frame: &mut TrapFrame) {
     // Phase 111 (Track C.4) — kgdb all-stop. When the in-kernel GDB stub owns
     // the machine, every OTHER core parks here (spins until released) so the
     // developer inspects a frozen system, then resumes exactly where it was.
@@ -3353,17 +3308,19 @@ extern "x86-interrupt" fn nmi_handler(_stack_frame: InterruptStackFrame) {
 /// active and also services slab-local reclaim handshakes when requested. The
 /// handler always runs on the owning core, so mutating CPU-local cache state is
 /// safe.
-extern "x86-interrupt" fn cache_drain_ipi_handler(stack_frame: InterruptStackFrame) {
+#[unsafe(no_mangle)]
+extern "C" fn cache_drain_ipi_body(frame: &mut TrapFrame) {
     crate::mm::frame_allocator::handle_cache_drain_ipi();
     super::apic::lapic_eoi();
-    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+    assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
 }
 
 // ---------------------------------------------------------------------------
 // Serial (COM1) IRQ handler — vector 36
 // ---------------------------------------------------------------------------
 
-extern "x86-interrupt" fn serial_handler(stack_frame: InterruptStackFrame) {
+#[unsafe(no_mangle)]
+extern "C" fn serial_body(frame: &mut TrapFrame) {
     clac_on_irq_entry(); // SMAP enforce in-ISR when interrupted from ring 3 (M1)
     crate::serial::handle_serial_irq();
 
@@ -3375,7 +3332,7 @@ extern "x86-interrupt" fn serial_handler(stack_frame: InterruptStackFrame) {
                 .notify_end_of_interrupt(InterruptIndex::Serial as u8);
         }
     }
-    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+    assert_preempt_count_zero_on_return_to_user_cs(frame.cs);
 }
 
 // ---------------------------------------------------------------------------
@@ -3557,7 +3514,7 @@ pub fn unregister_device_irq(vector: u8) {
 /// gate here covers every device IRQ — DRY-clean per the Engineering
 /// Practice Gates.
 #[inline(always)]
-fn dispatch_device_irq(vector: u8, stack_frame: &InterruptStackFrame) {
+fn dispatch_device_irq(vector: u8, cs: u64) {
     // A device IRQ can interrupt a userspace task running with AC=1; clear AC so
     // SMAP enforces while the (DMA-adjacent) device handler runs. No-op when the
     // IRQ interrupted kernel context (AC already 0). See M1.
@@ -3585,7 +3542,7 @@ fn dispatch_device_irq(vector: u8, stack_frame: &InterruptStackFrame) {
     if USING_APIC.load(Ordering::Relaxed) {
         super::apic::lapic_eoi();
     }
-    assert_preempt_count_zero_on_return_to_user(stack_frame);
+    assert_preempt_count_zero_on_return_to_user_cs(cs);
 }
 
 /// Test-only entry point into the device-IRQ dispatcher.
@@ -3598,76 +3555,929 @@ fn dispatch_device_irq(vector: u8, stack_frame: &InterruptStackFrame) {
 /// side effect. The function is `#[cfg(test)]`-gated so it does not ship in
 /// release builds.
 ///
-/// Synthesises a fresh `InterruptStackFrame` on the stack so the
-/// dispatch helper has a real reference to forward.  Tests run in ring 0
-/// (the kernel test harness boots before any userspace task), so the
-/// frame's CS naturally reflects ring 0 and the user-mode-return
-/// assertion is a no-op for the test path.
+/// Passes a ring-0 CS directly (Phase 110 A.3b dropped the `InterruptStackFrame`
+/// parameter for a raw `cs: u64`). Tests run in ring 0 (the kernel test harness
+/// boots before any userspace task), so the user-mode-return assertion is a
+/// no-op for the test path.
 #[cfg(test)]
 pub fn dispatch_device_irq_for_test(vector: u8) {
-    // Build a synthetic `InterruptStackFrame` whose CS encodes ring 0 —
-    // the user-mode-return assertion gate will skip it.  We never
-    // `iretq` through this frame; it exists only to satisfy
-    // `dispatch_device_irq`'s signature.
-    let frame = InterruptStackFrame::new(
-        VirtAddr::new(0),
-        gdt::kernel_code_selector(),
-        x86_64::registers::rflags::RFlags::empty(),
-        VirtAddr::new(0),
-        gdt::kernel_data_selector(),
-    );
-    dispatch_device_irq(vector, &frame);
+    // Pass a ring-0 CS so the user-mode-return assertion gate skips it — the
+    // test harness boots before any userspace task.
+    dispatch_device_irq(vector, u64::from(gdt::kernel_code_selector().0));
 }
 
-// Stubs — one per vector slot. The IDT requires a real
-// `extern "x86-interrupt"` function at each vector; we cannot generate them
-// at runtime. Each stub thunks to `dispatch_device_irq` with a compile-time
-// vector number.
-extern "x86-interrupt" fn device_irq_stub_0(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE, &stack_frame);
+/// The `extern "C"` body every `device_irq_entry_N` naked stub calls after its
+/// KPTI entry-CR3 switch. `vector` is the absolute IDT vector the stub baked in;
+/// `frame.cs` drives the user-return preempt assertion.
+#[unsafe(no_mangle)]
+extern "C" fn device_irq_body(frame: &mut TrapFrame, vector: u64) {
+    dispatch_device_irq(vector as u8, frame.cs);
 }
-extern "x86-interrupt" fn device_irq_stub_1(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 1, &stack_frame);
+
+// ---------------------------------------------------------------------------
+// Phase 110 Track A.3b — KPTI-aware naked IRQ entry section
+// ---------------------------------------------------------------------------
+//
+// Every ring-3-reachable **maskable** IRQ / IPI vector enters through a naked
+// stub here instead of an `extern "x86-interrupt"` handler. The reason is the
+// KPTI *exit* switch: on a return to ring 3 the CR3 must flip to the user half
+// in the last instruction before `iretq`, and an `extern "x86-interrupt"`
+// handler ends in a compiler-generated `iretq` we cannot precede. So each stub
+// owns the whole `entry → body → exit → iretq` sequence (the `timer_entry` /
+// `bp_entry` model), and its exit switch runs immediately before its `iretq`.
+//
+// The whole section is page-aligned (`.balign 4096` both ends) and lives in
+// `.text.kpti_irq_entry`, which `mm::kpti` maps into every user PML4 as
+// entry-set text (r-x): when KPTI is active and the interrupt fires while ring 3
+// runs, the CPU begins executing the stub on the *user* CR3, so the stub's
+// instructions up to the `mov cr3` (and, on the way out, from the exit `mov cr3`
+// through `iretq`) must be user-mapped or the very first fetch #PFs.
+//
+// **CR3 discipline (both macros are no-ops until A.4 activates KPTI).**
+//   - Entry: after saving the GPRs, if the frame came from ring 3 (`cs & 3`)
+//     and KPTI is active (`gs:[kpti_user_cr3] != 0`), load `gs:[kpti_kernel_cr3]`
+//     → the full kernel map (kstacks below the top page become reachable) before
+//     the body runs. A ring-0 interruption skips the switch (already kernel CR3).
+//   - Exit: symmetric — re-test the (possibly body-rewritten, e.g. a fault
+//     redirect to a ring-0 trampoline) `cs`; if it is ring 3 and KPTI is active,
+//     load `gs:[kpti_user_cr3]` in the instruction before `iretq`. The exit
+//     re-reads `cs` from the frame rather than assuming ring 3 so a body that
+//     redirected to a kernel continuation returns on the kernel CR3.
+//
+// **Phase 110 hardening — the per-CPU trampoline stack.** When KPTI is active,
+// RSP0 points at this core's trampoline-stack top (`gs:[kpti_tramp_top]`, the
+// m3OS `cpu_entry_area` entry stack), NOT at the task kstack: the CPU pushes
+// the ring-3 frame there on the *user* CR3, the stub pushes the GPRs after it,
+// and the entry switch — once on the kernel CR3 — copies the whole 20/21-qword
+// block to `gs:[SYSCALL_STACK_TOP] - 160/168`, exactly where it landed
+// pre-hardening (RSP0 was the kstack top then), so bodies, the preempt
+// capture, and the fault redirects see a byte-identical machine state. The
+// trampoline stack's frames only ever hold ring-3 register state, so its
+// user-half mapping (unlike the kstack top page it replaces) exposes no
+// kernel data. Maskable IRQ gates enter with IF=0 and the copy touches only
+// gs-reachable + kstack memory (no faults), so nothing nests on the
+// trampoline stack before the pivot (NMI/#DF use IST stacks + the A.3b
+// paranoid path; a nested NMI's paranoid entry/exit restores CR3 and touches
+// neither the trampoline stack nor rsp). While KPTI is inactive RSP0 stays
+// the task kstack top and the copy branch is never taken — the pre-hardening
+// behaviour, byte for byte.
+//
+// While KPTI is inactive (`mitigations=off` / `auto` on `RDCL_NO` silicon),
+// `gs:[kpti_user_cr3]` is 0 on every core, so both switches fall through their
+// `jz` — behaviourally identical to the old `extern "x86-interrupt"` handlers.
+// Since A.4 the default QEMU boot (`auto`, `rdcl_no=false`) is KPTI-active, so
+// the IRQ-driven gates (keyboard/serial input, device IRQs, TLB shootdowns)
+// exercise the live switches on every boot.
+//
+// `kpti_save_gprs` push order (r15 first → rax last) puts rax at the lowest
+// address (`gprs[0]`), matching `TrapFrame`. Alignment: re-align the stack to 16
+// with the `r12` trick (callee-saved across the call; `pop r12` in the restore
+// reloads the interrupted r12 from its frame slot), the same shape `bp_entry`
+// uses — correct regardless of the RSP0 / kernel-stack entry alignment.
+core::arch::global_asm!(
+    // Bind the `const` operands to assembler symbols the macro bodies reference
+    // (the same `.equ …, {operand}` indirection the syscall entry block uses).
+    ".equ IRQ_OFF_KERNEL_CR3, {irq_off_kernel_cr3}",
+    ".equ IRQ_OFF_USER_CR3,   {irq_off_user_cr3}",
+    ".equ IRQ_OFF_STACK_TOP,  {irq_off_stack_top}",
+    ".equ IRQ_OFF_SCRATCH,    {irq_off_scratch}",
+    ".equ IRQ_OFF_SCRATCH2,   {irq_off_scratch2}",
+    ".equ IRQ_OFF_TRAMP_TOP,  {irq_off_tramp_top}",
+    ".equ IRQ_DEV_BASE,       {irq_dev_base}",
+    "",
+    ".macro kpti_save_gprs",
+    "push r15",
+    "push r14",
+    "push r13",
+    "push r12",
+    "push r11",
+    "push r10",
+    "push r9",
+    "push r8",
+    "push rbp",
+    "push rdi",
+    "push rsi",
+    "push rdx",
+    "push rcx",
+    "push rbx",
+    "push rax",
+    ".endm",
+    "",
+    ".macro kpti_restore_gprs",
+    "pop rax",
+    "pop rbx",
+    "pop rcx",
+    "pop rdx",
+    "pop rsi",
+    "pop rdi",
+    "pop rbp",
+    "pop r8",
+    "pop r9",
+    "pop r10",
+    "pop r11",
+    "pop r12",
+    "pop r13",
+    "pop r14",
+    "pop r15",
+    ".endm",
+    "",
+    // Phase 110 hardening — copy the saved block (15 GPRs + [error code +]
+    // 5-word iretq frame = \\words qwords, rsp-based) from the per-CPU
+    // trampoline stack to the task kstack top, and pivot rsp there. Runs on
+    // the kernel CR3 (both stacks mapped). Destination = the exact address
+    // the block landed at pre-hardening (RSP0 was the kstack top then), so
+    // everything downstream is unchanged. Clobbers rsi/rdi/rcx + DF — their
+    // interrupted values are in the copied block and are restored from the
+    // kstack copy by kpti_restore_gprs; the explicit `cld` matters because
+    // ring 3 controls DF at delivery. IF=0 throughout (interrupt gates), and
+    // a nested NMI (IST + paranoid) preserves all of this state.
+    r".macro kpti_copy_frame_to_kstack words",
+    r"cld",
+    r"mov rsi, rsp",
+    r"mov rdi, gs:[IRQ_OFF_STACK_TOP]",
+    r"sub rdi, 8*\words",
+    r"mov rsp, rdi",
+    r"mov ecx, \words",
+    r"rep movsq",
+    r".endm",
+    "",
+    // The trampoline-stack copy for the PARANOID non-IST vectors (#PF/#GP/
+    // #BP/#DB): their CR3 load is unconditional-when-active (not ring-gated),
+    // so the copy needs its own "came from ring 3 on the trampoline stack"
+    // test — ring-3 cs in the frame AND a published user CR3 (⟺ RSP0 was the
+    // trampoline stack at delivery). Ring-0 faults pushed on the interrupted
+    // stack and are left in place.
+    r".macro kpti_entry_copy_if_user cs_off, words",
+    r"test qword ptr [rsp + \cs_off], 3",
+    r"jz 15f",
+    r"mov rax, gs:[IRQ_OFF_USER_CR3]",
+    r"test rax, rax",
+    r"jz 15f",
+    r"kpti_copy_frame_to_kstack \words",
+    r"15:",
+    r".endm",
+    "",
+    // Entry: switch to the kernel CR3 iff (from ring 3) AND (KPTI active).
+    // Runs after kpti_save_gprs, so cs is at [rsp+128]. Clobbers rax (its user
+    // value is already saved in the frame); the body gets its frame via rdi.
+    // When the switch is taken, the frame is on the per-CPU trampoline stack
+    // (RSP0 while KPTI is active) — copy it to the task kstack and pivot.
+    ".macro kpti_entry_switch",
+    "test qword ptr [rsp + 128], 3",
+    "jz 2f",
+    "mov rax, gs:[IRQ_OFF_USER_CR3]",
+    "test rax, rax",
+    "jz 2f",
+    "mov rax, gs:[IRQ_OFF_KERNEL_CR3]",
+    "mov cr3, rax",
+    "kpti_copy_frame_to_kstack 20",
+    "2:",
+    ".endm",
+    "",
+    // Exit + iretq (Phase 110 hardening). Replaces the old "flip CR3, then
+    // pop GPRs + iretq from the (user-mapped) kstack top page" tail: the GPR
+    // pops now happen on the KERNEL CR3 from the kstack copy, then the 5-word
+    // iretq frame is copied to the per-CPU trampoline stack, rsp pivots
+    // there, the CR3 flips, and `iretq` reads the frame from the trampoline
+    // stack's user-mapped top page — so the kstack needs no user-half mapping
+    // at all (dropped in 21/n).
+    //
+    // The ring-3 + KPTI-active branch `cli`s first: the copy parks live
+    // values in the persistent per-core scratch slots and targets a per-core
+    // stack, so neither a maskable preemption (which could migrate cores, or
+    // let another task's syscall clobber `kpti_scratch`) nor a post-flip
+    // delivery (the A.4 ring-0/user-CR3 #DF wedge) may interleave; `iretq`
+    // restores the task's own IF from the frame. A nested NMI (IST +
+    // paranoid, r15-based) preserves all of this state. The post-flip window
+    // stays two instructions, as before. The cs re-test keeps the body's
+    // fatal-fault redirects working: a frame rewritten to a ring-0 kill
+    // trampoline takes the plain branch — iretq from the kstack on the
+    // kernel CR3, exactly as pre-hardening.
+    ".macro kpti_exit_iretq",
+    "test qword ptr [rsp + 128], 3",
+    "jz 3f",
+    "mov rax, gs:[IRQ_OFF_USER_CR3]",
+    "test rax, rax",
+    "jz 3f",
+    "cli",
+    "kpti_restore_gprs",
+    // rsp → the 5-word iretq frame on the kstack (kernel CR3). Copy it to
+    // the trampoline-stack top via the two scratch slots (all GPRs are live).
+    "mov gs:[IRQ_OFF_SCRATCH], rax",
+    "mov gs:[IRQ_OFF_SCRATCH2], rbx",
+    "mov rbx, gs:[IRQ_OFF_TRAMP_TOP]",
+    "sub rbx, 40",
+    "mov rax, [rsp + 0]",
+    "mov [rbx + 0], rax", // rip
+    "mov rax, [rsp + 8]",
+    "mov [rbx + 8], rax", // cs
+    "mov rax, [rsp + 16]",
+    "mov [rbx + 16], rax", // rflags
+    "mov rax, [rsp + 24]",
+    "mov [rbx + 24], rax", // user rsp
+    "mov rax, [rsp + 32]",
+    "mov [rbx + 32], rax", // ss
+    "mov rsp, rbx",
+    "mov rbx, gs:[IRQ_OFF_SCRATCH2]",
+    "mov rax, gs:[IRQ_OFF_USER_CR3]",
+    "mov cr3, rax",
+    "mov rax, gs:[IRQ_OFF_SCRATCH]",
+    "iretq",
+    // Ring-0 return or KPTI inactive: pop + iretq in place (kernel CR3, or
+    // the whole path is inert), byte-for-byte the pre-hardening tail.
+    "3:",
+    "kpti_restore_gprs",
+    "iretq",
+    ".endm",
+    "",
+    // Error-code variants (#PF/#GP): the CPU pushed an 8-byte error code below
+    // the iretq frame, so after kpti_save_gprs cs sits at [rsp+136], not
+    // [rsp+128], and the copied block is 21 qwords.
+    ".macro kpti_entry_switch_err",
+    "test qword ptr [rsp + 136], 3",
+    "jz 4f",
+    "mov rax, gs:[IRQ_OFF_USER_CR3]",
+    "test rax, rax",
+    "jz 4f",
+    "mov rax, gs:[IRQ_OFF_KERNEL_CR3]",
+    "mov cr3, rax",
+    "kpti_copy_frame_to_kstack 21",
+    "4:",
+    ".endm",
+    "",
+    // Error-code variant of kpti_exit_iretq (#PF/#GP): cs sits at [rsp+136]
+    // pre-restore, and both branches discard the CPU error code after the
+    // GPR pops.
+    ".macro kpti_exit_iretq_err",
+    "test qword ptr [rsp + 136], 3",
+    "jz 5f",
+    "mov rax, gs:[IRQ_OFF_USER_CR3]",
+    "test rax, rax",
+    "jz 5f",
+    "cli",
+    "kpti_restore_gprs",
+    "add rsp, 8", // discard error code
+    "mov gs:[IRQ_OFF_SCRATCH], rax",
+    "mov gs:[IRQ_OFF_SCRATCH2], rbx",
+    "mov rbx, gs:[IRQ_OFF_TRAMP_TOP]",
+    "sub rbx, 40",
+    "mov rax, [rsp + 0]",
+    "mov [rbx + 0], rax", // rip
+    "mov rax, [rsp + 8]",
+    "mov [rbx + 8], rax", // cs
+    "mov rax, [rsp + 16]",
+    "mov [rbx + 16], rax", // rflags
+    "mov rax, [rsp + 24]",
+    "mov [rbx + 24], rax", // user rsp
+    "mov rax, [rsp + 32]",
+    "mov [rbx + 32], rax", // ss
+    "mov rsp, rbx",
+    "mov rbx, gs:[IRQ_OFF_SCRATCH2]",
+    "mov rax, gs:[IRQ_OFF_USER_CR3]",
+    "mov cr3, rax",
+    "mov rax, gs:[IRQ_OFF_SCRATCH]",
+    "iretq",
+    "5:",
+    "kpti_restore_gprs",
+    "add rsp, 8", // discard error code
+    "iretq",
+    ".endm",
+    "",
+    // Paranoid entry/exit for NMI + #DF (IST stacks). They can interrupt EITHER
+    // ring — including ring-0 code already on the user CR3 inside another stub's
+    // switch window — so a `cs`-based ring test is wrong. Instead save the entry
+    // CR3 in r15 (callee-saved across the body call; the interrupted r15 lives in
+    // the frame and is restored by kpti_restore_gprs) and unconditionally load
+    // the kernel CR3 when KPTI is active; the exit restores the saved CR3. When
+    // KPTI is inactive (`kpti_kernel_cr3 == 0`) neither touches CR3.
+    ".macro kpti_paranoid_entry",
+    "mov r15, cr3",
+    "mov rax, gs:[IRQ_OFF_KERNEL_CR3]",
+    "test rax, rax",
+    "jz 6f",
+    "mov cr3, rax",
+    "6:",
+    ".endm",
+    "",
+    ".macro kpti_paranoid_exit",
+    "mov rax, gs:[IRQ_OFF_KERNEL_CR3]",
+    "test rax, rax",
+    "jz 7f",
+    "mov cr3, r15",
+    "7:",
+    ".endm",
+    "",
+    // A no-error-code vector whose body is `extern "C" fn(&mut TrapFrame)`.
+    r".macro kpti_simple_stub name, body",
+    r".global \name",
+    r"\name:",
+    r"kpti_save_gprs",
+    r"kpti_entry_switch",
+    r"cld",
+    r"mov rdi, rsp",
+    r"mov r12, rsp",
+    r"and rsp, -16",
+    r"call \body",
+    r"mov rsp, r12",
+    r"kpti_exit_iretq",
+    r".endm",
+    "",
+    // A device-IRQ vector: body is `extern "C" fn(&mut TrapFrame, vector)`.
+    r".macro kpti_device_stub num",
+    r".global device_irq_entry_\num",
+    r"device_irq_entry_\num:",
+    r"kpti_save_gprs",
+    r"kpti_entry_switch",
+    r"cld",
+    r"mov rdi, rsp",
+    r"mov esi, IRQ_DEV_BASE + \num",
+    r"mov r12, rsp",
+    r"and rsp, -16",
+    r"call device_irq_body",
+    r"mov rsp, r12",
+    r"kpti_exit_iretq",
+    r".endm",
+    "",
+    ".section .text.kpti_irq_entry, \"ax\"",
+    ".balign 4096",
+    ".global kpti_irq_entry_start",
+    "kpti_irq_entry_start:",
+    "",
+    // --- timer_entry (Phase 57d Track B; two-path, CR3 on the user path) ------
+    // CS is at [rsp+8] before any push on both the ring-0 (3-field) and ring-3
+    // (5-field) IRQ frames.
+    ".global timer_entry",
+    "timer_entry:",
+    "test qword ptr [rsp+8], 3",
+    "jz .Ltimer_kernel",
+    // User path (ring 3): switch to kernel CR3 on entry, back to user on exit.
+    "kpti_save_gprs",
+    "kpti_entry_switch",
+    "cld",
+    "mov rdi, rsp", // &mut PreemptTrapFrameUser
+    "call timer_handler_user",
+    "kpti_exit_iretq", // re-tests cs — group-exit redirect may have rewritten it
+    // Kernel path (ring 0): already on the kernel CR3, no switch.
+    ".Ltimer_kernel:",
+    "kpti_save_gprs",
+    "lea rsi, [rsp + 144]", // captured_kernel_rsp = rsp + 15*8 + 3*8
+    "cld",
+    "mov rdi, rsp", // &mut PreemptTrapFrameKernel
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call timer_handler_kernel",
+    "mov rsp, r12",
+    "kpti_restore_gprs",
+    "iretq",
+    "",
+    // --- reschedule_ipi_entry -------------------------------------------------
+    ".global reschedule_ipi_entry",
+    "reschedule_ipi_entry:",
+    "test qword ptr [rsp+8], 3",
+    "jz .Lrescheduleipi_kernel",
+    "kpti_save_gprs",
+    "kpti_entry_switch",
+    "cld",
+    "mov rdi, rsp",
+    "call reschedule_ipi_handler_user",
+    "kpti_exit_iretq",
+    ".Lrescheduleipi_kernel:",
+    "kpti_save_gprs",
+    "lea rsi, [rsp + 144]",
+    "cld",
+    "mov rdi, rsp",
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call reschedule_ipi_handler_kernel",
+    "mov rsp, r12",
+    "kpti_restore_gprs",
+    "iretq",
+    "",
+    // --- #BP / #DB (Phase 111 Track C.2; single layout, ring test in Rust) ----
+    //
+    // Phase 110 A.4 — **paranoid ENTRY** (not the `cs & 3` ring test). #BP/#DB
+    // are IF-independent exceptions that can fire while a KPTI trampoline is in
+    // its ring-0/user-CR3 window (a hardware breakpoint or `RFLAGS.TF`
+    // single-step trapping on a window instruction), where the ring test reads
+    // a ring-0 `cs` and would *skip* the switch, running the body on the user
+    // half → nested fault → `#DF`. The paranoid entry reads the actual CR3 and
+    // loads the kernel CR3 unconditionally (when active), so the body always
+    // runs on the full map. The EXIT stays the `cs`-based `kpti_exit_iretq`
+    // (ring-3 return → user CR3; ring-0 return → keep kernel CR3): a fault
+    // taken inside a window is non-resumable in production (the window
+    // instructions only touch mapped memory, so a real #PF there is a kernel
+    // bug that halts; TF/DR7 on kernel code exists only under the off-in-prod
+    // `kgdb`/`ptrace` features), so no ring-0 return ever needs the user CR3.
+    ".global bp_entry",
+    "bp_entry:",
+    "kpti_save_gprs",
+    "kpti_paranoid_entry",
+    // Phase 110 hardening: a ring-3 #BP was delivered on the trampoline stack
+    // (RSP0 while KPTI is active) — copy the frame to the task kstack. The
+    // paranoid CR3 load above already put us on the kernel map. Ring-0 #BP
+    // (kgdb freeze point) stays on the interrupted stack.
+    "kpti_entry_copy_if_user 128, 20",
+    "cld",
+    "mov rdi, rsp", // &mut DebugTrapFrame
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call bp_trap_handler",
+    "mov rsp, r12",
+    "kpti_exit_iretq",
+    "",
+    ".global db_entry",
+    "db_entry:",
+    "kpti_save_gprs",
+    "kpti_paranoid_entry",
+    // Ring-3 #DB (ptrace single-step) arrives on the trampoline stack — copy.
+    "kpti_entry_copy_if_user 128, 20",
+    "cld",
+    "mov rdi, rsp",
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call db_trap_handler",
+    "mov rsp, r12",
+    "kpti_exit_iretq",
+    "",
+    // --- #PF / #GP (error-code exceptions; body is `fn(&mut TrapFrameErr)`) ----
+    //
+    // Phase 110 A.4 — **paranoid ENTRY** (not `kpti_entry_switch_err`'s ring
+    // test). Like #BP/#DB, a #PF/#GP can arrive while a trampoline holds the
+    // user CR3 in ring 0 — e.g. a non-canonical/bad-frame `iretq`/`sysretq`
+    // faulting *inside* an exit window (ring-0 `cs`, `CR3 = user`). The old
+    // ring test skipped the switch there, ran the deep-diagnostic
+    // `page_fault_body` on the partial user half, and it re-faulted descending
+    // the kstack below the single user-mapped top page → `#DF`
+    // (observed under regression-suite load). Paranoid entry loads the kernel
+    // CR3 unconditionally, so the body runs on the full map regardless of how
+    // it was entered.
+    //
+    // The EXIT keeps `kpti_exit_iretq_err` (the `cs`-based test): this is what
+    // makes the body's **fatal-fault redirect** work — `page_fault_body` /
+    // `try_recover_kstack_overflow` rewrite the frame's `cs` to a ring-0 kill
+    // trampoline on a kernel stack, and the `cs`-based exit then keeps the
+    // kernel CR3 for that ring-0 target (a paranoid exit would instead restore
+    // the *saved* entry CR3 — the user half for a ring-3-origin fault — and run
+    // the kill trampoline unisolated). Genuine ring-3 faults still return on the
+    // user CR3 (ring-3 `cs`). `add rsp, 8` discards the CPU error code.
+    ".global page_fault_entry",
+    "page_fault_entry:",
+    "kpti_save_gprs",
+    "kpti_paranoid_entry",
+    // Phase 110 hardening: a ring-3 #PF (CoW/demand paging) was delivered on
+    // the trampoline stack (RSP0 while KPTI is active) — copy the 21-qword
+    // block (error code included) to the task kstack. Ring-0 faults —
+    // including the kstack-overflow recovery path and a paranoid-window
+    // fault — pushed on the interrupted stack and are left in place.
+    "kpti_entry_copy_if_user 136, 21",
+    "cld",
+    "mov rdi, rsp", // &mut TrapFrameErr
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call page_fault_body",
+    "mov rsp, r12",
+    "kpti_exit_iretq_err",
+    "",
+    ".global general_protection_fault_entry",
+    "general_protection_fault_entry:",
+    "kpti_save_gprs",
+    "kpti_paranoid_entry",
+    // Ring-3 #GP arrives on the trampoline stack — copy (see page_fault_entry).
+    "kpti_entry_copy_if_user 136, 21",
+    "cld",
+    "mov rdi, rsp",
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call general_protection_fault_body",
+    "mov rsp, r12",
+    "kpti_exit_iretq_err",
+    "",
+    // --- #CP (Control-Protection, vector 21; error code; Phase 110 B.3) --------
+    // Same shape as #GP: paranoid entry (a ring-3 #CP could in principle arrive
+    // while a trampoline holds the user CR3), the ring-3-only trampoline-stack
+    // copy, the error-code exit. Fires only on CET silicon (inert on QEMU).
+    ".global control_protection_fault_entry",
+    "control_protection_fault_entry:",
+    "kpti_save_gprs",
+    "kpti_paranoid_entry",
+    "kpti_entry_copy_if_user 136, 21",
+    "cld",
+    "mov rdi, rsp",
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call control_protection_fault_body",
+    "mov rsp, r12",
+    "kpti_exit_iretq_err",
+    "",
+    // --- NMI (paranoid; IST stack; no error code) -----------------------------
+    ".global nmi_entry",
+    "nmi_entry:",
+    "kpti_save_gprs",
+    "kpti_paranoid_entry",
+    "cld",
+    "mov rdi, rsp", // &mut TrapFrame
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call nmi_body",
+    "mov rsp, r12",
+    "kpti_paranoid_exit",
+    "kpti_restore_gprs",
+    "iretq",
+    "",
+    // --- #DF (paranoid; IST stack; CPU pushes a 0 error code; body is `-> !`) --
+    ".global double_fault_entry",
+    "double_fault_entry:",
+    "kpti_save_gprs",
+    "kpti_paranoid_entry",
+    "cld",
+    "mov rdi, rsp", // &mut TrapFrameErr
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call double_fault_body",
+    // double_fault_body is `-> !`; the tail below is unreachable but kept
+    // well-formed so the stub is a valid function.
+    "mov rsp, r12",
+    "kpti_paranoid_exit",
+    "kpti_restore_gprs",
+    "add rsp, 8",
+    "iretq",
+    "",
+    "kpti_simple_stub keyboard_entry, keyboard_body",
+    "kpti_simple_stub serial_entry, serial_body",
+    "kpti_simple_stub mouse_entry, mouse_body",
+    "kpti_simple_stub sci_entry, sci_body",
+    "kpti_simple_stub spurious_entry, spurious_body",
+    "kpti_simple_stub tlb_shootdown_ipi_entry, tlb_shootdown_ipi_body",
+    "kpti_simple_stub cache_drain_ipi_entry, cache_drain_ipi_body",
+    "",
+    "kpti_device_stub 0",
+    "kpti_device_stub 1",
+    "kpti_device_stub 2",
+    "kpti_device_stub 3",
+    "kpti_device_stub 4",
+    "kpti_device_stub 5",
+    "kpti_device_stub 6",
+    "kpti_device_stub 7",
+    "kpti_device_stub 8",
+    "kpti_device_stub 9",
+    "kpti_device_stub 10",
+    "kpti_device_stub 11",
+    "kpti_device_stub 12",
+    "kpti_device_stub 13",
+    "kpti_device_stub 14",
+    "kpti_device_stub 15",
+    "",
+    ".balign 4096",
+    ".global kpti_irq_entry_end",
+    "kpti_irq_entry_end:",
+    ".text",
+    irq_off_kernel_cr3 = const crate::smp::offsets::KPTI_KERNEL_CR3,
+    irq_off_user_cr3 = const crate::smp::offsets::KPTI_USER_CR3,
+    irq_off_stack_top = const crate::smp::offsets::SYSCALL_STACK_TOP,
+    irq_off_scratch = const crate::smp::offsets::KPTI_SCRATCH,
+    irq_off_scratch2 = const crate::smp::offsets::KPTI_SCRATCH2,
+    irq_off_tramp_top = const crate::smp::offsets::KPTI_TRAMP_TOP,
+    irq_dev_base = const DEVICE_IRQ_VECTOR_BASE as usize,
+);
+
+unsafe extern "C" {
+    fn page_fault_entry();
+    fn general_protection_fault_entry();
+    fn control_protection_fault_entry();
+    fn nmi_entry();
+    fn double_fault_entry();
+    fn keyboard_entry();
+    fn serial_entry();
+    fn mouse_entry();
+    fn sci_entry();
+    fn spurious_entry();
+    fn tlb_shootdown_ipi_entry();
+    fn cache_drain_ipi_entry();
+    fn device_irq_entry_0();
+    fn device_irq_entry_1();
+    fn device_irq_entry_2();
+    fn device_irq_entry_3();
+    fn device_irq_entry_4();
+    fn device_irq_entry_5();
+    fn device_irq_entry_6();
+    fn device_irq_entry_7();
+    fn device_irq_entry_8();
+    fn device_irq_entry_9();
+    fn device_irq_entry_10();
+    fn device_irq_entry_11();
+    fn device_irq_entry_12();
+    fn device_irq_entry_13();
+    fn device_irq_entry_14();
+    fn device_irq_entry_15();
+    /// Bounds of the page-aligned `.text.kpti_irq_entry` section — mapped into
+    /// every user PML4 as entry-set text by `mm::kpti::collect_entry_pages`.
+    fn kpti_irq_entry_start();
+    fn kpti_irq_entry_end();
 }
-extern "x86-interrupt" fn device_irq_stub_2(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 2, &stack_frame);
+
+/// `[start, end)` VA range of the `.text.kpti_irq_entry` section: the naked
+/// maskable-IRQ / IPI entry stubs the user PML4 maps (r-x, ring-0 only). Both
+/// bounds are page-aligned by the section's `.balign 4096`.
+pub fn kpti_irq_entry_range() -> (u64, u64) {
+    (
+        kpti_irq_entry_start as *const () as u64,
+        kpti_irq_entry_end as *const () as u64,
+    )
 }
-extern "x86-interrupt" fn device_irq_stub_3(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 3, &stack_frame);
+
+// ---------------------------------------------------------------------------
+// Phase 110 Track A.3b part 3 — KPTI ring0→ring3 exit trampolines
+// ---------------------------------------------------------------------------
+//
+// The page-aligned, user-mapped `.text.kpti_exit` section (mapped r-x into every
+// user half by `mm::kpti::collect_entry_pages`). A ring0→ring3 `iretq` must load
+// the user CR3 in the instruction before `iretq`, and after that flip only the
+// user half is mapped — so both the `iretq` frame AND the `mov cr3 … iretq`
+// instructions must be user-mapped. Each trampoline therefore:
+//   1. `mov rsp, gs:[TRAMP_TOP]` — pivot to this core's KPTI **trampoline
+//      stack** (Phase 110 hardening; its top page is mapped into every user
+//      half, and — unlike the task-kstack top page it replaced — its frames
+//      only ever hold ring-3 register state). Per-core is safe: IF=0 from the
+//      `cli` below through `iretq`, so no migration and no reuse window (a
+//      nested NMI is IST + paranoid and touches neither this stack nor rsp).
+//      The trampolines are `-> !` and build a fresh frame (for the preempt
+//      path the scheduler RSP was already saved by
+//      `dispatch_preempted_and_resume` before its `jmp`). On the
+//      KPTI-inactive lane the pivot still happens (the slot is populated on
+//      every boot) — the frame just lives on a kernel-mapped stack instead.
+//   2. build the 5-field `iretq` frame there + restore GPRs from the kernel-
+//      mapped reg source (done BEFORE the flip — the source is gone afterwards).
+//   3. flip CR3 via the scratch slot (no-op while `kpti_user_cr3 == 0`).
+//   4. `iretq`.
+//
+// Phase 110 A.4 — each trampoline `cli`s first. After the CR3 flip (step 3) we
+// are in ring 0 on the USER CR3 (which maps only the entry set + kstack top
+// page, not the general kernel image), and stay there until `iretq`. A maskable
+// timer/reschedule IPI delivered in that window would vector to its naked stub,
+// see the interrupted ring-0 `cs`, take the "ring 0 ⟹ already-kernel-CR3"
+// kernel path (which does NO CR3 switch), and `call` its `.text` body — which is
+// absent from the user half → `INSTRUCTION_FETCH` #PF, and (pre-A.4-fix)
+// nested-fault #DF. `execve`/`sigreturn`/`fork` reach their trampoline with
+// IF=1 (the syscall's SFMASK cleared IF, but they re-enable it doing blocking
+// IPC / disk / scheduler work), so the flip window is genuinely IF=1 without
+// this `cli`. `dispatch_preempted_and_resume` already `cli`s before jumping to
+// `preempt_resume_to_user`; the explicit `cli` here makes all four uniform. NMI
+// is unmaskable but uses the paranoid entry (reads/loads the kernel CR3), and
+// the window instructions themselves touch only mapped memory, so IF=0 closes
+// the last delivery path into the window. The `iretq` restores the task's own
+// IF from the frame's rflags.
+//
+// The four ring0→ring3 exit trampolines all live here: part 3a landed
+// `preempt_resume_to_user` (the preemption-resume path) as the proof of
+// pattern; part 3b `fork_enter_userspace`; part 3c `execve_enter_userspace`;
+// part 3d `sigreturn_enter_userspace`. (The fifth user-return path, the
+// syscall sysret tail, is in `.text.kpti_entry` — A.2.)
+core::arch::global_asm!(
+    ".equ EXIT_OFF_USER_CR3,  {exit_off_user_cr3}",
+    ".equ EXIT_OFF_SCRATCH,   {exit_off_scratch}",
+    ".equ EXIT_OFF_TRAMP_TOP, {exit_off_tramp_top}",
+    ".section .text.kpti_exit, \"ax\"",
+    ".balign 4096",
+    ".global kpti_exit_start",
+    "kpti_exit_start:",
+    "",
+    // preempt_resume_to_user(rdi = *const PreemptFrame) -> !
+    // PreemptFrame offsets: rax=0 rbx=8 rcx=16 rdx=24 rsi=32 rdi=40 rbp=48
+    //   r8=56 r9=64 r10=72 r11=80 r12=88 r13=96 r14=104 r15=112
+    //   rip=120 cs=128 rflags=136 rsp=144 ss=152
+    ".global preempt_resume_to_user",
+    "preempt_resume_to_user:",
+    // Mask IRQs through the CR3-flip → iretq window (see the section header).
+    // Redundant here (dispatch_preempted_and_resume already cli'd) but uniform.
+    "cli",
+    // Pivot to this core's KPTI trampoline stack (user-half mapped; per-core
+    // safe under the cli above). The scheduler stack we abandon was already
+    // saved by dispatch_preempted_and_resume.
+    "mov rsp, gs:[EXIT_OFF_TRAMP_TOP]",
+    // Build the 5-field iretq frame there (push in reverse: ss first).
+    "mov rax, [rdi + 152]", // ss
+    "push rax",
+    "mov rax, [rdi + 144]", // user rsp
+    "push rax",
+    "mov rax, [rdi + 136]", // rflags
+    "push rax",
+    "mov rax, [rdi + 128]", // cs
+    "push rax",
+    "mov rax, [rdi + 120]", // rip
+    "push rax",
+    // Restore GPRs (all except rax/rdi) from the PreemptFrame — BEFORE the CR3
+    // flip, since the frame lives in the kernel map and vanishes after it.
+    "mov rbx, [rdi + 8]",
+    "mov rcx, [rdi + 16]",
+    "mov rdx, [rdi + 24]",
+    "mov rsi, [rdi + 32]",
+    "mov rbp, [rdi + 48]",
+    "mov r8,  [rdi + 56]",
+    "mov r9,  [rdi + 64]",
+    "mov r10, [rdi + 72]",
+    "mov r11, [rdi + 80]",
+    "mov r12, [rdi + 88]",
+    "mov r13, [rdi + 96]",
+    "mov r14, [rdi + 104]",
+    "mov r15, [rdi + 112]",
+    "mov rax, [rdi + 0]",
+    "mov rdi, [rdi + 40]", // rdi last (pointer becomes invalid)
+    // KPTI exit: flip to the user CR3 (rax holds a user value → spill via
+    // gs:[scratch], which is mapped on both halves). No-op while inactive.
+    "mov gs:[EXIT_OFF_SCRATCH], rax",
+    "mov rax, gs:[EXIT_OFF_USER_CR3]",
+    "test rax, rax",
+    "jz 1f",
+    "mov cr3, rax",
+    "1:",
+    "mov rax, gs:[EXIT_OFF_SCRATCH]",
+    "iretq",
+    "",
+    // fork_enter_userspace(rdi = *const ForkEntryCtx) -> !
+    // Restores ALL registers preserved by the Linux syscall ABI (everything
+    // except RAX/RCX/R11) so the fork child resumes with the parent's register
+    // state at the `syscall` instruction, with RAX = 0 (the child's fork
+    // return value).
+    // ForkEntryCtx offsets (arch/x86_64/mod.rs): rip=0 rsp=8 rbx=16 rbp=24
+    //   r12=32 r13=40 r14=48 r15=56 ss=64 cs=72 rdi=80 rsi=88 rdx=96 r8=104
+    //   r9=112 r10=120 rflags=128
+    ".global fork_enter_userspace",
+    "fork_enter_userspace:",
+    // Mask IRQs through the CR3-flip → iretq window (see the section header).
+    "cli",
+    // Pivot to this core's KPTI trampoline stack (user-half mapped; per-core
+    // safe under the cli above). The continuation stack below is abandoned
+    // (this trampoline never returns).
+    "mov rsp, gs:[EXIT_OFF_TRAMP_TOP]",
+    // Build the 5-field iretq frame there (push in reverse: ss first).
+    "mov rax, [rdi + 64]", // ss
+    "push rax",
+    "mov rax, [rdi + 8]", // user rsp
+    "push rax",
+    // Saved user RFLAGS, sanitized: force IF, clear IOPL/VM/RF/reserved.
+    "mov rax, [rdi + 128]",
+    "or  rax, 0x200",
+    "and eax, 0x000ED7FF",
+    "push rax",
+    "mov rax, [rdi + 72]", // cs
+    "push rax",
+    "mov rax, [rdi + 0]", // rip
+    "push rax",
+    // Restore GPRs from the ForkEntryCtx BEFORE the CR3 flip. (The ctx lives
+    // in PerCoreData — mapped on both halves — so fork *could* restore after
+    // the flip, but the exit trampolines stay uniform: reg source first.)
+    "mov rbx, [rdi + 16]",
+    "mov rbp, [rdi + 24]",
+    "mov r12, [rdi + 32]",
+    "mov r13, [rdi + 40]",
+    "mov r14, [rdi + 48]",
+    "mov r15, [rdi + 56]",
+    "mov rsi, [rdi + 88]",
+    "mov rdx, [rdi + 96]",
+    "mov r8,  [rdi + 104]",
+    "mov r9,  [rdi + 112]",
+    "mov r10, [rdi + 120]",
+    "mov rdi, [rdi + 80]", // rdi last (pointer becomes invalid)
+    // RAX = 0 (fork child return value) — preserved across the flip by the
+    // scratch spill/restore.
+    "xor eax, eax",
+    // KPTI exit: flip to the user CR3. No-op while inactive.
+    "mov gs:[EXIT_OFF_SCRATCH], rax",
+    "mov rax, gs:[EXIT_OFF_USER_CR3]",
+    "test rax, rax",
+    "jz 1f",
+    "mov cr3, rax",
+    "1:",
+    "mov rax, gs:[EXIT_OFF_SCRATCH]",
+    "iretq",
+    "",
+    // execve_enter_userspace(rdi = user rip, rsi = user rsp, rdx = cs,
+    //                        rcx = ss) -> !
+    // The execve initial-entry trampoline (called by
+    // arch::x86_64::enter_userspace): builds the iretq frame (rflags = 0x202:
+    // IF + reserved bit 1), zeroes every GPR, and flips CR3. The zeroing
+    // matters: a fresh image must start with deterministic registers (Linux
+    // does the same), both so no kernel values leak into ring 3 and because
+    // userspace observably depends on it — fork-test's `syscall2(WAITPID, …)`
+    // leaves `options` = the initial rdx, and the pre-zeroing trampoline
+    // leaked cs (0x23, odd) into rdx = accidental WNOHANG = a flaky
+    // fork-overlap regression (caught by the a3b pre-push gate).
+    ".global execve_enter_userspace",
+    "execve_enter_userspace:",
+    // Mask IRQs through the CR3-flip → iretq window (see the section header).
+    // execve reaches here with IF=1 (it re-enabled during its blocking IPC /
+    // disk load), so without this the flip window is a live ring-0/user-CR3
+    // IRQ target — the exact source of the A.4 reschedule-IPI-on-user-half #PF.
+    "cli",
+    // Pivot to this core's KPTI trampoline stack (user-half mapped; per-core
+    // safe under the cli above); the execve continuation stack below is
+    // abandoned (this trampoline never returns).
+    "mov rsp, gs:[EXIT_OFF_TRAMP_TOP]",
+    // Build the 5-field iretq frame there (push in reverse: ss first).
+    "push rcx",   // ss
+    "push rsi",   // user rsp
+    "push 0x202", // rflags: IF + reserved bit 1
+    "push rdx",   // cs
+    "push rdi",   // rip
+    // Fresh image: zero every GPR (rsp/rip come from the iretq frame).
+    "xor eax, eax",
+    "xor ebx, ebx",
+    "xor ecx, ecx",
+    "xor edx, edx",
+    "xor esi, esi",
+    "xor edi, edi",
+    "xor ebp, ebp",
+    "xor r8d, r8d",
+    "xor r9d, r9d",
+    "xor r10d, r10d",
+    "xor r11d, r11d",
+    "xor r12d, r12d",
+    "xor r13d, r13d",
+    "xor r14d, r14d",
+    "xor r15d, r15d",
+    // KPTI exit: flip to the user CR3. No-op while inactive. (rax is 0 here;
+    // the scratch spill/restore keeps it 0 across the flip.)
+    "mov gs:[EXIT_OFF_SCRATCH], rax",
+    "mov rax, gs:[EXIT_OFF_USER_CR3]",
+    "test rax, rax",
+    "jz 1f",
+    "mov cr3, rax",
+    "1:",
+    "mov rax, gs:[EXIT_OFF_SCRATCH]",
+    "iretq",
+    "",
+    // sigreturn_enter_userspace(rdi = *const SavedUserRegs, rsi = ss,
+    //                           rdx = cs, rcx = sanitized rflags) -> !
+    // The sigreturn full-register restore (called by
+    // syscall::restore_and_enter_userspace, which sanitizes rflags and
+    // validates rip/rsp canonical). Restores ALL GPRs so ring 3 resumes at
+    // the exact pre-signal state.
+    // SavedUserRegs offsets (signal.rs, #[repr(C)]): rax=0 rbx=8 rcx=16
+    //   rdx=24 rsi=32 rdi=40 rbp=48 rsp=56 r8=64 r9=72 r10=80 r11=88 r12=96
+    //   r13=104 r14=112 r15=120 rip=128 rflags=136
+    ".global sigreturn_enter_userspace",
+    "sigreturn_enter_userspace:",
+    // Mask IRQs through the CR3-flip → iretq window (see the section header).
+    "cli",
+    // Pivot to this core's KPTI trampoline stack (user-half mapped; per-core
+    // safe under the cli above); the sigreturn syscall continuation below is
+    // abandoned (this trampoline never returns).
+    "mov rsp, gs:[EXIT_OFF_TRAMP_TOP]",
+    // Build the 5-field iretq frame there (push in reverse: ss first).
+    "push rsi",         // ss
+    "push [rdi + 56]",  // user rsp
+    "push rcx",         // sanitized rflags
+    "push rdx",         // cs
+    "push [rdi + 128]", // rip
+    // Restore ALL GPRs from the SavedUserRegs BEFORE the CR3 flip — the
+    // sigframe copy lives on the kernel stack, gone after the flip.
+    "mov rax, [rdi + 0]",
+    "mov rbx, [rdi + 8]",
+    "mov rcx, [rdi + 16]",
+    "mov rdx, [rdi + 24]",
+    "mov rsi, [rdi + 32]",
+    "mov rbp, [rdi + 48]",
+    "mov r8,  [rdi + 64]",
+    "mov r9,  [rdi + 72]",
+    "mov r10, [rdi + 80]",
+    "mov r11, [rdi + 88]",
+    "mov r12, [rdi + 96]",
+    "mov r13, [rdi + 104]",
+    "mov r14, [rdi + 112]",
+    "mov r15, [rdi + 120]",
+    "mov rdi, [rdi + 40]", // rdi last (pointer becomes invalid)
+    // KPTI exit: flip to the user CR3 (rax holds the user rax → spill via
+    // gs:[scratch], mapped on both halves). No-op while inactive.
+    "mov gs:[EXIT_OFF_SCRATCH], rax",
+    "mov rax, gs:[EXIT_OFF_USER_CR3]",
+    "test rax, rax",
+    "jz 1f",
+    "mov cr3, rax",
+    "1:",
+    "mov rax, gs:[EXIT_OFF_SCRATCH]",
+    "iretq",
+    "",
+    ".balign 4096",
+    ".global kpti_exit_end",
+    "kpti_exit_end:",
+    ".text",
+    exit_off_user_cr3  = const crate::smp::offsets::KPTI_USER_CR3,
+    exit_off_scratch   = const crate::smp::offsets::KPTI_SCRATCH,
+    exit_off_tramp_top = const crate::smp::offsets::KPTI_TRAMP_TOP,
+);
+
+unsafe extern "C" {
+    /// Bounds of the page-aligned `.text.kpti_exit` section — mapped r-x into
+    /// every user PML4 by `mm::kpti::collect_entry_pages`.
+    fn kpti_exit_start();
+    fn kpti_exit_end();
 }
-extern "x86-interrupt" fn device_irq_stub_4(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 4, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_5(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 5, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_6(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 6, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_7(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 7, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_8(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 8, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_9(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 9, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_10(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 10, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_11(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 11, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_12(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 12, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_13(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 13, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_14(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 14, &stack_frame);
-}
-extern "x86-interrupt" fn device_irq_stub_15(stack_frame: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 15, &stack_frame);
+
+/// `[start, end)` VA range of the `.text.kpti_exit` section (the ring0→ring3
+/// exit trampolines the user PML4 maps r-x). Both bounds are page-aligned.
+pub fn kpti_exit_range() -> (u64, u64) {
+    (
+        kpti_exit_start as *const () as u64,
+        kpti_exit_end as *const () as u64,
+    )
 }
