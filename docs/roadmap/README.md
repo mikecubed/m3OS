@@ -540,7 +540,7 @@ These phases were drafted 2026-05-08 in response to the phase-completion audit (
 
 ### Next Arc — GUI Workstation on Real Hardware (Phases 99–110, chartered by Phase 98)
 
-The dependency-sequenced arc toward a usable GUI workstation on the Dell Tiger Lake laptop, then the HP OmniBook (AMD Strix Point). The hardware-dependent phases (101/102/103/104/108/109/110) validate per the [bare-metal validation strategy](../appendix/bare-metal-validation.md) and carry a `Validated-on-HW (run N, date)` status rather than a bare "Complete" (QEMU models none of this hardware). Sequencing: `99 → 100 → {101 → 102, 101 → 103} → 104 → 105 → 106 → 107 → 108 / 109 / 110`.
+The dependency-sequenced arc toward a usable GUI workstation on the Dell Tiger Lake laptop, then the HP OmniBook (AMD Strix Point). The hardware-dependent phases (101/102/103/104/108/109/110) validate per the [bare-metal validation strategy](../appendix/bare-metal-validation.md) and carry a `Validated-on-HW (run N, date)` status rather than a bare "Complete" (QEMU models none of this hardware). Sequencing: `99 → 100 → {101 → 102, 101 → 103} → 104 → 105 → 106 → 107 → 108 / 109 / 110`. The consolidated status + remaining-work plan for the whole hardware arc (which phases are built-but-unvalidated vs not-yet-built, the bench sequencing, and the hardware inventory) is [hw-validation-campaign.md](../appendix/hw-validation-campaign.md).
 
 Two sequencing notes (2026-07, re-evaluated while the Dell is unavailable):
 

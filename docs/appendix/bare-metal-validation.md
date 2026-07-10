@@ -3,6 +3,9 @@
 **Aligned Roadmap Phase:** Phase 98 (Track A.5), reused by every HW-only phase in the GUI-workstation arc (99→110)
 **Status:** Adopted (Phase 98 deliverable; the standing protocol for the 99→110 hardware-only arc)
 **Source Ref:** phase-98
+**Inventory + campaign plan:** this doc is the *protocol*; the whole-arc inventory of what still
+needs hardware (including the not-yet-built phases) and the recommended sequencing live in
+[hw-validation-campaign.md](./hw-validation-campaign.md).
 
 ## Why this exists
 
