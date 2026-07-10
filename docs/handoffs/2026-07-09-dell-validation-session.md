@@ -290,8 +290,10 @@ the per-CPU last-CR3 cache is the next lever. **A/B sanity:** temporarily mask
 PCID in `probe_pcid` (forces the full-flush fallback on the same silicon) to
 measure exactly what the tags recover.
 
-**Record:** A.5 perf box → `Validated-on-HW (run 2, 2026-07-09)` with both
-`ns_per_syscall` numbers. *(Open — run `/bin/perf-bench` on C and B.)*
+**Record:** A.5 perf box → **`Validated-on-HW (2026-07-10)`** — image C (`full`)
+`ns_full=6128`, image B (`off`) `ns_off=5967` → overhead `2.7 %` (≤ 30 % ⇒ **PASS**).
+PCID hides nearly all the KPTI CR3-switch cost; the full-flush fallback could not
+meet this. **Done.**
 
 ---
 

@@ -120,18 +120,15 @@ and is Meltdown-susceptible with KPTI off, so it is the right target.
       fallback). Watch for any CR3 `#GP` / triple-fault at first ring-3 entry
       (a PCIDE-ordering bug) or a wedged CoW/demand-fault loop (a missed
       user-PCID invalidation).
-- [ ] **A.5 — PCID perf bound** — **run `/bin/perf-bench`** (a 3M-iteration
-      `getpid()` round-trip timer; prints `ns_per_syscall`). With PCID active
-      under `M3OS_MITIGATIONS=full` (image C), the workload must be **≤30 %**
-      slower than `M3OS_MITIGATIONS=off` (image B) — the Phase 84 bound the naive
-      full-flush KPTI cannot meet. Run `perf-bench` on both images, compare
-      `ns_per_syscall`: `(ns_full − ns_off) / ns_off ≤ 0.30` ⇒ PASS. If the delta
-      exceeds 30 %, the same-address-space re-dispatch no-flush optimization
-      (per-CPU last-CR3 cache) is the next lever. Same-boot A/B: mask PCID in
-      `probe_pcid` to force the fallback and measure the recovery the tags buy.
-      **Run-2 partial (2026-07-10):** image C (full/PCID-on) `ns_per_syscall=6128`
-      (`elapsed_ms=18386` @ 3M iters). Need the image-B (`off`) baseline to
-      compute the ratio — still open.
+- [x] **A.5 — PCID perf bound** — `Validated-on-HW (2026-07-10) — Dell / Tiger
+      Lake`. `/bin/perf-bench` (3M-iteration `getpid()` round-trip):
+      image C (`full`, PCID+KPTI+CET on) `ns_per_syscall=6128`; image B (`off`)
+      `ns_per_syscall=5967`. Overhead `(6128 − 5967)/5967 = 2.7 %` — **≪ 30 %,
+      PASS** by a wide margin, confirming PCID hides almost all of the KPTI
+      CR3-switch cost (a naive full-flush KPTI could not meet this). `ns_off < ns_full`
+      also self-confirms image B really booted the mitigations-off kernel. No need
+      for the per-CPU last-CR3 lever. (image B: `B-mitigations-off-fixbranch.img`,
+      sha256 `63064824…`, off `fix/cet-nested-signal-ssp` @ `653d7ec9`.)
 - [x] **B.3 — CET user shadow stacks are live on real silicon** —
       `Validated-on-HW (run 2, 2026-07-09) — Dell / Tiger Lake`. Boots clean
       under CET → greeter → login → compositor → terminal → fork/exec;
