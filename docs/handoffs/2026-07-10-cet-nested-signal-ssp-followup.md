@@ -13,8 +13,10 @@ the signal-delivery seed and the `sigreturn` re-sync, and drop the single-slot
 check` + `smoke-test`/`rop-cet-poc-smoke`/`mitigations-status-smoke`/`smp-smoke`
 all green. The `#CP`-reject arm is bare-metal-only (QEMU TCG models no CET), so
 the last step is **re-flash image C on the Dell and confirm `NESTED_SIG_POC:PASS`
-(no `#CP`)**. See *Fix landed* below and *Next session — start here*.
-PoC: `/bin/nested-sig-cet-poc` (`userspace/nested-sig-cet-poc`).
+(no `#CP`)**. The fixed image is **built + staged** (2026-07-10):
+`target/dell-images/C-mitigations-full-nestfix.img` (off `fix/cet-nested-signal-ssp`
+@ `fe31d1be`). See *Fix landed* below and *Next session — start here* for the flash
+command. PoC: `/bin/nested-sig-cet-poc` (`userspace/nested-sig-cet-poc`).
 
 ---
 
@@ -165,16 +167,32 @@ PoC binaries + run-2 docs). Both are open; merge #327 then #328 (or #328 direct 
 full change list.
 
 **Only remaining task — re-validate on the Dell (bench-only; QEMU can't).**
-1. Rebuild image C: `M3OS_MITIGATIONS=full cargo xtask image` (on
-   `fix/cet-nested-signal-ssp`), flash `/dev/sda`.
-2. Run `/bin/nested-sig-cet-poc` → expect `NESTED_SIG_POC:PASS` (no `#CP`). The
-   pre-fix build `#CP`-killed the nested handler's `ret` (`pid=45 rip=0x2014b3`);
-   the fix should make it a clean PASS.
+
+**Fixed image C is BUILT + STAGED** (2026-07-10, off `fix/cet-nested-signal-ssp`
+@ `fe31d1be`): `target/dell-images/C-mitigations-full-nestfix.img`
+(sha256 `6fdc5787e4154fe13d192c0446df7b51c0a03d7fa94a24599975b4639192dbc5`;
+distinct from the pre-fix `C-mitigations-full.img` @ `5c2340ef…`). No rebuild
+needed — flash this file.
+
+1. **Flash** (USB = `/dev/sda` on the Dell; the NVMe system disk is `nvme0n1` —
+   **never** flash that). The script refuses partitions / the root disk / non-
+   removable disks and asks to confirm:
+   ```
+   scripts/phase-100-write-usb.sh --image target/dell-images/C-mitigations-full-nestfix.img /dev/sda
+   ```
+   (Direct fallback: `sudo dd if=target/dell-images/C-mitigations-full-nestfix.img of=/dev/sda bs=4M conv=fsync status=progress && sync`.)
+2. Boot the Dell, log in, run `/bin/nested-sig-cet-poc` → **expect
+   `NESTED_SIG_POC:PASS`** (no `#CP`). The pre-fix build `#CP`-killed the nested
+   handler's `ret` (`pid=45 rip=0x2014b3`); the fix should make it a clean PASS.
+   Read the line ordering (`outer-entered → inner-entered → inner-returning →
+   outer-resumed → after → PASS`) to confirm true nesting.
 3. Regression-check the other CET PoCs on the same image: `/bin/fork-cet-poc` must
    stay `FORK_CET_POC:PASS`, `rop-cet-poc` must still `#CP`-kill (no `PWNED`), and
    a normal login/compositor/terminal session must still work (single-level signal
    delivery unchanged). If any faults, the freeze dumper (`M3OS_BRINGUP_DIAG=1`)
    names the pid/RIP.
+4. **Record the result here** (promote status 🟡 → ✅ on PASS, or reopen with the
+   captured fault on `#CP`).
 
 **Independent open item — Block 3 perf A/B.** Needs the `off` baseline: build
 image B (`M3OS_MITIGATIONS=off cargo xtask image`), run `/bin/perf-bench` on it,
