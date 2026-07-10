@@ -94,6 +94,18 @@ unsafe fn read_ssp_reg() -> u64 {
     ssp
 }
 
+/// TEMP DIAG (nested-signal #CP) — remove before merge. `(RDSSP, IA32_PL3_SSP)`
+/// when CET is active, else `(0, 0)`. At a ring-3 `#CP` the IDT entry has already
+/// saved the faulting user SSP into `IA32_PL3_SSP` and zeroed the register, so
+/// the MSR here is the *faulting* SSP (the value at the mismatching `RET`).
+pub fn diag_live_ssp_and_msr() -> (u64, u64) {
+    if !cet_active() {
+        return (0, 0);
+    }
+    // SAFETY: cet_active; ring 0.
+    unsafe { (read_ssp_reg(), read_pl3_ssp()) }
+}
+
 /// The live user shadow-stack pointer, read from the authoritative hardware
 /// source for the current kernel-entry path (register on `SYSCALL`, MSR on IDT
 /// delivery — see [`kernel_core::cet::select_live_ssp`]). `0` when CET is
@@ -299,7 +311,18 @@ pub unsafe fn seed_signal_shadow_stack(ret_addr: u64) -> u64 {
     }
     // The live user SSP — register-first (SYSCALL path) with MSR fallback (IDT
     // path). Correct for nested delivery, where the MSR is stale (see fn doc).
-    let ssp = live_user_ssp();
+    // SAFETY: cet_active (checked above); ring 0.
+    let diag_rdssp = unsafe { read_ssp_reg() };
+    let diag_msr = unsafe { read_pl3_ssp() };
+    let ssp = kernel_core::cet::select_live_ssp(diag_rdssp, diag_msr);
+    // TEMP DIAG (nested-signal #CP) — remove before merge.
+    log::info!(
+        "[CET-DIAG] seed rdssp={:#x} msr={:#x} live={:#x} ret={:#x}",
+        diag_rdssp,
+        diag_msr,
+        ssp,
+        ret_addr,
+    );
     // Fail closed on a zero, misaligned, or too-small SSP. In normal operation
     // the SSP is kernel-armed, 8-byte-aligned, and deep in the shadow-stack
     // region — but a corrupted/unexpected `IA32_PL3_SSP` must NOT make the kernel
@@ -307,8 +330,10 @@ pub unsafe fn seed_signal_shadow_stack(ret_addr: u64) -> u64 {
     // page (a ring-0 fault). Skipping the seed just leaves the handler unseeded
     // (its `ret` `#CP`s → a clean userspace kill), never a ring-0 crash.
     let Some(new_ssp) = ssp.checked_sub(8).filter(|_| ssp & 0x7 == 0) else {
+        log::info!("[CET-DIAG] seed SKIPPED (ssp={:#x} zero/misaligned)", ssp);
         return 0;
     };
+    log::info!("[CET-DIAG] seed new_ssp={:#x} (wrote ret to it)", new_ssp);
     // SAFETY: `WRUSS` writes 8 bytes to the user shadow stack at `new_ssp`, one
     // 8-byte slot below the live SSP (free space — the shadow stack grows down,
     // so `[base, SSP)` is unused and mapped). `new_ssp` inherits the SSP's
