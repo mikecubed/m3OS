@@ -231,10 +231,17 @@ instrumentation was already reverted). Clean image staged at
 > trusting any result** verify the running kernel is the one you flashed — a
 > stale image booting is what made runs 1/1b look like the fix had failed.
 
-**Independent open item — Block 3 perf A/B.** Needs the `off` baseline: build
-image B (`M3OS_MITIGATIONS=off cargo xtask image`), run `/bin/perf-bench` on it,
-compare `ns_off` to the captured image-C `ns_per_syscall=6128` against the ≤30 %
-bound. Tracked in `next-dell-session.md` (A.5 perf box). Not affected by this fix.
+**Independent open item — Block 3 perf A/B (in progress).** Image B (`off`
+baseline) is **built + staged**: `target/dell-images/B-mitigations-off-fixbranch.img`
+(sha256 `63064824…`, off `fix/cet-nested-signal-ssp` @ `653d7ec9`, clean). `perf-bench`
+(3M-iteration `getpid()` round-trip; prints `ns_per_syscall`) ships in it. Steps:
+1. On **image C** (still-booted fixed image, or re-flash `C-mitigations-full-nestfix.img`):
+   `/bin/perf-bench` → record `ns_full`. (A prior pre-fix run measured `6128`;
+   re-measure on the current image for a same-commit A/B — `getpid()` never hits
+   the signal path, so the fix/diag builds give the same number.)
+2. Flash **image B**, boot, `/bin/perf-bench` → record `ns_off`.
+3. Compute `(ns_full − ns_off) / ns_off`; **pass ≤ 30 %.** Record both numbers in
+   `next-dell-session.md` (A.5 perf box). Not affected by the CET fix.
 
 **Everything else Phase 110 is validated** (run 2, checked off in
 `next-dell-session.md`): A.5 PCID live, B.3 CET live, B.3 ROP `#CP`-kill, A.6
