@@ -8,6 +8,7 @@ step 5 flagged *this exact* nesting limitation as deferred).
 **Status:** 🔴 **CONFIRMED ON REAL SILICON — open bug.** A nested signal under
 CET `#CP`-kills the process. Fix = per-frame / token-based shadow-stack restore
 for signal delivery. PoC: `/bin/nested-sig-cet-poc` (`userspace/nested-sig-cet-poc`).
+**Next-session pick-up:** see the final section, *Next session — start here*.
 
 ---
 
@@ -94,3 +95,48 @@ Keep the whole path `cet_active`-gated so it stays inert on QEMU.
 - Add a QEMU **run-to-completion** gate for the delivery/`sigreturn` logic (the
   nesting + `sigreturn` control flow works even without CET), so the non-CET half
   is regression-covered in CI; the `#CP`-reject half stays bench-only.
+
+---
+
+## Next session — start here
+
+**Branch / PR.** All of run 2 is on `feat/dell-cet-stress-pocs` (pushed) →
+**PR #327** (open, base `main`): the three PoC binaries (`fork-cet-poc`,
+`nested-sig-cet-poc`, `perf-bench`) + the run-2 validation doc sync, and this
+follow-up. Merge #327 whenever; the fix below can branch off it, or off `main`
+after merge.
+
+**Primary task — fix the nested-signal `#CP` (this doc's bug).** Implement the
+per-frame / `RSTORSSP`-token shadow-stack restore (see **Fix (design)** above).
+Order of work:
+1. `kernel/src/arch/x86_64/cet.rs` — add the per-delivery restore-token seed
+   (codec in `kernel_core::cet::shadow_stack_restore_token`); host-test the codec.
+2. `deliver_user_signal` + `sys_rt_sigreturn` in
+   `kernel/src/arch/x86_64/syscall/mod.rs` — push a token per delivery and
+   `RSTORSSP` the right token on `sigreturn`; retire the single
+   `Task::cet_signal_ssp` slot (or make it per-frame). Keep it all
+   `cet_active`-gated (inert on QEMU).
+3. `cargo xtask check` + `mitigations-status-smoke` + `smp-smoke` + `smoke-test`
+   green; add a QEMU run-to-completion gate for `nested-sig-cet-poc` (nesting +
+   `sigreturn` work without CET, so CI can cover the control-flow half).
+4. **Re-validate on the Dell:** rebuild image C (`M3OS_MITIGATIONS=full cargo
+   xtask image`), flash `/dev/sda`, run `/bin/nested-sig-cet-poc` → expect
+   `NESTED_SIG_POC:PASS` (no `#CP`); re-run `/bin/fork-cet-poc` (must stay
+   `FORK_CET_POC:PASS`).
+
+**Independent open item — Block 3 perf A/B.** Needs the `off` baseline: build
+image B (`M3OS_MITIGATIONS=off cargo xtask image`), run `/bin/perf-bench` on it,
+compare `ns_off` to the captured image-C `ns_per_syscall=6128` against the ≤30 %
+bound. Tracked in `next-dell-session.md` (A.5 perf box).
+
+**Everything else Phase 110 is validated** (run 2, checked off in
+`next-dell-session.md`): A.5 PCID live, B.3 CET live, B.3 ROP `#CP`-kill, A.6
+immune-silicon, and 4a fork-CoW.
+
+### Orientation for a fresh agent
+Phase 110 Dell/Tiger Lake validation is essentially complete. Run 2 confirmed
+KPTI + PCID + CET all live and the ROP / fork-CoW defenses working; the one
+remaining correctness gap is **this** nested-signal shadow-stack bug (single-slot
+`cet_signal_ssp`), captured with a real fault (`pid=45 rip=0x2014b3` — the nested
+handler's `ret`). The bench PoCs live in `userspace/` and ship on PR #327. Start
+with the Primary task above; the perf A/B is a quick independent close-out.
