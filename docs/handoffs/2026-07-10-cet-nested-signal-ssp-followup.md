@@ -136,6 +136,15 @@ straight from hardware — there is no clobberable per-task slot. `RSTORSSP` tok
 (the codec still lives in `kernel_core::cet::shadow_stack_restore_token`) were not
 needed.
 
+**Scope note (separate latent item, not this bug).** The scheduler's
+`save_task_ssp`/`restore_task_ssp` still read/write `IA32_PL3_SSP` via the MSR
+(`read_task_ssp_live`). A *timer* preemption freshens the MSR through the IDT save
+so a context switch inside a handler is fine; but a **voluntary** (blocking-
+syscall) switch *inside a signal handler* would save a stale MSR. This is
+pre-existing, unchanged by this fix, rare (a handler doing a blocking syscall),
+and not exercised by any PoC. If ever chased, `save_task_ssp` should adopt the
+same `live_user_ssp()` (`RDSSP`-first) source — deferred as out of scope here.
+
 ## Acceptance
 
 - On the Dell (image C): `/bin/nested-sig-cet-poc` → `NESTED_SIG_POC:PASS` (both
