@@ -55,9 +55,9 @@ compile. `M3OS_MITIGATIONS` and `M3OS_KERNEL_FEATURES` are **build-time**
 
 | # | Image | Build command | Purpose |
 |---|---|---|---|
-| A | **default (auto)** | `cargo xtask image` | KPTI+PCID+CET all active — the main security boot |
-| B | **mitigations=off** | `M3OS_MITIGATIONS=off cargo xtask image` | the A/B baseline: KPTI/PCID/CET all off (Meltdown leaks, ROP returns, perf floor) |
-| C | **mitigations=full** | `M3OS_MITIGATIONS=full cargo xtask image` | same as A on this silicon (Tiger Lake `rdcl_no=false`); use for the perf run to be explicit |
+| A | **default (auto)** | `cargo xtask image` | ⚠️ **CORRECTED (run 2):** this silicon is `rdcl_no=true` (Meltdown-**immune**), so `auto` leaves **KPTI OFF** → PCID also off (gated on KPTI) → **only CET is active**. Use image **C** to exercise KPTI/PCID. |
+| B | **mitigations=off** | `M3OS_MITIGATIONS=off cargo xtask image` | the A/B baseline: KPTI/PCID/CET all off (ROP returns, perf floor) |
+| C | **mitigations=full** | `M3OS_MITIGATIONS=full cargo xtask image` | ⚠️ **CORRECTED (run 2):** on `rdcl_no=true` silicon this is **NOT** the same as A — `full` **forces KPTI+PCID on** (auto would leave them off). **This is the security-posture image on the Dell** (KPTI+PCID+CET all active) and the perf-run image. |
 | D | **kgdb** | `M3OS_KERNEL_FEATURES=kgdb cargo xtask image` | Phase 111 kgdb arm |
 | E | **ptrace** | `M3OS_KERNEL_FEATURES=ptrace cargo xtask image` | Phase 111 native gdbserver arm |
 
@@ -118,25 +118,32 @@ workspace member + `bins` + ramdisk entry) staged at `/bin/meltdown-poc` and
 
 ## Block 1 — the security posture boot (do this FIRST; it validates the most)
 
-> **⚠️ RUN 1 (2026-07-09) RESULT — partial.** KPTI + PCID **boot clean** on the
-> Dell (image `F-cet-masked` = KPTI+PCID, CET off, reaches login). **CET
-> black-screens the boot** — bisected to the CET enable; a `CR0.WP` fix was
-> insufficient; blocked on serial. Full analysis + next steps:
-> [2026-07-09 CET boot-hang handoff](./2026-07-09-cet-boot-hang-on-tiger-lake.md).
-> Resume here once CET boots.
+> **✅ RUN 2 (2026-07-09) RESULT — VALIDATED.** KPTI + PCID + CET all boot clean
+> on the Dell under image **C** (`mitigations=full`) → login → compositor →
+> fork/exec. `m3ctl mitigations status` reads `KPTI PCID: active (kernel/user
+> PCID, no-flush)` and `CET: enabled (user shadow stacks)`; the Meltdown line
+> reads `Not affected` (this silicon is `rdcl_no=true`, so KPTI is not *needed* —
+> but `full` runs it anyway, which is exactly what this posture boot validates).
+> RUN 1's CET black-screen was root-caused and fixed (five CET bugs); full
+> analysis:
+> [2026-07-09 CET boot-hang handoff — RESOLVED](./2026-07-09-cet-boot-hang-on-tiger-lake.md).
+> **Use image C, not A** — on `rdcl_no=true` silicon `auto` (image A) leaves
+> KPTI+PCID OFF (see the corrected Block 0 table).
 
 **Objective.** Prove KPTI, PCID, and CET all activate and the machine boots
 clean to a login on real Tiger Lake silicon — validating in one shot every
 asm/CR3/MSR/PTE path QEMU could not run.
 
 **Steps.**
-1. Boot **image A** (default). Capture the boot log over AMT SOL / boot.log.
+1. Boot **image C** (`mitigations=full` — on `rdcl_no=true` silicon this is the
+   image that activates KPTI+PCID; image A/`auto` leaves them off). Capture the
+   boot log over AMT SOL / boot.log.
 2. Grep the `[sec]` policy line and the per-core enable lines.
 3. Log in; run `m3ctl mitigations status`.
 
-**Expected serial (exact — from the shipping code):**
+**Expected serial (exact — from the shipping code; `mitigations=Full` under image C):**
 ```
-[sec] mitigations=Auto … kpti(policy=true active=true) pcid(active=true supported=true) cet(active=true supported=true) global_kernel_ptes=0
+[sec] mitigations=Full … kpti(policy=true active=true) pcid(active=true supported=true) cet(active=true supported=true) global_kernel_ptes=0
 [sec] CR4.PCIDE enabled (KPTI PCID TLB-cost recovery active)
 [sec] CR4.CET enabled (CET user shadow stacks active)
 [sec] AP CR4.SMEP enabled CR4.SMAP enabled CR4.PKE enabled CR4.PCIDE enabled     ← one per AP
@@ -145,14 +152,22 @@ asm/CR3/MSR/PTE path QEMU could not run.
 by the boot line's `cet(active=true)` + clean multi-core run. Adding a CR4.CET
 field to the AP line is a nice 1-line follow-up if we want per-AP CET evidence.)
 
-**Expected `m3ctl mitigations status`:**
+**Expected `m3ctl mitigations status`** (⚠️ corrected for `rdcl_no=true` silicon):
 ```
-Meltdown: Mitigation: PTI
-… KPTI PCID: active (kernel/user PCID, no-flush)
+Meltdown: Not affected          ← rdcl_no=true → Meltdown-immune, so the vuln
+                                   line reads "Not affected" EVEN under `full`
+                                   where KPTI is actively enforcing. NOT the line
+                                   that confirms KPTI.
+… KPTI PCID: active (kernel/user PCID, no-flush)   ← THIS confirms KPTI is
+                                                      enforcing (line is absent
+                                                      when KPTI is off)
 … CET: enabled (user shadow stacks)
 ```
-(Contrast QEMU, which prints `pcid(active=false …)` / `cet(active=false …)` /
-`KPTI PCID: fallback …` / `CET: not-supported`.)
+(Contrast QEMU: `pcid(active=false …)` / `cet(active=false …)` /
+`KPTI PCID: fallback …` / `CET: not-supported`, and — because TCG is
+`rdcl_no=false` — `Meltdown: Mitigation: PTI`. The Meltdown *line* legitimately
+differs between QEMU and this Dell for that reason; the KPTI-PCID / CET lines are
+the real cross-environment proof.)
 
 **Pass:** all three `active=true`, both `CR4.*` enable lines present, `m3ctl`
 shows the three active postures, and the machine reaches a **usable login shell
@@ -173,13 +188,23 @@ per-task-SSP path across every process spawn).
   exactly the CET path QEMU can't test — capture the pid/rip and see Block 4.
 
 **Record:** `next-dell-session.md` A.5 + B.3 "live on real silicon" boxes →
-`Validated-on-HW (run 1, 2026-07-09)`; quote the `[sec]` line as evidence.
+`Validated-on-HW (run 2, 2026-07-09)` — **done** (checked off); quote the `[sec]`
+line as evidence.
 
 ---
 
 ## Block 2 — the functional PoCs (the whole point of Track A/B)
 
 ### 2a — Meltdown reject (A.6)
+
+> **⚠️ CORRECTED (run 2) — NOT demonstrable on this silicon.** The Dell is
+> `rdcl_no=true` (Meltdown-immune in hardware), so there is **no leak to reject**:
+> `meltdown-poc` runs its `channel=CALIBRATED` control then reports
+> `MELTDOWN_POC:NO-LEAK` on **both** image B (KPTI off) and image C (KPTI on) —
+> the "leak on B / no-leak on A" A/B below **cannot** be shown here. A positive
+> leak demo needs Meltdown-**susceptible** (pre-`rdcl_no`) silicon or a KVM CPU
+> model without `rdcl_no`. Recorded result: **immune-silicon, no exposure**
+> (handoff §0.7). The susceptible-silicon steps below are retained for that case.
 
 **Objective.** A ported public Meltdown PoC **leaks** kernel memory with KPTI
 **off** and **fails** with it **on** — the proof QEMU can never give.
@@ -192,7 +217,7 @@ recover a byte. (Standard public PoC, ported to the m3OS syscall/timing ABI.)
 1. Boot **image B** (`mitigations=off`, KPTI off). Run `meltdown-poc`.
    **Expected:** it recovers ≥1 known kernel byte (a non-zero leak rate). This
    proves the PoC works and the CPU is susceptible.
-2. Boot **image A** (KPTI on). Run the same PoC.
+2. Boot **image C** (KPTI on — *not* image A on this silicon). Run the same PoC.
    **Expected:** it recovers **nothing** (leak rate at noise floor) — the user
    CR3 has no kernel mapping to speculate against.
 
@@ -201,9 +226,16 @@ on):** a global kernel PTE survived the CR3 switch (the `global_kernel_ptes=0`
 guard should have caught it at boot — re-check that line) or a kernel mapping
 leaked into the user half (re-run the QEMU `kpti-selftest-smoke` invariant).
 
-**Record:** A.6 box → `Validated-on-HW (run 1, date)`; commit the PoC output.
+**Record:** A.6 box → `Validated-on-HW (run 2, 2026-07-09) — immune silicon,
+NO-LEAK`; commit the PoC output. (Done — this silicon cannot show a positive
+leak; recorded as immune.)
 
 ### 2b — CET catches a ROP/return-overwrite (B.3)
+
+> **✅ VALIDATED (run 2, 2026-07-09).** `rop-cet-poc` on the Dell (CET on) was
+> `#CP`-killed — no `ROP_CET_POC:PWNED`; `dmesg` shows the `#CP … process killed`
+> line. B.3 ROP box checked off in `next-dell-session.md`. Steps retained for the
+> CET-off control arm (image B) and re-runs.
 
 **Objective.** A return-address overwrite faults `#CP` with CET **on** and
 returns into the planted address with CET **off** — the CFI analogue of 2a.
@@ -215,7 +247,7 @@ one — `-Z stack-protector=none` on that crate — so the canary doesn't catch 
 first; CET is the layer under test.)
 
 **Steps.**
-1. Boot **image A** (CET on). Run `rop-cet-poc`.
+1. Boot **image C** (CET on; image A also has CET but not KPTI). Run `rop-cet-poc`.
    **Expected:** the `RET` faults `#CP` and the kernel kills it:
    ```
    [int] userspace #CP (CET control-protection): pid=… rip=… rsp=… err=… (shadow-stack/CFI violation — return-address overwrite) — process killed
@@ -231,7 +263,7 @@ with CET on):** the shadow stack isn't actually enforcing — check the boot
 `cet(active=true)`, that the PoC's shadow-stack pages carry the RO+Dirty
 encoding, and that `IA32_U_CET.SH_STK_EN` is set (`rdmsr 0x6A0`).
 
-**Record:** B.3 ROP box → `Validated-on-HW (run 1, date)`; quote the `#CP` line.
+**Record:** B.3 ROP box → `Validated-on-HW (run 2, 2026-07-09)` — **done**; quote the `#CP` line.
 
 ---
 
@@ -241,11 +273,16 @@ encoding, and that `IA32_U_CET.SH_STK_EN` is set (`rdmsr 0x6A0`).
 `mitigations=off` — the Phase 84 bound the naive full-flush KPTI cannot meet, so
 this proves the no-flush tags buy back the cost.
 
+**Tool (shipped this session):** **`/bin/perf-bench`** — a 3M-iteration
+`getpid()` round-trip timer (pure ring3→ring0→ring3, so it isolates the
+KPTI/PCID trampoline + CR3-switch cost). Prints `ns_per_syscall`. `ITERS` is a
+tunable `const` at the top of `userspace/perf-bench/src/main.rs`.
+
 **Steps.**
-1. On **image C** (`full`, PCID active): run the smoke suite / a syscall-heavy
-   workload on the Dell; record wall time `T_full`.
-2. On **image B** (`off`): same workload; record `T_off`.
-3. Compute `(T_full − T_off) / T_off`.
+1. On **image C** (`full`, PCID active): run `/bin/perf-bench`; record
+   `ns_per_syscall` as `ns_full`.
+2. On **image B** (`off`): run `/bin/perf-bench`; record `ns_off`.
+3. Compute `(ns_full − ns_off) / ns_off`.
 
 **Pass:** ≤ 30 %. **Fail (> 30 %):** the same-address-space re-dispatch no-flush
 skip already landed (PR #325, 23/n) — confirm it's active; if still over,
@@ -253,38 +290,49 @@ the per-CPU last-CR3 cache is the next lever. **A/B sanity:** temporarily mask
 PCID in `probe_pcid` (forces the full-flush fallback on the same silicon) to
 measure exactly what the tags recover.
 
-**Record:** A.5 perf box → `Validated-on-HW (run 1, date)` with both wall times.
+**Record:** A.5 perf box → `Validated-on-HW (run 2, 2026-07-09)` with both
+`ns_per_syscall` numbers. *(Open — run `/bin/perf-bench` on C and B.)*
 
 ---
 
 ## Block 4 — CET stress: flush out the two flagged risks
 
 These are documented Dell-validation risks in the CET handoff; Block 1's clean
-boot doesn't exercise them hard enough. Run **on image A**.
+boot doesn't exercise them hard enough. Run **on image C** (KPTI+CET active on
+this `rdcl_no=true` silicon; image A leaves KPTI off). Two dedicated PoCs ship
+this session: **`/bin/fork-cet-poc`** (4a) and **`/bin/nested-sig-cet-poc`** (4b).
 
-### 4a — fork CoW-of-shadow-stack
-**Risk.** A fork child inherits the parent's SSP and a CoW copy of the parent's
-RO+Dirty shadow-stack pages. The child's first shadow-stack push must
-CoW-duplicate that page; m3OS's *generic* CoW may not correctly duplicate a
-shadow-stack page (Linux copies it explicitly).
-**Test.** A fork-heavy workload where children make deep-ish calls after fork
-(any coreutils pipeline, `sh` running a script with subshells, or a small
-fork+recurse+return PoC). **Watch for** a `#CP`/`#PF` in a *forked child's*
-first `RET`/`CALL`.
-**Pass:** fork-heavy workloads run clean. **Fail:** capture the child pid/rip →
-this confirms the CoW arm is needed (a shadow-stack-aware CoW that copies rather
-than shares, or marks the page for eager-copy). Becomes the top CET follow-up.
+### 4a — fork CoW-of-shadow-stack (regression-confirm; **already fixed**)
+**Status.** **Fixed** by Fix #5 of the CET bring-up (handoff §0.6): fork now
+eagerly copies shadow-stack pages instead of sharing them. This arm is a
+**regression confirmation**, not an open bug hunt.
+**Risk (historical).** The generic CoW shared non-writable pages verbatim, so a
+fork parent and child aliased one RO+Dirty shadow-stack frame → a post-fork `RET`
+`#CP` (the original `ion _Fork` kill).
+**Test.** **Run `/bin/fork-cet-poc`** — forks 8 children; each (and the parent
+between spawns) recurses so both actively push/pop their shadow stacks. A shared
+page would corrupt across them.
+**Pass:** `FORK_CET_POC:PASS` (all children survived → shadow stacks are
+independent, Fix #5 holds). **Fail:** `FORK_CET_POC:FAIL` + a child `#CP … process
+killed` line → Fix #5 regressed; capture the child pid/rip.
 
-### 4b — nested-signal SSP
+### 4b — nested-signal SSP (the one genuinely OPEN CET risk)
 **Risk.** `Task.cet_signal_ssp` is a single slot — correct for non-nested
-signals, wrong for a signal interrupting a handler.
-**Test.** A program that takes a signal whose handler itself takes a second
-signal (e.g. `SIGALRM` handler that triggers/receives another), then both
-`sigreturn`. **Watch for** a `#CP` on return from the outer handler.
-**Pass:** nested signals resume clean. **Fail:** confirms the `RSTORSSP`-token
-path is needed (`kernel_core::cet::shadow_stack_restore_token` is modeled;
-`WR_SHSTK_EN` is on so `WRUSS` can seed the token) — the fix is to push a
-restore token per delivery instead of the single slot.
+signals, unproven for a signal interrupting a handler (handoff §0.3/§0.8 defer
+this).
+**Test.** **Run `/bin/nested-sig-cet-poc`** — installs handlers for two signals,
+raises `SIGUSR1` (`kill` self), and from inside that handler raises `SIGUSR2`
+(`kill` self) to force a nested delivery, then both `sigreturn`. (m3OS has no
+`SIGALRM`/`sigprocmask`, so self-`kill` of a *different* signal is how we nest.)
+Read the printed line ordering to tell true nesting (`outer-entered →
+inner-entered → inner-returning → outer-resumed`) from deferred delivery.
+**Pass:** `NESTED_SIG_POC:PASS` — both handlers entered and returned, no `#CP`
+(the single slot survives one nesting level). **Fail:** a `#CP` kill on the outer
+handler's return → confirms the `RSTORSSP`-token path is needed
+(`kernel_core::cet::shadow_stack_restore_token` is modeled; `WR_SHSTK_EN` is on
+so `WRUSS` can seed the token) — push a restore token per delivery instead of the
+single slot. **PARTIAL** (`NESTED_SIG_POC:PARTIAL`): handlers ran, no `#CP`, but
+delivery was sequential not nested — record the platform behavior.
 
 **Record:** note both outcomes in the CET handoff's "known risks" section
 (resolved, or promoted to a tracked follow-up with the captured failure).

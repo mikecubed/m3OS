@@ -90,16 +90,26 @@ Track A (KPTI) is merged and live on every QEMU boot, but QEMU TCG models
 bare-metal-only. The Precision 5560 (Intel Tiger Lake) has both PCID and INVPCID
 and is Meltdown-susceptible with KPTI off, so it is the right target.
 
-- [ ] **A.6 — Meltdown PoC reject** (`Validated-on-HW`, never a bare "Complete").
-      PoC **scaffolded and shipping** as `/bin/meltdown-poc`
-      (`userspace/meltdown-poc`): flush+reload channel + mispredicted-branch
-      speculative kernel read + a known-user-byte calibration control. Boot
-      `M3OS_MITIGATIONS=full` on the Dell, run it: it must **leak** kernel memory
-      (`MELTDOWN_POC:LEAK`) with KPTI off (`M3OS_MITIGATIONS=off`) and **fail**
-      (`MELTDOWN_POC:NO-LEAK`) with it on. Tune the `const`s at the top of
-      `main.rs` per the CPU (see the runbook Block 0). Record the run
-      (`run N, YYYY-MM-DD`) + the capture path. QEMU can never prove it.
-- [ ] **A.5 — PCID scheme is live on real silicon.** Boot the default image and
+- [x] **A.6 — Meltdown PoC: immune silicon** — `Validated-on-HW (run 2,
+      2026-07-09) — Dell Precision 5560 / Tiger Lake`. **This CPU is
+      `rdcl_no=true` (Meltdown-immune in hardware)**, so `mitigations=auto`
+      correctly leaves **KPTI OFF** and `m3ctl mitigations status` reads
+      `Meltdown: Not affected`. `/bin/meltdown-poc` (`userspace/meltdown-poc`)
+      runs its `channel=CALIBRATED` control then correctly reports
+      `MELTDOWN_POC:NO-LEAK` (an earlier uniform-`0xdb`×16 "leak" was a
+      stuck-hot cache-slot artifact — the PoC was hardened to require a
+      *non-uniform* recovery). **The leak-on-B / no-leak-on-A A/B is NOT
+      demonstrable on this silicon** — both arms are no-leak because the CPU is
+      immune; a positive leak demo needs Meltdown-**susceptible** (pre-`rdcl_no`)
+      silicon or a KVM CPU model without `rdcl_no`. Evidence:
+      [CET/Meltdown handoff §0.7](./2026-07-09-cet-boot-hang-on-tiger-lake.md#07--validation-result-20260709-delltiger-lake--cet-b3-closed).
+- [x] **A.5 — PCID scheme is live on real silicon** — `Validated-on-HW (run 2,
+      2026-07-09) — Dell / Tiger Lake` (evidence:
+      [CET/Meltdown handoff §0.7](./2026-07-09-cet-boot-hang-on-tiger-lake.md)):
+      `m3ctl mitigations status` shows `KPTI PCID: active (kernel/user PCID,
+      no-flush)`; the tagged-CR3 no-flush trampolines + both-PCID `INVPCID`
+      shootdown ran clean (no CR3 `#GP`/triple-fault at ring-3 entry). To
+      reconfirm: boot the default image and
       confirm the A.5 fallback flips to *active* on PCID hardware: the `[sec]`
       line reads `pcid(active=true supported=true)` (vs the QEMU
       `active=false supported=false`), every `[sec] AP CR4… CR4.PCIDE enabled`,
@@ -110,20 +120,26 @@ and is Meltdown-susceptible with KPTI off, so it is the right target.
       fallback). Watch for any CR3 `#GP` / triple-fault at first ring-3 entry
       (a PCIDE-ordering bug) or a wedged CoW/demand-fault loop (a missed
       user-PCID invalidation).
-- [ ] **A.5 — PCID perf bound.** With PCID active under `M3OS_MITIGATIONS=full`,
-      the smoke suite must be **≤30 %** slower than `M3OS_MITIGATIONS=off` (the
-      Phase 84 bound the naive full-flush KPTI cannot meet). Capture both wall
-      times; if the delta exceeds 30 %, the same-address-space re-dispatch
-      no-flush optimization (a documented A.5 follow-up: per-CPU last-CR3 cache)
-      is the next lever. Also worth a same-boot A/B: temporarily force the
-      fallback (mask PCID in `probe_pcid`) to measure the recovery the tags buy.
-- [ ] **B.3 — CET user shadow stacks are live on real silicon.** ⚠️ **BLOCKED
-      (2026-07-09): CET enable black-screens the Dell at boot.** Bisected to the
-      CET path (F=CET-off boots, G=PCID-off/CET-on hangs); a `CR0.WP`-before-
-      `CR4.CET` fix was necessary but insufficient. Needs serial to read the
-      fault. Full analysis + next steps:
+- [ ] **A.5 — PCID perf bound** — **run `/bin/perf-bench`** (a 3M-iteration
+      `getpid()` round-trip timer; prints `ns_per_syscall`). With PCID active
+      under `M3OS_MITIGATIONS=full` (image C), the workload must be **≤30 %**
+      slower than `M3OS_MITIGATIONS=off` (image B) — the Phase 84 bound the naive
+      full-flush KPTI cannot meet. Run `perf-bench` on both images, compare
+      `ns_per_syscall`: `(ns_full − ns_off) / ns_off ≤ 0.30` ⇒ PASS. If the delta
+      exceeds 30 %, the same-address-space re-dispatch no-flush optimization
+      (per-CPU last-CR3 cache) is the next lever. Same-boot A/B: mask PCID in
+      `probe_pcid` to force the fallback and measure the recovery the tags buy.
+- [x] **B.3 — CET user shadow stacks are live on real silicon** —
+      `Validated-on-HW (run 2, 2026-07-09) — Dell / Tiger Lake`. Boots clean
+      under CET → greeter → login → compositor → terminal → fork/exec;
+      `m3ctl mitigations status` reads `CET: enabled (user shadow stacks)` and
+      the `[sec]` line reads `cet(active=true supported=true)`. The earlier boot
+      hang was root-caused and **five** real-silicon CET bugs fixed (AP
+      `CR0.WP`-before-`CR4.CET`, init SSP arming, signal-delivery SSP seeding,
+      userspace-retpoline↔CET incompatibility, and fork eager-copy of
+      shadow-stack pages). RESOLVED analysis:
       [2026-07-09 CET boot-hang handoff](./2026-07-09-cet-boot-hang-on-tiger-lake.md).
-      The rest of this item is the acceptance once it boots — The whole B.3
+      Original acceptance detail retained — The whole B.3
       substrate is dormant on QEMU (TCG models no CET); Tiger Lake has `CET_SS`,
       so the Dell is the only place the active path runs. Boot the default image
       and confirm: the `[sec]` line flips to `cet(active=true supported=true)`
@@ -133,13 +149,20 @@ and is Meltdown-susceptible with KPTI off, so it is the right target.
       first proof the shadow-stack **enable + per-task SSP + context-switch
       save/restore + the shadow-stack PTE encoding** are all correct — a wrong
       encoding or a stale SSP restore shows up immediately as a `#CP` kill or a
-      `#PF` on the first ring-3 `CALL`. **Watch for:** the fork **CoW-of-shadow-
-      stack** interaction (a child's first shadow-stack push CoW-duplicating the
-      RO+Dirty page — m3OS's generic CoW may need a shadow-stack-aware arm,
-      unlike Linux's explicit copy), and **nested-signal** shadow-stack handling
-      (the single-slot `cet_signal_ssp` covers non-nested; nesting needs the
-      `RSTORSSP`-token path modeled in `kernel_core::cet::shadow_stack_restore_token`).
-- [ ] **B.3 — CET catches a real ROP/overwrite.** PoC **scaffolded and
+      `#PF` on the first ring-3 `CALL`. **Stress arms (dedicated PoCs shipped this session):**
+      (1) fork **CoW-of-shadow-stack** — **fixed** by Fix #5 (eager copy of
+      RO+Dirty shadow-stack pages); regression-confirm with **`/bin/fork-cet-poc`**
+      (expect `FORK_CET_POC:PASS`; a `FORK_CET_POC:FAIL` + a child `#CP` kill would
+      be a regression). (2) **nested-signal** shadow-stack handling — the
+      single-slot `cet_signal_ssp` covers non-nested delivery; deep nesting is the
+      **open follow-up** (`RSTORSSP`-token path in
+      `kernel_core::cet::shadow_stack_restore_token`). Exercise with
+      **`/bin/nested-sig-cet-poc`** (expect `NESTED_SIG_POC:PASS`; a `#CP` kill on
+      the outer handler's return confirms the per-frame-SSP redesign is needed).
+- [x] **B.3 — CET catches a real ROP/overwrite** — `Validated-on-HW (run 2,
+      2026-07-09) — Dell / Tiger Lake`: `/bin/rop-cet-poc`'s overwrite was
+      `#CP`-killed (no `ROP_CET_POC:PWNED`; `dmesg` shows `[int] userspace #CP …
+      process killed`). Details below. PoC **scaffolded and
       shipping** as `/bin/rop-cet-poc` (`userspace/rop-cet-poc`, built canary-off
       via `-Zstack-protector=none`): its naked `vulnerable()` does a precise
       return-address overwrite (`mov [rsp],rdi; ret`, asm-verified). With CET
@@ -147,8 +170,8 @@ and is Meltdown-susceptible with KPTI off, so it is the right target.
       `userspace #CP (CET control-protection) … process killed`) and never print
       `ROP_CET_POC:PWNED`; with CET off (mask `CET_SS` in `probe_cet`, or boot
       `M3OS_MITIGATIONS=off`) the overwrite returns into the planted address →
-      `ROP_CET_POC:PWNED`. `Validated-on-HW (run N, date)`, the CFI analogue of
-      the A.6 Meltdown PoC. Skip-with-reason under QEMU TCG.
+      `ROP_CET_POC:PWNED`. The CFI analogue of
+      the A.6 Meltdown PoC (validated — see the check-off above). Skip-with-reason under QEMU TCG.
 
 ## Phase 111 — Remote Debugging (kgdb / ptrace on metal)
 

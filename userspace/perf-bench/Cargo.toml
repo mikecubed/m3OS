@@ -1,0 +1,11 @@
+[package]
+name = "perf-bench"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "perf-bench"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib" }

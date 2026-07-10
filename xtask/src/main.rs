@@ -2106,6 +2106,12 @@ fn build_userspace_bins() {
         // trips CET, rather than being caught first by `__stack_chk_fail`.
         ("meltdown-poc", "meltdown-poc", false),
         ("rop-cet-poc", "rop-cet-poc", false),
+        // Phase 110 Dell Block 4a/4b/3 stress + perf PoCs. Default userspace
+        // build (canary-on, no retpoline) is already CET-compatible after Fix
+        // #4, so these need no RUSTFLAGS override.
+        ("fork-cet-poc", "fork-cet-poc", false),
+        ("nested-sig-cet-poc", "nested-sig-cet-poc", false),
+        ("perf-bench", "perf-bench", false),
         // Phase 111 Track D — ptrace tracer/tracee smoke.
         ("ptrace-test", "ptrace-test", false),
         // Phase 111 Track D.3 — native gdbserver (links kernel-core → alloc) + debuggee.

@@ -241,7 +241,10 @@ All session fixes are committed on `feat/phase-110-cet-shstk`; QEMU gates
 5. **CET follow-ups already noted in code** (lower priority): nested-signal
    shadow-stack handling still uses the single `Task::cet_signal_ssp` field
    (§0.3 note) — single-level delivery is correct; deep nesting would want a
-   per-frame SSP or to rely purely on the WRUSS seeds.
+   per-frame SSP or to rely purely on the WRUSS seeds. **A dedicated PoC now
+   ships to exercise this on HW: `/bin/nested-sig-cet-poc`** (runbook Block 4b).
+   The fork CoW fix (§0.6) is regression-covered by **`/bin/fork-cet-poc`**
+   (Block 4a), and **`/bin/perf-bench`** drives the A.5 perf bound (Block 3).
 
 ### 0.6 fork must eagerly copy shadow-stack pages (FIXED)
 
