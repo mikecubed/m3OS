@@ -5,18 +5,16 @@
 **Depends on:** [2026-07-09 CET bring-up — RESOLVED](./2026-07-09-cet-boot-hang-on-tiger-lake.md)
 (Fix #3 seeds the signal-delivery shadow stack; §0.3 "Known follow-up" + §0.8
 step 5 flagged *this exact* nesting limitation as deferred).
-**Status:** 🟡 **FIX IMPLEMENTED — pending Dell re-validation.** The kernel fix
-landed on `fix/cet-nested-signal-ssp` → **PR #328** (base `main`): source the
-user SSP from the **live shadow-stack register** (`RDSSP`, MSR fallback) at both
-the signal-delivery seed and the `sigreturn` re-sync, and drop the single-slot
-`Task::cet_signal_ssp`. QEMU gate (`nested-sig-cet-poc-smoke`) + `cargo xtask
-check` + `smoke-test`/`rop-cet-poc-smoke`/`mitigations-status-smoke`/`smp-smoke`
-all green. The `#CP`-reject arm is bare-metal-only (QEMU TCG models no CET), so
-the last step is **re-flash image C on the Dell and confirm `NESTED_SIG_POC:PASS`
-(no `#CP`)**. The fixed image is **built + staged** (2026-07-10):
-`target/dell-images/C-mitigations-full-nestfix.img` (off `fix/cet-nested-signal-ssp`
-@ `fe31d1be`). See *Fix landed* below and *Next session — start here* for the flash
-command. PoC: `/bin/nested-sig-cet-poc` (`userspace/nested-sig-cet-poc`).
+**Status:** 🟠 **FIX v1 DID NOT RESOLVE IT ON HW — DIAGNOSING.** The RDSSP-based
+fix on `fix/cet-nested-signal-ssp` → **PR #328** (source the user SSP from the
+live `RDSSP` register, MSR fallback, at the seed + `sigreturn`; drop the
+single-slot `Task::cet_signal_ssp`) is green on every QEMU gate — but Dell run 1
+**still `#CP`-kills** `nested-sig-cet-poc` at the inner handler's `ret`, identical
+to pre-fix. A **diagnostic image** (`target/dell-images/C-mitigations-full-nestdiag.img`,
+commit `12338eb2`, TEMP instrumentation) is staged to capture the live SSP values
+in one Dell run — see *Dell re-validation — run 1* below. **Next: flash the
+`nestdiag` image, run the PoC, `dmesg | grep CET-DIAG`, report the lines.**
+PoC: `/bin/nested-sig-cet-poc` (`userspace/nested-sig-cet-poc`).
 
 ---
 
@@ -95,6 +93,31 @@ tokens**, so each (possibly nested) signal frame carries its own SSP:
   token-on-shadow-stack scheme).
 
 Keep the whole path `cet_active`-gated so it stays inert on QEMU.
+
+## Dell re-validation — run 1 (2026-07-10): STILL FAILS, diagnosing
+
+The RDSSP-based fix (below) did **not** resolve it: `/bin/nested-sig-cet-poc`
+still dies at the inner handler's `ret`, an **identical** signature to pre-fix —
+`outer-entered → inner-entered → inner-returning`, then a SIGSEGV/`#CP` kill
+(`ion: process (44) ended by signal SIGSEGV`), no `outer-resumed`/`after`. Two
+possibilities: (a) the pre-fix image was booted (the fix never ran), or (b) the
+root-cause model is wrong. First-principles analysis kept concluding the inner
+`ret` should *match* once seeded relative to the live SSP, so the observed
+inner-`ret` fault points at something not yet understood.
+
+**Action: instrumented for one-shot ground truth** (commit `12338eb2`, TEMP,
+`M3OS_MITIGATIONS=full` → staged `target/dell-images/C-mitigations-full-nestdiag.img`,
+sha256 `bc141840…`). `[CET-DIAG]` kernel logs, retrievable via `dmesg`:
+- per signal delivery: `deliver sig=… pid=… handler=… restorer=… frame_rsp=…`
+  then `seed rdssp=… msr=… live=… ret=…` and `seed new_ssp=…` (or `seed SKIPPED`).
+- the `#CP` handler line now carries `[CET-DIAG faulting_ssp(msr)=… rdssp=…]` —
+  the SSP at the mismatching `RET` (the IDT entry saved it into `IA32_PL3_SSP`).
+
+From one run this shows whether the fix code is live (`[CET-DIAG]` present),
+whether `RDSSP` returns a sane SSP or `0` (always-fallback), whether the seed
+skipped, and whether the inner seed's `new_ssp` matches the faulting SSP.
+**Next: flash the `nestdiag` image, run the PoC, `dmesg | grep CET-DIAG`, report.**
+The TEMP instrumentation is reverted once the true cause is found.
 
 ## Fix landed (2026-07-10, PR #328)
 
