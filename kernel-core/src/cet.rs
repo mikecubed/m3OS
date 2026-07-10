@@ -173,6 +173,39 @@ pub fn shadow_stack_restore_token(token_addr: u64) -> Option<u64> {
     Some((token_addr + 8) | 0x1)
 }
 
+// ─── Live user-SSP source selection (nested-signal correctness) ──────────────
+//
+// The kernel needs the *live* user shadow-stack pointer at two loci in the
+// signal path — seeding the handler's restorer (`WRUSS`) on delivery, and
+// re-syncing `IA32_PL3_SSP` before the `IRETQ` at `sigreturn`. The live value
+// lives in one of two hardware places depending on how ring 0 was entered:
+//
+//   * **IDT delivery** (interrupt/exception): with the supervisor shadow stack
+//     disabled, the CPU saves the outgoing user `SSP` into `IA32_PL3_SSP` and
+//     loads `SSP = 0`. So a `RDSSP` in ring 0 reads `0`; the MSR is live.
+//   * **`SYSCALL`**: SSP is *not* switched (there is no supervisor shadow stack
+//     to switch to), so the `SSP` register still holds the live user value while
+//     `IA32_PL3_SSP` is stale — last written by an unrelated earlier transition
+//     (for a nested signal, by the *outer* handler's own delivery seed).
+//
+// This is the crux of the nested-signal bug: a handler entered via `IRETQ` runs
+// with its live SSP in the register, and a *nested* signal taken on that
+// handler's `SYSCALL` (e.g. `kill`) must read the handler's advanced SSP from
+// the register, not the stale seed value left in the MSR. Reading `RDSSP` and
+// falling back to the MSR only when it is zero picks the authoritative source in
+// both cases — with no clobberable per-task slot, so arbitrarily deep nesting is
+// correct because every frame's live SSP comes straight from hardware.
+
+/// Select the live user shadow-stack pointer from the two hardware sources: the
+/// `RDSSP` register read (`rdssp`) and the `IA32_PL3_SSP` MSR (`pl3_ssp_msr`).
+/// `RDSSP` is authoritative when non-zero (a `SYSCALL`-entered path, where the
+/// register still holds the live SSP); a zero `RDSSP` means an IDT entry zeroed
+/// the register and saved the live SSP into the MSR, so the MSR wins.
+#[inline]
+pub fn select_live_ssp(rdssp: u64, pl3_ssp_msr: u64) -> u64 {
+    if rdssp != 0 { rdssp } else { pl3_ssp_msr }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +287,23 @@ mod tests {
         // Misaligned token address is rejected (RSTORSSP requires 8-byte align).
         assert_eq!(shadow_stack_restore_token(0x1004), None);
         assert_eq!(shadow_stack_restore_token(0x1001), None);
+    }
+
+    #[test]
+    fn live_ssp_prefers_register_when_nonzero() {
+        // SYSCALL path: RDSSP holds the live SSP, MSR is stale — register wins.
+        // This is the nested-signal case: the outer handler's advanced SSP
+        // (0x7ff0) must beat the stale seed left in the MSR (0x8000).
+        assert_eq!(select_live_ssp(0x7ff0, 0x8000), 0x7ff0);
+        assert_eq!(select_live_ssp(0x1, 0x0), 0x1);
+    }
+
+    #[test]
+    fn live_ssp_falls_back_to_msr_when_register_zero() {
+        // IDT path: the CPU zeroed SSP and saved the live value into the MSR —
+        // fall back to the MSR. Also the CET-off / RDSSP-is-a-NOP degenerate case
+        // (register read stays the pre-zeroed 0), which correctly yields the MSR.
+        assert_eq!(select_live_ssp(0x0, 0x9abc), 0x9abc);
+        assert_eq!(select_live_ssp(0x0, 0x0), 0x0);
     }
 }

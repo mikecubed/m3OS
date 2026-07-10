@@ -679,15 +679,6 @@ pub struct Task {
     ///
     /// Placed AFTER `preempt_frame` to preserve `EXPECTED_TASK_PREEMPT_FRAME_OFFSET`.
     pub cet_ssp: u64,
-    /// Phase 110 Track B.3 — the user shadow-stack pointer saved across a signal
-    /// handler: at delivery the interrupted context's live `IA32_PL3_SSP` is
-    /// stashed here, and `sigreturn` restores it (the handler runs on the same
-    /// shadow stack, pushing below the saved SSP; the restore discards those
-    /// frames so the interrupted context resumes with the matching SSP). Covers
-    /// non-nested signals; nested-signal + `RSTORSSP`-token handling is a
-    /// Dell-session refinement. Only meaningful when CET is active; inert on
-    /// QEMU. Placed AFTER `preempt_frame` to preserve the 57d offset assert.
-    pub cet_signal_ssp: u64,
     /// Phase 61 Track E.4 — page-fault counters for `getrusage(2)`.
     ///
     /// Minor faults — fault successfully resolved in-memory (e.g., CoW page
@@ -821,7 +812,6 @@ impl Task {
             group_exit_pending: false,
             user_return: None,
             cet_ssp: 0,
-            cet_signal_ssp: 0,
             fork_ctx: None,
             wake_deadline: None,
             blocked_since_tick: 0,
