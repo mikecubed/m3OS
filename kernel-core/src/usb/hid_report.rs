@@ -718,6 +718,165 @@ pub fn decode_consumer_usages(fields: &[ReportField], report: &[u8]) -> Vec<u16>
 }
 
 // ---------------------------------------------------------------------------
+// Precision-Touchpad / multitouch decode (Phase 102 Track C)
+// ---------------------------------------------------------------------------
+
+/// HID Usage Page 0x0D — Digitizers (touchpad / touchscreen / stylus).
+const USAGE_PAGE_DIGITIZER: u16 = 0x0D;
+/// Digitizer Usage 0x42 — Tip Switch (finger touching the surface).
+const USAGE_DIG_TIP_SWITCH: u16 = 0x42;
+/// Digitizer Usage 0x51 — Contact Identifier (stable per-finger id).
+const USAGE_DIG_CONTACT_ID: u16 = 0x51;
+/// Digitizer Usage 0x54 — Contact Count (valid contacts this frame).
+const USAGE_DIG_CONTACT_COUNT: u16 = 0x54;
+
+/// One decoded touchpad contact (finger). `x`/`y` are the **absolute** logical
+/// coordinates straight from the report — the `i2c-hid` daemon scales and
+/// differences them into the relative `PointerEvent` deltas `mouse_server`
+/// expects (the mapping is device-geometry-dependent, so it stays in the
+/// daemon, not this pure decode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TouchContact {
+    /// Tip Switch — `true` while this finger is touching.
+    pub tip: bool,
+    /// Contact Identifier — stable across frames for the same finger.
+    pub contact_id: u8,
+    /// Absolute X in the touchpad's logical coordinate space.
+    pub x: u16,
+    /// Absolute Y in the touchpad's logical coordinate space.
+    pub y: u16,
+}
+
+/// A decoded Windows-Precision-Touchpad input-report frame.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TouchpadFrame {
+    /// Every contact *slot* present in the report, in descriptor order. A lifted
+    /// finger is still a slot but with `tip == false`.
+    pub contacts: Vec<TouchContact>,
+    /// The report's Contact Count field — how many slots are valid this frame
+    /// (`0` if the descriptor carries no Contact Count usage; fall back to
+    /// counting `tip` contacts).
+    pub contact_count: u8,
+    /// The clickpad / physical button (Button page usage 1) state.
+    pub button: bool,
+}
+
+impl TouchpadFrame {
+    /// The contacts actually touching (`tip == true`) — the fingers the daemon
+    /// turns into pointer motion / a two-finger scroll.
+    pub fn active_contacts(&self) -> impl Iterator<Item = &TouchContact> {
+        self.contacts.iter().filter(|c| c.tip)
+    }
+}
+
+/// Accumulates one contact's fields until a repeated usage (the next finger's
+/// collection) or the end of the report flushes it.
+#[derive(Default)]
+struct ContactAcc {
+    cur: TouchContact,
+    has_tip: bool,
+    has_id: bool,
+    has_x: bool,
+    has_y: bool,
+    dirty: bool,
+}
+
+impl ContactAcc {
+    /// Push the accumulated contact (if any field was set) and reset.
+    fn flush_into(&mut self, out: &mut Vec<TouchContact>) {
+        if self.dirty {
+            out.push(self.cur);
+            *self = Self::default();
+        }
+    }
+}
+
+/// Decode a **Windows-Precision-Touchpad / digitizer** input report using
+/// `fields` (the [`parse_report_descriptor`] output — the descriptor language is
+/// identical over I2C and USB, so this is shared with the USB HID path).
+/// OpenBSD `imt(4)` (`sys/dev/i2c/imt.c`) is the reference.
+///
+/// Per-contact usages — Digitizer Tip Switch (0x42) / Contact Identifier (0x51)
+/// and Generic-Desktop X (0x30) / Y (0x31) — are grouped into [`TouchContact`]s
+/// in descriptor order: a **repeated** per-contact usage begins the next finger
+/// (Precision Touchpad lays out one collection per finger). Digitizer Contact
+/// Count (0x54) fills [`TouchpadFrame::contact_count`]; a Button-page (0x09)
+/// usage-1 bit fills [`TouchpadFrame::button`].
+///
+/// Report-ID handling matches [`decode_pointer_report`]: an ID'd descriptor
+/// selects fields by `report[0]` and offsets the body past the ID byte. A
+/// too-short report decodes to zeroed fields without panicking (the shared
+/// `extract_bits` is bounds-safe).
+pub fn decode_touchpad_report(fields: &[ReportField], report: &[u8]) -> TouchpadFrame {
+    let mut frame = TouchpadFrame::default();
+
+    let uses_report_id = fields.iter().any(|f| f.report_id != 0);
+    let (active_id, body_base_bit) = if uses_report_id {
+        (report.first().copied().unwrap_or(0), 8usize)
+    } else {
+        (0u8, 0usize)
+    };
+
+    let mut acc = ContactAcc::default();
+
+    for f in fields {
+        if uses_report_id && f.report_id != active_id {
+            continue;
+        }
+        let abs_bit = body_base_bit + f.bit_offset;
+        let raw = extract_bits(report, abs_bit, f.bit_size);
+
+        match (f.usage_page, f.usage) {
+            (USAGE_PAGE_DIGITIZER, USAGE_DIG_TIP_SWITCH) => {
+                if acc.has_tip {
+                    acc.flush_into(&mut frame.contacts);
+                }
+                acc.cur.tip = raw & 0x01 != 0;
+                acc.has_tip = true;
+                acc.dirty = true;
+            }
+            (USAGE_PAGE_DIGITIZER, USAGE_DIG_CONTACT_ID) => {
+                if acc.has_id {
+                    acc.flush_into(&mut frame.contacts);
+                }
+                acc.cur.contact_id = raw as u8;
+                acc.has_id = true;
+                acc.dirty = true;
+            }
+            (USAGE_PAGE_GENERIC_DESKTOP, USAGE_X) => {
+                if acc.has_x {
+                    acc.flush_into(&mut frame.contacts);
+                }
+                acc.cur.x = raw as u16;
+                acc.has_x = true;
+                acc.dirty = true;
+            }
+            (USAGE_PAGE_GENERIC_DESKTOP, USAGE_Y) => {
+                if acc.has_y {
+                    acc.flush_into(&mut frame.contacts);
+                }
+                acc.cur.y = raw as u16;
+                acc.has_y = true;
+                acc.dirty = true;
+            }
+            (USAGE_PAGE_DIGITIZER, USAGE_DIG_CONTACT_COUNT) => {
+                frame.contact_count = raw as u8;
+            }
+            // A clickpad / physical button: Button page, usage 1..=8, 1 bit set.
+            (USAGE_PAGE_BUTTON, n) if f.bit_size >= 1 && (1..=8).contains(&n) => {
+                if raw & 0x01 != 0 {
+                    frame.button = true;
+                }
+            }
+            _ => { /* pressure, width, scan-time, azimuth, … — ignored */ }
+        }
+    }
+    acc.flush_into(&mut frame.contacts);
+
+    frame
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1390,5 +1549,93 @@ mod tests {
         // No bits → empty, no panic on a short report.
         assert!(decode_consumer_usages(&fields, &[0x00]).is_empty());
         assert!(decode_consumer_usages(&fields, &[]).is_empty());
+    }
+
+    // --- Precision-Touchpad multitouch decode (Phase 102 Track C) ---
+
+    fn tp_field(usage_page: u16, usage: u16, bit_offset: usize, bit_size: usize) -> ReportField {
+        ReportField {
+            usage_page,
+            usage,
+            bit_offset,
+            bit_size,
+            report_id: 1,
+            is_relative: false,
+        }
+    }
+
+    /// Two per-finger collections {Tip, ContactID, X, Y} + Contact Count +
+    /// clickpad Button, all under report ID 1 (the shape a Precision Touchpad
+    /// report descriptor parses to).
+    fn two_contact_fields() -> Vec<ReportField> {
+        alloc::vec![
+            tp_field(0x0D, 0x42, 0, 1),   // contact0 Tip Switch
+            tp_field(0x0D, 0x51, 8, 8),   // contact0 Contact ID
+            tp_field(0x01, 0x30, 16, 16), // contact0 X (Generic Desktop)
+            tp_field(0x01, 0x31, 32, 16), // contact0 Y
+            tp_field(0x0D, 0x42, 48, 1),  // contact1 Tip Switch
+            tp_field(0x0D, 0x51, 56, 8),  // contact1 Contact ID
+            tp_field(0x01, 0x30, 64, 16), // contact1 X
+            tp_field(0x01, 0x31, 80, 16), // contact1 Y
+            tp_field(0x0D, 0x54, 96, 8),  // Contact Count
+            tp_field(0x09, 0x01, 104, 1), // clickpad Button
+        ]
+    }
+
+    #[test]
+    fn touchpad_two_fingers_down_with_button() {
+        let fields = two_contact_fields();
+        // [reportID=1, tip0=1, id0=0, X0=0x0140, Y0=0x00C8, tip1=1, id1=1,
+        //  X1=0x0280, Y1=0x0190, count=2, button=1]
+        let report = [
+            1u8, 0x01, 0x00, 0x40, 0x01, 0xC8, 0x00, 0x01, 0x01, 0x80, 0x02, 0x90, 0x01, 0x02,
+            0x01,
+        ];
+        let frame = decode_touchpad_report(&fields, &report);
+        assert_eq!(frame.contacts.len(), 2);
+        assert_eq!(
+            frame.contacts[0],
+            TouchContact { tip: true, contact_id: 0, x: 320, y: 200 }
+        );
+        assert_eq!(
+            frame.contacts[1],
+            TouchContact { tip: true, contact_id: 1, x: 640, y: 400 }
+        );
+        assert_eq!(frame.contact_count, 2);
+        assert!(frame.button);
+        assert_eq!(frame.active_contacts().count(), 2);
+    }
+
+    #[test]
+    fn touchpad_one_finger_lifted_is_a_slot_but_not_active() {
+        let fields = two_contact_fields();
+        // contact1 Tip byte (index 7) = 0 → lifted; button byte (14) = 0.
+        let report = [
+            1u8, 0x01, 0x00, 0x40, 0x01, 0xC8, 0x00, 0x00, 0x01, 0x80, 0x02, 0x90, 0x01, 0x02,
+            0x00,
+        ];
+        let frame = decode_touchpad_report(&fields, &report);
+        assert_eq!(frame.contacts.len(), 2, "both slots still present");
+        assert!(frame.contacts[0].tip);
+        assert!(!frame.contacts[1].tip, "second finger lifted");
+        assert!(!frame.button);
+        assert_eq!(
+            frame.active_contacts().count(),
+            1,
+            "only the touching finger is active"
+        );
+    }
+
+    #[test]
+    fn touchpad_short_report_decodes_without_panicking() {
+        let fields = two_contact_fields();
+        // Only the report ID + the first body byte are present; every field past
+        // the end reads as 0 (bounds-safe extract_bits).
+        let frame = decode_touchpad_report(&fields, &[1u8, 0x01]);
+        assert_eq!(frame.contacts.len(), 2);
+        assert!(frame.contacts[0].tip, "byte present, tip bit set");
+        assert!(!frame.contacts[1].tip, "past the report end → 0");
+        assert_eq!(frame.contact_count, 0);
+        assert!(!frame.button);
     }
 }
