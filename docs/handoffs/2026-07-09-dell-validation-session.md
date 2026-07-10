@@ -302,6 +302,12 @@ boot doesn't exercise them hard enough. Run **on image C** (KPTI+CET active on
 this `rdcl_no=true` silicon; image A leaves KPTI off). Two dedicated PoCs ship
 this session: **`/bin/fork-cet-poc`** (4a) and **`/bin/nested-sig-cet-poc`** (4b).
 
+> **RUN 2 (2026-07-10) RESULTS.** 4a **✅ PASS** (`FORK_CET_POC:PASS` — Fix #5
+> holds on HW). 4b **🔴 FAIL — confirmed bug:** `nested-sig-cet-poc` `#CP`-killed
+> on the *nested* handler's `ret` (`pid=45 rip=0x2014b3 err=0x1`). Follow-up +
+> per-frame-SSP fix plan:
+> [2026-07-10 nested-signal SSP `#CP`](./2026-07-10-cet-nested-signal-ssp-followup.md).
+
 ### 4a — fork CoW-of-shadow-stack (regression-confirm; **already fixed**)
 **Status.** **Fixed** by Fix #5 of the CET bring-up (handoff §0.6): fork now
 eagerly copies shadow-stack pages instead of sharing them. This arm is a

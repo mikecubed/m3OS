@@ -129,6 +129,9 @@ and is Meltdown-susceptible with KPTI off, so it is the right target.
       exceeds 30 %, the same-address-space re-dispatch no-flush optimization
       (per-CPU last-CR3 cache) is the next lever. Same-boot A/B: mask PCID in
       `probe_pcid` to force the fallback and measure the recovery the tags buy.
+      **Run-2 partial (2026-07-10):** image C (full/PCID-on) `ns_per_syscall=6128`
+      (`elapsed_ms=18386` @ 3M iters). Need the image-B (`off`) baseline to
+      compute the ratio — still open.
 - [x] **B.3 — CET user shadow stacks are live on real silicon** —
       `Validated-on-HW (run 2, 2026-07-09) — Dell / Tiger Lake`. Boots clean
       under CET → greeter → login → compositor → terminal → fork/exec;
@@ -157,8 +160,13 @@ and is Meltdown-susceptible with KPTI off, so it is the right target.
       single-slot `cet_signal_ssp` covers non-nested delivery; deep nesting is the
       **open follow-up** (`RSTORSSP`-token path in
       `kernel_core::cet::shadow_stack_restore_token`). Exercise with
-      **`/bin/nested-sig-cet-poc`** (expect `NESTED_SIG_POC:PASS`; a `#CP` kill on
-      the outer handler's return confirms the per-frame-SSP redesign is needed).
+      **`/bin/nested-sig-cet-poc`** (expect `NESTED_SIG_POC:PASS`; a `#CP` kill
+      confirms the per-frame-SSP redesign is needed).
+      **Run-2 results (2026-07-10, Dell/Tiger Lake):** 4a **PASS**
+      (`FORK_CET_POC:PASS` — Fix #5 holds on HW). 4b **FAIL — confirmed bug**:
+      `nested-sig-cet-poc` `#CP`-killed on the *nested* handler's `ret`
+      (`pid=45 rip=0x2014b3 err=0x1`); follow-up:
+      [2026-07-10 nested-signal SSP `#CP`](./2026-07-10-cet-nested-signal-ssp-followup.md).
 - [x] **B.3 — CET catches a real ROP/overwrite** — `Validated-on-HW (run 2,
       2026-07-09) — Dell / Tiger Lake`: `/bin/rop-cet-poc`'s overwrite was
       `#CP`-killed (no `ROP_CET_POC:PWNED`; `dmesg` shows `[int] userspace #CP …
