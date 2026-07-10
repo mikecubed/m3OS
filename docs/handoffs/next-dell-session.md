@@ -7,7 +7,10 @@
 > the runbook works down.
 
 A running list of everything waiting on physical access to the reference laptop, so
-bench time gets batched instead of spent one item per session. **Add items here when
+bench time gets batched instead of spent one item per session. **This checklist covers only
+phases with *built* HW arms** (100/101/103/106/110/111); the whole-arc plan — including the
+not-yet-built phases (102 touchpad, 104 Wi-Fi, 108, 109) and the recommended sequencing — is
+[hw-validation-campaign.md](../appendix/hw-validation-campaign.md). **Add items here when
 work lands that needs a hardware arm; check items off (with the capture path / run
 record) when a session validates them.** Protocol: [bare-metal validation
 strategy](../appendix/bare-metal-validation.md). Workflow facts (SSH capture idiom,
