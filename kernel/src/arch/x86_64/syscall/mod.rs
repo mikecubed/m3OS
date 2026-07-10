@@ -3036,15 +3036,6 @@ fn deliver_user_signal(
     // the handler's final `RET` pops this slot and `sigreturn` re-syncs the MSR
     // from the live SSP (`cet::restore_signal_ssp`) — no per-task saved slot,
     // hence no single-slot clobber under nesting. No-op unless CET is active.
-    // TEMP DIAG (nested-signal #CP) — remove before merge.
-    log::info!(
-        "[CET-DIAG] deliver sig={} pid={} handler={:#x} restorer={:#x} frame_rsp={:#x}",
-        signum,
-        pid,
-        handler_entry,
-        restorer,
-        frame_rsp,
-    );
     unsafe {
         crate::arch::x86_64::cet::seed_signal_shadow_stack(restorer);
     }

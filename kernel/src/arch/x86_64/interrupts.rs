@@ -2142,15 +2142,10 @@ extern "C" fn control_protection_fault_body(frame: &mut TrapFrameErr) {
     let err = frame.error_code;
     if frame.from_user() {
         let pid = crate::process::current_pid();
-        // TEMP DIAG (nested-signal #CP) — remove before merge. At a ring-3 #CP the
-        // IDT entry saved the faulting user SSP into IA32_PL3_SSP; that is the SSP
-        // at the mismatching RET (compare to the [CET-DIAG] seed new_ssp).
-        let (diag_rdssp, diag_msr) = crate::arch::x86_64::cet::diag_live_ssp_and_msr();
         _panic_print(format_args!(
             "[int] userspace #CP (CET control-protection): pid={} rip={:#x} rsp={:#x} err={:#x} \
-             [CET-DIAG faulting_ssp(msr)={:#x} rdssp={:#x}] \
              (shadow-stack/CFI violation — return-address overwrite) — process killed\n",
-            pid, frame.rip, frame.rsp, err, diag_msr, diag_rdssp,
+            pid, frame.rip, frame.rsp, err,
         ));
         panic_diag::dump_crash_context();
         crate::trace::dump_trace_rings();
