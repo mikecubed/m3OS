@@ -15,6 +15,10 @@ members = [
     # Phase 110 Dell-validation PoCs — Meltdown (A.6) + CET/ROP (B.3) bench arms
     "userspace/meltdown-poc",
     "userspace/rop-cet-poc",
+    # Phase 110 Dell Block 4a/4b/3 — CET fork-CoW stress, nested-signal SSP, PCID perf
+    "userspace/fork-cet-poc",
+    "userspace/nested-sig-cet-poc",
+    "userspace/perf-bench",
     # Phase 111 Track D — ptrace tracer/tracee smoke binary
     "userspace/ptrace-test",
     # Phase 111 Track D.3 — native gdbserver + its debuggee

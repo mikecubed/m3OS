@@ -87,6 +87,10 @@ static STACK_SMASH_ELF: &[u8] = generated_initrd_asset!("stack-smash");
 // Phase 110 Dell-validation PoCs — Meltdown reject (A.6) + CET/ROP (B.3).
 static MELTDOWN_POC_ELF: &[u8] = generated_initrd_asset!("meltdown-poc");
 static ROP_CET_POC_ELF: &[u8] = generated_initrd_asset!("rop-cet-poc");
+// Phase 110 Dell Block 4a/4b/3 — CET fork-CoW stress, nested-signal SSP, PCID perf.
+static FORK_CET_POC_ELF: &[u8] = generated_initrd_asset!("fork-cet-poc");
+static NESTED_SIG_CET_POC_ELF: &[u8] = generated_initrd_asset!("nested-sig-cet-poc");
+static PERF_BENCH_ELF: &[u8] = generated_initrd_asset!("perf-bench");
 // Phase 111 Track D — ptrace tracer/tracee smoke.
 static PTRACE_TEST_ELF: &[u8] = generated_initrd_asset!("ptrace-test");
 // Phase 111 Track D.3 — native gdbserver + its debuggee.
@@ -564,6 +568,24 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "rop-cet-poc",
         RamdiskNode::File {
             content: ROP_CET_POC_ELF,
+        },
+    ),
+    (
+        "fork-cet-poc",
+        RamdiskNode::File {
+            content: FORK_CET_POC_ELF,
+        },
+    ),
+    (
+        "nested-sig-cet-poc",
+        RamdiskNode::File {
+            content: NESTED_SIG_CET_POC_ELF,
+        },
+    ),
+    (
+        "perf-bench",
+        RamdiskNode::File {
+            content: PERF_BENCH_ELF,
         },
     ),
     (

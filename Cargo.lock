@@ -808,6 +808,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
+name = "fork-cet-poc"
+version = "0.99.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
 name = "fork-test"
 version = "0.99.0"
 dependencies = [
@@ -1431,6 +1438,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nested-sig-cet-poc"
+version = "0.99.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
 name = "net_server"
 version = "0.99.0"
 dependencies = [
@@ -1583,6 +1597,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88b39c9bfcfc231068454382784bb460aae594343fb030d46e9f50a645418412"
 dependencies = [
  "base64ct",
+]
+
+[[package]]
+name = "perf-bench"
+version = "0.99.0"
+dependencies = [
+ "syscall-lib",
 ]
 
 [[package]]

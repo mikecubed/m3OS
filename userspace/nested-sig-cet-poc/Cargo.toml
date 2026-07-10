@@ -1,0 +1,11 @@
+[package]
+name = "nested-sig-cet-poc"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "nested-sig-cet-poc"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib" }
