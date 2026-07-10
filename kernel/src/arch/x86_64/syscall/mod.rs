@@ -3026,17 +3026,16 @@ fn deliver_user_signal(
     //    ignore RSI/RDX — Linux likewise always sets them for rt_sigframe.
     let siginfo_ptr = frame_rsp + crate::signal::OFF_SIGINFO as u64;
     let ucontext_ptr = frame_rsp + crate::signal::OFF_UCONTEXT as u64;
-    // Phase 110 B.3 — stash the interrupted context's user shadow-stack pointer
-    // so sigreturn restores it (the handler runs on the same shadow stack,
-    // pushing below the saved SSP). No-op unless CET is active.
-    crate::task::scheduler::save_current_task_signal_ssp();
     // Phase 110 B.3 — seed the handler's return address (`restorer`, the
-    // sigframe pretcode) onto the user shadow stack via WRUSS and drop
-    // IA32_PL3_SSP by 8. The handler is entered by IRETQ, which pushes nothing
-    // to the shadow stack, so without this its final `RET` to `restorer` would
-    // mismatch the shadow-stack top → `#CP` (kills any process whose signal
-    // handler returns — the Dell/Tiger Lake greeter respawn loop). No-op unless
-    // CET is active. `sigreturn` restores the saved SSP, discarding this slot.
+    // sigframe pretcode) onto the user shadow stack via WRUSS and drop the live
+    // SSP by 8. The handler is entered by IRETQ, which pushes nothing to the
+    // shadow stack, so without this its final `RET` to `restorer` would mismatch
+    // the shadow-stack top → `#CP` (kills any process whose signal handler
+    // returns — the Dell/Tiger Lake greeter respawn loop). The seed reads the
+    // *live* SSP (register-first), so it is correct for a nested delivery too;
+    // the handler's final `RET` pops this slot and `sigreturn` re-syncs the MSR
+    // from the live SSP (`cet::restore_signal_ssp`) — no per-task saved slot,
+    // hence no single-slot clobber under nesting. No-op unless CET is active.
     unsafe {
         crate::arch::x86_64::cet::seed_signal_shadow_stack(restorer);
     }
@@ -3858,11 +3857,14 @@ unsafe fn restore_and_enter_userspace(regs: &crate::signal::SavedUserRegs) -> ! 
     const PRIV_MASK: u64 =
         (1 << 12) | (1 << 13) | (1 << 14) | (1 << 17) | (1 << 19) | (1 << 20) | (1 << 21);
     let rflags = (regs.rflags & !PRIV_MASK) | 0x202;
-    // Phase 110 B.3 — restore the pre-signal user shadow-stack pointer stashed
-    // at delivery, so the interrupted context resumes with a matching SSP (the
-    // handler's shadow-stack frames are discarded). No-op unless CET is active.
-    // Done before the iretq trampoline, which reloads SSP from IA32_PL3_SSP.
-    crate::task::scheduler::restore_current_task_signal_ssp();
+    // Phase 110 B.3 — re-sync IA32_PL3_SSP to the live user shadow-stack pointer
+    // so the imminent iretq (which reloads SSP from IA32_PL3_SSP) resumes the
+    // interrupted context with a matching SSP. The handler's final RET already
+    // unwound the WRUSS-seeded restorer slot, leaving the live SSP register at
+    // the interrupted value; this copies it into the MSR. Reads the live SSP (no
+    // per-task slot), so nested sigreturns each restore their own frame's SSP.
+    // No-op unless CET is active.
+    crate::arch::x86_64::cet::restore_signal_ssp();
     unsafe { sigreturn_enter_userspace(regs, ss, cs, rflags) }
 }
 

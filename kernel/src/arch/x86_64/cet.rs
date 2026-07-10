@@ -13,14 +13,19 @@
 //!
 //! **SSP lifecycle (the load-bearing model, SDM Vol 3A §6.14).** m3OS enables
 //! *user* shadow stacks only (`IA32_S_CET.SH_STK_EN = 0`, no kernel shadow
-//! stack). On a ring-3 → ring-0 transition the CPU saves the outgoing user
-//! `SSP` into `IA32_PL3_SSP` and loads `SSP = 0`; `IRET` back to ring 3 reloads
-//! `SSP` from `IA32_PL3_SSP`. So within one kernel entry/exit the user SSP is
-//! preserved by hardware — the kernel only has to save/restore `IA32_PL3_SSP`
-//! across **task switches** (a different task's kernel entry overwrote the MSR)
-//! and around **signal delivery** (Track B.3 4/n). These MSR save/restore points
-//! are co-located with the FPU/XSAVE save/restore, which has the identical
-//! per-task-CPU-state lifecycle — that co-location is the correctness argument.
+//! stack). The entry path matters: on an **IDT** ring-3 → ring-0 transition
+//! (interrupt/exception) the CPU saves the outgoing user `SSP` into
+//! `IA32_PL3_SSP` and loads `SSP = 0`, and `IRET` back to ring 3 reloads `SSP`
+//! from `IA32_PL3_SSP`; but **`SYSCALL` does not** — with no supervisor shadow
+//! stack to switch to, `SSP` is left holding the live user value and the MSR is
+//! *not* updated (it stays stale). So the authoritative source for the live user
+//! SSP is entry-path-dependent (`RDSSP` register on `SYSCALL`, the MSR on IDT
+//! delivery) — see [`kernel_core::cet::select_live_ssp`]. The kernel saves/
+//! restores `IA32_PL3_SSP` across **task switches** (a different task's kernel
+//! entry overwrote the MSR), co-located with FPU/XSAVE; **signal delivery**
+//! (Track B.3 4/n) instead seeds the handler's restorer with `WRUSS` and reads
+//! the live SSP register-first, which is what makes *nested* signals correct
+//! (the stale-MSR conflation above was the nested-signal `#CP` bug).
 
 use kernel_core::cet::{MSR_IA32_PL3_SSP, compose_user_shadow_stack_pte};
 use x86_64::registers::model_specific::Msr;
@@ -62,6 +67,49 @@ unsafe fn read_pl3_ssp() -> u64 {
 #[inline]
 unsafe fn write_pl3_ssp(ssp: u64) {
     unsafe { Msr::new(MSR_IA32_PL3_SSP).write(ssp) };
+}
+
+/// Read the live `SSP` register via `RDSSP`. On a `SYSCALL`-entered path the
+/// register still holds the user SSP; on an IDT-entered path the CPU zeroed it
+/// (and saved the live SSP into `IA32_PL3_SSP` instead), so this returns `0`
+/// there — the caller distinguishes via [`kernel_core::cet::select_live_ssp`].
+///
+/// # Safety
+/// Ring 0. Encoded as raw bytes so the mnemonic needs no `+cet` target feature.
+/// When CET is disabled `RDSSP` executes as a `NOP` and leaves the input `0`
+/// untouched — harmless, and the `0` correctly routes callers to the MSR — but
+/// callers still gate on [`cet_active`] since they also touch the PL3 MSR.
+#[inline]
+unsafe fn read_ssp_reg() -> u64 {
+    // `F3 48 0F 1E C8` = `rdsspq rax` (ModRM C8: mod=11, reg=1 [RDSSP /1],
+    // rm=rax). Pre-seed rax=0 via `inout` so a NOP (CET off) yields 0.
+    let mut ssp: u64 = 0;
+    unsafe {
+        core::arch::asm!(
+            ".byte 0xF3, 0x48, 0x0F, 0x1E, 0xC8",
+            inout("rax") ssp,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    ssp
+}
+
+/// The live user shadow-stack pointer, read from the authoritative hardware
+/// source for the current kernel-entry path (register on `SYSCALL`, MSR on IDT
+/// delivery — see [`kernel_core::cet::select_live_ssp`]). `0` when CET is
+/// inactive. This is the nesting-safe SSP source for signal seed + `sigreturn`:
+/// it never consults a clobberable per-task slot, so a nested signal reads the
+/// *outer* handler's advanced SSP straight from hardware.
+#[inline]
+fn live_user_ssp() -> u64 {
+    if !cet_active() {
+        return 0;
+    }
+    // SAFETY: gated on `cet_active`; ring 0. `IA32_PL3_SSP` exists and `RDSSP`
+    // is a valid (real, not NOP) read.
+    let rdssp = unsafe { read_ssp_reg() };
+    let msr = unsafe { read_pl3_ssp() };
+    kernel_core::cet::select_live_ssp(rdssp, msr)
 }
 
 /// Read the current core's live `IA32_PL3_SSP` (the running task's user SSP),
@@ -227,21 +275,31 @@ pub unsafe fn setup_current_task_shadow_stack() -> bool {
 /// against a shadow-stack top holding the *interrupted* function's return
 /// address → mismatch → `#CP`, killing every process whose handler returns.
 /// Seeding `ret_addr` one slot below the live SSP makes that `RET` match; the
-/// handler's own calls nest below it and unwind back, and `sigreturn` restores
-/// the saved SSP ([`restore_task_ssp`]) discarding this slot.
+/// handler's own calls nest below it and unwind back to `ret_addr`, and its
+/// final `RET` pops the seeded slot so `SSP` lands back at the interrupted
+/// context's value — from which [`restore_signal_ssp`] re-syncs the MSR at
+/// `sigreturn`.
+///
+/// **Nesting.** The live SSP is read via [`live_user_ssp`] (register-first), not
+/// the `IA32_PL3_SSP` MSR — a *nested* signal is delivered on the outer
+/// handler's `SYSCALL`, which leaves the MSR stale (holding the outer *delivery*
+/// seed), so only the `RDSSP` register carries the handler's advanced SSP. This
+/// is what makes seeding correct for the nested frame; the old MSR read seeded
+/// the nested restorer at the wrong slot.
 ///
 /// Uses `WRUSS` (ring-0 write to a user shadow stack; requires `CR4.CET = 1`) —
 /// ordinary stores to a shadow-stack page (R/W=0) fault.
 ///
 /// # Safety
 /// CET active; the current CR3 is this task's address space with a live user
-/// shadow stack at `IA32_PL3_SSP`; ring 0.
+/// shadow stack; ring 0.
 pub unsafe fn seed_signal_shadow_stack(ret_addr: u64) -> u64 {
     if !cet_active() {
         return 0;
     }
-    // SAFETY: gated on `cet_active`, so `IA32_PL3_SSP` exists; ring 0.
-    let ssp = unsafe { read_pl3_ssp() };
+    // The live user SSP — register-first (SYSCALL path) with MSR fallback (IDT
+    // path). Correct for nested delivery, where the MSR is stale (see fn doc).
+    let ssp = live_user_ssp();
     // Fail closed on a zero, misaligned, or too-small SSP. In normal operation
     // the SSP is kernel-armed, 8-byte-aligned, and deep in the shadow-stack
     // region — but a corrupted/unexpected `IA32_PL3_SSP` must NOT make the kernel
@@ -268,4 +326,30 @@ pub unsafe fn seed_signal_shadow_stack(ret_addr: u64) -> u64 {
         write_pl3_ssp(new_ssp);
     }
     new_ssp
+}
+
+/// Re-sync `IA32_PL3_SSP` to the live user shadow-stack pointer at `sigreturn`,
+/// so the `IRETQ`-based return reloads the interrupted context's SSP. No-op when
+/// CET is inactive.
+///
+/// **Why the MSR needs re-syncing.** Delivery ([`seed_signal_shadow_stack`])
+/// lowered `IA32_PL3_SSP` by 8 for the handler; the handler's final `RET` popped
+/// that seeded slot, advancing the live `SSP` register back to the interrupted
+/// context's value — but nothing updated the *MSR* (ring-3 `RET`/`SYSCALL` don't
+/// touch it). So at `sigreturn` the MSR is 8 low. Copying the live SSP (from
+/// [`live_user_ssp`]) into the MSR fixes exactly that one slot.
+///
+/// **Nesting-safe.** This reads the *live* SSP from hardware every time; it does
+/// not consult a per-task saved slot. So a nested `sigreturn` restores the inner
+/// frame's SSP and the outer `sigreturn` restores the outer frame's — the
+/// single-slot clobber that killed the outer unwind is gone. Replaces the old
+/// `Task::cet_signal_ssp` save-at-delivery / restore-at-sigreturn pair.
+pub fn restore_signal_ssp() {
+    if !cet_active() {
+        return;
+    }
+    let ssp = live_user_ssp();
+    // SAFETY: gated on `cet_active`, so `IA32_PL3_SSP` exists; ring 0. `ssp` is
+    // the live user SSP the imminent `iretq` must reload.
+    unsafe { write_pl3_ssp(ssp) };
 }

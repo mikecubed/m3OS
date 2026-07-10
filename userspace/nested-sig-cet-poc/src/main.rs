@@ -1,12 +1,14 @@
 //! Nested-signal shadow-stack PoC (Phase 110 Track B.3, Block 4b).
 //!
-//! Exercises the **one genuinely open CET risk** the 2026-07-09 bring-up
-//! deferred (handoff §0.3 note + §0.8 step 5): signal delivery seeds the shadow
-//! stack via `WRUSS` (Fix #3) and saves the interrupted SSP in the *single*
-//! `Task::cet_signal_ssp` slot. That is correct for a non-nested handler, but a
-//! second signal taken *inside* a running handler reuses the same slot — so the
-//! nested delivery can clobber the SSP the outer frame needs, and the outer
-//! handler's final `RET` would then `#CP`.
+//! Exercises the CET risk the 2026-07-09 bring-up deferred (handoff §0.3 note +
+//! §0.8 step 5) — **now fixed** (PR #328; the kernel sources the SSP from the
+//! live `RDSSP` register at the seed + `sigreturn`, with no per-task slot). Prior
+//! to the fix, signal delivery seeded the shadow stack via `WRUSS` (Fix #3) and
+//! saved the interrupted SSP in a *single* `Task::cet_signal_ssp` slot: correct
+//! for a non-nested handler, but a second signal taken *inside* a running handler
+//! reused that slot — and (compounded by a stale `IA32_PL3_SSP` MSR on the
+//! nested `SYSCALL` delivery) the process `#CP`-killed on real silicon. This PoC
+//! stays as the regression witness: pre-fix it `#CP`-kills; post-fix it PASSes.
 //!
 //! We force the nesting without `sigprocmask`/`SIGALRM` (neither exists in
 //! m3OS): install handlers for two *different* signals, raise the outer
@@ -50,9 +52,10 @@ extern "C" fn inner_handler(_sig: i32) {
     write_str(STDOUT_FILENO, "NESTED_SIG_POC:inner-entered\n");
     STAGE.fetch_or(0b010, Ordering::SeqCst);
     // This RET runs syscall-lib's sigrestorer -> rt_sigreturn. Under CET it is
-    // shadow-stack-checked against the slot the kernel seeded at delivery; with
-    // the single-slot cet_signal_ssp this restore is what can leave the OUTER
-    // frame's SSP wrong.
+    // shadow-stack-checked against the slot the kernel seeded at delivery. Pre-fix
+    // this nested handler's own RET is where the bug surfaced (the seed used a
+    // stale MSR on the nested SYSCALL delivery); the PR #328 live-RDSSP seed makes
+    // it match.
     write_str(STDOUT_FILENO, "NESTED_SIG_POC:inner-returning\n");
 }
 
