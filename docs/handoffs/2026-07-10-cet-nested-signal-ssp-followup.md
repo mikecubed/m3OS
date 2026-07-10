@@ -119,6 +119,29 @@ skipped, and whether the inner seed's `new_ssp` matches the faulting SSP.
 **Next: flash the `nestdiag` image, run the PoC, `dmesg | grep CET-DIAG`, report.**
 The TEMP instrumentation is reverted once the true cause is found.
 
+## Dell re-validation — run 1b (2026-07-10): WRONG IMAGE IS BOOTING
+
+The `#CP` line from the "diag" attempt came back as
+`pid=62 rip=0x2014b3 … err=0x1` with **no `[CET-DIAG faulting_ssp(msr)=…]`
+marker**. Verified on the build host: the diagnostic kernel + staged
+`C-mitigations-full-nestdiag.img` contain the `CET-DIAG` strings (3 occurrences);
+the pre-fix `C-mitigations-full.img` and `-nestfix.img` contain **0**. So the
+Dell booted an image **without** the instrumentation — i.e. **not** `nestdiag`,
+and quite possibly none of the fix builds. This is almost certainly why every run
+looks identical to pre-fix: **the fix has likely never actually booted.**
+
+**Most likely cause — boot source.** The Dell's internal NVMe (`nvme0n1`) holds a
+bootable m3OS (Phase 106 install testing); UEFI may be booting *that* old install
+instead of the freshly-flashed USB. **Fix: at power-on use the Dell one-time boot
+menu (F12) and explicitly pick the USB device**, or make USB first in the boot
+order (or temporarily wipe/disable the internal ESP).
+
+**Verify the running kernel before trusting any result:** run
+`nested-sig-cet-poc; dmesg | grep CET-DIAG`. On the `nestdiag` image this prints
+`[CET-DIAG] deliver …` + `seed …` lines and the `#CP` line carries
+`[CET-DIAG faulting_ssp(msr)=…]`. **Empty grep ⇒ wrong kernel booted** — re-do the
+boot-source step above; do not interpret the fault until `[CET-DIAG]` lines show.
+
 ## Fix landed (2026-07-10, PR #328)
 
 The implemented fix is **simpler and more fundamental than the RSTORSSP-token
