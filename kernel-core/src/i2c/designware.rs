@@ -255,7 +255,10 @@ mod tests {
         let con = compose_con(Speed::Fast, false);
         assert!(con & IC_CON_MASTER_MODE != 0, "master mode");
         assert_eq!(con & (3 << 1), IC_CON_SPEED_FAST, "fast speed field");
-        assert!(con & IC_CON_RESTART_EN != 0, "restart enabled (combined xfer)");
+        assert!(
+            con & IC_CON_RESTART_EN != 0,
+            "restart enabled (combined xfer)"
+        );
         assert!(con & IC_CON_SLAVE_DISABLE != 0, "slave engine disabled");
         assert_eq!(con & IC_CON_10BITADDR_MASTER, 0, "7-bit addressing");
 
@@ -303,7 +306,10 @@ mod tests {
         // no preceding write ⇒ no RESTART on the first read.
         let plan = plan_transfer(&[], 8);
         assert_eq!(plan.len(), 8);
-        assert_eq!(plan[0], DATA_CMD_READ, "no RESTART without preceding writes");
+        assert_eq!(
+            plan[0], DATA_CMD_READ,
+            "no RESTART without preceding writes"
+        );
         assert!(plan[1..7].iter().all(|&w| w == DATA_CMD_READ));
         assert_eq!(plan[7], DATA_CMD_READ | DATA_CMD_STOP);
     }

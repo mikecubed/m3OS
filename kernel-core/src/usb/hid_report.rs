@@ -862,11 +862,11 @@ pub fn decode_touchpad_report(fields: &[ReportField], report: &[u8]) -> Touchpad
             (USAGE_PAGE_DIGITIZER, USAGE_DIG_CONTACT_COUNT) => {
                 frame.contact_count = raw as u8;
             }
-            // A clickpad / physical button: Button page, usage 1..=8, 1 bit set.
-            (USAGE_PAGE_BUTTON, n) if f.bit_size >= 1 && (1..=8).contains(&n) => {
-                if raw & 0x01 != 0 {
-                    frame.button = true;
-                }
+            // A clickpad / physical button: Button page, usage 1..=8, its bit set.
+            (USAGE_PAGE_BUTTON, n)
+                if f.bit_size >= 1 && (1..=8).contains(&n) && raw & 0x01 != 0 =>
+            {
+                frame.button = true;
             }
             _ => { /* pressure, width, scan-time, azimuth, … — ignored */ }
         }
@@ -1588,18 +1588,27 @@ mod tests {
         // [reportID=1, tip0=1, id0=0, X0=0x0140, Y0=0x00C8, tip1=1, id1=1,
         //  X1=0x0280, Y1=0x0190, count=2, button=1]
         let report = [
-            1u8, 0x01, 0x00, 0x40, 0x01, 0xC8, 0x00, 0x01, 0x01, 0x80, 0x02, 0x90, 0x01, 0x02,
-            0x01,
+            1u8, 0x01, 0x00, 0x40, 0x01, 0xC8, 0x00, 0x01, 0x01, 0x80, 0x02, 0x90, 0x01, 0x02, 0x01,
         ];
         let frame = decode_touchpad_report(&fields, &report);
         assert_eq!(frame.contacts.len(), 2);
         assert_eq!(
             frame.contacts[0],
-            TouchContact { tip: true, contact_id: 0, x: 320, y: 200 }
+            TouchContact {
+                tip: true,
+                contact_id: 0,
+                x: 320,
+                y: 200
+            }
         );
         assert_eq!(
             frame.contacts[1],
-            TouchContact { tip: true, contact_id: 1, x: 640, y: 400 }
+            TouchContact {
+                tip: true,
+                contact_id: 1,
+                x: 640,
+                y: 400
+            }
         );
         assert_eq!(frame.contact_count, 2);
         assert!(frame.button);
@@ -1611,8 +1620,7 @@ mod tests {
         let fields = two_contact_fields();
         // contact1 Tip byte (index 7) = 0 → lifted; button byte (14) = 0.
         let report = [
-            1u8, 0x01, 0x00, 0x40, 0x01, 0xC8, 0x00, 0x00, 0x01, 0x80, 0x02, 0x90, 0x01, 0x02,
-            0x00,
+            1u8, 0x01, 0x00, 0x40, 0x01, 0xC8, 0x00, 0x00, 0x01, 0x80, 0x02, 0x90, 0x01, 0x02, 0x00,
         ];
         let frame = decode_touchpad_report(&fields, &report);
         assert_eq!(frame.contacts.len(), 2, "both slots still present");

@@ -155,7 +155,12 @@ pub fn get_report_command(
     let [clo, chi] = command_register.to_le_bytes();
     let [dlo, dhi] = data_register.to_le_bytes();
     let mut v = Vec::with_capacity(7);
-    v.extend_from_slice(&[clo, chi, cmd_byte0(report_type, report_id), OPCODE_GET_REPORT]);
+    v.extend_from_slice(&[
+        clo,
+        chi,
+        cmd_byte0(report_type, report_id),
+        OPCODE_GET_REPORT,
+    ]);
     if report_id >= 0x0F {
         v.push(report_id); // extended report-ID byte
     }
