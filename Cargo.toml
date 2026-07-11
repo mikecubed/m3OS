@@ -104,6 +104,7 @@ members = [
     "userspace/drivers/acpid",
     # Phase 78c — ring-3 USB HID Boot-Protocol class driver (keyboard + mouse)
     "userspace/drivers/usb-hid",
+    "userspace/drivers/i2c-hid",
     # Phase 92 Track D — ring-3 USB Mass Storage (Bulk-Only Transport) class driver
     "userspace/drivers/usb-storage",
     # Phase 92e Track G — ring-3 USB-Ethernet (CDC-ECM/NCM) RemoteNic class driver

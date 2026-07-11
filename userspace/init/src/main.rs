@@ -227,6 +227,8 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/usbhub.conf\0",
     // Phase 78c: ring-3 USB HID Boot-Protocol class driver.
     b"/etc/services.d/usb-hid.conf\0",
+    // Phase 102 Track D: ring-3 I2C-HID touchpad driver.
+    b"/etc/services.d/i2c-hid.conf\0",
     // Phase 92 Track D: ring-3 USB Mass Storage (BOT) class driver.
     b"/etc/services.d/usb-storage.conf\0",
     // Phase 92e Track G: ring-3 USB-Ethernet (CDC-ECM/NCM) RemoteNic class driver.
@@ -1430,6 +1432,11 @@ impl ServiceManager {
             // xHCI host controller + USB HID class driver (USB keyboard/mouse).
             b"name=xhci_driver\ncommand=/drivers/xhci\ntype=daemon\nrestart=on-failure\nmax_restart=5\n",
             b"name=usb_hid\ncommand=/drivers/usb-hid\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n",
+            // Phase 102 Track D: ring-3 I2C-HID touchpad driver — the Dell's
+            // built-in Precision Touchpad (Elan DLL0945 on Intel LPSS DW I2C).
+            // Depends on acpid for ACPI device discovery; exits cleanly on QEMU
+            // (no DLL0945 in the namespace), so on-failure restarts don't loop.
+            b"name=i2c_hid\ncommand=/drivers/i2c-hid\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=acpid\n",
             // USB hub walker (Phase 92a): brings up external/dock hubs (descriptor
             // + per-port power/reset) so devices behind a hub — e.g. a USB keyboard
             // on a dock when all the laptop's own ports are full — get enumerated
