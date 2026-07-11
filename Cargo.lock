@@ -1028,6 +1028,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "i2c_hid"
+version = "0.99.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
