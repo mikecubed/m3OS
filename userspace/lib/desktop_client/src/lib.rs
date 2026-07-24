@@ -32,12 +32,14 @@ const LABEL_CLIENT_EVENT_PULL: u64 = 3;
 const VERB_ENCODE_BUF_LEN: usize = 128;
 
 /// Phase 105 Track B — the largest clipboard offer carried in one IPC
-/// bulk. The frame + bytes must fit under the protocol's
-/// `MAX_FRAME_BODY_LEN` (4096) `decode_message` guard; 3900 leaves room
-/// for the 13-byte frame and a safety margin. Text clipboards are far
-/// smaller in practice; multi-frame transfer for larger blobs is a
-/// documented follow-up.
-pub const CLIPBOARD_MAX_BYTES: usize = 3900;
+/// bulk.
+///
+/// Phase 112 Track B.2 moved the definition to
+/// `kernel_core::display::protocol`, beside the `MAX_FRAME_BODY_LEN` bound
+/// it is derived from, so `term` can honour the same cap without taking a
+/// dependency on this crate. Re-exported here so existing callers are
+/// unaffected.
+pub use kernel_core::display::protocol::CLIPBOARD_MAX_BYTES;
 
 /// Connection to `display_server`. Wraps an IPC handle plus a single
 /// surface id; clients that need more than one surface hold multiple

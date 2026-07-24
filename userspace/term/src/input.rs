@@ -42,6 +42,13 @@ pub enum KeyOutcome {
     WroteBytes,
     /// A scrollback viewport movement, consumed locally — no PTY bytes.
     View(ViewCmd),
+    /// Phase 112 Track B.3 — Ctrl+Shift+C: copy the current selection to
+    /// the compositor clipboard. Consumed locally.
+    Copy,
+    /// Phase 112 Track B.3 — Ctrl+Shift+V: paste the clipboard into the
+    /// PTY, bracketed. Consumed locally; the main loop does the IPC and
+    /// the write, because `InputHandler` owns no display connection.
+    Paste,
 }
 
 /// Phase 112 Track A.3 — a non-printable key's meaning, resolved against
@@ -100,6 +107,25 @@ impl InputHandler {
         // through the `symbol <= 0x7F` clause at the bottom.
         if symbol == 0 {
             return KeyOutcome::None;
+        }
+
+        // Phase 112 Track B.3 — Ctrl+Shift+C / Ctrl+Shift+V are
+        // terminal-level clipboard binds. They are matched *before* the
+        // Ctrl+letter path below, which would otherwise collapse them into
+        // 0x03 (SIGINT) and 0x16. Requiring Shift is what keeps plain
+        // Ctrl+C interrupting the foreground job, as every terminal does —
+        // the clipboard must not steal the single most important key in a
+        // shell.
+        //
+        // The keymap may deliver either case depending on whether Shift
+        // has already been applied to the symbol, so compare
+        // case-insensitively.
+        if modifiers.contains(MOD_CTRL) && modifiers.contains(MOD_SHIFT) && symbol <= 0x7F {
+            match (symbol as u8).to_ascii_lowercase() {
+                b'c' => return KeyOutcome::Copy,
+                b'v' => return KeyOutcome::Paste,
+                _ => {}
+            }
         }
 
         // Special keys live in the private-use area (0xE000+);
@@ -541,6 +567,46 @@ mod tests {
             assert_eq!(outcome, KeyOutcome::WroteBytes);
             assert_eq!(&bytes[..], *expected);
         }
+    }
+
+    /// B.3 acceptance: Ctrl+Shift+C / Ctrl+Shift+V are clipboard binds
+    /// consumed locally, writing nothing to the PTY. Both keymap cases are
+    /// accepted since Shift may already have upper-cased the symbol.
+    #[test]
+    fn ctrl_shift_c_and_v_are_clipboard_binds() {
+        for (sym, want) in [
+            (b'c' as u32, KeyOutcome::Copy),
+            (b'C' as u32, KeyOutcome::Copy),
+            (b'v' as u32, KeyOutcome::Paste),
+            (b'V' as u32, KeyOutcome::Paste),
+        ] {
+            let (outcome, bytes) = run_key(sym, MOD_CTRL | MOD_SHIFT);
+            assert_eq!(outcome, want, "symbol {sym:#x}");
+            assert!(bytes.is_empty(), "clipboard binds write no PTY bytes");
+        }
+    }
+
+    /// B.3 acceptance: **plain** Ctrl+C stays SIGINT and plain Ctrl+V
+    /// stays the literal 0x16. This is the whole reason the clipboard
+    /// binds require Shift — stealing Ctrl+C would break every shell.
+    #[test]
+    fn plain_ctrl_c_and_v_are_unchanged() {
+        let (outcome, bytes) = run_key(b'c' as u32, MOD_CTRL);
+        assert_eq!(outcome, KeyOutcome::WroteBytes);
+        assert_eq!(bytes, &[0x03], "Ctrl+C is still SIGINT");
+
+        let (outcome, bytes) = run_key(b'v' as u32, MOD_CTRL);
+        assert_eq!(outcome, KeyOutcome::WroteBytes);
+        assert_eq!(bytes, &[0x16], "Ctrl+V is still literal-next");
+    }
+
+    /// B.3 acceptance: Shift alone (no Ctrl) types a capital letter — the
+    /// clipboard match must require *both* modifiers.
+    #[test]
+    fn shift_alone_does_not_trigger_clipboard() {
+        let (outcome, bytes) = run_key(b'C' as u32, MOD_SHIFT);
+        assert_eq!(outcome, KeyOutcome::WroteBytes);
+        assert_eq!(bytes, b"C");
     }
 
     /// A.3 acceptance: printable keys and Ctrl+letter still report

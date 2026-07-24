@@ -36,6 +36,8 @@ use core::alloc::Layout;
 #[cfg(not(test))]
 use kernel_core::display::protocol::ServerMessage;
 #[cfg(not(test))]
+use kernel_core::input::events::{MOD_ALT, MOD_SHIFT, PointerButton};
+#[cfg(not(test))]
 use syscall_lib::heap::BrkAllocator;
 #[cfg(not(test))]
 use syscall_lib::{CLOCK_MONOTONIC, STDOUT_FILENO};
@@ -53,7 +55,7 @@ use term::pty::PtyHost;
 #[cfg(not(test))]
 use term::render::Renderer;
 #[cfg(not(test))]
-use term::screen::{RenderCommand, Screen};
+use term::screen::{RenderCommand, Screen, SelectionMode};
 #[cfg(not(test))]
 use term::syscall_pty::SyscallPtyOps;
 #[cfg(not(test))]
@@ -265,6 +267,10 @@ fn program_main(_args: &[&str]) -> i32 {
     );
     let mut input_handler = InputHandler::new();
     let mut mouse_reporter = MouseReporter::new();
+    // Phase 112 Track B.1 — `true` while a selection drag is in flight.
+    // The compositor delivers motion as button-less pointer events, so
+    // without this we could not distinguish "dragging" from "just moving".
+    let mut selecting = false;
 
     // Paint an initial cleared frame so the surface gets a buffer
     // attached *before* any PTY traffic arrives. Without this, the
@@ -428,6 +434,14 @@ fn program_main(_args: &[&str]) -> i32 {
                         // reaches the shell returns the user to the live
                         // tail, so they never type "into" history.
                         KeyOutcome::WroteBytes => screen.view_to_live(),
+                        // Phase 112 Track B.3 — Ctrl+Shift+C.
+                        KeyOutcome::Copy => {
+                            copy_selection(&screen, renderer.fb_mut());
+                        }
+                        // Phase 112 Track B.3 — Ctrl+Shift+V.
+                        KeyOutcome::Paste => {
+                            paste_clipboard(&mut screen, renderer.fb_mut(), primary_fd);
+                        }
                         KeyOutcome::None => {}
                     }
                 }
@@ -443,6 +457,22 @@ fn program_main(_args: &[&str]) -> i32 {
                     // mouse in 3-byte framing), so on a PS/2-only boot it
                     // simply never fires and the Shift+PageUp binds carry
                     // the feature.
+                    // Phase 112 Track B.1 — selection pre-pass. The app
+                    // gets the pointer when it has grabbed the mouse,
+                    // *unless* Shift is held: that is the standard xterm
+                    // override letting the user select out of a
+                    // mouse-reporting program like vim or htop.
+                    let force_select = ev.modifiers.contains(MOD_SHIFT);
+                    if !mouse_reporter.tracking_enabled() || force_select {
+                        if handle_selection_pointer(
+                            &mut screen,
+                            &ev,
+                            renderer.fb_mut(),
+                            &mut selecting,
+                        ) {
+                            continue;
+                        }
+                    }
                     match mouse_reporter.classify(
                         &ev,
                         screen.cols(),
@@ -918,6 +948,114 @@ fn lookup_display_for_input() -> Option<u32> {
         return None;
     }
     Some(raw as u32)
+}
+
+/// Phase 112 Track B.1 — drive the mouse selection from one pointer
+/// event. Returns `true` when the event was consumed by selection (and so
+/// must not also be reported to the application).
+///
+/// `selecting` tracks whether a drag is in flight, because the compositor
+/// delivers motion as button-less events: without it we could not tell
+/// "moving with the button down" from "moving with no button".
+///
+/// Wheel events are deliberately *not* consumed here — they fall through
+/// to the scrollback viewport (Track A.4).
+#[cfg(not(test))]
+fn handle_selection_pointer(
+    screen: &mut Screen,
+    ev: &kernel_core::input::events::PointerEvent,
+    display: &DisplayClient,
+    selecting: &mut bool,
+) -> bool {
+    // Alt held at press time makes the selection rectangular — the xterm
+    // convention for block select.
+    let mode = if ev.modifiers.contains(MOD_ALT) {
+        SelectionMode::Block
+    } else {
+        SelectionMode::Linear
+    };
+    let (row, col) = pointer_cell(ev, screen.cols(), screen.rows());
+    match ev.button {
+        PointerButton::Down(0) => {
+            screen.selection_begin(row, col, mode);
+            *selecting = true;
+            true
+        }
+        PointerButton::Up(0) => {
+            if *selecting {
+                screen.selection_commit();
+                *selecting = false;
+                // Copy-on-release: a completed selection is offered to the
+                // clipboard immediately, so Ctrl+Shift+V in another client
+                // works without an explicit copy keystroke.
+                copy_selection(screen, display);
+                return true;
+            }
+            false
+        }
+        PointerButton::None if *selecting && ev.wheel_dy == 0 => {
+            screen.selection_extend(row, col);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Phase 112 Track B.1 — project a pointer event's pixel position onto a
+/// 0-based `(row, col)` display cell, clamped into the grid.
+///
+/// Mirrors `mouse::compute_cell_position`, but that one returns 1-based
+/// coordinates for the VT wire protocol while selection indexes cells from
+/// zero. `CELL_WIDTH`/`CELL_HEIGHT` come from the `display` module, the
+/// same constants the renderer lays glyphs out with, so the highlight
+/// lands under the pointer.
+#[cfg(not(test))]
+fn pointer_cell(ev: &kernel_core::input::events::PointerEvent, cols: u16, rows: u16) -> (u16, u16) {
+    let (px, py) = ev.abs_position.unwrap_or((0, 0));
+    let col = (px.max(0) as u32 / term::display::CELL_WIDTH as u32) as u16;
+    let row = (py.max(0) as u32 / term::display::CELL_HEIGHT as u32) as u16;
+    (
+        row.min(rows.saturating_sub(1)),
+        col.min(cols.saturating_sub(1)),
+    )
+}
+
+/// Phase 112 Track B.3 — offer the current selection to the compositor
+/// clipboard. A no-op when nothing is selected or the selection is blank,
+/// so an accidental click never clobbers a useful clipboard.
+#[cfg(not(test))]
+fn copy_selection(screen: &Screen, display: &DisplayClient) {
+    let Some(text) = screen.selection_text() else {
+        return;
+    };
+    if text.is_empty() {
+        return;
+    }
+    if !display.set_clipboard(&text) {
+        // The only expected failure is an over-long selection, which
+        // `set_clipboard` rejects rather than truncating.
+        syscall_lib::write_str(STDOUT_FILENO, "term: clipboard copy rejected\n");
+    }
+}
+
+/// Phase 112 Track B.3 — fetch the clipboard and inject it into the PTY.
+///
+/// The payload always goes through `wrap_paste`, so when the application
+/// has enabled bracketed-paste (`?2004h`) it arrives framed by
+/// `ESC[200~` / `ESC[201~` and a shell or editor can tell pasted bytes
+/// from typed ones — the whole point of the mode. Pasting also snaps the
+/// viewport to the live tail, since the user is about to produce input.
+#[cfg(not(test))]
+fn paste_clipboard(screen: &mut Screen, display: &DisplayClient, primary_fd: i32) {
+    let Some(bytes) = display.get_clipboard() else {
+        return;
+    };
+    if bytes.is_empty() {
+        return;
+    }
+    screen.view_to_live();
+    let framed = term::input::wrap_paste(&bytes, screen.bracketed_paste_enabled());
+    let _ = syscall_lib::write(primary_fd, &framed);
 }
 
 /// Phase 69 Track E — translate a DEC private mode code into a

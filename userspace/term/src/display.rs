@@ -51,9 +51,11 @@
 //! buffer, and `CommitSurface` is the single atomic publication
 //! point. No protocol change required.
 
+use alloc::vec::Vec;
 use kernel_core::display::pixel_chunk::cell_pixel_offset;
 use kernel_core::display::protocol::{
-    BufferId, ClientMessage, PROTOCOL_VERSION, Rect, SurfaceId, SurfaceRole,
+    BufferId, CLIPBOARD_MAX_BYTES, ClientMessage, MimeTag, PROTOCOL_VERSION, Rect, ServerMessage,
+    SurfaceId, SurfaceRole,
 };
 use kernel_core::font::GlyphView;
 use syscall_lib::STDOUT_FILENO;
@@ -140,11 +142,11 @@ pub const SURFACE_HEIGHT_PX: u32 = (DEFAULT_ROWS as u32) * (CELL_HEIGHT as u32);
 /// bumped from 16 to 24 (3× the static 8×16 fallback width) so the
 /// terminal stays legible on a 1080p framebuffer; the static IBM VGA
 /// bitmap still occupies a clean integer sub-rect (top-left 8×16).
-pub const CELL_WIDTH: u8 = 24;
-/// Cell pixel height. Phase 73 bumped from 32 to 48 so the cell
-/// matches the wider [`CELL_WIDTH`] and stays a 3× multiple of the
-/// 8×16 static fallback.
-pub const CELL_HEIGHT: u8 = 48;
+/// Phase 112 Track B.1 moved the definition to the crate root so the
+/// (ungated) `mouse` module can share it — see [`crate::CELL_WIDTH`].
+/// Re-exported here because the renderer and the layout constants above
+/// have referred to `display::CELL_WIDTH` since Phase 57.
+pub use crate::{CELL_HEIGHT, CELL_WIDTH};
 
 /// Stack-sized encode buffer for protocol verbs. The widest
 /// `ClientMessage` body in Phase 57 is `SetSurfaceRole(Layer{...})`
@@ -262,6 +264,11 @@ pub struct DisplayClient {
     /// connect time so every protocol verb references the same value.
     /// See [`surface_id`] for the derivation.
     surface_id: SurfaceId,
+    /// Phase 112 Track B.2 — the PID-derived `client_token` sent in
+    /// `Hello`. Cached because `SetClipboard` carries it too: the
+    /// compositor scopes offer ownership to this token so the offer drops
+    /// on our `Goodbye`.
+    client_token: u32,
     /// Phase 72b — current surface pixel width. Initialised from
     /// [`SURFACE_WIDTH_PX`]; updated by [`DisplayClient::resize`] when
     /// the compositor sends `ServerMessage::SurfaceResized`. Cached
@@ -371,6 +378,7 @@ impl DisplayClient {
             surfaces: [front, back],
             back_idx: 1,
             surface_id: sid,
+            client_token,
             width: init_w,
             height: init_h,
         })
@@ -381,6 +389,91 @@ impl DisplayClient {
     /// can read the same value without redundantly calling `getpid`.
     pub fn surface_id(&self) -> SurfaceId {
         self.surface_id
+    }
+
+    /// Phase 112 Track B.2 — publish `text` as the compositor clipboard
+    /// offer (`text/plain;charset=utf-8`). Returns `false` when the text
+    /// exceeds [`CLIPBOARD_MAX_BYTES`] or the IPC send fails.
+    ///
+    /// This mirrors `desktop_client::set_clipboard`, but is implemented
+    /// inline and rides the **same** `"display"` handle `term` already
+    /// holds. `term` keeps exactly one display connection and one client
+    /// library; pulling in `desktop_client` purely for two verbs would
+    /// have added a second connection and a second surface-management
+    /// model to a binary that deliberately has neither.
+    ///
+    /// Over-long input is **rejected, not truncated** — silently copying
+    /// half a selection would be worse than copying nothing, because the
+    /// user cannot see the cut.
+    pub fn set_clipboard(&self, text: &str) -> bool {
+        let bytes = text.as_bytes();
+        if bytes.len() > CLIPBOARD_MAX_BYTES {
+            return false;
+        }
+        let msg = ClientMessage::SetClipboard {
+            mime_tag: MimeTag::TextPlainUtf8,
+            len: bytes.len() as u32,
+            client_token: self.client_token,
+        };
+        // The offer bytes follow the frame in the same IPC bulk; the
+        // compositor reads them after decoding the header.
+        let mut frame = [0u8; VERB_ENCODE_BUF_LEN];
+        let n = match msg.encode(&mut frame) {
+            Ok(n) => n,
+            Err(_) => {
+                Self::log_verb_failure("term: display verb encode failed: ", "SetClipboard");
+                return false;
+            }
+        };
+        let mut combined: Vec<u8> = Vec::with_capacity(n + bytes.len());
+        combined.extend_from_slice(&frame[..n]);
+        combined.extend_from_slice(bytes);
+        let reply = syscall_lib::ipc_call_buf(self.server_handle, LABEL_VERB, 0, &combined);
+        if reply == u64::MAX {
+            Self::log_verb_failure("term: display verb ipc_call_buf failed: ", "SetClipboard");
+            return false;
+        }
+        true
+    }
+
+    /// Phase 112 Track B.2 — fetch the current clipboard offer's bytes.
+    ///
+    /// Returns `Some(bytes)` on success — including `Some(vec![])` when
+    /// the clipboard is legitimately **empty**, which is distinct from
+    /// `None` (the request failed or the reply was malformed). Pasting an
+    /// empty clipboard is a no-op, not an error, and the caller should not
+    /// have to guess which happened.
+    pub fn get_clipboard(&self) -> Option<Vec<u8>> {
+        let msg = ClientMessage::RequestClipboard {
+            mime_tag: MimeTag::TextPlainUtf8,
+        };
+        let mut frame = [0u8; VERB_ENCODE_BUF_LEN];
+        let n = msg.encode(&mut frame).ok()?;
+        let reply = syscall_lib::ipc_call_buf(self.server_handle, LABEL_VERB, 0, &frame[..n]);
+        if reply == u64::MAX {
+            return None;
+        }
+        let mut buf = [0u8; CLIPBOARD_MAX_BYTES + 16];
+        let got = syscall_lib::ipc_take_pending_bulk(&mut buf);
+        if got == u64::MAX {
+            return None;
+        }
+        let got = (got as usize).min(buf.len());
+        let (hdr, consumed) = ServerMessage::decode(&buf[..got]).ok()?;
+        let len = match hdr {
+            ServerMessage::ClipboardData { len, .. } => len as usize,
+            _ => return None,
+        };
+        if len == 0 {
+            return Some(Vec::new());
+        }
+        // Clamp to what actually arrived: a truncated bulk must not be
+        // read past its end.
+        let end = (consumed + len).min(got);
+        if end <= consumed {
+            return None;
+        }
+        Some(buf[consumed..end].to_vec())
     }
 
     /// Current surface pixel width. Reflects either the initial

@@ -94,6 +94,27 @@ pub const DEFAULT_COLS: u16 = 80;
 /// [`DEFAULT_COLS`].
 pub const DEFAULT_ROWS: u16 = 25;
 
+/// Cell pixel width. Phase 73 bumped this from 16 to 24 (3× the static
+/// 8×16 fallback width) so the terminal stays legible on a 1080p
+/// framebuffer; the static IBM VGA bitmap still occupies a clean integer
+/// sub-rect (top-left 8×16).
+///
+/// Phase 112 Track B.1 **moved this here from `display`**. `display` is
+/// gated behind the `os-binary` feature, so `mouse` could not import it
+/// and carried a private copy of the literals instead — a copy that was
+/// never updated when Phase 73 changed them, leaving mouse reporting
+/// projecting pixels onto a 16×32 grid that had not existed for
+/// twenty-odd phases (a click was reported ~1.5 cells off). Selection
+/// hit-testing has to agree with rendering exactly, so the constants now
+/// live in the ungated crate root and every consumer reads the same two
+/// values.
+pub const CELL_WIDTH: u8 = 24;
+
+/// Cell pixel height. Phase 73 bumped this from 32 to 48 so the cell
+/// matches the wider [`CELL_WIDTH`] and stays a 3× multiple of the 8×16
+/// static fallback. See [`CELL_WIDTH`] for why it lives here.
+pub const CELL_HEIGHT: u8 = 48;
+
 /// Decide whether the event loop should publish the current renderer frame.
 ///
 /// The normal throttle avoids excessive display IPC, but PTY output that has

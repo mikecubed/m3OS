@@ -10,7 +10,7 @@
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
 | A | Scrollback viewport (`view_offset`, key + wheel bindings, snap-to-bottom) | — | ✅ Landed |
-| B | Mouse selection + clipboard copy/paste in `term` | A (shared render/pointer seam) | Planned |
+| B | Mouse selection + clipboard copy/paste in `term` | A (shared render/pointer seam) | ✅ Landed |
 | C | QMP input plumbing + render-probe / clipboard round-trip gate | A, B | Planned |
 
 Tracks A and B share the pointer-intake seam (the `PulledEvent::Pointer` arm of `main.rs`'s
@@ -98,10 +98,10 @@ should be treated as hints only.
 **Why it matters:** `term` has no selection/highlight state at all; this is the documented future track in `pull_one_event`.
 
 **Acceptance:**
-- [ ] A `Selection { anchor, extent, mode: Linear|Block, active }` tracks press-anchor / drag-extend / release-commit against cell coordinates (grid hit-test accounts for the current cols/rows and any scrollback offset).
-- [ ] Selection drives only when the app has not grabbed the mouse (Shift-drag force-selects when it has — the xterm override); otherwise pointer events still go to `MouseReporter::encode`.
-- [ ] Covered cells render inverted (fg/bg swap) in the compose path; clearing the selection repaints cleanly.
-- [ ] **Host tests:** anchor/extent normalization (drag up-left vs. down-right yield the same ordered range), `Linear` vs. `Block` coverage predicates, and that hit-test maps pixel → cell correctly at the grid edges.
+- [x] A `Selection { anchor, extent, mode: Linear|Block, active }` tracks press-anchor / drag-extend / release-commit against cell coordinates (grid hit-test accounts for the current cols/rows and any scrollback offset).
+- [x] Selection drives only when the app has not grabbed the mouse (Shift-drag force-selects when it has — the xterm override); otherwise pointer events still go to `MouseReporter::encode`.
+- [x] Covered cells render inverted (fg/bg swap) in the compose path; clearing the selection repaints cleanly.
+- [x] **Host tests:** anchor/extent normalization (drag up-left vs. down-right yield the same ordered range), `Linear` vs. `Block` coverage predicates, and that hit-test maps pixel → cell correctly at the grid edges.
 
 ### B.2 — Clipboard verbs on `term`'s `DisplayClient`
 
@@ -110,10 +110,10 @@ should be treated as hints only.
 **Why it matters:** `term` has no clipboard code and does not depend on `desktop_client` (confirmed in its `Cargo.toml`); the verbs must ride the single `"display"` handle `term` already holds, keeping its one-connection model. But `CLIPBOARD_MAX_BYTES` lives in `desktop_client` — the very crate `term` must not depend on — while its value (3900) is derived from `protocol.rs`'s `MAX_FRAME_BODY_LEN = 4096`. Relocate rather than duplicate.
 
 **Acceptance:**
-- [ ] `CLIPBOARD_MAX_BYTES` moves to `kernel-core/src/display/protocol.rs` beside `MAX_FRAME_BODY_LEN`, keeping its derivation comment; `desktop_client` re-exports it so existing callers (`clip-smoke`, m3ui) are untouched.
-- [ ] `DisplayClient::set_clipboard(&self, text: &str) -> bool` frames `SetClipboard { TextPlainUtf8, len, client_token }` + raw bytes (≤ `CLIPBOARD_MAX_BYTES`, over-long input rejected not truncated) and `ipc_call`s the display handle (mirrors `desktop_client::set_clipboard`, `lib.rs:195`).
-- [ ] `DisplayClient::get_clipboard(&self) -> Option<Vec<u8>>` sends `RequestClipboard`, takes the reply bulk, decodes `ClipboardData` (mirrors `desktop_client::get_clipboard`, `lib.rs:224`); a zero-length `ClipboardData` (empty clipboard) yields `Some(vec![])`, not `None`.
-- [ ] No second client library or extra IPC connection is introduced.
+- [x] `CLIPBOARD_MAX_BYTES` moves to `kernel-core/src/display/protocol.rs` beside `MAX_FRAME_BODY_LEN`, keeping its derivation comment; `desktop_client` re-exports it so existing callers (`clip-smoke`, m3ui) are untouched.
+- [x] `DisplayClient::set_clipboard(&self, text: &str) -> bool` frames `SetClipboard { TextPlainUtf8, len, client_token }` + raw bytes (≤ `CLIPBOARD_MAX_BYTES`, over-long input rejected not truncated) and `ipc_call`s the display handle (mirrors `desktop_client::set_clipboard`, `lib.rs:195`).
+- [x] `DisplayClient::get_clipboard(&self) -> Option<Vec<u8>>` sends `RequestClipboard`, takes the reply bulk, decodes `ClipboardData` (mirrors `desktop_client::get_clipboard`, `lib.rs:224`); a zero-length `ClipboardData` (empty clipboard) yields `Some(vec![])`, not `None`.
+- [x] No second client library or extra IPC connection is introduced.
 
 ### B.3 — Copy / paste key + pointer bindings
 
@@ -122,10 +122,10 @@ should be treated as hints only.
 **Why it matters:** Copy/paste must be bound without colliding with Ctrl+C (SIGINT); the paste direction must be bracketed so a shell can refuse to execute pasted bytes. Serialization is not "read the chars" — `Cell` carries a `wide_continuation` flag whose cell must be skipped or CJK text double-emits.
 
 **Acceptance:**
-- [ ] Copy on selection-release **and** on Ctrl+Shift+C: serialize the selected cells to UTF-8 and `set_clipboard` them. Serialization: skip cells with `wide_continuation == true`; trim trailing cells whose `codepoint == 0x20` per row; join rows with `\n`.
-- [ ] Ctrl+Shift+V (and optional middle-click) `get_clipboard`s and injects via `wrap_paste` (bracketed `ESC[200~`…`ESC[201~` when the mode is enabled) — never as a plain byte run.
-- [ ] Plain Ctrl+C / Ctrl+V are unchanged (SIGINT / literal), i.e. the clipboard binds require Shift.
-- [ ] **Host tests:** serialization over a fixture grid — trailing-blank trim, `\n` join, a double-width glyph yielding one codepoint not two, an all-blank row yielding an empty line, and a selection larger than `CLIPBOARD_MAX_BYTES` being rejected.
+- [x] Copy on selection-release **and** on Ctrl+Shift+C: serialize the selected cells to UTF-8 and `set_clipboard` them. Serialization: skip cells with `wide_continuation == true`; trim trailing cells whose `codepoint == 0x20` per row; join rows with `\n`.
+- [x] Ctrl+Shift+V (and optional middle-click) `get_clipboard`s and injects via `wrap_paste` (bracketed `ESC[200~`…`ESC[201~` when the mode is enabled) — never as a plain byte run.
+- [x] Plain Ctrl+C / Ctrl+V are unchanged (SIGINT / literal), i.e. the clipboard binds require Shift.
+- [x] **Host tests:** serialization over a fixture grid — trailing-blank trim, `\n` join, a double-width glyph yielding one codepoint not two, an all-blank row yielding an empty line, and a selection larger than `CLIPBOARD_MAX_BYTES` being rejected.
 
 ---
 

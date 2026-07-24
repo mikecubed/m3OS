@@ -69,6 +69,19 @@ pub const FRAME_HEADER_SIZE: usize = 4;
 /// [`ProtocolError::BodyTooLarge`].
 pub const MAX_FRAME_BODY_LEN: u16 = 4096;
 
+/// Phase 105 Track B — the largest clipboard offer carried in one IPC
+/// bulk. The frame + bytes must fit under the [`MAX_FRAME_BODY_LEN`]
+/// `decode_message` guard; 3900 leaves room for the 13-byte frame and a
+/// safety margin. Text clipboards are far smaller in practice; multi-frame
+/// transfer for larger blobs is a documented follow-up.
+///
+/// Phase 112 Track B.2 moved this next to the bound it is derived from.
+/// It previously lived in `desktop_client`, which `term` deliberately does
+/// not depend on (it keeps a single display connection and one client
+/// library), so the constant had to be reachable without that dep.
+/// `desktop_client` re-exports it, leaving its existing callers untouched.
+pub const CLIPBOARD_MAX_BYTES: usize = 3900;
+
 /// Hard upper bound on `SurfaceListReply` / `FrameStatsReply` entry count.
 /// Decoder rejects larger counts with
 /// [`ProtocolError::ListTooLong`] so a malformed control-socket peer

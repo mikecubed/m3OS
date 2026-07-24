@@ -341,6 +341,124 @@ pub enum ViewCmd {
     Live,
 }
 
+/// Phase 112 Track B.1 — how a mouse selection covers the grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionMode {
+    /// Reading-order selection: from the anchor to the end of its row,
+    /// every row between, then the start of the extent's row up to the
+    /// extent. What a normal click-drag produces.
+    Linear,
+    /// Rectangular selection: the column span between anchor and extent,
+    /// on every row between them. Held with Alt, the xterm convention.
+    Block,
+}
+
+/// Phase 112 Track B.1 — an in-progress or committed mouse selection, in
+/// **display** coordinates (i.e. what is on screen right now, which under
+/// a non-zero `view_offset` includes scrollback rows).
+///
+/// `anchor` is where the press landed and never moves; `extent` follows
+/// the pointer. Neither is pre-sorted — a drag up-and-left is as valid as
+/// down-and-right — so every consumer goes through [`Selection::ordered`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    anchor: (u16, u16),
+    extent: (u16, u16),
+    mode: SelectionMode,
+    /// `true` while the button is still down. A committed selection stays
+    /// visible (and copyable) with `dragging == false`.
+    dragging: bool,
+}
+
+impl Selection {
+    /// Begin a selection at `(row, col)` with the button down.
+    pub fn begin(row: u16, col: u16, mode: SelectionMode) -> Self {
+        Self {
+            anchor: (row, col),
+            extent: (row, col),
+            mode,
+            dragging: true,
+        }
+    }
+
+    /// Move the free end to `(row, col)`.
+    pub fn extend_to(&mut self, row: u16, col: u16) {
+        self.extent = (row, col);
+    }
+
+    /// Release the button; the range stays selected.
+    pub fn commit(&mut self) {
+        self.dragging = false;
+    }
+
+    /// `true` while the pointer button is still held.
+    pub fn is_dragging(&self) -> bool {
+        self.dragging
+    }
+
+    /// Selection mode.
+    pub fn mode(&self) -> SelectionMode {
+        self.mode
+    }
+
+    /// The `(start, end)` pair in reading order, so `start <= end`
+    /// lexicographically by `(row, col)`. For [`SelectionMode::Block`] the
+    /// row and column ranges are each ordered independently, which is what
+    /// makes a rectangle well-defined regardless of drag direction.
+    pub fn ordered(&self) -> ((u16, u16), (u16, u16)) {
+        match self.mode {
+            SelectionMode::Linear => {
+                if self.anchor <= self.extent {
+                    (self.anchor, self.extent)
+                } else {
+                    (self.extent, self.anchor)
+                }
+            }
+            SelectionMode::Block => {
+                let (r0, r1) = (
+                    self.anchor.0.min(self.extent.0),
+                    self.anchor.0.max(self.extent.0),
+                );
+                let (c0, c1) = (
+                    self.anchor.1.min(self.extent.1),
+                    self.anchor.1.max(self.extent.1),
+                );
+                ((r0, c0), (r1, c1))
+            }
+        }
+    }
+
+    /// `true` when the selection covers zero cells (press without drag).
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.extent
+    }
+
+    /// Does the selection cover display cell `(row, col)`?
+    pub fn contains(&self, row: u16, col: u16) -> bool {
+        let ((r0, c0), (r1, c1)) = self.ordered();
+        if row < r0 || row > r1 {
+            return false;
+        }
+        match self.mode {
+            SelectionMode::Block => col >= c0 && col <= c1,
+            SelectionMode::Linear => {
+                // Single-row selection is a plain column span; otherwise
+                // the first row runs to its end and the last starts at its
+                // beginning.
+                if r0 == r1 {
+                    col >= c0 && col <= c1
+                } else if row == r0 {
+                    col >= c0
+                } else if row == r1 {
+                    col <= c1
+                } else {
+                    true
+                }
+            }
+        }
+    }
+}
+
 /// Cell-buffer + cursor + ANSI-parser-driven screen state machine.
 ///
 /// The buffer is fixed-size (`cols * rows`) and pre-allocated; no
@@ -375,7 +493,14 @@ pub struct Screen {
     /// change several times within one tick (a wheel burst, or an output
     /// scroll that snaps back to the tail); one repaint per tick is
     /// enough and avoids emitting `rows * cols` PutGlyphs per event.
+    ///
+    /// Phase 112 Track B.1 also raises this for selection changes — both
+    /// are "the composited frame no longer matches the state", and they
+    /// share one repaint.
     view_dirty: bool,
+    /// Phase 112 Track B.1 — the active mouse selection, in display
+    /// coordinates. `None` means nothing is selected.
+    selection: Option<Selection>,
     /// Cursor row, 0-based.
     cursor_row: u16,
     /// Cursor col, 0-based.  May equal `cols` to mean "past the right
@@ -430,6 +555,7 @@ impl Screen {
             scrollback: Vec::new(),
             view_offset: 0,
             view_dirty: false,
+            selection: None,
             cursor_row: 0,
             cursor_col: 0,
             fg: DEFAULT_FG,
@@ -727,6 +853,132 @@ impl Screen {
         }
     }
 
+    /// Phase 112 — resolve one **display** cell: the cell currently shown
+    /// at `(row, col)`, which under a non-zero `view_offset` may come from
+    /// the scrollback ring rather than the live grid.
+    ///
+    /// ```text
+    ///   display row r <  view_offset  ->  scrollback[len - view_offset + r]
+    ///   display row r >= view_offset  ->  live_buf[r - view_offset]
+    /// ```
+    ///
+    /// This is the single source of truth for "what is on screen", shared
+    /// by [`Screen::compose_view`] (painting) and
+    /// [`Screen::selection_text`] (copying) so the two can never disagree
+    /// about what the user is looking at — the bug you get when copy
+    /// re-derives coordinates independently of render.
+    ///
+    /// Returns `None` outside the grid. A scrollback row evicted under a
+    /// narrower `cols` yields `None` past its end; callers pad.
+    pub fn display_cell(&self, row: u16, col: u16) -> Option<Cell> {
+        if row >= self.rows || col >= self.cols {
+            return None;
+        }
+        let k = self.view_offset.min(self.scrollback.len());
+        let (row, col) = (row as usize, col as usize);
+        if row < k {
+            let sb_base = self.scrollback.len() - k;
+            self.scrollback[sb_base + row].get(col).copied()
+        } else {
+            let live_row = row - k;
+            Some(self.active_buf()[live_row * self.cols as usize + col])
+        }
+    }
+
+    /// Phase 112 Track B.1 — the active selection, if any.
+    pub fn selection(&self) -> Option<Selection> {
+        self.selection
+    }
+
+    /// Phase 112 Track B.1 — begin a selection at display cell
+    /// `(row, col)`. Replaces any existing selection.
+    pub fn selection_begin(&mut self, row: u16, col: u16, mode: SelectionMode) {
+        self.selection = Some(Selection::begin(row, col, mode));
+        self.view_dirty = true;
+    }
+
+    /// Phase 112 Track B.1 — extend the in-progress selection to
+    /// `(row, col)`. Ignored when no drag is in flight, so stray motion
+    /// events cannot resurrect a committed selection.
+    pub fn selection_extend(&mut self, row: u16, col: u16) {
+        if let Some(sel) = self.selection.as_mut()
+            && sel.is_dragging()
+        {
+            sel.extend_to(row, col);
+            self.view_dirty = true;
+        }
+    }
+
+    /// Phase 112 Track B.1 — commit the in-progress selection on button
+    /// release. A press with no drag selects nothing and is cleared, so a
+    /// plain click dismisses the previous selection (xterm behaviour).
+    pub fn selection_commit(&mut self) {
+        let drop_empty = match self.selection.as_mut() {
+            Some(sel) if sel.is_dragging() => {
+                sel.commit();
+                sel.is_empty()
+            }
+            _ => return,
+        };
+        if drop_empty {
+            self.selection = None;
+        }
+        self.view_dirty = true;
+    }
+
+    /// Phase 112 Track B.1 — clear any selection and repaint.
+    pub fn selection_clear(&mut self) {
+        if self.selection.is_some() {
+            self.selection = None;
+            self.view_dirty = true;
+        }
+    }
+
+    /// Phase 112 Track B.3 — serialize the selected cells to text.
+    ///
+    /// Rules, all of which exist because `Cell` is not a plain `char`:
+    ///
+    /// - Cells flagged `wide_continuation` are **skipped**: they are the
+    ///   trailing half of a double-width glyph whose codepoint lives in
+    ///   the leading cell, so emitting both would duplicate every CJK
+    ///   character.
+    /// - Trailing blanks (`codepoint == 0x20`) are trimmed per row —
+    ///   the grid is blank-padded to `cols`, and copying that padding
+    ///   would paste a wall of spaces.
+    /// - Rows are joined with `\n`. A fully blank row becomes an empty
+    ///   line rather than disappearing, so vertical structure survives.
+    ///
+    /// Returns `None` when there is no selection.
+    pub fn selection_text(&self) -> Option<alloc::string::String> {
+        let sel = self.selection?;
+        let ((r0, _), (r1, _)) = sel.ordered();
+        let mut out = alloc::string::String::new();
+        let last_row = r1.min(self.rows.saturating_sub(1));
+        for row in r0..=last_row {
+            if row > r0 {
+                out.push('\n');
+            }
+            let mut line = alloc::string::String::new();
+            for col in 0..self.cols {
+                if !sel.contains(row, col) {
+                    continue;
+                }
+                let Some(cell) = self.display_cell(row, col) else {
+                    continue;
+                };
+                if cell.wide_continuation {
+                    continue;
+                }
+                line.push(char::from_u32(cell.codepoint).unwrap_or(' '));
+            }
+            while line.ends_with(' ') {
+                line.pop();
+            }
+            out.push_str(&line);
+        }
+        Some(out)
+    }
+
     /// Phase 112 Track A — emit a full frame for the *current viewport*.
     ///
     /// At `view_offset == 0` this is exactly the existing full re-emit
@@ -751,39 +1003,37 @@ impl Screen {
             bg: self.bg,
         });
         out.push(RenderCommand::Clear);
-        let cols = self.cols as usize;
-        let rows = self.rows as usize;
-        let k = self.view_offset.min(self.scrollback.len());
-        let sb_base = self.scrollback.len() - k;
-        let live = self.active_buf();
+        let cols = self.cols;
+        let rows = self.rows;
         for row in 0..rows {
             for col in 0..cols {
-                let cell = if row < k {
-                    // Sourced from history. A row evicted under a narrower
-                    // `cols` simply runs out; pad with a blank.
-                    self.scrollback[sb_base + row]
-                        .get(col)
-                        .copied()
-                        .unwrap_or_else(|| Cell::blank(self.fg, self.bg))
+                let cell = self
+                    .display_cell(row, col)
+                    .unwrap_or_else(|| Cell::blank(self.fg, self.bg));
+                // Phase 112 Track B.1 — the highlight is a compositional
+                // attribute applied right here in the emit path (an fg/bg
+                // swap), so selection needs no separate draw pass and no
+                // renderer change.
+                let selected = self.selection.is_some_and(|s| s.contains(row, col));
+                let (fg, bg) = if selected {
+                    (cell.bg, cell.fg)
                 } else {
-                    let live_row = row - k;
-                    // `live_row < rows` always holds (row < rows, k >= 0),
-                    // so this index is in bounds for the live grid.
-                    live[live_row * cols + col]
+                    (cell.fg, cell.bg)
                 };
                 out.push(RenderCommand::PutGlyph {
-                    row: row as u16,
-                    col: col as u16,
+                    row,
+                    col,
                     codepoint: cell.codepoint,
-                    fg: cell.fg,
-                    bg: cell.bg,
+                    fg,
+                    bg,
                 });
             }
         }
         // Push the cursor down by the scroll amount so it tracks the live
         // row it belongs to; clamp it into the grid when history has
         // pushed it off the bottom.
-        let cursor_row = (self.cursor_row as usize + k).min(rows.saturating_sub(1)) as u16;
+        let k = self.view_offset.min(self.scrollback.len());
+        let cursor_row = (self.cursor_row as usize + k).min(rows.saturating_sub(1) as usize) as u16;
         out.push(RenderCommand::MoveCursor {
             row: cursor_row,
             col: self.cursor_col,
@@ -2812,6 +3062,303 @@ mod tests {
         let mut out = Vec::new();
         s.resize(12, 6, &mut out);
         assert_eq!(s.view_offset(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 112 Track B.1 — selection geometry + highlight
+    // -----------------------------------------------------------------
+
+    /// B.1 acceptance: a drag up-and-left and a drag down-and-right over
+    /// the same two corners select the identical range.
+    #[test]
+    fn selection_ordering_is_drag_direction_independent() {
+        let mut down = Selection::begin(1, 2, SelectionMode::Linear);
+        down.extend_to(3, 5);
+        let mut up = Selection::begin(3, 5, SelectionMode::Linear);
+        up.extend_to(1, 2);
+        assert_eq!(down.ordered(), up.ordered());
+        assert_eq!(down.ordered(), ((1, 2), (3, 5)));
+
+        // Block mode orders rows and columns independently, so a drag
+        // that goes down-and-left still yields a proper rectangle.
+        let mut blk = Selection::begin(3, 7, SelectionMode::Block);
+        blk.extend_to(1, 2);
+        assert_eq!(blk.ordered(), ((1, 2), (3, 7)));
+    }
+
+    /// B.1 acceptance: `Linear` covers reading order — first row to its
+    /// end, whole middle rows, last row from its start.
+    #[test]
+    fn linear_selection_covers_reading_order() {
+        let mut sel = Selection::begin(1, 3, SelectionMode::Linear);
+        sel.extend_to(3, 2);
+
+        // First row: from col 3 to the end.
+        assert!(!sel.contains(1, 2));
+        assert!(sel.contains(1, 3));
+        assert!(sel.contains(1, 79));
+        // Middle row: everything.
+        assert!(sel.contains(2, 0));
+        assert!(sel.contains(2, 79));
+        // Last row: up to col 2.
+        assert!(sel.contains(3, 0));
+        assert!(sel.contains(3, 2));
+        assert!(!sel.contains(3, 3));
+        // Outside the row span.
+        assert!(!sel.contains(0, 5));
+        assert!(!sel.contains(4, 0));
+    }
+
+    /// B.1 acceptance: a single-row `Linear` selection is a plain column
+    /// span, not "to end of line".
+    #[test]
+    fn single_row_linear_selection_is_a_column_span() {
+        let mut sel = Selection::begin(2, 4, SelectionMode::Linear);
+        sel.extend_to(2, 8);
+        assert!(!sel.contains(2, 3));
+        assert!(sel.contains(2, 4));
+        assert!(sel.contains(2, 8));
+        assert!(!sel.contains(2, 9));
+    }
+
+    /// B.1 acceptance: `Block` covers the rectangle only — the column
+    /// span applies to every row, unlike `Linear`.
+    #[test]
+    fn block_selection_covers_a_rectangle() {
+        let mut sel = Selection::begin(1, 2, SelectionMode::Block);
+        sel.extend_to(3, 5);
+        for row in 1..=3 {
+            assert!(!sel.contains(row, 1));
+            assert!(sel.contains(row, 2));
+            assert!(sel.contains(row, 5));
+            assert!(!sel.contains(row, 6));
+        }
+        // The distinguishing case: Linear would take all of row 2.
+        let mut lin = Selection::begin(1, 2, SelectionMode::Linear);
+        lin.extend_to(3, 5);
+        assert!(lin.contains(2, 40));
+        assert!(!sel.contains(2, 40));
+    }
+
+    /// B.1 acceptance: covered cells render with fg/bg swapped, and
+    /// clearing the selection repaints them normally.
+    #[test]
+    fn selection_renders_inverted_and_clears_cleanly() {
+        let mut s = Screen::with_geometry(8, 4);
+        fill_lines(&mut s, 3);
+
+        let plain = {
+            let mut c = Vec::new();
+            s.compose_view(&mut c);
+            c
+        };
+        let cell_of = |cmds: &[RenderCommand], row: u16, col: u16| -> (u32, u32) {
+            for cmd in cmds {
+                if let RenderCommand::PutGlyph {
+                    row: r,
+                    col: c,
+                    fg,
+                    bg,
+                    ..
+                } = cmd
+                    && *r == row
+                    && *c == col
+                {
+                    return (*fg, *bg);
+                }
+            }
+            panic!("cell ({row},{col}) not emitted");
+        };
+        let (fg0, bg0) = cell_of(&plain, 0, 1);
+
+        s.selection_begin(0, 0, SelectionMode::Linear);
+        s.selection_extend(0, 3);
+        let mut sel_cmds = Vec::new();
+        s.compose_view(&mut sel_cmds);
+        assert_eq!(
+            cell_of(&sel_cmds, 0, 1),
+            (bg0, fg0),
+            "selected cell inverts fg/bg"
+        );
+        assert_eq!(
+            cell_of(&sel_cmds, 1, 1),
+            cell_of(&plain, 1, 1),
+            "unselected cells are untouched"
+        );
+
+        s.selection_clear();
+        let mut cleared = Vec::new();
+        s.compose_view(&mut cleared);
+        assert_eq!(cell_of(&cleared, 0, 1), (fg0, bg0), "clearing repaints");
+    }
+
+    /// B.1 acceptance: selection changes mark the view dirty so the main
+    /// loop repaints.
+    #[test]
+    fn selection_changes_mark_view_dirty() {
+        let mut s = Screen::with_geometry(8, 4);
+        fill_lines(&mut s, 3);
+        let _ = s.take_view_dirty();
+
+        s.selection_begin(0, 0, SelectionMode::Linear);
+        assert!(s.take_view_dirty());
+        s.selection_extend(0, 3);
+        assert!(s.take_view_dirty());
+        s.selection_commit();
+        assert!(s.take_view_dirty());
+        s.selection_clear();
+        assert!(s.take_view_dirty());
+    }
+
+    /// B.1 acceptance: a press with no drag selects nothing — a plain
+    /// click dismisses the previous selection rather than leaving a
+    /// zero-width one behind.
+    #[test]
+    fn plain_click_dismisses_selection() {
+        let mut s = Screen::with_geometry(8, 4);
+        fill_lines(&mut s, 3);
+        s.selection_begin(0, 0, SelectionMode::Linear);
+        s.selection_extend(0, 3);
+        s.selection_commit();
+        assert!(s.selection().is_some());
+
+        // Press + release with no movement.
+        s.selection_begin(2, 2, SelectionMode::Linear);
+        s.selection_commit();
+        assert!(s.selection().is_none(), "empty click clears the selection");
+    }
+
+    /// B.1 acceptance: motion after release does not resurrect a
+    /// committed selection.
+    #[test]
+    fn extend_after_commit_is_ignored() {
+        let mut s = Screen::with_geometry(8, 4);
+        fill_lines(&mut s, 3);
+        s.selection_begin(0, 0, SelectionMode::Linear);
+        s.selection_extend(0, 3);
+        s.selection_commit();
+        let before = s.selection().unwrap().ordered();
+
+        s.selection_extend(3, 7);
+        assert_eq!(s.selection().unwrap().ordered(), before);
+    }
+
+    /// B.1/B.3 acceptance: selection reads through the *display* mapping,
+    /// so a selection made while scrolled back copies the history the user
+    /// can actually see — not the live grid hiding behind it.
+    #[test]
+    fn selection_over_scrollback_reads_history() {
+        let mut s = Screen::with_geometry(8, 4);
+        fill_lines(&mut s, 10);
+        s.set_view_offset(2);
+        // Display row 0 is scrollback "L5" (see the compose_view test).
+        s.selection_begin(0, 0, SelectionMode::Linear);
+        s.selection_extend(0, 7);
+        assert_eq!(s.selection_text().as_deref(), Some("L5"));
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 112 Track B.3 — selection → UTF-8 serialization
+    // -----------------------------------------------------------------
+
+    /// B.3 acceptance: trailing blanks are trimmed per row and rows join
+    /// with `\n`. The grid is blank-padded to `cols`, so without the trim
+    /// every copied line would drag a tail of spaces.
+    #[test]
+    fn selection_text_trims_trailing_blanks_and_joins_rows() {
+        let mut s = Screen::with_geometry(10, 4);
+        let mut out = Vec::new();
+        for b in b"ab\r\ncde\r\n" {
+            s.feed(*b, &mut out);
+        }
+        // Select the full width of rows 0..=1.
+        s.selection_begin(0, 0, SelectionMode::Linear);
+        s.selection_extend(1, 9);
+        assert_eq!(s.selection_text().as_deref(), Some("ab\ncde"));
+    }
+
+    /// B.3 acceptance: a fully blank row inside the range becomes an empty
+    /// line, not a dropped one — vertical structure has to survive a copy.
+    #[test]
+    fn selection_text_keeps_blank_rows_as_empty_lines() {
+        let mut s = Screen::with_geometry(10, 4);
+        let mut out = Vec::new();
+        for b in b"ab\r\n\r\ncd\r\n" {
+            s.feed(*b, &mut out);
+        }
+        s.selection_begin(0, 0, SelectionMode::Linear);
+        s.selection_extend(2, 9);
+        assert_eq!(s.selection_text().as_deref(), Some("ab\n\ncd"));
+    }
+
+    /// B.3 acceptance: a double-width glyph yields **one** codepoint, not
+    /// two. The trailing cell carries `wide_continuation` and no codepoint
+    /// of its own; emitting it would duplicate every CJK character.
+    #[test]
+    fn selection_text_emits_wide_glyph_once() {
+        let mut s = Screen::with_geometry(10, 2);
+        let mut out = Vec::new();
+        // U+4F60 is double-width; it occupies cells 0 and 1.
+        for b in "你a".as_bytes() {
+            s.feed(*b, &mut out);
+        }
+        assert!(
+            s.cell(0, 1).unwrap().wide_continuation,
+            "fixture precondition: cell 1 is the wide continuation"
+        );
+
+        s.selection_begin(0, 0, SelectionMode::Linear);
+        s.selection_extend(0, 9);
+        assert_eq!(s.selection_text().as_deref(), Some("你a"));
+    }
+
+    /// B.3 acceptance: block selection copies only the rectangle, one line
+    /// per row — the column-extraction case block select exists for.
+    #[test]
+    fn selection_text_block_mode_copies_the_rectangle() {
+        let mut s = Screen::with_geometry(10, 4);
+        let mut out = Vec::new();
+        for b in b"abcd\r\nefgh\r\nijkl\r\n" {
+            s.feed(*b, &mut out);
+        }
+        // Columns 1..=2 of rows 0..=2.
+        s.selection_begin(0, 1, SelectionMode::Block);
+        s.selection_extend(2, 2);
+        assert_eq!(s.selection_text().as_deref(), Some("bc\nfg\njk"));
+    }
+
+    /// B.3 acceptance: no selection means nothing to copy.
+    #[test]
+    fn selection_text_is_none_without_a_selection() {
+        let mut s = Screen::with_geometry(8, 4);
+        fill_lines(&mut s, 3);
+        assert!(s.selection_text().is_none());
+    }
+
+    /// B.3 acceptance: a selection larger than the clipboard transport cap
+    /// is rejected by `set_clipboard`, not truncated. `Screen` will happily
+    /// serialize it; the cap lives at the protocol seam, and this pins the
+    /// bound the copy path checks against.
+    #[test]
+    fn oversized_selection_exceeds_the_clipboard_cap() {
+        use kernel_core::display::protocol::CLIPBOARD_MAX_BYTES;
+        // 200 cols × 40 rows of non-blank text far exceeds 3900 bytes.
+        let mut s = Screen::with_geometry(200, 40);
+        let mut out = Vec::new();
+        for _ in 0..40 {
+            for _ in 0..200 {
+                s.feed(b'x', &mut out);
+            }
+            out.clear();
+        }
+        s.selection_begin(0, 0, SelectionMode::Linear);
+        s.selection_extend(39, 199);
+        let text = s.selection_text().expect("selection present");
+        assert!(
+            text.len() > CLIPBOARD_MAX_BYTES,
+            "fixture must exceed the cap: {} vs {CLIPBOARD_MAX_BYTES}",
+            text.len()
+        );
     }
 
     /// A.2 regression: a scrollback row evicted under a *narrower* grid

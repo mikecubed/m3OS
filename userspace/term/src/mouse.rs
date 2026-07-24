@@ -360,14 +360,16 @@ impl MouseReporter {
 /// project into the cell grid by dividing by the renderer's glyph
 /// dimensions (`GLYPH_W` / `GLYPH_H`).
 fn compute_cell_position(event: &PointerEvent, cols: u16, rows: u16) -> (u16, u16) {
-    // MUST match `term::display::CELL_WIDTH` / `CELL_HEIGHT`.
-    // The `display` module is gated behind the `os-binary` feature
-    // so we duplicate the literals here; mismatching them would
-    // misproject pointer pixels onto the cell grid. The reporter is
-    // bounded by the cell grid regardless; an off-by-one cell at
-    // the grid boundary is harmless.
-    const GLYPH_W: u16 = 16;
-    const GLYPH_H: u16 = 32;
+    // Phase 112 Track B.1 — read the real cell size from the crate root.
+    //
+    // These used to be private `16` / `32` literals here, duplicated
+    // because the `display` module is `os-binary`-gated. Phase 73 changed
+    // the actual cell to 24×48 and this copy was missed, so every
+    // reported mouse position was projected onto a grid 1.5× too fine.
+    // The constants now live in the ungated crate root precisely so this
+    // cannot happen again.
+    const GLYPH_W: u16 = crate::CELL_WIDTH as u16;
+    const GLYPH_H: u16 = crate::CELL_HEIGHT as u16;
     let (px_x, px_y) = match event.abs_position {
         Some((x, y)) => (x.max(0) as u32, y.max(0) as u32),
         None => (0, 0),
@@ -384,11 +386,16 @@ mod tests {
     use super::*;
     use kernel_core::input::events::{ModifierState, PointerButton, PointerEvent};
 
-    // Mirror the literals in `compute_cell_position`. Tests use
-    // these so the cell-coord assertions stay readable when the
-    // pixel inputs are derived from `cell × CELL_*`.
-    const CELL_W_PX: i32 = 16;
-    const CELL_H_PX: i32 = 32;
+    // Tests derive pixel inputs as `cell × CELL_*` so the cell-coord
+    // assertions stay readable.
+    //
+    // Phase 112 Track B.1 — these were hardcoded `16` / `32`, mirroring
+    // the stale private literals in `compute_cell_position`. Because both
+    // copies were wrong in the same way, the tests passed while real mouse
+    // reporting was off by 1.5 cells. They now reference the single
+    // production constant, so the fixture cannot drift from the code again.
+    const CELL_W_PX: i32 = crate::CELL_WIDTH as i32;
+    const CELL_H_PX: i32 = crate::CELL_HEIGHT as i32;
 
     fn press(button: u8, x: i32, y: i32) -> PointerEvent {
         PointerEvent {
