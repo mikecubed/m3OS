@@ -36,7 +36,22 @@ use kernel_core::input::events::{PointerButton, PointerEvent};
 pub const MAX_BYTES: usize = 24;
 
 /// Inline byte buffer returned by [`MouseReporter::encode`].
-#[derive(Clone, Copy)]
+/// Phase 112 Track A.4 — what the main loop should do with one pointer
+/// event, as decided by [`MouseReporter::classify`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerAction {
+    /// Forward these bytes to the PTY — the application is tracking the
+    /// mouse and this was a button edge.
+    Report(MouseBytes),
+    /// Move `term`'s own scrollback viewport by this many rows; positive
+    /// is toward older history.
+    ScrollView(isize),
+    /// Nothing to do (motion-only sample, or a wheel notch while the app
+    /// holds the mouse).
+    Ignore,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MouseBytes {
     buf: [u8; MAX_BYTES],
     len: usize,
@@ -229,6 +244,54 @@ impl MouseReporter {
         };
         self.tracking = t;
         self.encoding = e;
+    }
+
+    /// Phase 112 Track A.4 — decide what one pointer event should do.
+    ///
+    /// This is the whole pointer policy in one host-testable place, so the
+    /// binary's event loop stays a three-arm match. The order matters:
+    ///
+    /// 1. An application that has grabbed the mouse gets button events
+    ///    reported to it, exactly as before Phase 112.
+    /// 2. Otherwise a wheel event scrolls `term`'s own scrollback
+    ///    viewport (`wheel_dy` positive = wheel-up = older history).
+    /// 3. Anything else is ignored.
+    ///
+    /// `wheel_rows` is the rows-per-notch step the caller wants.
+    pub fn classify(
+        &self,
+        event: &PointerEvent,
+        cols: u16,
+        rows: u16,
+        wheel_rows: isize,
+    ) -> PointerAction {
+        if let Some(bytes) = self.encode(event, cols, rows) {
+            return PointerAction::Report(bytes);
+        }
+        // The wheel drives the viewport only when the app has not grabbed
+        // the mouse — the xterm convention. When it has, a wheel notch is
+        // the app's to interpret (and `encode` already declined it, since
+        // Phase 69 reports button edges only).
+        if !self.tracking_enabled()
+            && matches!(event.button, PointerButton::None)
+            && event.wheel_dy != 0
+        {
+            return PointerAction::ScrollView(event.wheel_dy as isize * wheel_rows);
+        }
+        PointerAction::Ignore
+    }
+
+    /// Phase 112 Track A.4 — `true` when the application has grabbed the
+    /// mouse (any tracking mode other than [`TrackingMode::Disabled`]).
+    ///
+    /// [`MouseReporter::encode`] returns `None` both when tracking is off
+    /// *and* for a button-less event, so the main loop cannot use its
+    /// return value alone to decide whether a wheel event is free to drive
+    /// the scrollback viewport. This accessor disambiguates: the wheel
+    /// scrolls history only when the app is *not* tracking, matching
+    /// xterm.
+    pub fn tracking_enabled(&self) -> bool {
+        !matches!(self.tracking, TrackingMode::Disabled)
     }
 
     /// Disable reporting. Resets tracking to [`TrackingMode::Disabled`]
@@ -498,5 +561,83 @@ mod tests {
         assert_eq!(r.tracking(), TrackingMode::Normal);
         assert_eq!(r.encoding(), EncodingMode::Sgr);
         assert_eq!(r.mode(), Mode::Sgr);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 112 Track A.4 — wheel → scrollback viewport
+    // -----------------------------------------------------------------
+
+    /// A wheel-notch event: no button edge, non-zero `wheel_dy`. This is
+    /// the exact shape the `usb-hid` Report-protocol decoder injects
+    /// (`PointerEvent { button: None, wheel_dy: p.wheel, .. }`).
+    fn wheel(dy: i32) -> PointerEvent {
+        PointerEvent {
+            timestamp_ms: 0,
+            dx: 0,
+            dy: 0,
+            abs_position: None,
+            button: PointerButton::None,
+            wheel_dx: 0,
+            wheel_dy: dy,
+            modifiers: ModifierState(0),
+        }
+    }
+
+    /// A.4 acceptance: with mouse reporting **off**, a wheel notch maps to
+    /// a viewport scroll of `wheel_dy * wheel_rows`, positive = older.
+    #[test]
+    fn wheel_scrolls_viewport_when_app_is_not_tracking() {
+        let r = MouseReporter::new();
+        assert!(!r.tracking_enabled(), "reporter starts disabled");
+
+        assert_eq!(
+            r.classify(&wheel(1), 80, 25, 3),
+            PointerAction::ScrollView(3),
+            "wheel-up scrolls toward older history"
+        );
+        assert_eq!(
+            r.classify(&wheel(-1), 80, 25, 3),
+            PointerAction::ScrollView(-3),
+            "wheel-down scrolls back toward the live tail"
+        );
+        // The step is the caller's to choose.
+        assert_eq!(
+            r.classify(&wheel(2), 80, 25, 1),
+            PointerAction::ScrollView(2)
+        );
+    }
+
+    /// A.4 acceptance: once the application grabs the mouse, the wheel is
+    /// the app's — the viewport must not move (the xterm convention).
+    #[test]
+    fn wheel_does_not_scroll_viewport_while_app_tracks() {
+        let mut r = MouseReporter::new();
+        r.set_tracking(TrackingMode::Normal);
+        assert!(r.tracking_enabled());
+        assert_eq!(
+            r.classify(&wheel(1), 80, 25, 3),
+            PointerAction::Ignore,
+            "a tracking app owns the wheel; term's viewport stays put"
+        );
+    }
+
+    /// A.4 acceptance: button edges are still reported unchanged — the
+    /// classifier must not have stolen the pre-Phase-112 behaviour.
+    #[test]
+    fn button_edges_still_report_to_the_application() {
+        let mut r = MouseReporter::new();
+        r.set_tracking(TrackingMode::Normal);
+        let ev = press(0, CELL_W_PX, CELL_H_PX);
+        let expected = r.encode(&ev, 80, 25).expect("button edge encodes");
+        assert_eq!(r.classify(&ev, 80, 25, 3), PointerAction::Report(expected));
+    }
+
+    /// A.4 acceptance: a PS/2-only lane never produces a wheel delta, so
+    /// the classifier is inert there — `wheel_dy == 0` yields `Ignore`,
+    /// not a zero-row scroll that would still dirty the viewport.
+    #[test]
+    fn zero_wheel_delta_is_ignored_not_a_zero_scroll() {
+        let r = MouseReporter::new();
+        assert_eq!(r.classify(&wheel(0), 80, 25, 3), PointerAction::Ignore);
     }
 }

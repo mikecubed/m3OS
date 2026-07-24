@@ -45,9 +45,9 @@ use term::bell::{AudioClientBellSink, AudioUnavailableBellSink, Bell, BellError}
 #[cfg(not(test))]
 use term::display::DisplayClient;
 #[cfg(not(test))]
-use term::input::{InputHandler, PtyWriter};
+use term::input::{InputHandler, KeyOutcome, PtyWriter};
 #[cfg(not(test))]
-use term::mouse::{EncodingMode, MouseReporter, TrackingMode};
+use term::mouse::{EncodingMode, MouseReporter, PointerAction, TrackingMode};
 #[cfg(not(test))]
 use term::pty::PtyHost;
 #[cfg(not(test))]
@@ -119,6 +119,13 @@ const COMPOSE_INTERVAL_MS: u64 = 16;
 /// Matches xterm's default cursor blink rate.
 #[cfg(not(test))]
 const BLINK_INTERVAL_MS: u64 = 500;
+
+/// Phase 112 Track A.4 — scrollback rows moved per wheel notch. Three is
+/// the near-universal terminal default (xterm/VTE/kitty all ship it), and
+/// it is small enough that a single notch never skips past a short
+/// command's output.
+#[cfg(not(test))]
+const WHEEL_SCROLL_ROWS: isize = 3;
 
 #[cfg(not(test))]
 const SHELL_DEPENDENCY_SERVICE: &str = "vfs";
@@ -335,6 +342,21 @@ fn program_main(_args: &[&str]) -> i32 {
             for &byte in &pty_buf[..n as usize] {
                 screen.feed(byte, &mut render_cmds);
             }
+            // Phase 112 Track A.2 — while the user is reading scrollback,
+            // the frame on screen is history, not the live grid, so the
+            // *visual* commands this output produced must not paint over
+            // it. The live grid still absorbed every byte above; it is
+            // only the painting that waits. Control commands (bell, mouse
+            // mode, host replies) are side effects the application is owed
+            // regardless of what the user is looking at, so they always
+            // run.
+            //
+            // Note this is evaluated *after* the feed loop: output that
+            // scrolled the primary region already snapped the view back to
+            // the live tail inside `scroll_region_up`, so the common case
+            // (a scrolling shell) reads `false` here and paints normally,
+            // then the dirty-view repaint below refreshes the frame.
+            let suppress_visual = screen.is_scrolled_back();
             for cmd in render_cmds.drain(..) {
                 match cmd {
                     RenderCommand::Bell => {
@@ -357,7 +379,11 @@ fn program_main(_args: &[&str]) -> i32 {
                         let n = len as usize;
                         let _ = syscall_lib::write(primary_fd, &bytes[..n]);
                     }
-                    other => renderer.apply(other),
+                    other => {
+                        if !suppress_visual {
+                            renderer.apply(other);
+                        }
+                    }
                 }
             }
         } else if n == 0 {
@@ -390,12 +416,44 @@ fn program_main(_args: &[&str]) -> i32 {
             ) {
                 PulledEvent::Key(ev) => {
                     did_work = true;
-                    input_handler.translate(&ev, &mut writer);
+                    // Phase 112 Track A.3 — `translate` reports what the
+                    // key did so the scrollback viewport can react. It
+                    // owns no `Screen` (it stays host-testable standalone),
+                    // so the policy lives here.
+                    match input_handler.translate(&ev, &mut writer) {
+                        // Shift+PageUp/PageDown/Home/End — consumed
+                        // locally, no PTY bytes.
+                        KeyOutcome::View(cmd) => screen.apply_view_cmd(cmd),
+                        // Snap-to-bottom-on-keystroke: anything that
+                        // reaches the shell returns the user to the live
+                        // tail, so they never type "into" history.
+                        KeyOutcome::WroteBytes => screen.view_to_live(),
+                        KeyOutcome::None => {}
+                    }
                 }
                 PulledEvent::Pointer(ev) => {
                     did_work = true;
-                    if let Some(bytes) = mouse_reporter.encode(&ev, screen.cols(), screen.rows()) {
-                        let _ = syscall_lib::write(primary_fd, bytes.as_slice());
+                    // Phase 112 Track A.4 — the pointer policy lives in
+                    // `MouseReporter::classify` so it is host-testable;
+                    // this arm just executes the verdict.
+                    //
+                    // Lane note: the `ScrollView` arm is live only where a
+                    // Report-protocol USB pointer is attached. The PS/2
+                    // path never sets `wheel_dy` (the kernel keeps the
+                    // mouse in 3-byte framing), so on a PS/2-only boot it
+                    // simply never fires and the Shift+PageUp binds carry
+                    // the feature.
+                    match mouse_reporter.classify(
+                        &ev,
+                        screen.cols(),
+                        screen.rows(),
+                        WHEEL_SCROLL_ROWS,
+                    ) {
+                        PointerAction::Report(bytes) => {
+                            let _ = syscall_lib::write(primary_fd, bytes.as_slice());
+                        }
+                        PointerAction::ScrollView(delta) => screen.scroll_view_by(delta),
+                        PointerAction::Ignore => {}
                     }
                 }
                 PulledEvent::SurfaceResized { width, height } => {
@@ -447,6 +505,22 @@ fn program_main(_args: &[&str]) -> i32 {
         }
         if disconnect {
             break;
+        }
+
+        // 5b2. Phase 112 Track A.2 — the scrollback viewport moved this
+        //      tick (wheel, Shift+PageUp, or a snap-to-bottom from new
+        //      output). The renderer is command-driven and has no notion
+        //      of a view, so re-emit a full frame for the current offset.
+        //      Coalesced to one repaint per tick: a wheel burst delivers
+        //      many events, and each would otherwise cost rows*cols
+        //      PutGlyphs.
+        if screen.take_view_dirty() {
+            did_work = true;
+            render_cmds.clear();
+            screen.compose_view(&mut render_cmds);
+            for cmd in render_cmds.drain(..) {
+                renderer.apply(cmd);
+            }
         }
 
         // 5c. Poll shell exit. `Some(_)` ⇒ child exited (cleanly or

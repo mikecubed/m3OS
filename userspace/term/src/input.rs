@@ -16,8 +16,42 @@
 //! - Unknown private-use keysyms write nothing.  No worker threads —
 //!   the binary's main loop drives this synchronously.
 
-use kernel_core::input::events::{KeyEvent, KeyEventKind, MOD_CTRL};
-use kernel_core::input::keymap::{KEYSYM_DOWN, KEYSYM_LEFT, KEYSYM_RIGHT, KEYSYM_UP};
+use crate::screen::ViewCmd;
+use kernel_core::input::events::{KeyEvent, KeyEventKind, MOD_CTRL, MOD_SHIFT, ModifierState};
+use kernel_core::input::keymap::{
+    KEYSYM_DOWN, KEYSYM_END, KEYSYM_HOME, KEYSYM_LEFT, KEYSYM_PAGEDOWN, KEYSYM_PAGEUP,
+    KEYSYM_RIGHT, KEYSYM_UP,
+};
+
+/// Phase 112 Track A.3 — what one translated key did.
+///
+/// `translate` used to return `()`, which could express neither "this key
+/// was consumed locally, write nothing to the PTY" (needed for the
+/// Shift+PageUp viewport binds) nor "this key produced PTY bytes" (the
+/// snap-to-bottom trigger). `InputHandler` deliberately holds no `Screen`
+/// reference — it stays host-testable in isolation — so the outcome is
+/// handed back to the main loop, which owns both the screen and the PTY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyOutcome {
+    /// The event produced no output (an `Up` edge, a modifier-only event,
+    /// or an unmapped private-use keysym).
+    None,
+    /// Bytes were written to the PTY. The main loop snaps the scrollback
+    /// viewport back to the live tail so the user never types into
+    /// history.
+    WroteBytes,
+    /// A scrollback viewport movement, consumed locally — no PTY bytes.
+    View(ViewCmd),
+}
+
+/// Phase 112 Track A.3 — a non-printable key's meaning, resolved against
+/// the live modifier state.
+enum SpecialKey {
+    /// A VT100/CSI sequence destined for the PTY.
+    Bytes(&'static [u8]),
+    /// A scrollback viewport command handled inside `term`.
+    View(ViewCmd),
+}
 
 /// Pluggable PTY-write seam. Production wraps `syscall_lib::write`;
 /// host tests record byte slices.
@@ -40,13 +74,17 @@ impl InputHandler {
     /// Translate one event into PTY bytes; the writer is called once
     /// per event with the bytes (or not at all for events that do not
     /// produce output).
-    pub fn translate<W: PtyWriter>(&mut self, event: &KeyEvent, writer: &mut W) {
+    ///
+    /// Phase 112 Track A.3 — returns a [`KeyOutcome`] so the caller can
+    /// distinguish "wrote to the PTY" (snap the scrollback view back to
+    /// the live tail) from "consumed locally as a viewport command".
+    pub fn translate<W: PtyWriter>(&mut self, event: &KeyEvent, writer: &mut W) -> KeyOutcome {
         // Only down / repeat events produce input.  Up events update
         // modifier state in `kbd_server`; clients see the latched
         // snapshot on the next down event.
         match event.kind {
             KeyEventKind::Down | KeyEventKind::Repeat => {}
-            KeyEventKind::Up => return,
+            KeyEventKind::Up => return KeyOutcome::None,
         }
 
         let symbol = event.symbol;
@@ -61,20 +99,24 @@ impl InputHandler {
         // path below. Drop these here so we don't emit a NUL byte
         // through the `symbol <= 0x7F` clause at the bottom.
         if symbol == 0 {
-            return;
+            return KeyOutcome::None;
         }
 
         // Special keys live in the private-use area (0xE000+);
         // printable ASCII in [0x20..=0x7E] flows through verbatim.
-        if let Some(seq) = special_key_sequence(symbol) {
-            writer.write(seq);
-            return;
+        match special_key_sequence(symbol, modifiers) {
+            Some(SpecialKey::Bytes(seq)) => {
+                writer.write(seq);
+                return KeyOutcome::WroteBytes;
+            }
+            Some(SpecialKey::View(cmd)) => return KeyOutcome::View(cmd),
+            None => {}
         }
 
         // Backspace (0x08) → DEL (0x7F).
         if symbol == 0x08 {
             writer.write(&[0x7F]);
-            return;
+            return KeyOutcome::WroteBytes;
         }
 
         // Ctrl + letter → control code.
@@ -85,27 +127,68 @@ impl InputHandler {
             // shell-essential subset.
             if let Some(c) = ctrl_byte(symbol) {
                 writer.write(&[c]);
-                return;
+                return KeyOutcome::WroteBytes;
             }
         }
 
         // Printable ASCII or control bytes that flow through.
         if symbol <= 0x7F {
             writer.write(&[symbol as u8]);
+            return KeyOutcome::WroteBytes;
         }
+        KeyOutcome::None
     }
 }
 
-/// Map an arrow / function-key keysym to its CSI escape sequence.
-fn special_key_sequence(symbol: u32) -> Option<&'static [u8]> {
+/// Map an arrow / navigation keysym to its CSI escape sequence, or — for
+/// the Shift-modified navigation cluster — to a scrollback viewport
+/// command handled inside `term`.
+///
+/// Phase 112 Track A.3 filled in the PageUp/PageDown/Home/End rows. Before
+/// this phase `term` mapped the four arrows only, so plain PageUp/Home/End
+/// produced **nothing at all** and paging inside `less`/`htop` was broken.
+/// The unshifted sequences below are the same ones
+/// `kernel_core::input::hid_poll::key_event_to_stdin` emits for the USB
+/// HID path; the `hid_poll_*` tests below pin them together so the two
+/// tables cannot drift.
+///
+/// Shift is the xterm convention for "talk to the terminal, not the
+/// application", which is why the viewport binds live there and the
+/// unshifted keys still reach the app.
+fn special_key_sequence(symbol: u32, modifiers: ModifierState) -> Option<SpecialKey> {
+    let shift = modifiers.contains(MOD_SHIFT);
     if symbol == KEYSYM_UP.0 {
-        Some(b"\x1b[A")
+        Some(SpecialKey::Bytes(b"\x1b[A"))
     } else if symbol == KEYSYM_DOWN.0 {
-        Some(b"\x1b[B")
+        Some(SpecialKey::Bytes(b"\x1b[B"))
     } else if symbol == KEYSYM_RIGHT.0 {
-        Some(b"\x1b[C")
+        Some(SpecialKey::Bytes(b"\x1b[C"))
     } else if symbol == KEYSYM_LEFT.0 {
-        Some(b"\x1b[D")
+        Some(SpecialKey::Bytes(b"\x1b[D"))
+    } else if symbol == KEYSYM_PAGEUP.0 {
+        Some(if shift {
+            SpecialKey::View(ViewCmd::PageUp)
+        } else {
+            SpecialKey::Bytes(b"\x1b[5~")
+        })
+    } else if symbol == KEYSYM_PAGEDOWN.0 {
+        Some(if shift {
+            SpecialKey::View(ViewCmd::PageDown)
+        } else {
+            SpecialKey::Bytes(b"\x1b[6~")
+        })
+    } else if symbol == KEYSYM_HOME.0 {
+        Some(if shift {
+            SpecialKey::View(ViewCmd::Oldest)
+        } else {
+            SpecialKey::Bytes(b"\x1b[H")
+        })
+    } else if symbol == KEYSYM_END.0 {
+        Some(if shift {
+            SpecialKey::View(ViewCmd::Live)
+        } else {
+            SpecialKey::Bytes(b"\x1b[F")
+        })
     } else {
         None
     }
@@ -164,8 +247,11 @@ pub fn wrap_paste(payload: &[u8], enabled: bool) -> alloc::vec::Vec<u8> {
 mod tests {
     use super::*;
     use alloc::vec::Vec;
-    use kernel_core::input::events::{MOD_CTRL, ModifierState};
-    use kernel_core::input::keymap::{KEYSYM_DOWN, KEYSYM_LEFT, KEYSYM_RIGHT, KEYSYM_UP};
+    use kernel_core::input::events::{MOD_CTRL, MOD_SHIFT, ModifierState};
+    use kernel_core::input::keymap::{
+        KEYSYM_DOWN, KEYSYM_END, KEYSYM_HOME, KEYSYM_LEFT, KEYSYM_PAGEDOWN, KEYSYM_PAGEUP,
+        KEYSYM_RIGHT, KEYSYM_UP,
+    };
 
     struct FakeWriter {
         bytes: Vec<u8>,
@@ -366,5 +452,129 @@ mod tests {
     fn wrap_paste_does_not_escape_close_sequence_in_payload() {
         let wrapped = wrap_paste(b"a\x1b[201~b", true);
         assert_eq!(wrapped, b"\x1b[200~a\x1b[201~b\x1b[201~");
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 112 Track A.3 — key outcomes, page keys, viewport binds
+    // -----------------------------------------------------------------
+
+    /// Drive one key and return `(outcome, bytes written)`.
+    fn run_key(symbol: u32, modifiers: u16) -> (KeyOutcome, Vec<u8>) {
+        let mut h = InputHandler::new();
+        let mut w = FakeWriter::new();
+        let outcome = h.translate(&key_down(symbol, modifiers), &mut w);
+        (outcome, w.bytes)
+    }
+
+    /// A.3 acceptance: **unshifted** PageUp/PageDown/Home/End emit the
+    /// standard VT sequences. Before Phase 112 these produced no bytes at
+    /// all, so `less`/`htop` could not page.
+    #[test]
+    fn unshifted_page_keys_emit_vt_sequences() {
+        let cases: &[(u32, &[u8])] = &[
+            (KEYSYM_PAGEUP.0, b"\x1b[5~"),
+            (KEYSYM_PAGEDOWN.0, b"\x1b[6~"),
+            (KEYSYM_HOME.0, b"\x1b[H"),
+            (KEYSYM_END.0, b"\x1b[F"),
+        ];
+        for (symbol, expected) in cases {
+            let (outcome, bytes) = run_key(*symbol, 0);
+            assert_eq!(outcome, KeyOutcome::WroteBytes, "symbol {symbol:#x}");
+            assert_eq!(&bytes[..], *expected, "symbol {symbol:#x}");
+        }
+    }
+
+    /// A.3 acceptance: `term`'s unshifted navigation table must stay
+    /// byte-identical to the authoritative one in
+    /// `kernel_core::input::hid_poll`, which the USB HID path uses. Two
+    /// copies of a VT table is exactly the kind of thing that silently
+    /// drifts, so pin them together.
+    #[test]
+    fn unshifted_sequences_match_hid_poll_table() {
+        for symbol in [
+            KEYSYM_UP.0,
+            KEYSYM_DOWN.0,
+            KEYSYM_LEFT.0,
+            KEYSYM_RIGHT.0,
+            KEYSYM_PAGEUP.0,
+            KEYSYM_PAGEDOWN.0,
+            KEYSYM_HOME.0,
+            KEYSYM_END.0,
+        ] {
+            let mut expected = Vec::new();
+            kernel_core::input::hid_poll::key_event_to_stdin(symbol, 0, 0, |b| expected.push(b));
+            let (outcome, got) = run_key(symbol, 0);
+            assert_eq!(outcome, KeyOutcome::WroteBytes, "symbol {symbol:#x}");
+            assert_eq!(got, expected, "term vs hid_poll drift at {symbol:#x}");
+        }
+    }
+
+    /// A.3 acceptance: Shift + the navigation cluster is consumed locally
+    /// as a viewport command and writes **no** PTY bytes.
+    #[test]
+    fn shift_page_keys_drive_the_viewport_without_pty_bytes() {
+        let cases: &[(u32, ViewCmd)] = &[
+            (KEYSYM_PAGEUP.0, ViewCmd::PageUp),
+            (KEYSYM_PAGEDOWN.0, ViewCmd::PageDown),
+            (KEYSYM_HOME.0, ViewCmd::Oldest),
+            (KEYSYM_END.0, ViewCmd::Live),
+        ];
+        for (symbol, cmd) in cases {
+            let (outcome, bytes) = run_key(*symbol, MOD_SHIFT);
+            assert_eq!(outcome, KeyOutcome::View(*cmd), "symbol {symbol:#x}");
+            assert!(bytes.is_empty(), "viewport binds write nothing to the PTY");
+        }
+    }
+
+    /// A.3 acceptance: Shift+arrow is *not* a viewport bind — the arrows
+    /// keep their CSI sequences so shift-select in an app still works.
+    #[test]
+    fn shift_arrows_still_emit_csi_sequences() {
+        let cases: &[(u32, &[u8])] = &[
+            (KEYSYM_UP.0, b"\x1b[A"),
+            (KEYSYM_DOWN.0, b"\x1b[B"),
+            (KEYSYM_RIGHT.0, b"\x1b[C"),
+            (KEYSYM_LEFT.0, b"\x1b[D"),
+        ];
+        for (symbol, expected) in cases {
+            let (outcome, bytes) = run_key(*symbol, MOD_SHIFT);
+            assert_eq!(outcome, KeyOutcome::WroteBytes);
+            assert_eq!(&bytes[..], *expected);
+        }
+    }
+
+    /// A.3 acceptance: printable keys and Ctrl+letter still report
+    /// `WroteBytes` (the snap-to-bottom trigger), and `Up` edges / bare
+    /// modifier events report `None`.
+    #[test]
+    fn outcome_table_for_ordinary_keys() {
+        let (outcome, bytes) = run_key(b'a' as u32, 0);
+        assert_eq!(outcome, KeyOutcome::WroteBytes);
+        assert_eq!(bytes, b"a");
+
+        // Ctrl+C is unchanged: SIGINT's 0x03, not a clipboard bind.
+        let (outcome, bytes) = run_key(b'c' as u32, MOD_CTRL);
+        assert_eq!(outcome, KeyOutcome::WroteBytes);
+        assert_eq!(bytes, &[0x03]);
+
+        // Modifier-only event (symbol 0) writes nothing.
+        let (outcome, bytes) = run_key(0, MOD_SHIFT);
+        assert_eq!(outcome, KeyOutcome::None);
+        assert!(bytes.is_empty());
+
+        // Unmapped private-use keysym writes nothing.
+        let (outcome, bytes) = run_key(0xE0FF, 0);
+        assert_eq!(outcome, KeyOutcome::None);
+        assert!(bytes.is_empty());
+
+        // Up edges never produce output.
+        let mut h = InputHandler::new();
+        let mut w = FakeWriter::new();
+        assert_eq!(
+            h.translate(&key_up(b'a' as u32), &mut w),
+            KeyOutcome::None,
+            "key-up produces no outcome"
+        );
+        assert!(w.bytes.is_empty());
     }
 }
