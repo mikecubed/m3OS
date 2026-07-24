@@ -1,6 +1,6 @@
 # Phase 112 — Terminal Daily-Driver Polish (Scrollback + Selection/Clipboard): Task List
 
-**Status:** Planned
+**Status:** ✅ Complete
 **Source Ref:** phase-112
 **Depends on:** Phase 22 (TTY and Terminal) ✅, Phase 56 (Display and Input) ✅, Phase 69–69d (Terminal TUI + ncurses) ✅, Phase 92b (USB HID Report Protocol) ✅, Phase 105 (compositor clipboard broker) ✅
 **Goal:** Make `term`'s already-stored 1000-line scrollback viewable (Shift+PageUp/Down/Home/End everywhere, wheel on Report-protocol pointer lanes, with snap-to-bottom), fill in the missing unshifted page keys, and add mouse text selection + compositor-brokered copy/paste — all userspace-only, reusing the Phase 105 clipboard protocol and the Phase 69 bracketed-paste framing.
@@ -11,7 +11,7 @@
 |---|---|---|---|
 | A | Scrollback viewport (`view_offset`, key + wheel bindings, snap-to-bottom) | — | ✅ Landed |
 | B | Mouse selection + clipboard copy/paste in `term` | A (shared render/pointer seam) | ✅ Landed |
-| C | QMP input plumbing + render-probe / clipboard round-trip gate | A, B | Planned |
+| C | QMP input plumbing + render-probe / clipboard round-trip gate | A, B | ✅ Landed |
 
 Tracks A and B share the pointer-intake seam (the `PulledEvent::Pointer` arm of `main.rs`'s
 event loop) and the `PutGlyph` emit path; land A first (it establishes the render seam the
@@ -138,9 +138,9 @@ should be treated as hints only.
 **Why it matters:** `qmp.rs` can inject keys and pointer *motion* but has **no button press/release and no wheel**. C.2's scrollback arm needs wheel injection and its selection arm needs press → motion → release; neither can be written until these exist. Both are `input-send-event` `btn` events.
 
 **Acceptance:**
-- [ ] `send_button(button: &str, down: bool)` (and/or a `click`/`drag` convenience) emits `input-send-event` with `{"type":"btn","data":{"down":…,"button":"left"}}`.
-- [ ] `send_wheel(dy: i32)` emits the corresponding `wheel-up` / `wheel-down` btn events, repeated `|dy|` times.
-- [ ] Host tests assert the emitted JSON shape (the existing `ascii_to_qkeys` tests are the pattern).
+- [x] `send_button(button: &str, down: bool)` (and/or a `click`/`drag` convenience) emits `input-send-event` with `{"type":"btn","data":{"down":…,"button":"left"}}`.
+- [x] `send_wheel(dy: i32)` emits the corresponding `wheel-up` / `wheel-down` btn events, repeated `|dy|` times.
+- [x] Host tests assert the emitted JSON shape (the existing `ascii_to_qkeys` tests are the pattern).
 
 ### C.2 — `term-daily-driver-smoke` (scrollback render probe + clipboard round-trip)
 
@@ -150,11 +150,11 @@ should be treated as hints only.
 **Scoping notes:** (1) This is a **new composite lane**, not a small extension of `clipboard-smoke` — `clipboard_smoke_steps()` merely runs `/bin/clip-smoke` standalone from sh0 and never launches `term`. (2) The wheel sub-arm requires `-device qemu-xhci -device usb-tablet`; `usb-mouse` is Boot-subclass and its wheel byte is discarded. (3) The harness watches serial, not `term`'s PTY, so the bracketed-paste assertion needs an explicit oracle — run `cat -v` inside the `term` so `ESC[200~` renders as visible `^[[200~`, and assert on the screendump (or via a debug sentinel `term` emits on paste).
 
 **Acceptance:**
-- [ ] Scrollback arm (all lanes): fill past one page, inject Shift+PageUp over QMP, screendump, and assert evicted rows are visible; inject a keystroke and assert the frame snaps back to the live tail.
-- [ ] Wheel sub-arm (Report-protocol lane only): same assertion driven by `send_wheel`, on the `qemu-xhci` + `usb-tablet` device set. Skips with a printed reason on lanes without it.
-- [ ] Alternate-screen arm: launch an htop/less and assert the wheel reaches the app rather than moving the viewport.
-- [ ] Selection/clipboard arm: drive a selection with `send_button` + motion over known text, Ctrl+Shift+C via `press_chord`, read the compositor `ClipboardStore` back from a second client and assert byte-equality; Ctrl+Shift+V and assert the bracketed bytes via the `cat -v` oracle. Highlight visible on the dump.
-- [ ] Gate is opt-in (`M3OS_TERM_POLISH_REGRESSION=1`), off in the default pre-push set until stabilized; production build unaffected.
+- [x] Scrollback arm (all lanes): fill past one page, inject Shift+PageUp over QMP, screendump, and assert evicted rows are visible; inject a keystroke and assert the frame snaps back to the live tail.
+- [x] Wheel sub-arm (Report-protocol lane only): same assertion driven by `send_wheel`, on the `qemu-xhci` + `usb-tablet` device set. Skips with a printed reason on lanes without it.
+- [x] Alternate-screen arm: launch an htop/less and assert the wheel reaches the app rather than moving the viewport.
+- [x] Selection/clipboard arm: drive a selection with `send_button` + motion over known text, Ctrl+Shift+C via `press_chord`, read the compositor `ClipboardStore` back from a second client and assert byte-equality; Ctrl+Shift+V and assert the bracketed bytes via the `cat -v` oracle. Highlight visible on the dump.
+- [x] Gate is opt-in (`M3OS_TERM_POLISH_REGRESSION=1`), off in the default pre-push set until stabilized; production build unaffected.
 
 ---
 

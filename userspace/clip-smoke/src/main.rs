@@ -49,7 +49,52 @@ fn log(msg: &str) {
     syscall_lib::serial_print(msg);
 }
 
-fn program_main(_args: &[&str]) -> i32 {
+/// Phase 112 Track C.2 — sentinel prefix for the paste-only mode. The
+/// gate greps for this on the serial console, so the exact bytes matter.
+const PASTE_PREFIX: &str = "CLIP_PASTE:";
+
+fn program_main(args: &[&str]) -> i32 {
+    // Phase 112 Track C.2 — `clip-smoke --paste` is a *read-only* second
+    // client: it connects, reads whatever offer the compositor currently
+    // holds, and prints it. The Phase 112 gate uses this to verify that a
+    // copy performed in `term` really landed in the compositor's
+    // `ClipboardStore` — read back by an independent client, not by the
+    // same one that wrote it (which would prove nothing about the broker).
+    if args.iter().any(|a| *a == "--paste") {
+        let conn = match DisplayConnection::connect_auto() {
+            Some(c) => c,
+            None => {
+                log("CLIP_PASTE_FAIL reason=connect\n");
+                return 1;
+            }
+        };
+        let result = conn.get_clipboard();
+        conn.goodbye();
+        return match result {
+            Some(bytes) => {
+                // Print `CLIP_PASTE:<text>` on one line. Non-UTF-8 is not
+                // expected (the only MIME tag is text/plain;utf-8) but is
+                // reported rather than panicking.
+                match core::str::from_utf8(&bytes) {
+                    Ok(text) => {
+                        log(PASTE_PREFIX);
+                        log(text);
+                        log("\n");
+                        0
+                    }
+                    Err(_) => {
+                        log("CLIP_PASTE_FAIL reason=not-utf8\n");
+                        1
+                    }
+                }
+            }
+            None => {
+                log("CLIP_PASTE_FAIL reason=request-failed\n");
+                1
+            }
+        };
+    }
+
     // ---- Client A (parent): copy the payload -------------------------
     let conn_a = match DisplayConnection::connect_auto() {
         Some(c) => c,

@@ -233,6 +233,55 @@ impl QmpClient {
         Ok(())
     }
 
+    /// Phase 112 Track C.1 — press or release a pointer button in the
+    /// guest via QMP `input-send-event`.
+    ///
+    /// `button` is a QEMU button name (`"left"`, `"middle"`, `"right"`).
+    /// Press and release are separate calls so a caller can hold the
+    /// button down across intervening motion events — which is exactly
+    /// what a selection drag is, and why [`Self::press_key`]-style
+    /// press-and-release-in-one would not work here.
+    pub fn send_button(&mut self, button: &str, down: bool) -> Result<(), QmpError> {
+        let _ = self.execute("input-send-event", button_event_args(button, down))?;
+        Ok(())
+    }
+
+    /// Phase 112 Track C.1 — inject `|notches|` wheel events via QMP
+    /// `input-send-event`. Positive `notches` is wheel-**up**, matching
+    /// the `PointerEvent::wheel_dy` convention the guest sees.
+    ///
+    /// QEMU models a wheel notch as a button press+release of the
+    /// pseudo-buttons `wheel-up` / `wheel-down`, so each notch is two
+    /// events. A wheel only reaches the guest through a Report-protocol
+    /// pointer (`usb-tablet`); the PS/2 path never carries one.
+    pub fn send_wheel(&mut self, notches: i32) -> Result<(), QmpError> {
+        for _ in 0..notches.unsigned_abs() {
+            let _ = self.execute("input-send-event", wheel_notch_args(notches))?;
+        }
+        Ok(())
+    }
+
+    /// Phase 112 Track C.1 — drag from one absolute position to another
+    /// with the left button held: press, a few interpolated motion
+    /// samples, release.
+    ///
+    /// The intermediate samples matter — `term` extends a selection on
+    /// motion events, so a press followed immediately by a release at a
+    /// different spot would select nothing. Coordinates are in QEMU's
+    /// normalized 0..0x7FFF absolute range (see [`Self::send_pointer_abs`]).
+    pub fn drag_abs(&mut self, from: (i32, i32), to: (i32, i32)) -> Result<(), QmpError> {
+        const STEPS: i32 = 8;
+        self.send_pointer_abs(from.0, from.1)?;
+        self.send_button("left", true)?;
+        for step in 1..=STEPS {
+            let x = from.0 + (to.0 - from.0) * step / STEPS;
+            let y = from.1 + (to.1 - from.1) * step / STEPS;
+            self.send_pointer_abs(x, y)?;
+        }
+        self.send_button("left", false)?;
+        Ok(())
+    }
+
     /// Type a literal ASCII string, one PS/2 keypress per character.
     /// Whitespace, punctuation, and shift-modified letters are mapped
     /// through [`ascii_to_qkeys`]. Characters outside the supported
@@ -422,6 +471,36 @@ static QMP_SOCKET_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::Ato
 /// The path is *not* created; we hand it to QEMU which `bind`s it,
 /// and the connect helper waits for the listener to come up. See
 /// `QMP_SOCKET_COUNTER` for the cleanup contract.
+/// Phase 112 Track C.1 — build the `input-send-event` argument object for
+/// one pointer-button edge. Split out from
+/// [`QmpClient::send_button`] so the wire shape is assertable without a
+/// live QEMU socket.
+pub fn button_event_args(button: &str, down: bool) -> Value {
+    json!({
+        "events": [
+            {"type": "btn", "data": {"down": down, "button": button}}
+        ]
+    })
+}
+
+/// Phase 112 Track C.1 — build the `input-send-event` argument object for
+/// a single wheel notch. Positive `notches` selects `wheel-up`, negative
+/// `wheel-down`; the magnitude is the caller's loop count, not part of
+/// this payload (QEMU models one notch as a press+release pair).
+pub fn wheel_notch_args(notches: i32) -> Value {
+    let button = if notches >= 0 {
+        "wheel-up"
+    } else {
+        "wheel-down"
+    };
+    json!({
+        "events": [
+            {"type": "btn", "data": {"down": true, "button": button}},
+            {"type": "btn", "data": {"down": false, "button": button}},
+        ]
+    })
+}
+
 pub fn fresh_socket_path() -> PathBuf {
     let pid = std::process::id();
     let seq = QMP_SOCKET_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -483,5 +562,55 @@ mod tests {
         let b = fresh_socket_path();
         assert_ne!(a, b);
         assert!(a.to_string_lossy().contains("m3os-xtask-qmp-"));
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 112 Track C.1 — pointer button / wheel injection
+    // -----------------------------------------------------------------
+
+    /// C.1 acceptance: a button edge is one `btn` event carrying the
+    /// button name and the press/release flag.
+    #[test]
+    fn button_event_wire_shape() {
+        let down = button_event_args("left", true);
+        assert_eq!(
+            down,
+            json!({"events": [{"type": "btn", "data": {"down": true, "button": "left"}}]})
+        );
+        let up = button_event_args("left", false);
+        assert_eq!(up["events"][0]["data"]["down"], json!(false));
+        // Middle-click is the other button the selection path may use.
+        assert_eq!(
+            button_event_args("middle", true)["events"][0]["data"]["button"],
+            json!("middle")
+        );
+    }
+
+    /// C.1 acceptance: a wheel notch is a press+release pair of QEMU's
+    /// `wheel-up` / `wheel-down` pseudo-buttons, with the direction taken
+    /// from the sign.
+    #[test]
+    fn wheel_notch_wire_shape_and_direction() {
+        let up = wheel_notch_args(1);
+        let events = up["events"].as_array().expect("events array");
+        assert_eq!(events.len(), 2, "one notch is a press + a release");
+        assert_eq!(events[0]["data"]["button"], json!("wheel-up"));
+        assert_eq!(events[0]["data"]["down"], json!(true));
+        assert_eq!(events[1]["data"]["button"], json!("wheel-up"));
+        assert_eq!(events[1]["data"]["down"], json!(false));
+
+        let down = wheel_notch_args(-3);
+        assert_eq!(
+            down["events"][0]["data"]["button"],
+            json!("wheel-down"),
+            "negative notches scroll down"
+        );
+
+        // Zero is treated as up; `send_wheel` loops |notches| times, so a
+        // zero-notch call emits nothing at all.
+        assert_eq!(
+            wheel_notch_args(0)["events"][0]["data"]["button"],
+            json!("wheel-up")
+        );
     }
 }

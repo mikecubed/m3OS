@@ -46,6 +46,55 @@ Gates are ordered identically to the AGENTS.md lean table.
 
 **Env var:** `M3OS_HTOP_REGRESSION=1`
 
+## term-daily-driver-smoke
+
+**Env var:** `M3OS_TERM_POLISH_REGRESSION=1`
+
+Phase 112. Boots the graphical stack headlessly (QMP + VNC) with an extra
+`usb-tablet` on the xHCI bus, then asserts on the **composited framebuffer**
+— a serial `Wait` proves a program ran, not that the screen scrolled or a
+highlight painted. Four arms:
+
+1. **Scrollback viewport.** `dmesg` fills far past the 25-row live grid, so
+   the early lines exist only in the ring. Shift+PageUp must change ≥20
+   scanlines versus the live-tail frame (evicted rows are back on screen),
+   and a subsequent Return must change ≥20 scanlines versus the scrolled
+   frame (snap-to-bottom fired).
+2. **Report-protocol wheel.** The same viewport assertion driven by QMP
+   `send_wheel`. The `usb-tablet` is load-bearing: QEMU's `usb-mouse` is
+   Boot-subclass and the boot decoder discards the wheel byte, so only a
+   Report-protocol pointer (subclass 0 → `decode_pointer_report`) delivers
+   `wheel_dy` to `term`. The PS/2 path never carries a wheel at all — see
+   the Phase 112 deferral on IntelliMouse.
+3. **Selection + clipboard.** A QMP left-button drag over a known marker
+   must paint a visible highlight, and copy-on-release must land the text in
+   the compositor's `ClipboardStore`. The read-back is done by an
+   **independent** client (`clip-smoke --paste`, added in Phase 112) rather
+   than by `term` itself, so the assertion covers the broker and not just
+   `term`'s own memory.
+4. **Paste reaches the PTY.** Ctrl+Shift+V into a bare `cat` must visibly
+   change the frame *and* leave the terminal on screen (asserted via the
+   frame's black-pixel ratio — term paints black, the compositor teal). The
+   `cat` sink is load-bearing: `ion` does not enable bracketed-paste mode,
+   so `wrap_paste` correctly passes the payload through unframed, and
+   pasting a multi-row selection at a shell prompt would execute every line
+   in it and take the shell down — which is exactly what this gate caught
+   before the sink was added, while a naive "did the frame change?" check
+   scored it a pass. The `ESC[200~` / `ESC[201~` framing is therefore not
+   observable on this lane (it is conditioned on the application enabling
+   `?2004h`) and is covered by the `wrap_paste` host tests in `term::input`.
+
+**Known upstream limitation.** The tablet's absolute coordinates arrive
+unscaled: `usb-hid` injects the decoded logical value straight into
+`PointerEvent::abs_position` without mapping the report's logical range onto
+the framebuffer. QEMU's `usb-tablet` has a 0..0x7FFF logical range, so QMP
+abs values pass through 1:1 and this gate deliberately sends **screen-pixel**
+coordinates rather than the usual normalized range — sending 0x4000 would
+hit-test at (16384, 16384), miss every surface, and silently drop the event.
+Fixing this properly needs `ReportField` to carry logical min/max (it does
+not today) plus a framebuffer-size query in the driver; that is Phase 92b
+work, not Phase 112.
+
 ## toolkit-render-probe
 
 **Env var:** `M3OS_M3UI_REGRESSION=1`

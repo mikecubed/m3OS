@@ -1,6 +1,6 @@
 # Phase 112 - Terminal Daily-Driver Polish (Scrollback + Selection/Clipboard)
 
-**Status:** Planned
+**Status:** ✅ Complete
 **Source Ref:** phase-112
 **Depends on:** Phase 22 (TTY and Terminal) ✅, Phase 56 (Display and Input Architecture) ✅, Phase 69–69d (Terminal TUI Capabilities + ncurses) ✅, Phase 92b (USB HID Report Protocol) ✅, Phase 105 (m3ui toolkit + compositor clipboard broker) ✅
 **Builds on:** The `term` emulator (`userspace/term/`) and its already-present but **unviewable** 1000-line scrollback ring (Phase 57 G.4), the compositor clipboard broker (`kernel_core::display::clipboard::ClipboardStore`, Phase 105 Track B.4), the `display_server` focus-aware key/pointer dispatch, the Phase 92b `usb-hid` Report-protocol pointer decode (the tree's only wheel producer), and the bracketed-paste framing already shipped in Phase 69 Track G.
@@ -279,6 +279,18 @@ same task that adds them**, not deferred to the QEMU gate.
   framing risks cursor desync. Enabling it (with a device-ID `0x03` check and a fallback to
   3-byte framing) is the follow-up that would bring the wheel to PS/2-only lanes. Until then
   Shift+PageUp/PageDown is the supported scrollback control there.
+- **Unscaled USB-tablet absolute coordinates (Phase 92b defect, found here).**
+  `usb-hid`'s `poll_report_pointer` injects the decoded logical position straight into
+  `PointerEvent::abs_position` (`abs_position = (x as i32, y as i32)`) with no mapping from the
+  report's logical range onto the framebuffer. QEMU's `usb-tablet` declares a 0..0x7FFF logical
+  range, so a pointer parked in the middle of that range lands at ~(16384, 16384) — far outside
+  a 1920×1080 screen — and `hit_test` finds no surface, so the compositor drops *every* tablet
+  pointer event. The Phase 112 gate works around it by injecting screen-pixel coordinates (QEMU
+  passes `input-send-event` abs values into the tablet's logical range 1:1, so device units
+  coincidentally equal pixels), which is why that lane is scoped to pixel coordinates and says
+  so. A real fix needs `ReportField` to carry logical min/max — it carries neither today — plus
+  a framebuffer-size query in the driver, so it belongs to the USB/HID subsystem, not here.
+- **PS/2 IntelliMouse (4-byte) wheel support** — see above; the wheel is USB-only until then.
 - Scrollback reflow on resize and a configurable/unbounded history size.
 - OSC 52 clipboard (remote-program clipboard control) and primary-selection (middle-click)
   as a separate buffer from the clipboard.

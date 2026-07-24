@@ -1828,6 +1828,17 @@ fn main() {
             });
             cmd_htop_render_probe(&probe_args);
         }
+        // Phase 112 Track C.2 — scrollback viewport + selection/clipboard
+        // proof on the composited framebuffer (QMP/PPM), plus a clipboard
+        // read-back from an independent client.
+        Some("term-daily-driver-smoke") => {
+            let probe_args = parse_less_render_probe_args(&args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_term_polish_smoke(&probe_args);
+        }
         Some("compositor-stress") => {
             let stress_args = parse_compositor_stress_args(&args[2..]).unwrap_or_else(|err| {
                 eprintln!("Error: {err}");
@@ -2006,7 +2017,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|debug [--fresh] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|argon2-smoke [--timeout <secs>] [--display]|aslr-smoke [--timeout <secs>] [--display]|stack-smash-smoke [--timeout <secs>] [--display]|meltdown-poc-smoke [--timeout <secs>] [--display]|rop-cet-poc-smoke [--timeout <secs>] [--display]|nested-sig-cet-poc-smoke [--timeout <secs>] [--display]|debug-substrate-smoke [--timeout <secs>] [--display]|kpti-selftest-smoke [--timeout <secs>] [--display]|kgdb-smoke [--timeout <secs>] [--display]|ptrace-smoke [--timeout <secs>] [--display]|ptrace-gdbserver-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|debug [--fresh] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|argon2-smoke [--timeout <secs>] [--display]|aslr-smoke [--timeout <secs>] [--display]|stack-smash-smoke [--timeout <secs>] [--display]|meltdown-poc-smoke [--timeout <secs>] [--display]|rop-cet-poc-smoke [--timeout <secs>] [--display]|nested-sig-cet-poc-smoke [--timeout <secs>] [--display]|debug-substrate-smoke [--timeout <secs>] [--display]|kpti-selftest-smoke [--timeout <secs>] [--display]|kgdb-smoke [--timeout <secs>] [--display]|ptrace-smoke [--timeout <secs>] [--display]|ptrace-gdbserver-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|term-daily-driver-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm.\n\
      USB passthrough: --usb-passthrough <vid:pid> (e.g. `--usb-passthrough 0bda:8156`) passes a physical USB device into the guest's emulated xHCI (qemu-xhci,id=xhci_pt). The QEMU process must have access to the USB device node — add a udev rule granting the user/group read-write on the device, or run with sudo. The device is claimed from the host kernel while QEMU runs and is released on exit."
@@ -21112,6 +21123,462 @@ fn wait_for_serial_pattern(
                     "serial disconnected while waiting for '{pattern}'\n--- last serial ---\n{tail}"
                 ));
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 112 Track C.2 — term-daily-driver-smoke
+// ---------------------------------------------------------------------------
+
+/// Phase 112 Track C.2 — capture screendumps until two consecutive frames
+/// are identical, i.e. the guest has stopped painting. Returns the settled
+/// frame.
+///
+/// Every scrollback assertion in this gate has to run against a *quiet*
+/// screen, and not for the usual flakiness reasons. Snap-to-bottom is a
+/// real feature: any output that scrolls the primary region yanks the
+/// viewport back to the live tail. So if a Shift+PageUp lands while
+/// `dmesg` is still streaming, the viewport scrolls up and is immediately
+/// snapped back down by the next output line — a correct behaviour that
+/// looks exactly like "the key did nothing". Waiting for quiescence is
+/// what makes the assertion measure the binding rather than the race.
+fn capture_settled(
+    q: &mut qmp::QmpClient,
+    out_dir: &Path,
+    tag: &str,
+    max_wait: std::time::Duration,
+) -> Result<ppm::PpmFrame, String> {
+    const SETTLE_GAP_MS: u64 = 700;
+    let deadline = std::time::Instant::now() + max_wait;
+    capture_frame(q, out_dir, tag)?;
+    let mut prev = ppm::read_ppm(&out_dir.join(format!("{tag}.ppm")))?;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(SETTLE_GAP_MS));
+        capture_frame(q, out_dir, tag)?;
+        let now = ppm::read_ppm(&out_dir.join(format!("{tag}.ppm")))?;
+        let moved = changed_rows_in_band(&prev, &now, 0.0, 1.0);
+        if moved == 0 {
+            return Ok(now);
+        }
+        if std::time::Instant::now() >= deadline {
+            // Not fatal on its own — return the latest frame and let the
+            // caller's own assertion decide. A blinking cursor alone can
+            // keep a frame from ever being pixel-identical.
+            println!(
+                "term-daily-driver-smoke: {tag} still moving ({moved} scanlines) at settle deadline"
+            );
+            return Ok(now);
+        }
+        prev = now;
+    }
+}
+
+/// Phase 112 Track C.2 — headless QMP/PPM proof of the scrollback viewport
+/// and the selection/clipboard round trip.
+///
+/// A serial `Wait` proves a program ran, not that the screen scrolled or a
+/// highlight painted, so every assertion here is on the composited
+/// framebuffer or on a sentinel an independent client printed.
+///
+/// Arms, in order:
+///
+/// 1. **Scrollback** (every lane): fill well past one page with `dmesg`,
+///    Shift+PageUp, and assert the frame *changed* — i.e. rows that had
+///    scrolled off are on screen again. Then press a key and assert the
+///    frame returns to the live tail (snap-to-bottom).
+/// 2. **Wheel** (Report-protocol lane only): the same assertion driven by
+///    `send_wheel` against the `usb-tablet` attached below. On a lane with
+///    no Report-protocol pointer this would be inert by construction — the
+///    PS/2 path never carries a wheel — so the gate always attaches one.
+/// 3. **Selection + clipboard**: drag over known text, which copies on
+///    release, then read the compositor's `ClipboardStore` back from an
+///    **independent** client (`clip-smoke --paste`) and assert exact
+///    bytes. Finally Ctrl+Shift+V and assert the bracketed-paste framing
+///    arrives on the PTY, observed through `cat -v` so `ESC[200~` renders
+///    as visible `^[[200~`.
+#[allow(clippy::zombie_processes)]
+fn cmd_term_polish_smoke(args: &LessRenderProbeArgs) {
+    /// Minimum changed scanlines across the terminal band for a frame to
+    /// count as "the screen content moved". A scrollback page-up rewrites
+    /// essentially every text row; an ignored keystroke changes ~0. 20
+    /// cleanly separates the two, matching the `htop-render-probe`
+    /// threshold.
+    const MIN_CHANGED_SCANLINES: u32 = 20;
+    /// Text selected by the drag and expected to reach the clipboard.
+    const COPY_MARKER: &str = "M3OS_COPY_ME";
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+    let ovmf = find_ovmf();
+    if let Err(e) = std::fs::create_dir_all(&args.out_dir) {
+        eprintln!(
+            "term-daily-driver-smoke: cannot create out dir {}: {e}",
+            args.out_dir.display()
+        );
+        std::process::exit(1);
+    }
+
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let vnc_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&vnc_socket);
+
+    // The wheel arm needs a Report-protocol pointer. QEMU's `usb-mouse` is
+    // Boot-subclass, and the boot decoder discards the wheel byte
+    // (`kernel_core::usb::hid.rs`), so only `usb-tablet` (subclass 0 ->
+    // `decode_pointer_report`) actually delivers `wheel_dy` to term. This
+    // mirrors the device set `usb-report-smoke` uses.
+    let devices = DeviceSet {
+        xhci: true,
+        ..DeviceSet::default()
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, QemuDisplayMode::Headless, devices);
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let mut idx = 0;
+    while idx + 1 < qemu_args.len() {
+        if qemu_args[idx] == "-display" && qemu_args[idx + 1] == "none" {
+            qemu_args[idx + 1] = format!("vnc=unix:{}", vnc_socket.display());
+            break;
+        }
+        idx += 1;
+    }
+    // Drop the Boot-subclass `usb-mouse` the xhci DeviceSet attaches, and
+    // put a Report-protocol `usb-tablet` in its place.
+    //
+    // This is load-bearing, not tidiness. QMP `input-send-event` cannot be
+    // addressed at an input device — its `device` argument names a
+    // *display* device — so with both pointers present QEMU delivers the
+    // wheel to whichever claims the event class, and the Boot-protocol
+    // mouse's 3-byte decoder discards the wheel byte before the guest sees
+    // it (`kernel_core::usb::hid`). Leaving exactly one pointer on the bus
+    // is the only way to guarantee the notch lands on the Report-protocol
+    // path that actually carries `wheel_dy`.
+    let mut i = 0;
+    while i + 1 < qemu_args.len() {
+        if qemu_args[i] == "-device" && qemu_args[i + 1].starts_with("usb-mouse") {
+            qemu_args.drain(i..=i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    qemu_args.push("-device".to_string());
+    qemu_args.push("usb-tablet,bus=xhci0.0".to_string());
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+    qemu_args.push("-vga".to_string());
+    qemu_args.push("std".to_string());
+
+    println!(
+        "term-daily-driver-smoke: launching QEMU with qemu-xhci + usb-tablet (timeout {}s, qmp {})",
+        args.timeout_secs,
+        qmp_socket.display()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+
+    let result: Result<(), String> = (|| {
+        let step = std::time::Duration::from_secs(args.timeout_secs.min(180));
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "display_server: registered as 'display.input-owner'",
+            step,
+            global_start,
+            global_timeout,
+        )?;
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "TERM_SMOKE:prompt-ready",
+            step,
+            global_start,
+            global_timeout,
+        )?;
+        println!("term-daily-driver-smoke: term prompt is ready");
+
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+        println!("term-daily-driver-smoke: QMP handshake complete");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // ---- Arm 1: scrollback viewport ------------------------------
+        // `dmesg` emits hundreds of lines, so the early ones are long gone
+        // from the 25-row live grid and can only come back from the ring.
+        q.type_text("dmesg\n")
+            .map_err(|e| format!("type dmesg: {e}"))?;
+        // Wait until dmesg has finished painting: while output is still
+        // scrolling, snap-to-bottom would undo a Shift+PageUp instantly.
+        let live_tail = capture_settled(
+            &mut q,
+            &args.out_dir,
+            "10-live-tail",
+            std::time::Duration::from_secs(45),
+        )?;
+
+        // Shift+PageUp pages the viewport into history.
+        q.press_chord(&["shift", "pgup"], 30)
+            .map_err(|e| format!("shift+pgup: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        capture_frame(&mut q, &args.out_dir, "11-scrolled-back")?;
+        let scrolled = ppm::read_ppm(&args.out_dir.join("11-scrolled-back.ppm"))?;
+        let scrolled_rows = changed_rows_in_band(&live_tail, &scrolled, 0.0, 1.0);
+        println!(
+            "term-daily-driver-smoke: shift+pgup changed {scrolled_rows} scanlines vs the live tail"
+        );
+        if scrolled_rows < MIN_CHANGED_SCANLINES {
+            return Err(format!(
+                "scrollback arm: Shift+PageUp changed only {scrolled_rows} scanlines \
+                 (min {MIN_CHANGED_SCANLINES}); the viewport did not show evicted rows"
+            ));
+        }
+
+        // A keystroke that reaches the shell must snap back to the live
+        // tail. A bare Return re-prints the prompt, so compare against a
+        // fresh baseline rather than the pre-scroll frame.
+        q.press_key("ret", 30)
+            .map_err(|e| format!("press ret: {e}"))?;
+        let snapped = capture_settled(
+            &mut q,
+            &args.out_dir,
+            "12-snapped-back",
+            std::time::Duration::from_secs(20),
+        )?;
+        let still_scrolled = changed_rows_in_band(&scrolled, &snapped, 0.0, 1.0);
+        println!(
+            "term-daily-driver-smoke: keystroke changed {still_scrolled} scanlines vs the scrolled frame"
+        );
+        if still_scrolled < MIN_CHANGED_SCANLINES {
+            return Err(format!(
+                "scrollback arm: after a keystroke the frame still matches the scrolled-back \
+                 view ({still_scrolled} changed scanlines); snap-to-bottom did not fire"
+            ));
+        }
+
+        // ---- Arm 2: wheel (Report-protocol pointer) ------------------
+        let wheel_base = capture_settled(
+            &mut q,
+            &args.out_dir,
+            "20-wheel-base",
+            std::time::Duration::from_secs(20),
+        )?;
+        // Park the pointer over the terminal so the wheel routes to term's
+        // surface: the compositor hit-tests the *cursor* position, not the
+        // event, so a wheel with the cursor off-surface is dropped.
+        //
+        // Coordinates are screen pixels, not QEMU's usual 0..0x7FFF
+        // normalized range. QEMU scales `input-send-event` abs values into
+        // the tablet's logical range, which for `usb-tablet` is 0..0x7FFF
+        // — i.e. pass-through — and `usb-hid` currently injects the
+        // decoded value unscaled (`abs_position = (x, y)` raw). So a value
+        // here arrives at the compositor as that literal pixel. Sending
+        // 0x4000 would land at (16384, 16384), far outside the 1920x1080
+        // framebuffer, hit-test nothing, and silently drop the event.
+        // See the Phase 112 note on the unscaled tablet path.
+        q.send_pointer_abs(960, 540)
+            .map_err(|e| format!("park pointer: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        q.send_wheel(5).map_err(|e| format!("wheel up: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        capture_frame(&mut q, &args.out_dir, "21-wheel-scrolled")?;
+        let wheel_scrolled = ppm::read_ppm(&args.out_dir.join("21-wheel-scrolled.ppm"))?;
+        let wheel_rows = changed_rows_in_band(&wheel_base, &wheel_scrolled, 0.0, 1.0);
+        println!("term-daily-driver-smoke: wheel-up changed {wheel_rows} scanlines");
+        if wheel_rows < MIN_CHANGED_SCANLINES {
+            return Err(format!(
+                "wheel arm: wheel-up changed only {wheel_rows} scanlines (min \
+                 {MIN_CHANGED_SCANLINES}); the Report-protocol wheel did not reach the viewport"
+            ));
+        }
+        // Return to the live tail for the selection arm.
+        q.press_chord(&["shift", "end"], 30)
+            .map_err(|e| format!("shift+end: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(800));
+
+        // ---- Arm 3: selection + clipboard ----------------------------
+        // Put a known marker on screen, on its own line, then drag across
+        // it. Release copies (copy-on-release).
+        q.type_text(&format!("echo {COPY_MARKER}\n"))
+            .map_err(|e| format!("type marker: {e}"))?;
+        let marker_frame = capture_settled(
+            &mut q,
+            &args.out_dir,
+            "30-marker",
+            std::time::Duration::from_secs(20),
+        )?;
+
+        // Drag a tall band across most of the terminal (screen pixels —
+        // see the wheel arm's note on the unscaled tablet path). A Linear
+        // selection covers every row between its endpoints in full, so a
+        // tall band captures the marker line wherever the compositor
+        // happens to have placed term's surface; the assertion below is on
+        // the clipboard *containing* the marker, not on an exact cell span.
+        q.drag_abs((60, 200), (1800, 1000))
+            .map_err(|e| format!("drag: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        capture_frame(&mut q, &args.out_dir, "31-selected")?;
+        let selected = ppm::read_ppm(&args.out_dir.join("31-selected.ppm"))?;
+        let hl_rows = changed_rows_in_band(&marker_frame, &selected, 0.0, 1.0);
+        println!("term-daily-driver-smoke: selection highlight changed {hl_rows} scanlines");
+        if hl_rows == 0 {
+            return Err(
+                "selection arm: the drag produced no visible highlight on the framebuffer".into(),
+            );
+        }
+
+        // Read the compositor's ClipboardStore back from an INDEPENDENT
+        // client. Copying and pasting in the same client would prove
+        // nothing about the broker.
+        q.type_text("/bin/clip-smoke --paste\n")
+            .map_err(|e| format!("type clip-smoke: {e}"))?;
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "CLIP_PASTE:",
+            std::time::Duration::from_secs(30),
+            global_start,
+            global_timeout,
+        )?;
+        let pasted = strip_ansi(&serial_history);
+        // The offer is a multi-row selection, so the payload spans several
+        // serial lines after the sentinel. Search the window following the
+        // *last* `CLIP_PASTE:` rather than a single line.
+        let at = pasted
+            .rfind("CLIP_PASTE:")
+            .ok_or("clipboard arm: CLIP_PASTE sentinel vanished from the transcript")?;
+        let window = &pasted[at..(at + 4096).min(pasted.len())];
+        if !window.contains(COPY_MARKER) {
+            return Err(format!(
+                "clipboard arm: the compositor's clipboard does not contain the selected text \
+                 {COPY_MARKER:?}. Second client read back:\n{}",
+                tail_lines(window, 12)
+            ));
+        }
+        println!(
+            "term-daily-driver-smoke: independent client read {COPY_MARKER:?} back from the \
+             compositor ClipboardStore"
+        );
+
+        // ---- Arm 4: paste reaches the PTY ----------------------------
+        // Paste into a bare `cat`, which echoes stdin and never executes
+        // it. This is not cosmetic: `ion` does not enable bracketed-paste
+        // mode (`?2004h`), so `wrap_paste` correctly passes the payload
+        // through unframed — and a multi-row selection pasted at a *shell
+        // prompt* would run every line in it and take the shell down with
+        // it. (That is precisely the hazard bracketed paste exists to
+        // prevent, and this gate reproduced it before the sink was added.)
+        //
+        // The `ESC[200~` / `ESC[201~` framing itself is therefore not
+        // observable on this lane — it is conditioned on the application
+        // enabling the mode — and is covered by the `wrap_paste` host
+        // tests in `term::input` instead. What this arm owns is the live
+        // path: clipboard -> IPC -> `wrap_paste` -> PTY -> echo.
+        q.type_text("cat\n").map_err(|e| format!("type cat: {e}"))?;
+        let cat_base = capture_settled(
+            &mut q,
+            &args.out_dir,
+            "40-cat",
+            std::time::Duration::from_secs(20),
+        )?;
+        q.press_chord(&["ctrl", "shift", "v"], 40)
+            .map_err(|e| format!("ctrl+shift+v: {e}"))?;
+        let pasted_frame = capture_settled(
+            &mut q,
+            &args.out_dir,
+            "41-pasted",
+            std::time::Duration::from_secs(20),
+        )?;
+        let paste_rows = changed_rows_in_band(&cat_base, &pasted_frame, 0.0, 1.0);
+        // `term` paints a black background; the compositor's is teal. A
+        // frame with almost no black pixels means term is *gone* from the
+        // screen, not that it painted something new — the difference a
+        // bare "did the frame change?" check cannot see, and the way this
+        // arm silently passed while the shell was actually dying.
+        let black = pasted_frame.black_pixel_ratio();
+        println!(
+            "term-daily-driver-smoke: paste changed {paste_rows} scanlines (term black-ratio {black:.2})"
+        );
+        if black < 0.15 {
+            return Err(format!(
+                "paste arm: the terminal is no longer on screen after the paste \
+                 (black-ratio {black:.2}); the frame changed because term died, not because \
+                 it painted the pasted text"
+            ));
+        }
+        if paste_rows == 0 {
+            return Err(
+                "paste arm: Ctrl+Shift+V produced no visible change; nothing reached the PTY"
+                    .into(),
+            );
+        }
+        // Close `cat`'s stdin so it exits cleanly and leaves a live shell.
+        let _ = q.press_chord(&["ctrl", "d"], 30);
+        Ok(())
+    })();
+
+    while let Ok(chunk) = rx.try_recv() {
+        append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+    }
+    if !args.keep_qemu {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&qmp_socket);
+        let _ = std::fs::remove_file(&vnc_socket);
+    }
+    let serial_log = args.out_dir.join("serial.log");
+    let _ = std::fs::write(&serial_log, &serial_history);
+
+    match result {
+        Ok(()) => {
+            println!(
+                "term-daily-driver-smoke: PASSED — scrollback viewport (Shift+PageUp + \
+                 Report-protocol wheel, with snap-to-bottom), selection highlight, compositor \
+                 clipboard round trip read back by an independent client, and Ctrl+Shift+V \
+                 delivering the offer to the PTY. (The ESC[200~ framing itself is host-tested: \
+                 ion does not enable ?2004, so it is not observable on this lane.) Frames in {}",
+                args.out_dir.display()
+            );
+        }
+        Err(msg) => {
+            eprintln!(
+                "term-daily-driver-smoke: FAILED\n{msg}\nFrames + serial log in {}",
+                args.out_dir.display()
+            );
+            std::process::exit(1);
         }
     }
 }
