@@ -302,6 +302,15 @@ flowchart TD
     P19 --> P111
     P25 --> P111
     P110 -.->|appended after arc| P111
+
+    %% Usability & Web — appended after Developer Experience
+    P111 -.->|appended after| P112["Phase 112<br/>Terminal Polish<br/>(scrollback + clipboard)"]
+    P105 --> P112
+    P34 --> P113["Phase 113<br/>Network Time<br/>(SNTP)"]
+    P113 --> P114["Phase 114<br/>Text Browser<br/>(w3m)"]
+    P86 --> P114
+    P114 --> P115["Phase 115<br/>Graphical Browser<br/>(NetSurf)"]
+    P105 --> P115
 ```
 
 ## Milestone Summary
@@ -570,6 +579,17 @@ Not part of the hardware-bring-up narrative; a developer-tooling addition append
 |---|---|---|---|---|---|---|
 | 111 | Remote Debugging (Source-Level Kernel + Userspace) | Turn the long-deferred "gdb stub" item into real source-level debugging in three escalating tiers: **(A)** free in-emulator **kernel** debugging via QEMU's gdbstub + a DWARF-bearing build (`cargo xtask debug` → `-s -S`); **(B)** the trap/debug-register substrate that registers the absent-since-Phase-3 `#DB` handler, upgrades `#BP`, and adds `RFLAGS.TF` single-step + a `DR0`–`DR7` wrapper + `int3` patching; **(C)** an in-kernel `kgdb`-style GDB-RSP stub over **polled COM2** with NMI-IPI **SMP all-stop** + panic→stub hook, so the same workflow works **on bare metal**; and **(D)** a `ptrace`-backed userspace debugger — generate the defined-but-unused `SIGTRAP`, convert the kill-on-trap path to **stop-and-notify**, add `sys_ptrace`, and an `m3gdbserver` so host `gdb` debugs ring-3 programs over TCP. `kgdb`/`ptrace` are build-time features, off in production (W^X/PKU/capability posture). | ✅ **Complete (merged)** — all four tracks landed and merged to `main`; every QEMU-validatable gate green. **A** (PR #311): `[profile.kdebug]` DWARF build + `cargo xtask debug` (`-s -S` + auto gdb script; PIE 1 TiB offset correction). **B** (#312): the absent-since-Phase-3 `#DB` handler + `#BP` dispatcher, `RFLAGS.TF` single-step, `DR0`–`DR7` wrapper (host-tested `kernel_core::debug_regs`), `int3` patch; `debug-substrate-smoke`. **C** (#313 codec + #314 stub): in-kernel `kgdb` stub — full-GPR `#BP`/`#DB` naked entry, polled COM2, RSP command loop (`kernel_core::gdb_rsp`), releasable NMI SMP all-stop, panic→stub hook, and GDB-Ctrl-C **async break** (BSP timer poll); `kgdb-smoke`. **D** (#315): `ptrace` — `SIGTRAP` on ring-3 `int3`, stop-and-notify, `sys_ptrace` (TRACEME/CONT/SINGLESTEP/GET+SETREGS/PEEK+POKETEXT/DETACH), cross-address-space peek/poke, `execve` exec-stop, and native `m3gdbserver` (RSP↔ptrace over TCP); `ptrace-smoke` + `ptrace-gdbserver-smoke`. `kgdb`/`ptrace` are off-in-production features. Residual (operator-owned): a source-level DWARF userspace build for a real host `gdb`, and the on-metal arms in [next-dell-session.md](../handoffs/next-dell-session.md). | `phase-111` | [Phase 111](./111-remote-debugging.md) | [Tasks](./tasks/111-remote-debugging-tasks.md) |
 
+### Usability & Web (planned, appended after Developer Experience)
+
+Not part of the hardware-bring-up narrative — daily-driver quality-of-life and web access, the everyday-usability gaps left after the 99–110 arc and Phase 111. Sequenced independently of the Dell bench line. Phase 113 (SNTP) precedes the browser phases because HTTPS certificate validity depends on a correct clock; Phase 115 (NetSurf) is a multi-library arc expected to split into 115a/115b.
+
+| Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
+|---|---|---|---|---|---|---|
+| 112 | Terminal Daily-Driver Polish | Make `term`'s already-stored 1000-line scrollback ring **viewable** (mouse wheel + Shift+PageUp/PageDown/Home/End, snap-to-bottom) and add **mouse text selection + compositor-brokered copy/paste** (Ctrl+Shift+C/V via the Phase 105 clipboard broker, paste bracketed via the Phase 69 `wrap_paste`). Userspace-only — the wheel event is already delivered by the Phase 56 input path and merely dropped in `term`, and the clipboard protocol already exists; this is the last user-facing mile. | Planned | `phase-112` | [Phase 112](./112-terminal-daily-driver-polish.md) | [Tasks](./tasks/112-terminal-daily-driver-polish-tasks.md) |
+| 113 | Network Time Synchronization (SNTP) | Add the **first writable path to the wall clock** — a root-gated `settimeofday`/`clock_settime` syscall + a `BOOT_EPOCH_SECS` writer with a TSC re-anchor and a Phase 86a build-date anti-rollback clamp (today the RTC epoch is written exactly once at boot, `rtc.rs:237`, and cannot be corrected) — then ship a minimal `no_std` `sntpd` that queries an NTP server over UDP and **steps `CLOCK_REALTIME`**, filling the orphan `ntpd.conf` slot in init's `KNOWN_CONFIGS`. Directly fixes silent clock-drift failures in TLS cert validation (86c) and `cron` scheduling. | Planned | `phase-113` | [Phase 113](./113-network-time-sntp.md) | [Tasks](./tasks/113-network-time-sntp-tasks.md) |
+| 114 | Text-Mode Web Browsing (TLS library + w3m) | Add the OS's **second TLS library — LibreSSL** (OpenSSL-API `libssl`/`libcrypto`, the class every text browser links; mbedTLS is the only TLS port today and serves only curl/git) + a small Boehm-GC port, then port **`w3m`** on top — fetching + rendering **HTTPS** pages in `term`, verified against the existing CA bundle. One new TLS library unlocks the whole OpenSSL-linking tool class; `lynx`/`links` and a `vim` port are noted follow-ons. | Planned | `phase-114` | [Phase 114](./114-text-mode-web-browsing.md) | [Tasks](./tasks/114-text-mode-web-browsing-tasks.md) |
+| 115 | Graphical Web Browser (NetSurf) | Render real **HTML+CSS graphically** — port the **NetSurf** engine (~10 `libns*`/libcss/libdom/libhubbub libraries + `libnsfb` + libpng/libjpeg) and its **framebuffer frontend**, bound to `display_server` as an SHM client the way DOOM (47/70) and `imgview` (105) are, fetching over libcurl/LibreSSL. The usability-arc capstone; multi-library, expected to split into 115a (libraries) / 115b (frontend). Documented ceiling: HTML+CSS with little/no JavaScript — a documentation/static-site browser, not a modern web-app engine. | Planned | `phase-115` | [Phase 115](./115-graphical-web-browser-netsurf.md) | [Tasks](./tasks/115-graphical-web-browser-netsurf-tasks.md) |
+
 ## Suggested Delivery Rhythm
 
 ```mermaid
@@ -731,6 +751,12 @@ gantt
 
     section Developer Experience (planned, post-arc)
     Remote Debugging (gdb/ptrace) :p111, after p110, 1
+
+    section Usability & Web (planned, post-arc)
+    Terminal Polish (scrollback/clip) :p112, after p111, 1
+    Network Time (SNTP)               :p113, after p112, 1
+    Text Browser (w3m)                :p114, after p113, 1
+    Graphical Browser (NetSurf)       :p115, after p114, 1
 ```
 
 ## Required Documentation for Every Phase
