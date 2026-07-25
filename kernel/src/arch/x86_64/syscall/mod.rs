@@ -6853,6 +6853,74 @@ fn block_on_pty_master_read(pty_id: u32) -> Result<(), u64> {
     Ok(())
 }
 
+/// Park a **master-side writer** until the slave side has room again.
+///
+/// Mirror of [`block_on_pty_master_read`], and registered on the same queue:
+/// the wake that matters here is the slave's read draining `edit_buf` (canonical)
+/// or `m2s` (raw), and both of those paths already call `crate::pty::wake_master`.
+/// `close_slave` wakes it too, so a hangup releases the writer instead of
+/// stranding it.
+///
+/// Registration happens BEFORE the readiness re-check so a drain that lands in
+/// the window between the caller's failed write and the block below sets the
+/// `woken` token rather than being lost.
+fn block_on_pty_master_write(pty_id: u32) -> Result<(), u64> {
+    let task_id = crate::task::scheduler::current_task_id().ok_or(NEG_EINTR)?;
+    let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    crate::pty::PTY_MASTER_WQ[pty_id as usize].register(task_id, &woken);
+    let ready = {
+        let table = crate::pty::PTY_TABLE.lock();
+        match table.get(pty_id as usize).and_then(|slot| slot.as_ref()) {
+            Some(pair) => pair.master_write_ready(),
+            // Pair freed underneath us — retry so the arm reports -EIO.
+            None => true,
+        }
+    };
+    if !ready {
+        let _ = crate::task::scheduler::block_current_until(
+            crate::task::TaskState::BlockedOnSend,
+            &woken,
+            None,
+        );
+    }
+    crate::pty::PTY_MASTER_WQ[pty_id as usize].deregister(task_id);
+    Ok(())
+}
+
+/// Park a **slave-side writer** until `s2m` has `need` bytes of room again
+/// (`need` is 2 for an OPOST+ONLCR newline, 1 otherwise).
+///
+/// Mirror of [`block_on_pty_slave_read`], and registered on the same queue:
+/// the wake that matters here is the master's read draining `s2m`, which
+/// already calls `crate::pty::wake_slave` for exactly this reason. `close_master`
+/// wakes it too, so a dying `term` releases the writer with `-EIO`.
+///
+/// The `need == 1` predicate is precisely what `poll()` advertises as `POLLOUT`
+/// for a slave fd (`!pair.s2m.is_full()`), so a poll-then-write loop cannot be
+/// told "writable" and then find the write parked.
+fn block_on_pty_slave_write(pty_id: u32, need: usize) -> Result<(), u64> {
+    let task_id = crate::task::scheduler::current_task_id().ok_or(NEG_EINTR)?;
+    let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    crate::pty::PTY_SLAVE_WQ[pty_id as usize].register(task_id, &woken);
+    let ready = {
+        let table = crate::pty::PTY_TABLE.lock();
+        match table.get(pty_id as usize).and_then(|slot| slot.as_ref()) {
+            Some(pair) => pair.slave_write_ready(need),
+            // Pair freed underneath us — retry so the arm reports -EIO.
+            None => true,
+        }
+    };
+    if !ready {
+        let _ = crate::task::scheduler::block_current_until(
+            crate::task::TaskState::BlockedOnSend,
+            &woken,
+            None,
+        );
+    }
+    crate::pty::PTY_SLAVE_WQ[pty_id as usize].deregister(task_id);
+    Ok(())
+}
+
 fn block_on_pty_slave_read(pty_id: u32) -> Result<(), u64> {
     let task_id = crate::task::scheduler::current_task_id().ok_or(NEG_EINTR)?;
     let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
@@ -8295,7 +8363,18 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         FdBackend::PtyMaster { pty_id } => {
             // Master writes to m2s (master-to-slave) buffer.
             // Apply line discipline on the slave side (input processing).
+            //
+            // Phase 112 fix — the mirror image of the PtySlave arm below: this
+            // path had the same `write(..) == 0 → break → return written`
+            // defect, so a master write against a full slave-side buffer
+            // reported 0 instead of -EAGAIN/blocking. `term`'s paste path
+            // (`write_all_bounded`) can only retry correctly if the kernel
+            // distinguishes "no room right now" from "wrote nothing, ever".
+            if count == 0 {
+                return 0;
+            }
             let pty_id = *pty_id;
+            let nonblock = entry.nonblock;
             let mut src_data = alloc::vec![0u8; count.min(4096) as usize];
             if UserSliceRo::new(buf_ptr, src_data.len())
                 .and_then(|s| s.copy_to_kernel(&mut src_data))
@@ -8303,236 +8382,298 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             {
                 return NEG_EFAULT;
             }
-            let mut table = crate::pty::PTY_TABLE.lock();
-            if let Some(Some(pair)) = table.get_mut(pty_id as usize) {
-                if pair.slave_refcount == 0 && !pair.locked {
-                    drop(table);
-                    return NEG_EIO;
-                }
-                let is_canonical = pair.termios.is_canonical();
-                let is_echo = pair.termios.is_echo();
-                let is_isig = pair.termios.is_isig();
-                let iexten = pair.termios.c_lflag & kernel_core::tty::IEXTEN != 0;
-                let echoe = pair.termios.c_lflag & kernel_core::tty::ECHOE != 0;
-                let echok = pair.termios.c_lflag & kernel_core::tty::ECHOK != 0;
-                let echonl = pair.termios.c_lflag & kernel_core::tty::ECHONL != 0;
-                let icrnl = pair.termios.c_iflag & kernel_core::tty::ICRNL != 0;
-                let inlcr = pair.termios.c_iflag & kernel_core::tty::INLCR != 0;
-                let igncr = pair.termios.c_iflag & kernel_core::tty::IGNCR != 0;
-                let ixon = pair.termios.c_iflag & kernel_core::tty::IXON != 0;
-                let vintr = pair.termios.c_cc[kernel_core::tty::VINTR];
-                let vquit = pair.termios.c_cc[kernel_core::tty::VQUIT];
-                let vsusp = pair.termios.c_cc[kernel_core::tty::VSUSP];
-                let verase = pair.termios.c_cc[kernel_core::tty::VERASE];
-                let vkill = pair.termios.c_cc[kernel_core::tty::VKILL];
-                let vwerase = pair.termios.c_cc[kernel_core::tty::VWERASE];
-                let veof = pair.termios.c_cc[kernel_core::tty::VEOF];
-                let vstart = pair.termios.c_cc[kernel_core::tty::VSTART];
-                let vstop = pair.termios.c_cc[kernel_core::tty::VSTOP];
-                let vlnext = pair.termios.c_cc[kernel_core::tty::VLNEXT];
-                let vdiscard = pair.termios.c_cc[kernel_core::tty::VDISCARD];
-                let fg_pgid = pair.slave_fg_pgid;
+            loop {
+                let mut table = crate::pty::PTY_TABLE.lock();
+                let written = if let Some(Some(pair)) = table.get_mut(pty_id as usize) {
+                    // Re-checked every pass: a slave that closes while we sleep must
+                    // release us with -EIO rather than wait on a drain that will
+                    // never come.
+                    if pair.slave_refcount == 0 && !pair.locked {
+                        drop(table);
+                        return NEG_EIO;
+                    }
+                    let is_canonical = pair.termios.is_canonical();
+                    let is_echo = pair.termios.is_echo();
+                    let is_isig = pair.termios.is_isig();
+                    let iexten = pair.termios.c_lflag & kernel_core::tty::IEXTEN != 0;
+                    let echoe = pair.termios.c_lflag & kernel_core::tty::ECHOE != 0;
+                    let echok = pair.termios.c_lflag & kernel_core::tty::ECHOK != 0;
+                    let echonl = pair.termios.c_lflag & kernel_core::tty::ECHONL != 0;
+                    let icrnl = pair.termios.c_iflag & kernel_core::tty::ICRNL != 0;
+                    let inlcr = pair.termios.c_iflag & kernel_core::tty::INLCR != 0;
+                    let igncr = pair.termios.c_iflag & kernel_core::tty::IGNCR != 0;
+                    let ixon = pair.termios.c_iflag & kernel_core::tty::IXON != 0;
+                    let vintr = pair.termios.c_cc[kernel_core::tty::VINTR];
+                    let vquit = pair.termios.c_cc[kernel_core::tty::VQUIT];
+                    let vsusp = pair.termios.c_cc[kernel_core::tty::VSUSP];
+                    let verase = pair.termios.c_cc[kernel_core::tty::VERASE];
+                    let vkill = pair.termios.c_cc[kernel_core::tty::VKILL];
+                    let vwerase = pair.termios.c_cc[kernel_core::tty::VWERASE];
+                    let veof = pair.termios.c_cc[kernel_core::tty::VEOF];
+                    let vstart = pair.termios.c_cc[kernel_core::tty::VSTART];
+                    let vstop = pair.termios.c_cc[kernel_core::tty::VSTOP];
+                    let vlnext = pair.termios.c_cc[kernel_core::tty::VLNEXT];
+                    let vdiscard = pair.termios.c_cc[kernel_core::tty::VDISCARD];
+                    let fg_pgid = pair.slave_fg_pgid;
 
-                let mut written = 0usize;
-                let mut lnext_pending = false;
-                for &byte in &src_data {
-                    // Phase 69a Track E.3: VLNEXT — deliver next byte literally.
-                    if lnext_pending {
-                        lnext_pending = false;
-                        let pair = match table.get_mut(pty_id as usize).and_then(|s| s.as_mut()) {
-                            Some(p) => p,
-                            None => return written as u64,
-                        };
-                        if is_canonical {
-                            if !pair.edit_buf.push(byte) {
+                    let mut written = 0usize;
+                    let mut lnext_pending = false;
+                    // Set when the pair is freed underneath us by a concurrent
+                    // close (the ISIG arms below drop and re-take PTY_TABLE).
+                    let mut gone = false;
+                    for &byte in &src_data {
+                        // Phase 69a Track E.3: VLNEXT — deliver next byte literally.
+                        if lnext_pending {
+                            lnext_pending = false;
+                            let pair = match table.get_mut(pty_id as usize).and_then(|s| s.as_mut())
+                            {
+                                Some(p) => p,
+                                None => {
+                                    gone = true;
+                                    break;
+                                }
+                            };
+                            if is_canonical {
+                                if !pair.edit_buf.push(byte) {
+                                    break;
+                                }
+                            } else if pair.m2s.write(&[byte]) == 0 {
                                 break;
                             }
-                        } else if pair.m2s.write(&[byte]) == 0 {
-                            break;
-                        }
-                        if is_echo {
-                            pair.s2m.write(&[byte]);
-                        }
-                        written += 1;
-                        continue;
-                    }
-
-                    // Input flag transformations.
-                    let mut b = byte;
-                    if b == b'\r' {
-                        if igncr {
-                            written += 1;
-                            continue;
-                        }
-                        if icrnl {
-                            b = b'\n';
-                        }
-                    } else if b == b'\n' && inlcr {
-                        b = b'\r';
-                    }
-
-                    // Phase 69a Track C: IXON flow control (XOFF/XON).
-                    if ixon {
-                        if b == vstop {
-                            let pair = match table.get_mut(pty_id as usize).and_then(|s| s.as_mut())
-                            {
-                                Some(p) => p,
-                                None => return written as u64,
-                            };
-                            pair.ldisc_output_suspended = true;
-                            written += 1;
-                            continue;
-                        }
-                        if b == vstart {
-                            let pair = match table.get_mut(pty_id as usize).and_then(|s| s.as_mut())
-                            {
-                                Some(p) => p,
-                                None => return written as u64,
-                            };
-                            pair.ldisc_output_suspended = false;
-                            written += 1;
-                            continue;
-                        }
-                    }
-
-                    // Phase 69a Track E.3: IEXTEN/VLNEXT/VDISCARD.
-                    if iexten {
-                        if vlnext != 0 && b == vlnext {
-                            lnext_pending = true;
-                            written += 1;
-                            continue;
-                        }
-                        if vdiscard != 0 && b == vdiscard {
-                            // VDISCARD toggles output discard; treated as a
-                            // consume-only byte for now (kernel side never
-                            // actually drops s2m bytes — symmetric to a no-op
-                            // toggle so userspace can round-trip the byte).
-                            written += 1;
-                            continue;
-                        }
-                    }
-
-                    // Signal generation (ISIG).
-                    if is_isig {
-                        if b == vintr {
-                            if fg_pgid != 0 {
-                                drop(table);
-                                crate::process::send_signal_to_group(
-                                    fg_pgid,
-                                    crate::process::SIGINT,
-                                );
-                                table = crate::pty::PTY_TABLE.lock();
-                            }
-                            written += 1;
-                            continue;
-                        }
-                        if b == vquit {
-                            if fg_pgid != 0 {
-                                drop(table);
-                                crate::process::send_signal_to_group(
-                                    fg_pgid,
-                                    crate::process::SIGQUIT,
-                                );
-                                table = crate::pty::PTY_TABLE.lock();
-                            }
-                            written += 1;
-                            continue;
-                        }
-                        if b == vsusp {
-                            if fg_pgid != 0 {
-                                drop(table);
-                                crate::process::send_signal_to_group(
-                                    fg_pgid,
-                                    crate::process::SIGTSTP,
-                                );
-                                table = crate::pty::PTY_TABLE.lock();
-                            }
-                            written += 1;
-                            continue;
-                        }
-                    }
-
-                    // Re-acquire pair reference after potential drop/reacquire.
-                    let pair = match table.get_mut(pty_id as usize).and_then(|s| s.as_mut()) {
-                        Some(p) => p,
-                        None => return written as u64,
-                    };
-
-                    if is_canonical {
-                        // Canonical mode: buffer in edit_buf.
-                        if b == verase {
-                            if pair.edit_buf.erase_char().is_some() && is_echo && echoe {
-                                pair.s2m.write(b"\x08 \x08");
-                            }
-                        } else if b == vkill {
-                            let n = pair.edit_buf.kill_line();
                             if is_echo {
-                                if echok {
-                                    pair.s2m.write(b"\n");
-                                } else {
+                                pair.s2m.write(&[byte]);
+                            }
+                            written += 1;
+                            continue;
+                        }
+
+                        // Input flag transformations.
+                        let mut b = byte;
+                        if b == b'\r' {
+                            if igncr {
+                                written += 1;
+                                continue;
+                            }
+                            if icrnl {
+                                b = b'\n';
+                            }
+                        } else if b == b'\n' && inlcr {
+                            b = b'\r';
+                        }
+
+                        // Phase 69a Track C: IXON flow control (XOFF/XON).
+                        if ixon {
+                            if b == vstop {
+                                let pair =
+                                    match table.get_mut(pty_id as usize).and_then(|s| s.as_mut()) {
+                                        Some(p) => p,
+                                        None => {
+                                            gone = true;
+                                            break;
+                                        }
+                                    };
+                                pair.ldisc_output_suspended = true;
+                                written += 1;
+                                continue;
+                            }
+                            if b == vstart {
+                                let pair =
+                                    match table.get_mut(pty_id as usize).and_then(|s| s.as_mut()) {
+                                        Some(p) => p,
+                                        None => {
+                                            gone = true;
+                                            break;
+                                        }
+                                    };
+                                pair.ldisc_output_suspended = false;
+                                written += 1;
+                                continue;
+                            }
+                        }
+
+                        // Phase 69a Track E.3: IEXTEN/VLNEXT/VDISCARD.
+                        if iexten {
+                            if vlnext != 0 && b == vlnext {
+                                lnext_pending = true;
+                                written += 1;
+                                continue;
+                            }
+                            if vdiscard != 0 && b == vdiscard {
+                                // VDISCARD toggles output discard; treated as a
+                                // consume-only byte for now (kernel side never
+                                // actually drops s2m bytes — symmetric to a no-op
+                                // toggle so userspace can round-trip the byte).
+                                written += 1;
+                                continue;
+                            }
+                        }
+
+                        // Signal generation (ISIG).
+                        if is_isig {
+                            if b == vintr {
+                                if fg_pgid != 0 {
+                                    drop(table);
+                                    crate::process::send_signal_to_group(
+                                        fg_pgid,
+                                        crate::process::SIGINT,
+                                    );
+                                    table = crate::pty::PTY_TABLE.lock();
+                                }
+                                written += 1;
+                                continue;
+                            }
+                            if b == vquit {
+                                if fg_pgid != 0 {
+                                    drop(table);
+                                    crate::process::send_signal_to_group(
+                                        fg_pgid,
+                                        crate::process::SIGQUIT,
+                                    );
+                                    table = crate::pty::PTY_TABLE.lock();
+                                }
+                                written += 1;
+                                continue;
+                            }
+                            if b == vsusp {
+                                if fg_pgid != 0 {
+                                    drop(table);
+                                    crate::process::send_signal_to_group(
+                                        fg_pgid,
+                                        crate::process::SIGTSTP,
+                                    );
+                                    table = crate::pty::PTY_TABLE.lock();
+                                }
+                                written += 1;
+                                continue;
+                            }
+                        }
+
+                        // Re-acquire pair reference after potential drop/reacquire.
+                        let pair = match table.get_mut(pty_id as usize).and_then(|s| s.as_mut()) {
+                            Some(p) => p,
+                            None => {
+                                gone = true;
+                                break;
+                            }
+                        };
+
+                        if is_canonical {
+                            // Canonical mode: buffer in edit_buf.
+                            if b == verase {
+                                if pair.edit_buf.erase_char().is_some() && is_echo && echoe {
+                                    pair.s2m.write(b"\x08 \x08");
+                                }
+                            } else if b == vkill {
+                                let n = pair.edit_buf.kill_line();
+                                if is_echo {
+                                    if echok {
+                                        pair.s2m.write(b"\n");
+                                    } else {
+                                        for _ in 0..n {
+                                            pair.s2m.write(b"\x08 \x08");
+                                        }
+                                    }
+                                }
+                            } else if b == vwerase {
+                                let n = pair.edit_buf.word_erase();
+                                if is_echo {
                                     for _ in 0..n {
                                         pair.s2m.write(b"\x08 \x08");
                                     }
                                 }
-                            }
-                        } else if b == vwerase {
-                            let n = pair.edit_buf.word_erase();
-                            if is_echo {
-                                for _ in 0..n {
-                                    pair.s2m.write(b"\x08 \x08");
+                            } else if b == veof {
+                                // ^D: if edit buffer has content, flush as a line.
+                                // If empty, signal EOF to the reader.
+                                if !pair.edit_buf.is_empty() {
+                                    if !pair.edit_buf.push(b'\n') {
+                                        // Edit buffer full — stop without counting this byte.
+                                        break;
+                                    }
+                                } else {
+                                    pair.eof_pending = true;
                                 }
-                            }
-                        } else if b == veof {
-                            // ^D: if edit buffer has content, flush as a line.
-                            // If empty, signal EOF to the reader.
-                            if !pair.edit_buf.is_empty() {
-                                if !pair.edit_buf.push(b'\n') {
+                                // Don't echo ^D.
+                            } else {
+                                if !pair.edit_buf.push(b) {
                                     // Edit buffer full — stop without counting this byte.
                                     break;
                                 }
-                            } else {
-                                pair.eof_pending = true;
-                            }
-                            // Don't echo ^D.
-                        } else {
-                            if !pair.edit_buf.push(b) {
-                                // Edit buffer full — stop without counting this byte.
-                                break;
-                            }
-                            if is_echo {
-                                if b == b'\n' || echonl || b >= 0x20 {
-                                    pair.s2m.write(&[b]);
-                                } else {
-                                    // Echo control chars as ^X.
-                                    pair.s2m.write(&[b'^', b + 0x40]);
+                                if is_echo {
+                                    if b == b'\n' || echonl || b >= 0x20 {
+                                        pair.s2m.write(&[b]);
+                                    } else {
+                                        // Echo control chars as ^X.
+                                        pair.s2m.write(&[b'^', b + 0x40]);
+                                    }
                                 }
                             }
+                        } else {
+                            // Raw mode: write directly to m2s.
+                            if pair.m2s.write(&[b]) == 0 {
+                                break; // buffer full
+                            }
+                            if is_echo {
+                                pair.s2m.write(&[b]);
+                            }
                         }
-                    } else {
-                        // Raw mode: write directly to m2s.
-                        if pair.m2s.write(&[b]) == 0 {
-                            break; // buffer full
-                        }
-                        if is_echo {
-                            pair.s2m.write(&[b]);
-                        }
+                        written += 1;
                     }
-                    written += 1;
+                    drop(table);
+                    // Wake slave waiters (data written to m2s / edit_buf).
+                    crate::pty::wake_slave(pty_id);
+                    // Wake master waiters (echo may have written to s2m).
+                    crate::pty::wake_master(pty_id);
+                    if gone && written == 0 {
+                        // Pair freed mid-write with nothing transferred: both ends
+                        // are closed, so this is a hangup, not a zero-byte write.
+                        return NEG_EIO;
+                    }
+                    written
+                } else {
+                    return NEG_EIO;
+                };
+                // Every path through the byte loop above either consumes its byte
+                // (`written += 1`) or breaks because the slave-side buffer had no
+                // room (or the pair vanished, handled above). `count == 0` returned
+                // early. So `written == 0` here means the very first byte did not
+                // fit — never "there was nothing to do", which is why returning it
+                // to userspace as a 0 was a lie the pipe/EOF-shaped std wrappers
+                // turn into a panic.
+                if written > 0 {
+                    return written as u64;
                 }
-                drop(table);
-                // Wake slave waiters (data written to m2s / edit_buf).
-                crate::pty::wake_slave(pty_id);
-                // Wake master waiters (echo may have written to s2m).
-                crate::pty::wake_master(pty_id);
-                written as u64
-            } else {
-                NEG_EIO
+                if nonblock {
+                    return NEG_EAGAIN;
+                }
+                if has_pending_signal() {
+                    return NEG_EINTR;
+                }
+                if let Err(err) = block_on_pty_master_write(pty_id) {
+                    return err;
+                }
             }
         }
         FdBackend::PtySlave { pty_id } => {
             // Slave writes to s2m (slave-to-master) buffer.
             // Apply output processing (OPOST).
+            //
+            // Phase 112 fix (pre-existing since the Phase 29 PTY): this arm used
+            // to return the raw `written` count even when it was 0, i.e. a
+            // non-empty write against a full `s2m` reported "wrote nothing" and
+            // succeeded. Userspace cannot distinguish that from a closed pipe —
+            // POSIX says a blocking `write(2)` either transfers at least one
+            // byte or fails — and Rust's std maps `Ok(0)` to
+            // `ErrorKind::WriteZero`, which makes `println!` panic. With `ion`
+            // built `panic = "abort"` the shell died (SIGABRT) whenever a
+            // program printed faster than `term` drained the pty, taking the
+            // terminal window with it. Now: a partial write returns its count,
+            // a non-blocking fd gets -EAGAIN, and a blocking fd sleeps until the
+            // master drains `s2m` (or hangs up → -EIO, or a signal → -EINTR).
+            if count == 0 {
+                return 0;
+            }
             let pty_id = *pty_id;
+            let nonblock = entry.nonblock;
             let mut src_data = alloc::vec![0u8; count.min(4096) as usize];
             if UserSliceRo::new(buf_ptr, src_data.len())
                 .and_then(|s| s.copy_to_kernel(&mut src_data))
@@ -8540,33 +8681,66 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             {
                 return NEG_EFAULT;
             }
-            let mut table = crate::pty::PTY_TABLE.lock();
-            if let Some(Some(pair)) = table.get_mut(pty_id as usize) {
-                if pair.master_refcount == 0 {
-                    return NEG_EIO;
-                }
-                let opost = pair.termios.c_oflag & kernel_core::tty::OPOST != 0;
-                let onlcr = pair.termios.c_oflag & kernel_core::tty::ONLCR != 0;
-                let mut written = 0usize;
-                for &b in &src_data {
-                    if opost && onlcr && b == b'\n' {
-                        // Ensure atomic CR+LF: need at least 2 bytes of space.
-                        if pair.s2m.space() < 2 {
+            loop {
+                // `need` records how much room the byte that stalled us wants:
+                // 2 for an ONLCR-expanded newline (CR+LF must land atomically),
+                // 1 for anything else. Sleeping on the coarser "not full" would
+                // spin when exactly one slot is free and a newline is pending.
+                let mut need = 1usize;
+                let written = {
+                    let mut table = crate::pty::PTY_TABLE.lock();
+                    let pair = match table.get_mut(pty_id as usize).and_then(|s| s.as_mut()) {
+                        Some(p) => p,
+                        None => return NEG_EIO,
+                    };
+                    // Re-checked every pass: a master that closes while we sleep
+                    // must release us with -EIO, not wedge us on a ring that
+                    // nobody will ever drain again.
+                    if pair.master_refcount == 0 {
+                        return NEG_EIO;
+                    }
+                    let opost = pair.termios.c_oflag & kernel_core::tty::OPOST != 0;
+                    let onlcr = pair.termios.c_oflag & kernel_core::tty::ONLCR != 0;
+                    let mut written = 0usize;
+                    for &b in &src_data {
+                        if opost && onlcr && b == b'\n' {
+                            // Ensure atomic CR+LF: need at least 2 bytes of space.
+                            if pair.s2m.space() < 2 {
+                                need = 2;
+                                break;
+                            }
+                            pair.s2m.write(b"\r");
+                            pair.s2m.write(b"\n");
+                        } else if pair.s2m.write(&[b]) == 0 {
                             break;
                         }
-                        pair.s2m.write(b"\r");
-                        pair.s2m.write(b"\n");
-                    } else if pair.s2m.write(&[b]) == 0 {
-                        break;
+                        written += 1;
                     }
-                    written += 1;
-                }
-                drop(table);
+                    written
+                    // PTY_TABLE released here: nothing below sleeps under it.
+                };
                 // Wake master waiters (data written to s2m).
                 crate::pty::wake_master(pty_id);
-                written as u64
-            } else {
-                NEG_EIO
+                // A short write is POSIX-legal on a tty, so any progress at all
+                // returns immediately; only a completely stalled write blocks.
+                if written > 0 {
+                    return written as u64;
+                }
+                if nonblock {
+                    return NEG_EAGAIN;
+                }
+                // Checked before parking so ^C / ^D break a stalled write. A
+                // signal that arrives while we are parked also wakes us
+                // (`interrupt_ipc_waits` wakes every Blocked* task) and lands
+                // here on the next pass.
+                if has_pending_signal() {
+                    return NEG_EINTR;
+                }
+                if let Err(err) = block_on_pty_slave_write(pty_id, need) {
+                    return err;
+                }
+                // Spurious wakeups are absorbed by the retry: worst case we
+                // re-run the copy loop, fail to place a byte, and park again.
             }
         }
         FdBackend::Socket { .. } => {

@@ -133,6 +133,46 @@ pub struct PtyPairState {
 }
 
 impl PtyPairState {
+    /// Readiness predicate for a **slave-side** `write(2)` that stalled with a
+    /// full `s2m` ring — see the `FdBackend::PtySlave` write arm.
+    ///
+    /// `need` is the space the *stalling* byte requires: 1 for an ordinary
+    /// byte, 2 for a `\n` that OPOST+ONLCR must expand to `\r\n` atomically.
+    /// Blocking on `space() >= need` rather than on the coarser
+    /// `!s2m.is_full()` is what keeps the write path from live-spinning: with
+    /// exactly one free slot and a pending newline, "not full" is true but the
+    /// retry still cannot make progress.
+    ///
+    /// `master_refcount == 0` is part of the predicate so a master that closes
+    /// while a slave writer sleeps releases it (the write arm then returns
+    /// `-EIO`) instead of stranding it forever.
+    pub fn slave_write_ready(&self, need: usize) -> bool {
+        self.s2m.space() >= need || self.master_refcount == 0
+    }
+
+    /// Readiness predicate for a **master-side** `write(2)` that stalled — see
+    /// the `FdBackend::PtyMaster` write arm.
+    ///
+    /// Which buffer the master fills depends on the line discipline: canonical
+    /// input accumulates in `edit_buf` until a `\n` completes the line, raw
+    /// input goes straight into the `m2s` ring. The mode is re-read here rather
+    /// than captured at stall time so a concurrent `tcsetattr` cannot leave the
+    /// sleeper waiting on the buffer the retry will no longer touch.
+    ///
+    /// The `slave_refcount == 0 && !locked` term mirrors the arm's `-EIO`
+    /// hangup check: once the slave side is gone for good the writer must wake
+    /// and fail rather than wait for a drain that can never happen. A still
+    /// `locked` pair has simply not been opened yet, so it is not a hangup.
+    pub fn master_write_ready(&self) -> bool {
+        // `EditBuffer::push` succeeds exactly while `len < buf.len()`.
+        let has_room = if self.termios.is_canonical() {
+            self.edit_buf.len < self.edit_buf.buf.len()
+        } else {
+            !self.m2s.is_full()
+        };
+        has_room || (self.slave_refcount == 0 && !self.locked)
+    }
+
     /// Create a new PTY pair with default settings.
     pub fn new(_id: u32) -> Self {
         PtyPairState {
@@ -256,6 +296,101 @@ mod tests {
     }
 
     // -- PtyPairState tests --
+
+    // -- write-readiness predicate tests (Phase 112 PTY blocking-write fix) --
+
+    #[test]
+    fn slave_write_ready_tracks_required_space() {
+        let mut pair = PtyPairState::new(0);
+        assert!(pair.slave_write_ready(1));
+        assert!(pair.slave_write_ready(2));
+
+        // Fill s2m to exactly one free slot: enough for a plain byte, not for
+        // an ONLCR-expanded newline.
+        let filler = [b'x'; PTY_BUF_SIZE - 1];
+        assert_eq!(pair.s2m.write(&filler), PTY_BUF_SIZE - 1);
+        assert_eq!(pair.s2m.space(), 1);
+        assert!(pair.slave_write_ready(1));
+        assert!(!pair.slave_write_ready(2));
+
+        // Completely full: no write can progress.
+        assert_eq!(pair.s2m.write(b"y"), 1);
+        assert!(pair.s2m.is_full());
+        assert!(!pair.slave_write_ready(1));
+        assert!(!pair.slave_write_ready(2));
+
+        // Draining one byte re-arms a single-byte writer only.
+        let mut sink = [0u8; 1];
+        assert_eq!(pair.s2m.read(&mut sink), 1);
+        assert!(pair.slave_write_ready(1));
+        assert!(!pair.slave_write_ready(2));
+    }
+
+    #[test]
+    fn slave_write_ready_on_master_hangup() {
+        let mut pair = PtyPairState::new(0);
+        let filler = [b'x'; PTY_BUF_SIZE];
+        assert_eq!(pair.s2m.write(&filler), PTY_BUF_SIZE);
+        assert!(!pair.slave_write_ready(1));
+
+        // A departing master must release the blocked writer (it then sees
+        // -EIO) rather than leave it parked on a ring nobody will drain.
+        pair.master_refcount = 0;
+        assert!(pair.slave_write_ready(1));
+        assert!(pair.slave_write_ready(2));
+    }
+
+    #[test]
+    fn master_write_ready_follows_line_discipline() {
+        let mut pair = PtyPairState::new(0);
+        pair.slave_refcount = 1;
+        pair.locked = false;
+        assert!(pair.termios.is_canonical());
+        assert!(pair.master_write_ready());
+
+        // Canonical mode fills edit_buf; a full m2s is irrelevant there.
+        let filler = [b'x'; PTY_BUF_SIZE];
+        assert_eq!(pair.m2s.write(&filler), PTY_BUF_SIZE);
+        assert!(pair.m2s.is_full());
+        assert!(pair.master_write_ready());
+
+        while pair.edit_buf.push(b'a') {}
+        assert!(!pair.master_write_ready());
+
+        // Switching to raw mode re-points the predicate at m2s, which is full.
+        pair.termios.c_lflag &= !crate::tty::ICANON;
+        assert!(!pair.termios.is_canonical());
+        assert!(!pair.master_write_ready());
+
+        // Draining one byte of m2s re-arms the raw-mode writer, while the
+        // still-full edit buffer keeps the canonical one parked.
+        let mut sink = [0u8; 1];
+        assert_eq!(pair.m2s.read(&mut sink), 1);
+        assert!(pair.master_write_ready());
+        pair.termios.c_lflag |= crate::tty::ICANON;
+        assert!(!pair.master_write_ready());
+    }
+
+    #[test]
+    fn master_write_ready_on_slave_hangup() {
+        let mut pair = PtyPairState::new(0);
+        pair.slave_refcount = 1;
+        pair.locked = false;
+        pair.termios.c_lflag &= !crate::tty::ICANON;
+        let filler = [b'x'; PTY_BUF_SIZE];
+        assert_eq!(pair.m2s.write(&filler), PTY_BUF_SIZE);
+        assert!(!pair.master_write_ready());
+
+        // A pair that was never unlocked is not a hangup — the slave simply
+        // has not opened yet, so the writer keeps waiting.
+        pair.slave_refcount = 0;
+        pair.locked = true;
+        assert!(!pair.master_write_ready());
+
+        // Slave closed after having been opened → wake and fail with -EIO.
+        pair.locked = false;
+        assert!(pair.master_write_ready());
+    }
 
     #[test]
     fn pair_state_defaults() {
