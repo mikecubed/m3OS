@@ -1,9 +1,9 @@
 # Phase 112 — Terminal Daily-Driver Polish (Scrollback + Selection/Clipboard): Task List
 
-**Status:** ✅ Complete
+**Status:** ✅ Complete — with four acceptance items re-scoped rather than delivered (one host test in B.3, three gate assertions in C.2). Each is left **unticked** below with the reason, and carried into the phase doc's "Deferred Until Later".
 **Source Ref:** phase-112
 **Depends on:** Phase 22 (TTY and Terminal) ✅, Phase 56 (Display and Input) ✅, Phase 69–69d (Terminal TUI + ncurses) ✅, Phase 92b (USB HID Report Protocol) ✅, Phase 105 (compositor clipboard broker) ✅
-**Goal:** Make `term`'s already-stored 1000-line scrollback viewable (Shift+PageUp/Down/Home/End everywhere, wheel on Report-protocol pointer lanes, with snap-to-bottom), fill in the missing unshifted page keys, and add mouse text selection + compositor-brokered copy/paste — all userspace-only, reusing the Phase 105 clipboard protocol and the Phase 69 bracketed-paste framing.
+**Goal:** Make `term`'s already-stored 1000-line scrollback viewable (Shift+PageUp/Down/Home/End everywhere, wheel on Report-protocol pointer lanes, with snap-to-bottom), fill in the missing unshifted page keys, and add mouse text selection + compositor-brokered copy/paste, reusing the Phase 105 clipboard protocol and the Phase 69 bracketed-paste framing. Feature work is userspace-only; one ring-0 fix rides along because the Track C gate exposed it — a PTY `write()` returning `0` on a full ring, which killed the shell inside `term` whenever output outran the drain (see the phase doc, "The PTY write-zero fix").
 
 ## Track Layout
 
@@ -11,11 +11,12 @@
 |---|---|---|---|
 | A | Scrollback viewport (`view_offset`, key + wheel bindings, snap-to-bottom) | — | ✅ Landed |
 | B | Mouse selection + clipboard copy/paste in `term` | A (shared render/pointer seam) | ✅ Landed |
-| C | QMP input plumbing + render-probe / clipboard round-trip gate | A, B | ✅ Landed |
+| C | QMP input plumbing + render-probe / clipboard round-trip gate | A, B | ✅ Landed (C.2 re-scoped — three acceptance items unticked) |
 
 Tracks A and B share the pointer-intake seam (the `PulledEvent::Pointer` arm of `main.rs`'s
 event loop) and the `PutGlyph` emit path; land A first (it establishes the render seam the
-highlight reuses). Both are userspace-only — no kernel change.
+highlight reuses). Both feature tracks are userspace-only; the only ring-0 change in the phase is
+the PTY write-zero fix that Track C's gate uncovered.
 
 **Wheel scoping (read before starting A.3).** The wheel is *not* already arriving and merely
 dropped. On the default PS/2 lane it is never produced: `MouseDecoder` fills `packet.wheel`
@@ -74,7 +75,8 @@ should be treated as hints only.
 - [x] **Unshifted** PageUp/PageDown/Home/End emit the standard VT sequences (`ESC[5~`, `ESC[6~`, `ESC[H`, `ESC[F`), sourced from the existing `hid_poll.rs` table — closing the pre-existing paging gap.
 - [x] Shift+PageUp/PageDown map to a ±(rows−1) viewport page and Shift+Home/End to oldest-line / live-tail, returning `ViewScroll` and consuming the key locally (no PTY bytes).
 - [x] Any key that produces PTY output makes `main.rs` snap `view_offset` to `0` first — the snap-to-bottom-on-keystroke half.
-- [x] **Host tests:** a table over (symbol, modifiers) → `KeyOutcome` covering all four keys shifted and unshifted, arrows unchanged, Ctrl+letter unchanged, and that the unshifted sequences match `hid_poll.rs` byte-for-byte.
+- [x] **Adjacent gap closed in the same function:** `KEYSYM_DELETE` → `ESC[3~`. `special_key_sequence` handled eight keysyms where `hid_poll` handles nine, so the Delete key produced literally nothing in `term` (it is not `0x08`, not a Ctrl chord, and `0xE019` fails the `symbol <= 0x7F` passthrough). Emitted unconditionally with respect to modifiers — Shift+Delete is the same four bytes and is *not* a viewport bind. `KEYSYM_INSERT` remains deliberately silent, matching `hid_poll.rs`'s documented omission.
+- [x] **Host tests:** a table over (symbol, modifiers) → `KeyOutcome` covering all four page keys shifted and unshifted, arrows unchanged, Ctrl+letter unchanged. The `hid_poll` cross-check is a **range sweep over the whole private-use keysym block `0xE000..=0xE0FF`**, not a hardcoded array — the hardcoded array is exactly why the missing Delete arm was invisible, and the sweep now fails automatically in *both* directions if either table starts or stops handling a keysym. `unshifted_special_keys_are_the_expected_nine` pins the nine actual sequences (the sweep alone would pass if both tables were blanked) and `insert_writes_nothing` pins the Delete/Insert asymmetry as deliberate.
 
 ### A.4 — Wheel binding (Report-protocol lanes)
 
@@ -83,9 +85,10 @@ should be treated as hints only.
 **Why it matters:** `encode` returns `None` for `PointerButton::None` and never reads `wheel_dx`/`wheel_dy`, so even on a lane where the wheel *is* produced (USB HID Report protocol) it dies in `term`. Split from A.3 because it is lane-conditional while the key bindings are universal.
 
 **Acceptance:**
-- [x] When the app has **not** enabled mouse reporting, a `PointerEvent` with `button == None` and non-zero `wheel_dy` adjusts `view_offset` (up = older) instead of being dropped; when mouse reporting is on (`update_mouse_mode`), the wheel is reported to the app as today.
+- [x] When the app has **not** enabled mouse reporting, a `PointerEvent` with `button == None` and non-zero `wheel_dy` adjusts `view_offset` (up = older) instead of being dropped — `MouseReporter::classify` returns `PointerAction::ScrollView(wheel_dy * wheel_rows)`.
+- [x] When mouse reporting **is** on, the notch is reported to the application as the xterm wheel pseudo-buttons: `MouseReporter::encode` maps `wheel_dy > 0` to button `WHEEL_UP = 64` and `wheel_dy < 0` to `WHEEL_DOWN = 65` (`mouse.rs`), always encoded as a *press* — a notch has no release edge, so SGR reports terminate in upper-case `M` and press-only X10 (`?9h`) receives it too. Note this is **not** "as before": before this phase `encode` returned `None` for every `PointerButton::None` event, so a tracking app saw no wheel at all.
 - [x] Behaviour is a documented no-op on lanes with no Report-protocol pointer (PS/2-only boots) — `wheel_dy` is simply always `0` there; no code path asserts a wheel exists.
-- [x] **Host tests:** synthetic `PointerEvent`s with `button == None` + `wheel_dy = ±1` produce the expected `view_offset` deltas with mouse reporting off, and are handed to `encode` unchanged with it on.
+- [x] **Host tests:** `wheel_scrolls_viewport_when_app_is_not_tracking` (viewport delta with reporting off), `wheel_reports_to_the_app_instead_of_scrolling_the_viewport` (the 64/65 report with it on), `zero_wheel_delta_is_ignored_not_a_zero_scroll`, `zero_wheel_delta_reports_nothing_while_tracking`, and `wheel_report_fits_max_bytes` (the widest SGR wheel report, `\x1b[<65;65535;65535M` = 18 bytes, stays inside `MAX_BYTES = 24`).
 
 ---
 
@@ -101,7 +104,9 @@ should be treated as hints only.
 - [x] A `Selection { anchor, extent, mode: Linear|Block, active }` tracks press-anchor / drag-extend / release-commit against cell coordinates (grid hit-test accounts for the current cols/rows and any scrollback offset).
 - [x] Selection drives only when the app has not grabbed the mouse (Shift-drag force-selects when it has — the xterm override); otherwise pointer events still go to `MouseReporter::encode`.
 - [x] Covered cells render inverted (fg/bg swap) in the compose path; clearing the selection repaints cleanly.
-- [x] **Host tests:** anchor/extent normalization (drag up-left vs. down-right yield the same ordered range), `Linear` vs. `Block` coverage predicates, and that hit-test maps pixel → cell correctly at the grid edges.
+- [x] **Host tests:** anchor/extent normalization (drag up-left vs. down-right yield the same ordered range), `Linear` vs. `Block` coverage predicates, and that hit-test maps pixel → cell correctly at the grid edges. The hit-test lives in the library as `term::pointer_cell` (`lib.rs`) precisely so it is host-testable — `main.rs` is `#[cfg(not(test))]` throughout and nothing in it is compiled by `cargo test -p term`. Seven tests cover the origin pixel, the first pixel of an interior cell, the last cell of the grid, clamping past the right/bottom edges, negative coordinates (including `i32::MIN`), an `abs_position: None` event, and a degenerate 0×0 grid.
+- [x] A selection is **invalidated** (cleared, and the view marked dirty) by every grid mutation — `Screen::invalidate_selection` is wired into `switch_to_alt`, `switch_to_primary`, `resize`, `set_view_offset`, `put_char`, `scroll_region_up`, `scroll_region_down`, `insert_chars`, `delete_chars`, `blank_cell`, and `clear_buffer`. `Selection` stores *display* coordinates re-resolved through `display_cell()` at both paint and copy time, so a selection that outlived a mutation would highlight unrelated text and copy the wrong bytes. A no-op viewport set (wheeling against either end of history) deliberately does not clear.
+- [x] **Host tests:** nine invalidation tests, including that `resize` still leaves `take_view_dirty()` true (the hook sits below `resize`'s own `view_dirty = false`), that a clamped-to-no-op `set_view_offset` keeps the selection, and that output arriving with no selection active does not dirty the view (the cost guard).
 
 ### B.2 — Clipboard verbs on `term`'s `DisplayClient`
 
@@ -123,9 +128,13 @@ should be treated as hints only.
 
 **Acceptance:**
 - [x] Copy on selection-release **and** on Ctrl+Shift+C: serialize the selected cells to UTF-8 and `set_clipboard` them. Serialization: skip cells with `wide_continuation == true`; trim trailing cells whose `codepoint == 0x20` per row; join rows with `\n`.
-- [x] Ctrl+Shift+V (and optional middle-click) `get_clipboard`s and injects via `wrap_paste` (bracketed `ESC[200~`…`ESC[201~` when the mode is enabled) — never as a plain byte run.
+- [x] Ctrl+Shift+V `get_clipboard`s and injects via `wrap_paste` (bracketed `ESC[200~`…`ESC[201~` when the mode is enabled) — never as a plain byte run. The optional middle-click binding was **not** implemented; nothing in `term` binds a non-zero pointer button.
 - [x] Plain Ctrl+C / Ctrl+V are unchanged (SIGINT / literal), i.e. the clipboard binds require Shift.
-- [x] **Host tests:** serialization over a fixture grid — trailing-blank trim, `\n` join, a double-width glyph yielding one codepoint not two, an all-blank row yielding an empty line, and a selection larger than `CLIPBOARD_MAX_BYTES` being rejected.
+- [x] A rejected copy is **reported**, not swallowed: `copy_selection` returns `false` and both call sites ring the terminal bell in addition to the `term: clipboard copy rejected` serial line. (`term` has no status line, and painting a message into the cell grid would overwrite the application's own output and be repainted away on its next refresh.) A copy with no selection returns `true`, so a stray click never beeps.
+- [x] A paste that cannot be written in full is reported rather than silently truncated: `paste_clipboard` writes through `write_all_bounded`, which distinguishes backpressure (`EAGAIN` / zero-byte write → 25 ms sleep, ~1 s budget) from a hard errno, and logs `term: paste truncated` on failure. A short write that dropped the closing `ESC[201~` would strand the application in bracketed-paste mode.
+- [x] **Host tests:** serialization over a fixture grid — trailing-blank trim, `\n` join, a double-width glyph yielding one codepoint not two, an all-blank row yielding an empty line.
+- [x] **Host tests:** the clipboard cap predicate `term::clipboard_payload_fits` (`lib.rs`) — at the cap, one byte over, empty, and a multi-byte UTF-8 payload whose *byte* length exceeds the cap while its *character* count does not (pinning that the check is on encoded bytes). `DisplayClient::set_clipboard` calls the same predicate and rejects rather than truncates.
+- [ ] **Host test — an oversized selection driven through the rejecting predicate.** `screen.rs`'s `oversized_selection_exceeds_the_clipboard_cap` builds a 200×40 selection and asserts only that the *fixture* exceeds `CLIPBOARD_MAX_BYTES`; it never calls `clipboard_payload_fits` or `set_clipboard`, so the selection → rejection chain itself is not exercised in one test. The two halves are each covered (serialization above, the predicate above) but not composed. See "Deferred Until Later" in the phase doc.
 
 ---
 
@@ -145,16 +154,21 @@ should be treated as hints only.
 ### C.2 — `term-daily-driver-smoke` (scrollback render probe + clipboard round-trip)
 
 **Files:** `xtask/src/main.rs` (new `cmd_term_polish_smoke` + QMP/PPM driver), `.githooks/pre-push` (`M3OS_TERM_POLISH_REGRESSION` gate), `AGENTS.md` + `docs/appendix/regression-gates.md` (gate row)
-**Symbols:** QMP/PPM plumbing (`xtask/src/qmp.rs`, `xtask/src/ppm.rs`), the `htop-render-probe` pattern, the device set from `cmd_usb_report_smoke`
+**Symbols:** `cmd_term_polish_smoke`, `capture_settled`, `capture_term_frame`, `changed_rows_in_band`, `band_pixels_matching`, `clip_payload_before_anchor`, `window_has_exact_line`; QMP/PPM plumbing (`xtask/src/qmp.rs`, `xtask/src/ppm.rs`), the `htop-render-probe` pattern, the device set from `cmd_usb_report_smoke`
 **Why it matters:** A serial `Wait` proves a program ran, not that the screen scrolled or the highlight painted; the framebuffer must be inspected.
-**Scoping notes:** (1) This is a **new composite lane**, not a small extension of `clipboard-smoke` — `clipboard_smoke_steps()` merely runs `/bin/clip-smoke` standalone from sh0 and never launches `term`. (2) The wheel sub-arm requires `-device qemu-xhci -device usb-tablet`; `usb-mouse` is Boot-subclass and its wheel byte is discarded. (3) The harness watches serial, not `term`'s PTY, so the bracketed-paste assertion needs an explicit oracle — run `cat -v` inside the `term` so `ESC[200~` renders as visible `^[[200~`, and assert on the screendump (or via a debug sentinel `term` emits on paste).
+**Scoping notes:** (1) This is a **new composite lane**, not a small extension of `clipboard-smoke` — `clipboard_smoke_steps()` merely runs `/bin/clip-smoke` standalone from sh0 and never launches `term`. (2) The wheel arms require `-device qemu-xhci -device usb-tablet`; `usb-mouse` is Boot-subclass and its wheel byte is discarded, so the gate *drops* the `usb-mouse` the xhci `DeviceSet` attaches and leaves exactly one pointer on the bus — QMP `input-send-event` cannot be addressed at an input device, so with both present QEMU would deliver the notch to whichever claims the event class. (3) **The bracketed framing is not observable on this lane and the gate does not assert it.** The `cat -v` oracle sketched here does not work: `ESC[200~`/`ESC[201~` are emitted only when the *application* has set `?2004h`, and a tree-wide grep for `2004` finds the mode bit in `term::screen` and the framing in `term::input::wrap_paste` and nothing else — no program in the image enables it, so `wrap_paste` correctly passes the payload through unframed and there is nothing on the wire to render. The framed form is covered by the `wrap_paste` host tests. (4) The alternate-screen arm uses `tui-smoke mouse-live`, a purpose-built in-guest probe, not a ported TUI: htop's process list can legitimately change zero pixels on a scroll, nothing guarantees ncurses enables mouse tracking under `TERM=m3os-term`, and pulling a port build into this gate would cost minutes.
 
-**Acceptance:**
-- [x] Scrollback arm (all lanes): fill past one page, inject Shift+PageUp over QMP, screendump, and assert evicted rows are visible; inject a keystroke and assert the frame snaps back to the live tail.
-- [x] Wheel sub-arm (Report-protocol lane only): same assertion driven by `send_wheel`, on the `qemu-xhci` + `usb-tablet` device set. Skips with a printed reason on lanes without it.
-- [x] Alternate-screen arm: launch an htop/less and assert the wheel reaches the app rather than moving the viewport.
-- [x] Selection/clipboard arm: drive a selection with `send_button` + motion over known text, Ctrl+Shift+C via `press_chord`, read the compositor `ClipboardStore` back from a second client and assert byte-equality; Ctrl+Shift+V and assert the bracketed bytes via the `cat -v` oracle. Highlight visible on the dump.
-- [x] Gate is opt-in (`M3OS_TERM_POLISH_REGRESSION=1`), off in the default pre-push set until stabilized; production build unaffected.
+**Acceptance (six arms as landed):**
+- [x] **Arm 1 — scrollback (all lanes):** `dmesg` fills far past the 25-row live grid, injected Shift+PageUp must change ≥20 scanlines versus the settled live-tail frame, and a plain `x` keystroke must change ≥20 scanlines versus the scrolled frame **and** land within `TERM_QUIET_SCANLINES` (96) of the live-tail frame. `x` rather than Return: an ordinary printable key writes PTY bytes without scrolling the primary region, so the snap is attributable to the keystroke path and not to `scroll_region_up`'s snap-on-any-primary-scroll.
+- [x] **Arm 2 — Report-protocol wheel → viewport:** the same assertion driven by `send_wheel(5)` on the `qemu-xhci` + `usb-tablet` device set, followed by a Shift+End that must return the frame to within 96 scanlines of the pre-wheel baseline (a viewport still stuck in history would make every later arm select evicted rows).
+- [x] **Arm 3 — selection + clipboard:** a QMP left-button drag (`drag_abs`) over an `echo M3OS_COPY_ME` line must change ≥20 scanlines (the highlight), and copy-on-release must land the text in the compositor `ClipboardStore`, read back by an **independent** client (`clip-smoke --paste`) and asserted as a *whole trimmed line* equal to the marker — a line merely *containing* it would be the echoed command row, not the copied output. The read-back is sequenced by an `echo-args CLIPSYNCA` anchor rather than by counting sentinel occurrences (`serial_history` is a rolling 192 KiB window, so counts taken minutes apart are not comparable).
+- [x] **Arm 4 — paste reaches the PTY:** Ctrl+Shift+V into a bare `cat` must change ≥20 scanlines *and* leave the frame's black-pixel ratio ≥0.15 (`term` paints black, the compositor teal — a frame that changed because `term` died is not a pass). The `cat` sink is load-bearing: pasting a multi-row selection at a shell prompt would execute every line in it.
+- [x] **Arm 5 — wheel → application on the alternate screen:** `/bin/tui-smoke mouse-live` takes the alternate screen, enables `?1000h` + `?1006h` itself, decodes `term`'s SGR reports, and floods half the grid per notch. Injection waits on its `TUI_SMOKE:mouse-live:ready` sentinel (injecting earlier is a race with a *wrong answer* — until `?1000h` reaches `term` the notch is consumed by term's own viewport). One wheel-up must produce `cb=64` on serial plus ≥20 000 saturated-red pixels in the top half dominating the bottom; one wheel-down must produce `cb=65` plus ≥20 000 blue in the bottom half dominating the top, with the red band gone. On `q` the probe's own tally must read exactly `up=1` / `down=1` / `ok`. Afterwards the primary buffer must be back (black ratio ≥0.15) and a Shift+End must change nothing (≤96 scanlines) — no notch leaked into `term`'s viewport.
+- [x] **Arm 6 — Shift-drag override, while the app still holds the mouse:** an unshifted drag must change ≤96 scanlines (the application owns it), and the identical drag via `drag_abs_with_mods(&["shift"], …)` must change ≥20 **and** replace the compositor clipboard offer (read back with its own `CLIPSYNCB` anchor, asserting arm 3's marker is no longer the standing offer). This is the only arm that exercises the compositor's live-modifier stamping end to end.
+- [x] Gate is opt-in (`M3OS_TERM_POLISH_REGRESSION=1`, `.githooks/pre-push`), off in the default pre-push set until stabilized; production build unaffected.
+- [ ] **Wheel arm skips with a printed reason on lanes without a Report-protocol pointer.** Not implemented: `cmd_term_polish_smoke` unconditionally builds its own device set and appends `-device usb-tablet,bus=xhci0.0`, so the lane always exists and there is no skip branch to take. The gate therefore has no PS/2-only mode; the wheel arms are simply always run against the tablet it attaches.
+- [ ] **Ctrl+Shift+C driven over QMP, and a byte-exact whole-payload compare.** The gate copies via **copy-on-release** only — there is no `press_chord(&["ctrl","shift","c"], …)` anywhere in it — and it asserts a *whole-line* match on the marker inside a multi-row payload rather than byte-equality of the entire offer (the tall drag deliberately captures the rows above and below the marker, so the payload is not known exactly). Ctrl+Shift+C's key path is covered only by the `term::input` host tests.
+- [ ] **Bracketed `ESC[200~` / `ESC[201~` bytes asserted on the wire.** Not assertable on this lane — see scoping note (3). Covered by the `term::input::wrap_paste` host tests instead.
 
 ---
 
@@ -172,6 +186,17 @@ should be treated as hints only.
   phase — the fix is adjacent, in the same function, and unblocks `less`/`htop` paging.
 - `term` becomes the second real clipboard client after the Phase 105 `clip-smoke` gate;
   reference the unchanged `ClipboardStore` broker.
-- Note the `CLIPBOARD_MAX_BYTES` relocation to `protocol.rs` — the one shared-crate change in
-  an otherwise `term`-local phase.
+- Note the `CLIPBOARD_MAX_BYTES` relocation to `protocol.rs` — one of the two shared-crate
+  changes in an otherwise `term`-local phase.
+- **Document the pointer coordinate-space change.** The other shared-crate change —
+  `PointerRouteDecision::deliver_origin` + `InputDispatcher::modifiers()` in
+  `kernel_core::input::dispatch`, consumed by `display_server` — is the widest-reaching
+  behavior change in the phase and is not `term`-specific. Every `display_server` client now
+  receives **surface-local** pointer coordinates and **live** keyboard modifiers. See the phase
+  doc's "Pointer coordinate space and live modifiers" section; the residual letterbox delta and
+  the missing implicit pointer grab are recorded as deferrals, not glossed.
+- Record the terminfo consequence: `xtask/terminfo/m3os-term.ti` gained `kdch1`, `khome`,
+  `kend`, `kpp`, `knp`, and it is compiled by `tic` at image-build time, so
+  `cargo xtask clean` is required before the next run/gate or the existing `disk.img` keeps the
+  old compiled entry. `kich1` is deliberately absent — `term` sends nothing for Insert.
 - Prefer exact symbols over line numbers where `main.rs`/`screen.rs` line numbers may drift.

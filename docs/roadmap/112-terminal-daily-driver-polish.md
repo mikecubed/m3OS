@@ -1,10 +1,10 @@
 # Phase 112 - Terminal Daily-Driver Polish (Scrollback + Selection/Clipboard)
 
-**Status:** ✅ Complete
+**Status:** ✅ Complete — four acceptance items were re-scoped rather than delivered (one B.3 host test, three C.2 gate assertions). They are left unticked in the task list and named in "Deferred Until Later" below, not quietly folded in.
 **Source Ref:** phase-112
 **Depends on:** Phase 22 (TTY and Terminal) ✅, Phase 56 (Display and Input Architecture) ✅, Phase 69–69d (Terminal TUI Capabilities + ncurses) ✅, Phase 92b (USB HID Report Protocol) ✅, Phase 105 (m3ui toolkit + compositor clipboard broker) ✅
 **Builds on:** The `term` emulator (`userspace/term/`) and its already-present but **unviewable** 1000-line scrollback ring (Phase 57 G.4), the compositor clipboard broker (`kernel_core::display::clipboard::ClipboardStore`, Phase 105 Track B.4), the `display_server` focus-aware key/pointer dispatch, the Phase 92b `usb-hid` Report-protocol pointer decode (the tree's only wheel producer), and the bracketed-paste framing already shipped in Phase 69 Track G.
-**Primary Components:** `userspace/term` (`screen.rs`, `render.rs`, `input.rs`, `mouse.rs`, `main.rs`, `display.rs`), `kernel-core/src/display/protocol.rs`, `xtask/src/qmp.rs`
+**Primary Components:** `userspace/term` (`lib.rs`, `screen.rs`, `render.rs`, `input.rs`, `mouse.rs`, `main.rs`, `display.rs`), `kernel-core/src/display/protocol.rs`, `kernel-core/src/input/dispatch.rs`, `userspace/display_server` (`input.rs`, `main.rs`), `userspace/tui-smoke`, `xtask/terminfo/m3os-term.ti`, `xtask/src/qmp.rs`, `xtask/src/main.rs`
 
 ## Milestone Goal
 
@@ -12,9 +12,14 @@ The graphical terminal becomes pleasant to **live in**: the user can scroll back
 history that has already left the screen (Shift+PageUp/PageDown on every lane, mouse wheel
 where a Report-protocol pointer is present), and can select terminal text with the mouse and
 copy it to the system clipboard / paste it back — the two everyday interactions every real
-terminal has and `term` currently lacks. Nothing new is invented at the kernel level; both
-features are userspace changes in `term` plus the compositor clipboard protocol that already
-exists.
+terminal has and `term` currently lacks. Both features are userspace changes in `term` plus the
+compositor clipboard protocol that already exists.
+
+One ring-0 fix proved unavoidable, and it is the most user-visible bug the phase closes: a PTY
+`write()` that could not fit in the 4 KiB ring returned `0` instead of `-EAGAIN`, which Rust's
+`std` reports as `WriteZero` and `println!` turns into a panic — so **the shell inside `term`
+died whenever a program printed faster than `term` drained the PTY**. Running `dmesg` killed the
+terminal essentially every time. See "The PTY write-zero fix" below.
 
 ## Why This Phase Exists
 
@@ -89,6 +94,12 @@ This phase is the last user-facing mile on top of infrastructure that already ex
   bytes from typed bytes and refuse to execute them.
 - How HID **Boot** vs. **Report** protocol changes which fields survive decode — the reason
   a wheel exists on `usb-tablet` but not on `usb-mouse`.
+- Why a display server owes its clients **surface-local** coordinates rather than screen ones,
+  and why the compositor must keep the screen-absolute value for itself (cursor blit,
+  hit-test) — two coordinate spaces that look identical only for a window at the origin.
+- Why the **compositor** is the only process that can put keyboard modifiers on a pointer
+  event: the mouse driver never sees the keyboard, so a modifier field filled in by the
+  producer is structurally always empty.
 
 ## Feature Scope
 
@@ -113,7 +124,9 @@ grid; when it is `0`, rendering is exactly as today. Bindings:
   produces PTY bytes, resets `view_offset = 0` so the user never types "into" history.
 - Scrollback is primary-screen only (matching the existing eviction guard in
   `scroll_region_up`: `if primary && full_screen`): the alternate screen (vim/htop) has no
-  scrollback and the wheel passes through to the app's own mouse reporting, unchanged.
+  scrollback, and once an application has enabled a tracking mode the wheel is reported **to
+  the application** rather than driving the viewport. That pass-through had to be *built*, not
+  merely preserved — see below.
 
 ### Track B — Mouse selection + clipboard copy/paste
 
@@ -129,7 +142,7 @@ Add selection state to `term` and wire copy/paste to the compositor clipboard:
   plain char: skip cells with `wide_continuation == true` (the trailing half of a
   double-width glyph, whose codepoint lives in the leading cell — copying both double-emits
   CJK text), trim trailing cells whose `codepoint == 0x20` per row, and join rows with `\n`.
-- **Paste** — **Ctrl+Shift+V** (and middle-click, optional) sends `RequestClipboard`, reads
+- **Paste** — **Ctrl+Shift+V** sends `RequestClipboard`, reads
   the `ServerMessage::ClipboardData` reply bulk, and injects it through the existing
   `wrap_paste` (`input.rs:152`) so it arrives bracketed.
 
@@ -165,6 +178,86 @@ isolation. Track A therefore changes `translate` to **return a typed outcome** (
 which owns both the `Screen` and the PTY fd — apply it. `special_key_sequence` likewise gains
 a modifiers parameter, and `input.rs` starts importing `MOD_SHIFT` alongside `MOD_CTRL`.
 
+### The wheel's two destinations (Track A)
+
+One injected notch has two possible destinations, and which one it reaches is decided by
+`MouseReporter::classify` (`userspace/term/src/mouse.rs`):
+
+- **No tracking mode enabled** — `classify` returns `PointerAction::ScrollView(wheel_dy *
+  wheel_rows)` and `term` scrolls its own scrollback viewport. Positive `wheel_dy` (wheel-up)
+  moves toward older history. Nothing is written to the PTY.
+- **A tracking mode enabled** (`?9` / `?1000` / `?1002` / `?1003`) — `MouseReporter::encode`
+  turns the notch into an xterm **wheel pseudo-button** and it goes to the application, so
+  `less`/`htop`/`tmux` scroll their own panes instead of `term` scrolling behind them.
+
+The pseudo-button convention is xterm's: the wheel rides the same button field as the real
+buttons, distinguished by bit 6, so **wheel-up is button 64 and wheel-down 65** (66/67 are the
+horizontal pair, which nothing in this tree produces — no source populates `wheel_dx`). A notch
+has **no release edge**, so it is always encoded as a press: SGR reports terminate in upper-case
+`M` (`ESC[<64;Px;PyM`) and there is no lower-case-`m` counterpart to look for, and the
+press-only X10 mode (`?9h`) receives the notch for free rather than having it dropped by the
+release guard. In the legacy 6-byte form the indices land on `Cb` bytes 96/97
+(`ESC[M` + `` ` `` / `a`).
+
+This is the correction to the phase's original framing, which said the wheel "passes through to
+the app's own mouse reporting, unchanged." It did not. `encode` returned `None` for every
+`PointerButton::None` event, so on the alternate screen a tracking application saw **nothing** —
+the notch fell through `classify` to `Ignore` and was discarded. The button index widened from
+`u8` to `u16` to make room for 64/65 above the real-button range, and both encoder clamps (the
+legacy 2-bit button field's `min(2)`, SGR's `min(31)`) are bypassed for indices ≥ 64 so the
+pseudo-buttons are not folded back onto a real button. Note the scope of the fix: an application
+that has *not* enabled a tracking mode still receives no wheel byte, which is correct xterm
+behavior — there the notch drives `term`'s own scrollback instead.
+
+### Pointer coordinate space and live modifiers (cross-cutting)
+
+The most architecturally significant change in the phase is not in `term` at all. Making mouse
+selection work required fixing what `display_server` sends every client, and that is a
+wire-visible behavior change for the whole graphical stack.
+
+**Surface-local coordinates.** `ServerMessage::Pointer(ev).abs_position` used to be
+**output-local** — the same screen-absolute value the compositor hit-tested with. A client had
+no way to convert it, because the compositor never told a client where its own surface sat, so
+every client that divided the coordinate by a cell or compared it against a widget rect laid out
+from `(0, 0)` was silently wrong by its window's origin. For `term` that is at minimum the bar's
+48 px exclusive zone plus the outer gap in *y*, plus the whole tile width in *x* for any window
+not in the leftmost column.
+
+The fix threads the origin out of the router rather than having each client guess:
+`kernel_core::input::dispatch::PointerRouteDecision` gained
+`deliver_origin: Option<(i32, i32)>` — the hit surface's geometry-rect top-left in output-local
+coordinates, set in the same statement pair as `deliver_to` from the live geometry slice, so it
+is `Some` exactly when `deliver_to` is and always reflects the surface's *current* position
+rather than a hover-time cache. `display_server`'s outbound branch subtracts it
+(`saturating_sub`) immediately before the `InputEffect::Outbound` push. Three consequences worth
+naming:
+
+- `term`'s cell derivation (`term::pointer_cell`, `abs_position / CELL_WIDTH`) is correct as
+  written, and VT mouse reports and selection hit-testing become correct at the same moment.
+- `m3ui`'s widget hit-test (`apply_pointer` → `InputState::set_pointer`, used by `settings` and
+  `imgview`) compares against rects laid out from `(0, 0)` and is likewise fixed — a defect that
+  had been latent since Phase 105 and was never on record.
+- The compositor's *own* `pointer_position` is no longer read back out of a client-bound
+  message. `main.rs` had a feedback loop that took the position from the outgoing
+  `ServerMessage::Pointer`; with the message now surface-local that would drag the cursor toward
+  the top-left by the surface origin on every event, so the loop is deleted.
+  `InputEffect::CursorMoved` — which fires unconditionally, including over empty desktop — is
+  the sole authority, and it stays **screen-absolute** along with the cursor blit and the next
+  pass's hit-test. The two spaces are now distinct and must not be confused.
+
+**Live keyboard modifiers.** Every pointer producer in the tree (`mouse_server`, `usb-hid`)
+hardcodes `ModifierState::empty()`, because none of them read the keyboard. The compositor is
+the only process that sees both streams, so `InputDispatcher` now snapshots the modifier state
+at the top of `route_key_event` — before the `match` on event kind, so it updates on Down,
+Repeat **and** Up, and whether the key was delivered, grabbed or dropped — and exposes it via
+`modifiers()`. `display_server` stamps that over the producer's placeholder before routing.
+The snapshot is masked to `MOD_SHIFT | MOD_CTRL | MOD_ALT | MOD_SUPER`, so the CAPS/NUM lock
+latches that `ModifierTracker::state()` ORs in never reach a pointer event. Without this the
+xterm Shift-drag override and Alt block-select in Track B are *unreachable* — the modifier field
+on a pointer event was always empty. A companion `forget_modifiers()` exists for stream
+interruptions (session lock, VT switch, `kbd_server` reconnect) but has no call site yet; see
+"Deferred Until Later".
+
 ### Selection state and highlight (Track B)
 
 A small `Selection { anchor: (u16,u16), extent: (u16,u16), mode: Linear|Block, active: bool }`
@@ -194,6 +287,44 @@ Track C arms need what is missing: the scrollback arm needs wheel injection, and
 arm needs press → motion → release. Both are `input-send-event` `btn` events (`wheel-up` /
 `wheel-down`, `left`), so Track C adds the wrappers before the smoke itself can be written.
 
+### The PTY write-zero fix (ring 0, found by the Track C gate)
+
+The scrollback arm was the first thing in the tree to type `dmesg` into the graphical `term`, and
+it failed every time — not because the viewport was wrong, but because **the shell had died**
+(`[signal] [p21] killed by signal 6`, then `term: shell exited`, leaving bare compositor
+background). The bug is in the PTY write path and predates this phase: it has been there since
+the original Phase 29 PTY implementation (`1f9cc7d90`).
+
+`PtyRingBuffer::write` (`kernel-core/src/pty.rs`) returns `0` when the ring (`PTY_BUF_SIZE =
+4096`) is full. Both `sys_write` PTY arms (`kernel/src/arch/x86_64/syscall/mod.rs`,
+`FdBackend::PtySlave` and `FdBackend::PtyMaster`) propagated that straight out as the syscall's
+return value — so a full ring looked to userspace exactly like a successful zero-byte write.
+Rust's `std` maps a `write()` of `Ok(0)` to `ErrorKind::WriteZero`, `println!`/`eprintln!` panic
+on a failed write, and `ion` is built `panic = "abort"`. The chain is therefore:
+
+    dmesg bursts the log -> s2m ring fills -> write() returns 0 -> WriteZero
+      -> ion's next prompt panics -> abort() -> SIGABRT -> term's shell exits
+
+The neighbouring `FdBackend::UnixSocket` arm already did this correctly, `poll()` already
+advertised `POLLOUT` only when `!s2m.is_full()`, and the wake side already existed and was
+already commented for exactly this purpose ("Reading from s2m frees space for slave writers" ->
+`wake_slave`). Nothing had ever slept on it. The fix wraps each copy loop in a retry: a partial
+write returns the count (POSIX-legal on a tty), a non-blocking fd gets `-EAGAIN`, a pending
+signal gets `-EINTR`, and otherwise the writer parks on the wait queue until space frees, with
+the master/slave-hangup check re-evaluated each pass so a dying `term` releases a blocked writer
+with `-EIO` rather than hanging it.
+
+The readiness predicates live in `kernel-core/src/pty.rs` (`slave_write_ready`,
+`master_write_ready`) so they are host-testable. `slave_write_ready` takes the number of bytes
+required rather than asking `!is_full()`: an OPOST+ONLCR newline expands to CR+LF and must land
+atomically, so with exactly one free slot "not full" is true while the retry still cannot place
+the byte — a tight kernel busy-spin. `master_write_ready` re-reads the line-discipline mode at
+wake time (canonical checks `edit_buf`, raw checks `m2s`) so a concurrent `tcsetattr` cannot
+leave a sleeper waiting on the wrong buffer.
+
+This is why "the terminal becomes pleasant to live in" needed a kernel change: no amount of
+scrollback polish matters if the shell dies when a command prints quickly.
+
 ## How This Builds on Earlier Phases
 
 - **Extends Phase 57/69** by making the long-stored scrollback ring actually viewable, and
@@ -204,10 +335,16 @@ arm needs press → motion → release. Both are `input-send-event` `btn` events
   `RequestClipboard`/`ClipboardData` protocol) unchanged — `term` becomes its second real
   client after `clip-smoke`.
 - **Reuses the Phase 69 `wrap_paste`** bracketed-paste framing for the paste direction.
-- **Changes nothing in the kernel.** Both tracks are userspace-only, honoring the
-  userspace-first rule. This holds *because* the PS/2 IntelliMouse work is deferred — see
-  "Deferred Until Later". The only shared-crate change is relocating the
-  `CLIPBOARD_MAX_BYTES` constant into `protocol.rs`.
+- **Touches ring 0 in exactly one place**, and only to fix a POSIX violation the phase's own gate
+  exposed: the PTY `sys_write` arms (see "The PTY write-zero fix"). Every *feature* track is ring-3,
+  honoring the userspace-first rule. No new policy moved into the kernel.
+  The PS/2 IntelliMouse work stays deferred — see "Deferred Until Later".
+  Two shared-crate (`kernel-core`) changes ride along, both pure logic and both host-tested:
+  relocating `CLIPBOARD_MAX_BYTES` into `display/protocol.rs` beside the
+  `MAX_FRAME_BODY_LEN` guard its value derives from, and the `input/dispatch.rs` work described
+  under "Pointer coordinate space and live modifiers" (`PointerRouteDecision::deliver_origin`
+  and `InputDispatcher::modifiers()`). Neither is kernel code — `kernel-core` is the shared
+  host-testable logic crate.
 
 ## Implementation Outline
 
@@ -221,8 +358,36 @@ arm needs press → motion → release. Both are `input-send-event` `btn` events
    `PutGlyph` emit path; move `CLIPBOARD_MAX_BYTES` to `protocol.rs`; add
    `set_clipboard`/`get_clipboard` to `term`'s `DisplayClient`; bind Ctrl+Shift+C
    (copy-on-release) and Ctrl+Shift+V (paste via `wrap_paste`).
-3. **Track C:** add QMP `btn`/wheel injection to `xtask/src/qmp.rs`, then the render probe +
-   clipboard round-trip gate (below).
+   *Discovered while wiring the pre-pass:* the modifier field on a delivered pointer event is
+   always empty and the coordinates are output-local, so neither the Shift override nor the
+   cell hit-test can work as specified. Add `PointerRouteDecision::deliver_origin` and
+   `InputDispatcher::modifiers()` to `kernel_core::input::dispatch`, consume both in
+   `display_server`'s outbound path, and delete the compositor's
+   `pointer_position`-from-outbound-message feedback loop.
+   *Also discovered:* `MouseReporter::encode` never reported the wheel to a tracking
+   application, so the alternate-screen pass-through the scope assumed did not exist. Widen the
+   button index and add the xterm 64/65 pseudo-buttons.
+3. **Track C:** add QMP `btn`/wheel injection plus `send_key_state` / `drag_abs_with_mods`
+   (a modifier held *across* a drag, which `press_key`'s synthesised down+up cannot express) to
+   `xtask/src/qmp.rs`; add the in-guest `tui-smoke mouse-live` probe that gives the
+   alternate-screen arm a deterministic serial oracle; then the six-arm gate.
+   *Discovered while bringing arm 6 up:* a modifier-held drag fired edge-to-edge does **not**
+   reach the guest as a held modifier, and QEMU is not at fault — it delivers every edge as
+   asked. The keyboard and the pointer are two independent interrupt-IN endpoints drained by
+   one `usb-hid` poll loop, one report per device per tick; `usb-tablet` hands out its queued
+   motion/button reports one poll at a time while `usb-kbd` drains its whole scancode queue in
+   a couple of polls, so the keyboard timeline runs *ahead* of the pointer timeline and the
+   guest reads the Shift **break** — sent last — between the first `MoveAbs` and the button
+   press. The compositor then stamps the whole gesture with no modifiers and the arm reads a
+   false negative (both drags change zero scanlines, exactly as if the capability were
+   missing). Fix: `qmp::GESTURE_STEP_PACING`, a per-edge gap that must exceed the guest
+   poller's worst-case sleep (`hid_poll::HID_POLL_MAX_IDLE_NS`, 100 ms); applied uniformly so
+   the arm's unshifted and Shift-held drags differ *only* in the modifier.
+4. **Terminfo:** add the input-side capabilities for the navigation cluster `term` now emits
+   (`kdch1`, `khome`, `kend`, `kpp`, `knp`) to `xtask/terminfo/m3os-term.ti`. `kich1` stays
+   absent — `term` sends nothing for Insert, and advertising a sequence the terminal never
+   sends is the failure mode that file's own comment block warns about. The entry is compiled
+   by `tic` at image-build time, so `cargo xtask clean` is required for it to reach the disk.
 
 Every pure-logic piece above is host-testable — `term` ships a `[lib]` target precisely for
 this and `cargo xtask check` already runs its host tests. Viewport clamping, `compose_view`
@@ -231,22 +396,56 @@ same task that adds them**, not deferred to the QEMU gate.
 
 ## Acceptance Criteria
 
-- **Track A:** a headless QMP/PPM probe (the `htop-render-probe` pattern) fills the screen
-  past one page, scrolls up via injected Shift+PageUp, and asserts that **evicted** content
-  (rows no longer in the live grid) is now visible; a subsequent keystroke/output snaps back
-  to the live tail (the pre-scroll frame re-appears). On the Report-protocol lane
-  (`-device qemu-xhci -device usb-tablet`, as in `usb-report-smoke`) the same assertion is
-  driven by injected wheel-up. The alternate screen (an htop/less launch) shows the wheel
-  passing through to the app, not the viewport.
-- **Track B:** a clipboard round-trip through `term` — drive a selection over known text,
-  Ctrl+Shift+C, and assert the compositor `ClipboardStore` now holds exactly those bytes
-  (read back by a second client); then Ctrl+Shift+V and assert the bracketed bytes
-  (`ESC[200~`…`ESC[201~`) arrive on the PTY. The highlight is visible on the QMP/PPM dump
-  (inverted cells).
-- Host tests cover viewport clamping, `compose_view` (including that `view_offset == 0`
-  output is unchanged from today), the key-outcome table for shifted/unshifted page keys, and
-  selection→UTF-8 serialization (wide-continuation skip, trailing-blank trim, `\n` join).
-- A new gate `term-daily-driver-smoke` (`M3OS_TERM_POLISH_REGRESSION=1`) runs both arms; the
+These are the criteria **as met**. Where the original wording promised something the delivered
+gate does not assert, the honest version is stated here and the shortfall is carried into
+"Deferred Until Later"; the per-item record with reasons is in the companion task list.
+
+- **Track A — scrollback:** a headless QMP/PPM probe (the `htop-render-probe` pattern) fills
+  the screen past one page with `dmesg`, scrolls up via injected Shift+PageUp, and asserts that
+  **evicted** content (rows no longer in the live grid) is now visible (≥20 changed scanlines
+  against the settled live-tail frame); a subsequent printable keystroke both moves the frame
+  *and* lands within 96 scanlines of the live-tail frame — "it moved" is not "it went home".
+  On the Report-protocol lane (`-device qemu-xhci -device usb-tablet`, as in
+  `usb-report-smoke`, with the Boot-subclass `usb-mouse` removed so exactly one pointer is on
+  the bus) the same assertion is driven by injected wheel-up.
+- **Track A — the wheel's other destination:** with an application holding the mouse on the
+  alternate screen, the same injected notch reaches the *application* instead. The
+  purpose-built `tui-smoke mouse-live` probe enables `?1000h` + `?1006h`, decodes `term`'s SGR
+  reports, and gives two independent oracles: `TUI_SMOKE:mouse-live:cb=64` / `cb=65` on serial
+  (the application decoded it) and a per-notch hue-and-region check on the PPM (≥20 000
+  saturated-red pixels in the top half for wheel-up, blue in the bottom half for wheel-down,
+  each dominating the opposite half, with the previous band gone). Its exit tally must read
+  exactly `up=1` / `down=1`.
+- **Track B — clipboard round trip:** drive a selection over known text with a QMP drag; the
+  highlight is visible on the QMP/PPM dump (≥20 changed scanlines, an fg/bg swap across the
+  band), and copy-on-release lands the text in the compositor `ClipboardStore`, read back by an
+  **independent** client (`clip-smoke --paste`) and asserted as a whole trimmed line equal to
+  the marker. Ctrl+Shift+V then delivers the offer to the PTY: the frame changes by ≥20
+  scanlines *and* `term` is still on screen afterwards (black-pixel ratio ≥0.15).
+  **Not asserted on this lane:** the `ESC[200~`…`ESC[201~` framing itself, because no program in
+  the image enables `?2004h` and PTY bytes have no sink but the framebuffer — it is covered by
+  the `term::input::wrap_paste` host tests. Copy is driven by release, not by Ctrl+Shift+C.
+- **Track B — the xterm Shift override:** with a mouse-tracking application holding the pointer,
+  an unshifted drag must leave the frame quiet (≤96 scanlines — the application owns it) while
+  the identical Shift-held drag must paint a selection **and** replace the compositor's standing
+  clipboard offer. This is the only end-to-end proof of the compositor's live-modifier stamping.
+- Host tests cover viewport clamping and `scrollback_row` bounds, `compose_view` (including
+  that `view_offset == 0` output is byte-identical to the existing full re-emit, and that a
+  non-zero offset is inert on the alternate screen), the key-outcome table for shifted and
+  unshifted page keys plus a **range sweep** proving `term`'s unshifted sequences match
+  `hid_poll` across the whole `0xE000..=0xE0FF` keysym block in both directions,
+  selection→UTF-8 serialization (wide-continuation skip, trailing-blank trim, `\n` join),
+  selection invalidation across all eleven grid mutators, the pixel→cell hit-test at the grid
+  edges (`term::pointer_cell`), the clipboard cap predicate, the wheel pseudo-button encodings,
+  and — in `kernel-core` — that `deliver_origin` is `Some` exactly when `deliver_to` is, tracks
+  a moved surface's current geometry, that `modifiers()` is masked to
+  SHIFT/CTRL/ALT/SUPER and updates on Down, Repeat and Up, and that a whole drag's worth of
+  pointer events routed after a Shift key-down leaves that snapshot intact (the compositor
+  stamps *from* it, so a `route_pointer_event` that cleared it would silently downgrade every
+  Shift-drag). `xtask`'s own tests pin the gesture wire shape and step order, and assert
+  `GESTURE_STEP_PACING` outlasts the guest HID poller's idle backoff. `cargo test -p term`
+  reports 186 passing.
+- A new gate `term-daily-driver-smoke` (`M3OS_TERM_POLISH_REGRESSION=1`) runs all six arms; the
   default production build is unchanged.
 
 ## Companion Task List
@@ -290,8 +489,74 @@ same task that adds them**, not deferred to the QEMU gate.
   coincidentally equal pixels), which is why that lane is scoped to pixel coordinates and says
   so. A real fix needs `ReportField` to carry logical min/max — it carries neither today — plus
   a framebuffer-size query in the driver, so it belongs to the USB/HID subsystem, not here.
-- **PS/2 IntelliMouse (4-byte) wheel support** — see above; the wheel is USB-only until then.
+- **Selection is cleared by a grid mutation, never re-anchored.** `Selection` stores *display*
+  coordinates, re-resolved through `display_cell()` at both paint and copy time, so it cannot
+  survive a mutation of the grid it points at — a stale selection would highlight unrelated
+  text and a later copy would put the wrong string on the clipboard. `Screen` therefore clears
+  it in all eleven mutators (`put_char`, both `scroll_region_*`, `insert_chars`,
+  `delete_chars`, `blank_cell`, `clear_buffer`, `resize`, both screen switches, and a
+  view-offset change that actually moves). A real terminal instead **re-anchors** the selection
+  to the underlying content — anchoring to `(scrollback_generation, absolute_row, col)` rather
+  than to a display row — so a selection survives shell output scrolling underneath it. That is
+  the follow-up; today the practical consequence is that a selection is lost the moment the
+  shell prints anything, including a prompt repaint.
+- **No implicit pointer grab in the dispatcher.** There is no pointer grab anywhere in the tree
+  (`CompositorState::grab_state` is the keyboard `bind_table::GrabState`; a repo-wide grep for
+  `pointer_grab` / `grab_surface` / `PointerGrab` is empty), so a drag that leaves the source
+  surface is routed by hit-test on every event like any other motion. `term` compensates
+  client-side with a `selecting` latch that keeps consuming pointer events until a button-up,
+  and widens the release arm from `Up(0)` to `Up(_)` precisely because a compositor
+  outbound-queue overflow can drop the matching edge and strand the latch forever. The correct
+  fix is a real implicit grab in the compositor — press captures the pointer to the hit surface
+  until the last button releases — which also removes the client-side latch and the
+  lost-Up-edge hazard it works around. Until then a lost Up edge is recovered only by the next
+  press, not by the compositor.
+- **`InputDispatcher::forget_modifiers()` has no call site.** The keyboard-reconnect path lives
+  in `KbdInputSource::try_lazy_reconnect`, a `&mut self` method on the source with no access to
+  the dispatcher (which lives on `InputWiring`), so wiring a reconnect signal out to it was not
+  attempted. Residual hazard, narrow: if `kbd_server` dies while Shift is physically held,
+  pointer events carry a stale `MOD_SHIFT` until the next key event of *any* kind. The same
+  call belongs on the session-lock and VT-switch paths.
+- **Toplevel pointer coordinates are tile-relative, not buffer-relative.** A Toplevel's
+  geometry rect is its *tile*, but `surface_screen_rect` (`compose.rs`) letterbox-centres a
+  client's pixels inside that tile when the buffer is smaller. `deliver_origin` reports the
+  tile origin, so between a `SurfaceResized` and the client's realloc the delivered coordinates
+  are off by the centring delta; in steady state the client has resized to the tile and the
+  delta is zero. Layer surfaces (bar, wallpaper, lockscreen, launcher, notifyd) carry their
+  paint rect as their geometry and are always exact. Closing this needs the compositor to
+  deliver the *painted* rect origin rather than the geometry rect, which means resolving the
+  letterbox at route time.
+- **The `term-daily-driver-smoke` wheel arms cannot be skipped.** The gate builds its own
+  device set and unconditionally appends `-device usb-tablet,bus=xhci0.0`, so there is no
+  PS/2-only mode and no skip branch with a printed reason. A lane-detecting variant would be
+  the follow-up if the gate ever needs to run where a Report-protocol pointer is unavailable.
+- **Ctrl+Shift+C is not driven by the gate**, and the clipboard read-back is a whole-line match
+  on a known marker inside a multi-row payload rather than a byte-exact whole-payload compare
+  (the deliberately tall drag captures the rows above and below the marker, so the payload is
+  not known exactly). Copy is exercised through copy-on-release only; the Ctrl+Shift+C key path
+  is covered by the `term::input` host tests.
+- **The selection latch has no host test.** `handle_selection_pointer`, `SelectionOutcome`, the
+  `selecting` latch, `write_all_bounded`, and the bell-on-rejected-copy all live in `main.rs`,
+  which is `#[cfg(not(test))]` throughout inside a bin target with
+  `required-features = ["os-binary"]` — nothing in it is compiled by `cargo test -p term`.
+  Pinning it means lifting a `SelectionLatch` type (the `bool` plus the `PointerButton` →
+  `SelectionOutcome` mapping) into `lib.rs`, leaving the `Screen` calls to the caller. Today it
+  is covered only by the QEMU gate. The same applies to `display_server`, which is a
+  `no_std`/`no_main` binary with no host test harness at all — its two behavior changes are
+  covered by the `kernel_core::input::dispatch` tests plus the gate.
+- **An oversized *selection* is never driven through the rejecting predicate in one test.**
+  `oversized_selection_exceeds_the_clipboard_cap` asserts only that its 200×40 fixture exceeds
+  `CLIPBOARD_MAX_BYTES`; `term::clipboard_payload_fits` is tested at the cap boundary
+  separately. Composing them is a one-line addition to that test.
+- **The bracketed-paste framing is not asserted anywhere but in host tests.** No program in the
+  image sets `?2004h`, so on every lane `wrap_paste` correctly passes the payload through
+  unframed and there is no framing on the wire to observe; and pasted bytes land on the PTY,
+  whose only sink is the framebuffer, which a PPM cannot be OCR'd from. Proving the framed form
+  in-guest needs an application (or a `tui-smoke` subcommand) that enables `?2004h` and echoes
+  what it reads back to serial.
 - Scrollback reflow on resize and a configurable/unbounded history size.
+- Middle-click paste. The B.3 scope listed it as optional and it was not implemented — paste is
+  Ctrl+Shift+V only; nothing in `term` binds a non-zero pointer button.
 - OSC 52 clipboard (remote-program clipboard control) and primary-selection (middle-click)
   as a separate buffer from the clipboard.
 - Word/line (double/triple-click) selection and URL/hyperlink detection (OSC 8).
