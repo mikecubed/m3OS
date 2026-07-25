@@ -45,6 +45,9 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+use kernel_core::display::protocol::CLIPBOARD_MAX_BYTES;
+use kernel_core::input::events::PointerEvent;
+
 pub mod bell;
 pub mod input;
 pub mod mouse;
@@ -115,6 +118,53 @@ pub const CELL_WIDTH: u8 = 24;
 /// static fallback. See [`CELL_WIDTH`] for why it lives here.
 pub const CELL_HEIGHT: u8 = 48;
 
+/// Project a pointer event's pixel position onto a 0-based `(row, col)`
+/// display cell, clamped into a `cols` × `rows` grid.
+///
+/// The pixels are **surface-local**: `display_server` rebases
+/// `PointerEvent::abs_position` onto the hit surface's geometry origin
+/// before delivering the event, so `(0, 0)` is term's own top-left corner
+/// and the plain division below needs no origin term. (Before that
+/// rebasing landed, every term window's hit-test was off by its tile
+/// origin — at minimum the bar's exclusive zone in `y`.)
+///
+/// An event with no absolute position projects to the origin cell rather
+/// than being rejected: the only producer that omits it is the USB HID
+/// Report-protocol decoder, whose wheel notches carry no coordinates and
+/// for which a cell is still required to encode a report.
+///
+/// Mirrors `mouse::compute_cell_position`, but that one returns 1-based
+/// coordinates for the VT wire protocol while selection indexes cells
+/// from zero. [`CELL_WIDTH`] / [`CELL_HEIGHT`] are the same constants the
+/// renderer lays glyphs out with, so the highlight lands under the
+/// pointer.
+pub fn pointer_cell(ev: &PointerEvent, cols: u16, rows: u16) -> (u16, u16) {
+    let (px, py) = ev.abs_position.unwrap_or((0, 0));
+    let col = (px.max(0) as u32 / CELL_WIDTH as u32) as u16;
+    let row = (py.max(0) as u32 / CELL_HEIGHT as u32) as u16;
+    (
+        row.min(rows.saturating_sub(1)),
+        col.min(cols.saturating_sub(1)),
+    )
+}
+
+/// Whether `text` fits in a single compositor clipboard offer.
+///
+/// The compositor's `SetClipboard` verb carries a byte length, so the cap
+/// is on **encoded bytes**, not characters — a selection of multi-byte
+/// glyphs hits the limit at correspondingly fewer characters.
+///
+/// The check lives here rather than inline in the `display` module's
+/// `DisplayClient::set_clipboard` because that module only compiles for
+/// the OS target, which put the predicate out of reach of the host tests
+/// that are supposed to pin it. `set_clipboard` calls this and *rejects*
+/// an over-cap offer rather than truncating it: silently copying half a
+/// selection is worse than copying nothing, because the user cannot see
+/// the cut.
+pub fn clipboard_payload_fits(text: &str) -> bool {
+    text.len() <= CLIPBOARD_MAX_BYTES
+}
+
 /// Decide whether the event loop should publish the current renderer frame.
 ///
 /// The normal throttle avoids excessive display IPC, but PTY output that has
@@ -165,6 +215,115 @@ pub enum TermError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kernel_core::input::events::{ModifierState, PointerButton};
+
+    /// Motion event at `pos` with no buttons and no wheel — the shape the
+    /// compositor delivers while a selection drag is in flight.
+    fn motion_at(pos: Option<(i32, i32)>) -> PointerEvent {
+        PointerEvent {
+            timestamp_ms: 0,
+            dx: 0,
+            dy: 0,
+            abs_position: pos,
+            button: PointerButton::None,
+            wheel_dx: 0,
+            wheel_dy: 0,
+            modifiers: ModifierState::empty(),
+        }
+    }
+
+    #[test]
+    fn pointer_cell_maps_the_origin_pixel_to_the_origin_cell() {
+        assert_eq!(pointer_cell(&motion_at(Some((0, 0))), 80, 25), (0, 0));
+        // Anywhere inside the first cell still resolves to it.
+        let inside = Some((CELL_WIDTH as i32 - 1, CELL_HEIGHT as i32 - 1));
+        assert_eq!(pointer_cell(&motion_at(inside), 80, 25), (0, 0));
+    }
+
+    #[test]
+    fn pointer_cell_maps_the_first_pixel_of_each_cell_to_that_cell() {
+        let pos = Some((CELL_WIDTH as i32, CELL_HEIGHT as i32));
+        assert_eq!(pointer_cell(&motion_at(pos), 80, 25), (1, 1));
+        let pos = Some((3 * CELL_WIDTH as i32 + 5, 7 * CELL_HEIGHT as i32 + 5));
+        assert_eq!(pointer_cell(&motion_at(pos), 80, 25), (7, 3));
+    }
+
+    #[test]
+    fn pointer_cell_resolves_the_last_cell_of_the_grid() {
+        // Top-left pixel of the bottom-right cell of an 80×25 grid.
+        let pos = Some((79 * CELL_WIDTH as i32, 24 * CELL_HEIGHT as i32));
+        assert_eq!(pointer_cell(&motion_at(pos), 80, 25), (24, 79));
+    }
+
+    #[test]
+    fn pointer_cell_clamps_past_the_right_and_bottom_edges() {
+        // The surface is letterboxed inside its tile and the compositor
+        // clips against the output, not against term's cell grid, so a
+        // pointer can legitimately land past the last full cell.
+        let pos = Some((10_000, 10_000));
+        assert_eq!(pointer_cell(&motion_at(pos), 80, 25), (24, 79));
+        // One pixel past the last cell of each axis is already outside.
+        let pos = Some((80 * CELL_WIDTH as i32, 25 * CELL_HEIGHT as i32));
+        assert_eq!(pointer_cell(&motion_at(pos), 80, 25), (24, 79));
+    }
+
+    #[test]
+    fn pointer_cell_clamps_negative_coordinates_to_the_origin() {
+        // Surface-local coordinates are produced by a saturating subtract
+        // so they should never be negative, but a drag that leaves the
+        // surface must clamp rather than wrap through the `as u32` cast.
+        assert_eq!(pointer_cell(&motion_at(Some((-1, -1))), 80, 25), (0, 0));
+        assert_eq!(
+            pointer_cell(&motion_at(Some((i32::MIN, i32::MIN))), 80, 25),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn pointer_cell_treats_a_missing_position_as_the_origin_cell() {
+        assert_eq!(pointer_cell(&motion_at(None), 80, 25), (0, 0));
+    }
+
+    #[test]
+    fn pointer_cell_survives_a_degenerate_grid() {
+        // `saturating_sub` keeps a zero-sized grid from underflowing to
+        // 65535; a grid is never empty in practice, but a `SurfaceResized`
+        // race could ask.
+        assert_eq!(pointer_cell(&motion_at(Some((500, 500))), 0, 0), (0, 0));
+        assert_eq!(pointer_cell(&motion_at(Some((500, 500))), 1, 1), (0, 0));
+    }
+
+    #[test]
+    fn clipboard_cap_accepts_exactly_the_limit_and_rejects_one_more() {
+        let at_cap = "a".repeat(CLIPBOARD_MAX_BYTES);
+        assert!(clipboard_payload_fits(&at_cap));
+        let over_cap = "a".repeat(CLIPBOARD_MAX_BYTES + 1);
+        assert!(!clipboard_payload_fits(&over_cap));
+    }
+
+    #[test]
+    fn clipboard_cap_accepts_an_empty_offer() {
+        // An empty selection is a no-op at the call site, not a rejection.
+        assert!(clipboard_payload_fits(""));
+    }
+
+    #[test]
+    fn clipboard_cap_counts_bytes_not_characters() {
+        // 'é' is two UTF-8 bytes, so this string has half as many chars as
+        // bytes and straddles the cap: one char short fits, the char that
+        // crosses it does not.
+        let fits = "é".repeat(CLIPBOARD_MAX_BYTES / 2);
+        assert_eq!(fits.len(), CLIPBOARD_MAX_BYTES);
+        assert_eq!(fits.chars().count(), CLIPBOARD_MAX_BYTES / 2);
+        assert!(clipboard_payload_fits(&fits));
+
+        let over = "é".repeat(CLIPBOARD_MAX_BYTES / 2 + 1);
+        assert_eq!(over.len(), CLIPBOARD_MAX_BYTES + 2);
+        // Fewer characters than the cap, yet still rejected — the check is
+        // on the wire length the `SetClipboard` verb carries.
+        assert!(over.chars().count() < CLIPBOARD_MAX_BYTES);
+        assert!(!clipboard_payload_fits(&over));
+    }
 
     /// Default geometry must be the documented fixed grid.
     #[test]

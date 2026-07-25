@@ -404,10 +404,12 @@ impl DisplayClient {
     ///
     /// Over-long input is **rejected, not truncated** — silently copying
     /// half a selection would be worse than copying nothing, because the
-    /// user cannot see the cut.
+    /// user cannot see the cut. The cap predicate itself lives in the
+    /// ungated crate root as [`crate::clipboard_payload_fits`] so host
+    /// tests can exercise it; this module never compiles off-target.
     pub fn set_clipboard(&self, text: &str) -> bool {
         let bytes = text.as_bytes();
-        if bytes.len() > CLIPBOARD_MAX_BYTES {
+        if !crate::clipboard_payload_fits(text) {
             return false;
         }
         let msg = ClientMessage::SetClipboard {

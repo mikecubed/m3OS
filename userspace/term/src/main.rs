@@ -436,7 +436,9 @@ fn program_main(_args: &[&str]) -> i32 {
                         KeyOutcome::WroteBytes => screen.view_to_live(),
                         // Phase 112 Track B.3 — Ctrl+Shift+C.
                         KeyOutcome::Copy => {
-                            copy_selection(&screen, renderer.fb_mut());
+                            if !copy_selection(&screen, renderer.fb_mut()) {
+                                ring_bell(&mut bell_audio, &mut bell_unavail, clock.now_ms());
+                            }
                         }
                         // Phase 112 Track B.3 — Ctrl+Shift+V.
                         KeyOutcome::Paste => {
@@ -462,15 +464,36 @@ fn program_main(_args: &[&str]) -> i32 {
                     // *unless* Shift is held: that is the standard xterm
                     // override letting the user select out of a
                     // mouse-reporting program like vim or htop.
+                    //
+                    // A drag already in flight also stays with the
+                    // selection, whatever the app and the modifiers say.
+                    // `PointerEvent` carries only button *edges*, never a
+                    // held-button mask, so the latch below is the only
+                    // record that a drag is open — and the release edge is
+                    // the only thing that can clear it. Routing that edge
+                    // to the app instead (which is what happened when the
+                    // user let Shift go mid-drag) latched the terminal into
+                    // a permanent drag, after which every button-less
+                    // motion smeared the highlight around with the bare
+                    // cursor. Holding the pointer until the button comes up
+                    // is the xterm convention, but it is worth stating
+                    // plainly: a tracking app does not see the events
+                    // between press and release of a Shift-started drag.
                     let force_select = ev.modifiers.contains(MOD_SHIFT);
-                    if !mouse_reporter.tracking_enabled() || force_select {
-                        if handle_selection_pointer(
-                            &mut screen,
-                            &ev,
-                            renderer.fb_mut(),
-                            &mut selecting,
-                        ) {
-                            continue;
+                    if !mouse_reporter.tracking_enabled() || force_select || selecting {
+                        match handle_selection_pointer(&mut screen, &ev, &mut selecting) {
+                            SelectionOutcome::Consumed => continue,
+                            SelectionOutcome::Committed => {
+                                // Copy-on-release: a completed selection is
+                                // offered to the clipboard immediately, so
+                                // a paste in another client works without
+                                // an explicit copy keystroke.
+                                if !copy_selection(&screen, renderer.fb_mut()) {
+                                    ring_bell(&mut bell_audio, &mut bell_unavail, clock.now_ms());
+                                }
+                                continue;
+                            }
+                            SelectionOutcome::Passthrough => {}
                         }
                     }
                     match mouse_reporter.classify(
@@ -950,13 +973,32 @@ fn lookup_display_for_input() -> Option<u32> {
     Some(raw as u32)
 }
 
+/// What the selection state machine did with one pointer event.
+///
+/// Distinguishing "consumed" from "finished a drag" keeps the clipboard
+/// side effect at the call site, where the bell and the display handle
+/// already live, instead of threading them through this function.
+#[cfg(not(test))]
+enum SelectionOutcome {
+    /// Not a selection gesture — the caller passes the event on to
+    /// `MouseReporter` for VT reporting / viewport scrolling.
+    Passthrough,
+    /// Absorbed by the selection; the application must not also see it.
+    Consumed,
+    /// A drag just ended. The caller offers the result to the clipboard.
+    Committed,
+}
+
 /// Phase 112 Track B.1 — drive the mouse selection from one pointer
-/// event. Returns `true` when the event was consumed by selection (and so
-/// must not also be reported to the application).
+/// event.
 ///
 /// `selecting` tracks whether a drag is in flight, because the compositor
 /// delivers motion as button-less events: without it we could not tell
-/// "moving with the button down" from "moving with no button".
+/// "moving with the button down" from "moving with no button". It is a
+/// latch with exactly one clearing edge, so every arm that can plausibly
+/// end a drag clears it — a stuck latch turns every subsequent mouse
+/// movement into a selection drag with no button held, and the user has
+/// no way to escape it short of restarting the terminal.
 ///
 /// Wheel events are deliberately *not* consumed here — they fall through
 /// to the scrollback viewport (Track A.4).
@@ -964,9 +1006,8 @@ fn lookup_display_for_input() -> Option<u32> {
 fn handle_selection_pointer(
     screen: &mut Screen,
     ev: &kernel_core::input::events::PointerEvent,
-    display: &DisplayClient,
     selecting: &mut bool,
-) -> bool {
+) -> SelectionOutcome {
     // Alt held at press time makes the selection rectangular — the xterm
     // convention for block select.
     let mode = if ev.modifiers.contains(MOD_ALT) {
@@ -974,68 +1015,76 @@ fn handle_selection_pointer(
     } else {
         SelectionMode::Linear
     };
-    let (row, col) = pointer_cell(ev, screen.cols(), screen.rows());
+    let (row, col) = term::pointer_cell(ev, screen.cols(), screen.rows());
     match ev.button {
         PointerButton::Down(0) => {
             screen.selection_begin(row, col, mode);
             *selecting = true;
-            true
+            SelectionOutcome::Consumed
         }
-        PointerButton::Up(0) => {
+        // A secondary button pressed mid-drag ends the drag: the user has
+        // moved on to something else, and leaving the latch set would
+        // strand us in a phantom drag. The press itself still passes
+        // through, so a tracking application sees a matched press/release
+        // pair rather than an orphaned release.
+        PointerButton::Down(_) => {
             if *selecting {
                 screen.selection_commit();
                 *selecting = false;
-                // Copy-on-release: a completed selection is offered to the
-                // clipboard immediately, so Ctrl+Shift+V in another client
-                // works without an explicit copy keystroke.
-                copy_selection(screen, display);
-                return true;
             }
-            false
+            SelectionOutcome::Passthrough
+        }
+        // Any release ends the drag, not just button 0's. The compositor
+        // can drop events when a client's outbound queue overflows, so the
+        // release we get may not be the one that matches the press; if we
+        // waited for `Up(0)` specifically, a dropped or reordered edge
+        // would leave the latch set forever. `selection_commit` is safe to
+        // call when no drag is open.
+        PointerButton::Up(_) => {
+            if *selecting {
+                screen.selection_commit();
+                *selecting = false;
+                return SelectionOutcome::Committed;
+            }
+            SelectionOutcome::Passthrough
         }
         PointerButton::None if *selecting && ev.wheel_dy == 0 => {
             screen.selection_extend(row, col);
-            true
+            SelectionOutcome::Consumed
         }
-        _ => false,
+        _ => SelectionOutcome::Passthrough,
     }
-}
-
-/// Phase 112 Track B.1 — project a pointer event's pixel position onto a
-/// 0-based `(row, col)` display cell, clamped into the grid.
-///
-/// Mirrors `mouse::compute_cell_position`, but that one returns 1-based
-/// coordinates for the VT wire protocol while selection indexes cells from
-/// zero. `CELL_WIDTH`/`CELL_HEIGHT` come from the `display` module, the
-/// same constants the renderer lays glyphs out with, so the highlight
-/// lands under the pointer.
-#[cfg(not(test))]
-fn pointer_cell(ev: &kernel_core::input::events::PointerEvent, cols: u16, rows: u16) -> (u16, u16) {
-    let (px, py) = ev.abs_position.unwrap_or((0, 0));
-    let col = (px.max(0) as u32 / term::display::CELL_WIDTH as u32) as u16;
-    let row = (py.max(0) as u32 / term::display::CELL_HEIGHT as u32) as u16;
-    (
-        row.min(rows.saturating_sub(1)),
-        col.min(cols.saturating_sub(1)),
-    )
 }
 
 /// Phase 112 Track B.3 — offer the current selection to the compositor
 /// clipboard. A no-op when nothing is selected or the selection is blank,
 /// so an accidental click never clobbers a useful clipboard.
+///
+/// Returns `false` only when the compositor offer was *rejected* — an
+/// empty or absent selection reports success, because nothing was lost.
+///
+/// The diagnostic below goes to term's own stdout, which is the serial
+/// console, not the terminal window: writing it into the cell grid would
+/// overwrite whatever the application is displaying and be repainted away
+/// on its next refresh, and `term` has no status line to put it in. So
+/// the user-visible half of the failure report is the bell the caller
+/// rings — the standard terminal signal for "that did not work" — and the
+/// serial line carries the detail for whoever is reading the log.
 #[cfg(not(test))]
-fn copy_selection(screen: &Screen, display: &DisplayClient) {
+fn copy_selection(screen: &Screen, display: &DisplayClient) -> bool {
     let Some(text) = screen.selection_text() else {
-        return;
+        return true;
     };
     if text.is_empty() {
-        return;
+        return true;
     }
-    if !display.set_clipboard(&text) {
-        // The only expected failure is an over-long selection, which
-        // `set_clipboard` rejects rather than truncating.
-        syscall_lib::write_str(STDOUT_FILENO, "term: clipboard copy rejected\n");
+    if display.set_clipboard(&text) {
+        return true;
     }
+    // The only expected failure is an over-long selection, which
+    // `set_clipboard` rejects rather than truncating.
+    syscall_lib::write_str(STDOUT_FILENO, "term: clipboard copy rejected\n");
+    false
 }
 
 /// Phase 112 Track B.3 — fetch the clipboard and inject it into the PTY.
@@ -1045,6 +1094,14 @@ fn copy_selection(screen: &Screen, display: &DisplayClient) {
 /// `ESC[200~` / `ESC[201~` and a shell or editor can tell pasted bytes
 /// from typed ones — the whole point of the mode. Pasting also snaps the
 /// viewport to the live tail, since the user is about to produce input.
+///
+/// The write must complete, which is why it is the one PTY write in this
+/// binary that retries. The primary fd is non-blocking and the payload
+/// runs to `CLIPBOARD_MAX_BYTES`, several times the PTY input ring, so a
+/// single `write` is routinely short — and a short write that stops
+/// inside the frame drops the closing `ESC[201~`, leaving the application
+/// stuck in bracketed-paste mode and treating everything the user
+/// subsequently types as pasted text.
 #[cfg(not(test))]
 fn paste_clipboard(screen: &mut Screen, display: &DisplayClient, primary_fd: i32) {
     let Some(bytes) = display.get_clipboard() else {
@@ -1055,7 +1112,66 @@ fn paste_clipboard(screen: &mut Screen, display: &DisplayClient, primary_fd: i32
     }
     screen.view_to_live();
     let framed = term::input::wrap_paste(&bytes, screen.bracketed_paste_enabled());
-    let _ = syscall_lib::write(primary_fd, &framed);
+    if !write_all_bounded(primary_fd, &framed) {
+        syscall_lib::write_str(STDOUT_FILENO, "term: paste truncated\n");
+    }
+}
+
+/// `-EAGAIN` as the non-blocking PTY primary reports it: the slave's
+/// input ring is full because the application has not read from it yet.
+#[cfg(not(test))]
+const EAGAIN: isize = -11;
+
+/// Consecutive no-progress writes [`write_all_bounded`] tolerates before
+/// giving up, and the pause between them — together ≈ 1 s, the same order
+/// of budget `sshd`'s PTY relay allows itself. An application that has
+/// stopped reading its stdin keeps the ring full indefinitely, so this
+/// loop must never be allowed to run forever: term is single-threaded and
+/// spinning here would freeze rendering, key input, and the shell-exit
+/// poll along with it.
+#[cfg(not(test))]
+const WRITE_STALL_ATTEMPTS: u32 = 40;
+
+#[cfg(not(test))]
+const WRITE_STALL_SLEEP_NS: u32 = 25_000_000;
+
+/// Write all of `bytes` to a **non-blocking** fd, retrying a bounded
+/// number of times while the far end refuses to drain.
+///
+/// Returns `false` when the stall budget ran out or the write failed
+/// hard; in that case some unknown prefix of `bytes` was delivered and
+/// the caller should report the truncation rather than pretend it wrote.
+///
+/// Progress resets the stall counter, which does not make the loop
+/// unbounded: every progressing iteration consumes at least one byte of a
+/// finite payload, so the iteration count is capped at
+/// `bytes.len() + WRITE_STALL_ATTEMPTS`.
+#[cfg(not(test))]
+fn write_all_bounded(fd: i32, bytes: &[u8]) -> bool {
+    let mut written = 0usize;
+    let mut stalls = 0u32;
+    while written < bytes.len() {
+        let n = syscall_lib::write(fd, &bytes[written..]);
+        if n > 0 {
+            // `min` guards the slice index against a kernel that claims to
+            // have written more than it was handed.
+            written = written.saturating_add(n as usize).min(bytes.len());
+            stalls = 0;
+            continue;
+        }
+        // A hard error (the shell exited, the PTY hung up) will not clear
+        // by waiting, so fail immediately instead of spending the whole
+        // budget on it. Only EAGAIN and a zero-byte write are backpressure.
+        if n < 0 && n != EAGAIN {
+            return false;
+        }
+        stalls += 1;
+        if stalls >= WRITE_STALL_ATTEMPTS {
+            return false;
+        }
+        let _ = syscall_lib::nanosleep_for(0, WRITE_STALL_SLEEP_NS);
+    }
+    true
 }
 
 /// Phase 69 Track E — translate a DEC private mode code into a

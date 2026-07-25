@@ -19,8 +19,8 @@
 use crate::screen::ViewCmd;
 use kernel_core::input::events::{KeyEvent, KeyEventKind, MOD_CTRL, MOD_SHIFT, ModifierState};
 use kernel_core::input::keymap::{
-    KEYSYM_DOWN, KEYSYM_END, KEYSYM_HOME, KEYSYM_LEFT, KEYSYM_PAGEDOWN, KEYSYM_PAGEUP,
-    KEYSYM_RIGHT, KEYSYM_UP,
+    KEYSYM_DELETE, KEYSYM_DOWN, KEYSYM_END, KEYSYM_HOME, KEYSYM_LEFT, KEYSYM_PAGEDOWN,
+    KEYSYM_PAGEUP, KEYSYM_RIGHT, KEYSYM_UP,
 };
 
 /// Phase 112 Track A.3 — what one translated key did.
@@ -170,13 +170,15 @@ impl InputHandler {
 /// the Shift-modified navigation cluster — to a scrollback viewport
 /// command handled inside `term`.
 ///
-/// Phase 112 Track A.3 filled in the PageUp/PageDown/Home/End rows. Before
-/// this phase `term` mapped the four arrows only, so plain PageUp/Home/End
-/// produced **nothing at all** and paging inside `less`/`htop` was broken.
+/// Phase 112 Track A.3 filled in the PageUp/PageDown/Home/End rows, and the
+/// Delete row after them. Before this phase `term` mapped the four arrows
+/// only, so plain PageUp/Home/End/Delete produced **nothing at all** — paging
+/// inside `less`/`htop` was broken and the Delete key was inert even though
+/// the keymap has produced `KEYSYM_DELETE` from scancode 0x53 all along.
 /// The unshifted sequences below are the same ones
 /// `kernel_core::input::hid_poll::key_event_to_stdin` emits for the USB
-/// HID path; the `hid_poll_*` tests below pin them together so the two
-/// tables cannot drift.
+/// HID path; `unshifted_sequences_match_hid_poll_table` below sweeps the
+/// whole private-use keysym range to pin them together.
 ///
 /// Shift is the xterm convention for "talk to the terminal, not the
 /// application", which is why the viewport binds live there and the
@@ -215,6 +217,13 @@ fn special_key_sequence(symbol: u32, modifiers: ModifierState) -> Option<Special
         } else {
             SpecialKey::Bytes(b"\x1b[F")
         })
+    } else if symbol == KEYSYM_DELETE.0 {
+        // Delete is unconditional: unlike PageUp/PageDown/Home/End it has no
+        // Shift-modified meaning for the viewport, and Shift+Delete belongs to
+        // the application (it is "cut" in many editors), so both cases go to
+        // the PTY. Insert (`KEYSYM_INSERT`) is deliberately absent here — it
+        // has no VT sequence in the authoritative `hid_poll` table either.
+        Some(SpecialKey::Bytes(b"\x1b[3~"))
     } else {
         None
     }
@@ -275,8 +284,8 @@ mod tests {
     use alloc::vec::Vec;
     use kernel_core::input::events::{MOD_CTRL, MOD_SHIFT, ModifierState};
     use kernel_core::input::keymap::{
-        KEYSYM_DOWN, KEYSYM_END, KEYSYM_HOME, KEYSYM_LEFT, KEYSYM_PAGEDOWN, KEYSYM_PAGEUP,
-        KEYSYM_RIGHT, KEYSYM_UP,
+        KEYSYM_DELETE, KEYSYM_DOWN, KEYSYM_END, KEYSYM_HOME, KEYSYM_INSERT, KEYSYM_LEFT,
+        KEYSYM_PAGEDOWN, KEYSYM_PAGEUP, KEYSYM_RIGHT, KEYSYM_UP,
     };
 
     struct FakeWriter {
@@ -512,27 +521,106 @@ mod tests {
 
     /// A.3 acceptance: `term`'s unshifted navigation table must stay
     /// byte-identical to the authoritative one in
-    /// `kernel_core::input::hid_poll`, which the USB HID path uses. Two
-    /// copies of a VT table is exactly the kind of thing that silently
-    /// drifts, so pin them together.
+    /// `kernel_core::input::hid_poll`, which the USB HID path uses. The tree
+    /// carries **three** copies of this VT table — this one, `hid_poll`'s, and
+    /// the raw-scancode one in `userspace/stdin_feeder/src/main.rs` — which is
+    /// exactly the kind of thing that silently drifts. (`stdin_feeder` keys off
+    /// PS/2 scancodes rather than keysyms, so it cannot be pinned from here;
+    /// the two keysym tables can.)
+    ///
+    /// The sweep is over the whole private-use keysym block rather than a
+    /// hand-written list of the keys we happen to support: a list has to be
+    /// extended by hand whenever either table grows, which is how the Delete
+    /// row (`KEYSYM_DELETE` → `ESC [ 3 ~`) sat in `hid_poll` while `term`
+    /// silently dropped the key. Sweeping the range means any future keysym
+    /// either table starts handling is compared automatically, in both
+    /// directions.
     #[test]
     fn unshifted_sequences_match_hid_poll_table() {
-        for symbol in [
-            KEYSYM_UP.0,
-            KEYSYM_DOWN.0,
-            KEYSYM_LEFT.0,
-            KEYSYM_RIGHT.0,
-            KEYSYM_PAGEUP.0,
-            KEYSYM_PAGEDOWN.0,
-            KEYSYM_HOME.0,
-            KEYSYM_END.0,
-        ] {
+        // `keymap` allocates its non-printable keysyms as `0xE000 + n` with
+        // `n` currently topping out at 0x4B (F12), so this covers every
+        // defined special key with room to spare. Everything in the block is
+        // above 0x7F, so `term`'s ASCII passthrough can never fire here.
+        for symbol in 0xE000u32..=0xE0FFu32 {
+            // Insert is the one key both tables deliberately drop: it has no
+            // useful VT100 output, as `hid_poll`'s table comment records. Skip
+            // it explicitly so the omission stays a decision rather than
+            // becoming an accident of whatever the two tables happen to do.
+            if symbol == KEYSYM_INSERT.0 {
+                continue;
+            }
+
             let mut expected = Vec::new();
             kernel_core::input::hid_poll::key_event_to_stdin(symbol, 0, 0, |b| expected.push(b));
             let (outcome, got) = run_key(symbol, 0);
-            assert_eq!(outcome, KeyOutcome::WroteBytes, "symbol {symbol:#x}");
             assert_eq!(got, expected, "term vs hid_poll drift at {symbol:#x}");
+            let want_outcome = if expected.is_empty() {
+                KeyOutcome::None
+            } else {
+                KeyOutcome::WroteBytes
+            };
+            assert_eq!(outcome, want_outcome, "symbol {symbol:#x}");
         }
+    }
+
+    /// The sweep above only proves the two tables agree; assert the nine keys
+    /// they agree *on* are actually the nine we expect, so a regression that
+    /// blanked both tables at once would still be caught.
+    #[test]
+    fn unshifted_special_keys_are_the_expected_nine() {
+        let expected: &[(u32, &[u8])] = &[
+            (KEYSYM_UP.0, b"\x1b[A"),
+            (KEYSYM_DOWN.0, b"\x1b[B"),
+            (KEYSYM_RIGHT.0, b"\x1b[C"),
+            (KEYSYM_LEFT.0, b"\x1b[D"),
+            (KEYSYM_HOME.0, b"\x1b[H"),
+            (KEYSYM_END.0, b"\x1b[F"),
+            (KEYSYM_DELETE.0, b"\x1b[3~"),
+            (KEYSYM_PAGEUP.0, b"\x1b[5~"),
+            (KEYSYM_PAGEDOWN.0, b"\x1b[6~"),
+        ];
+        for (symbol, want) in expected {
+            let (outcome, got) = run_key(*symbol, 0);
+            assert_eq!(outcome, KeyOutcome::WroteBytes, "symbol {symbol:#x}");
+            assert_eq!(&got[..], *want, "symbol {symbol:#x}");
+        }
+        let emitting = (0xE000u32..=0xE0FFu32)
+            .filter(|s| run_key(*s, 0).0 == KeyOutcome::WroteBytes)
+            .count();
+        assert_eq!(emitting, expected.len(), "unexpected extra special key");
+    }
+
+    /// The Delete key produces `ESC [ 3 ~` (terminfo `kdch1`). The keymap has
+    /// mapped scancode 0x53 to `KEYSYM_DELETE` since Phase 56, but `term` had
+    /// no arm for it, so the key was inert: not 0x08, not a Ctrl chord, and
+    /// too high for the `symbol <= 0x7F` passthrough. Shift+Delete belongs to
+    /// the application, so the sequence is emitted regardless of modifiers.
+    #[test]
+    fn delete_writes_csi_3_tilde() {
+        let (outcome, bytes) = run_key(KEYSYM_DELETE.0, 0);
+        assert_eq!(outcome, KeyOutcome::WroteBytes);
+        assert_eq!(bytes, b"\x1b[3~");
+
+        let (outcome, bytes) = run_key(KEYSYM_DELETE.0, MOD_SHIFT);
+        assert_eq!(
+            outcome,
+            KeyOutcome::WroteBytes,
+            "Shift+Delete is not a bind"
+        );
+        assert_eq!(bytes, b"\x1b[3~");
+    }
+
+    /// Insert stays silent in `term`, matching `hid_poll`. Pinned so the
+    /// asymmetry with Delete is visible rather than looking like an oversight.
+    #[test]
+    fn insert_writes_nothing() {
+        let (outcome, bytes) = run_key(KEYSYM_INSERT.0, 0);
+        assert_eq!(outcome, KeyOutcome::None);
+        assert!(bytes.is_empty());
+
+        let mut hid = Vec::new();
+        kernel_core::input::hid_poll::key_event_to_stdin(KEYSYM_INSERT.0, 0, 0, |b| hid.push(b));
+        assert!(hid.is_empty(), "hid_poll also emits nothing for Insert");
     }
 
     /// A.3 acceptance: Shift + the navigation cluster is consumed locally

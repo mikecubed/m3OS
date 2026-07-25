@@ -606,6 +606,9 @@ impl Screen {
         if matches!(self.active, ScreenSelect::Alt) {
             return;
         }
+        // The whole grid is about to be swapped out from under any
+        // selection made on the primary screen.
+        self.invalidate_selection();
         self.saved_cursor = SavedCursor {
             row: self.cursor_row,
             col: self.cursor_col,
@@ -640,6 +643,9 @@ impl Screen {
         if matches!(self.active, ScreenSelect::Primary) {
             return;
         }
+        // Same reasoning as `switch_to_alt`: the grid behind the display
+        // coordinates is replaced wholesale.
+        self.invalidate_selection();
         self.active = ScreenSelect::Primary;
         self.fg = self.saved_cursor.fg;
         self.bg = self.saved_cursor.bg;
@@ -687,6 +693,13 @@ impl Screen {
         // tail; the full re-emit below then paints a consistent frame.
         self.view_offset = 0;
         self.view_dirty = false;
+        // Every cell moves to a new `(row, col)` when the row stride changes,
+        // and cells outside the new geometry vanish outright, so no selection
+        // survives a resize. This must stay *below* the `view_dirty = false`
+        // above: that assignment deliberately drops the pending repaint (the
+        // full re-emit at the end of this function supersedes it), and a hook
+        // placed above it would have its repaint request silently discarded.
+        self.invalidate_selection();
         let total = cols as usize * rows as usize;
         let mut new_buf = alloc::vec![Cell::blank(self.fg, self.bg); total];
         let mut new_alt = alloc::vec![Cell::blank(self.fg, self.bg); total];
@@ -813,6 +826,11 @@ impl Screen {
         if clamped != self.view_offset {
             self.view_offset = clamped;
             self.view_dirty = true;
+            // Display row `r` now resolves to a different grid row, so a
+            // selection anchored to it no longer covers the text it was
+            // drawn over. Inside the "value changed" arm so a no-op set
+            // (wheel-up at the top of history) leaves the selection alone.
+            self.invalidate_selection();
         }
     }
 
@@ -932,6 +950,30 @@ impl Screen {
             self.selection = None;
             self.view_dirty = true;
         }
+    }
+
+    /// Drop any selection because the grid underneath it just changed.
+    ///
+    /// A [`Selection`] is a pair of **display** coordinates; it holds no
+    /// reference to the cells it was drawn over, and both consumers
+    /// ([`Screen::compose_view`] for the highlight, [`Screen::selection_text`]
+    /// for the clipboard) re-resolve those coordinates through
+    /// [`Screen::display_cell`] every time they run. So the instant the cells
+    /// move (a scroll), get overwritten (a print or an erase), or are
+    /// re-addressed (a resize, an alt-screen switch, a viewport move), the
+    /// stored coordinates designate *different text* than the user picked.
+    /// The visible symptom is an inverted band riding up onto unrelated rows;
+    /// the silent one is worse — a later copy serializes whatever now lives at
+    /// those coordinates and replaces the clipboard with text nobody selected.
+    ///
+    /// Reflowing a selection with the grid would need per-cell provenance the
+    /// buffer does not carry, so the honest answer is to drop it, which is
+    /// also what xterm does on output. Cost is bounded: `selection_clear`
+    /// returns without touching `view_dirty` when nothing is selected, so a
+    /// hook on the per-character path costs one `Option` test per character
+    /// and at most one extra full repaint per selection lifetime.
+    fn invalidate_selection(&mut self) {
+        self.selection_clear();
     }
 
     /// Phase 112 Track B.3 — serialize the selected cells to text.
@@ -1328,6 +1370,11 @@ impl Screen {
     }
 
     fn put_char(&mut self, codepoint: u32, out: &mut Vec<RenderCommand>) {
+        // Printing overwrites a cell that may lie under the selection, and
+        // may scroll the grid on wrap. Cheap because `selection_clear`
+        // returns early when nothing is selected, which is the state the
+        // per-character path is in for all but one character per selection.
+        self.invalidate_selection();
         // Phase 69b Track F — wide-glyph accounting. A double-width
         // codepoint occupies `(row, col)` *and* `(row, col + 1)`. If
         // only one column remains on the current row, wrap to the next
@@ -1481,6 +1528,11 @@ impl Screen {
         if primary {
             self.view_to_live();
         }
+        // Rows inside the region slide up by `n`, so a selection over them
+        // would now cover different text. Not covered by the `view_to_live`
+        // above: that only clears when the viewport was actually scrolled
+        // back, and the common case is `view_offset == 0`.
+        self.invalidate_selection();
         // Evict only when the region is the full primary surface — the
         // alternate screen and partial regions do not feed scrollback
         // per xterm.
@@ -1541,6 +1593,9 @@ impl Screen {
         let cols = self.cols as usize;
         let fg = self.fg;
         let bg = self.bg;
+        // Rows inside the region slide down by `n`; a selection over them
+        // would ride onto text it was not drawn over.
+        self.invalidate_selection();
         let active = self.active_buf_mut();
         // Shift rows down within the region: row `r` <- row `r - n`,
         // iterating from the bottom up so we don't clobber sources.
@@ -1672,6 +1727,9 @@ impl Screen {
         let start = self.cursor_col as usize;
         let fg = self.fg;
         let bg = self.bg;
+        // ICH rewrites the row through `active_buf_mut` directly rather than
+        // through `blank_cell`, so it needs its own invalidation hook.
+        self.invalidate_selection();
         let buf = self.active_buf_mut();
         // Shift right: iterate from end so we don't clobber sources.
         for c in (start + n as usize..cols).rev() {
@@ -1695,6 +1753,9 @@ impl Screen {
         let start = self.cursor_col as usize;
         let fg = self.fg;
         let bg = self.bg;
+        // As in `insert_chars` — DCH bypasses `blank_cell` and shifts the row
+        // in place, so the selection has to be dropped here too.
+        self.invalidate_selection();
         let buf = self.active_buf_mut();
         for c in start..cols - n as usize {
             buf[row * cols + c] = buf[row * cols + c + n as usize];
@@ -1788,6 +1849,10 @@ impl Screen {
         if row >= self.rows || col >= self.cols {
             return;
         }
+        // The shared erase primitive behind ED 0/1/2, EL 0/1/2, ECH and
+        // backspace: one hook here covers all of them. Below the bounds
+        // check so an out-of-grid no-op cannot drop a valid selection.
+        self.invalidate_selection();
         let idx = row as usize * self.cols as usize + col as usize;
         let fg = self.fg;
         let bg = self.bg;
@@ -1802,6 +1867,8 @@ impl Screen {
     }
 
     fn clear_buffer(&mut self) {
+        // Every cell the selection could point at is about to be blanked.
+        self.invalidate_selection();
         let fg = self.fg;
         let bg = self.bg;
         for cell in self.active_buf_mut().iter_mut() {
@@ -3358,6 +3425,201 @@ mod tests {
             text.len() > CLIPBOARD_MAX_BYTES,
             "fixture must exceed the cap: {} vs {CLIPBOARD_MAX_BYTES}",
             text.len()
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Selection invalidation — a display-anchored selection cannot
+    // survive a mutation of the grid it points at.
+    // -----------------------------------------------------------------
+
+    /// Select rows 0..=1, then commit the selection and read it back, so the
+    /// helper below always starts from a known-good "user has text selected"
+    /// state.
+    fn select_first_two_rows(s: &mut Screen) {
+        s.selection_begin(0, 0, SelectionMode::Linear);
+        s.selection_extend(1, s.cols() - 1);
+        s.selection_commit();
+        assert!(
+            s.selection_text().is_some(),
+            "fixture precondition: something is selected"
+        );
+    }
+
+    /// Clipboard-corruption regression: after selecting text and then letting
+    /// output scroll the primary region, the *same* display coordinates name
+    /// different rows. Without invalidation a subsequent copy silently
+    /// serializes that unrelated text into the clipboard, so this asserts the
+    /// stale string specifically — not just "something changed".
+    #[test]
+    fn output_scroll_invalidates_selection_instead_of_copying_stale_text() {
+        let mut s = Screen::with_geometry(8, 4);
+        fill_lines(&mut s, 3); // rows: L0 L1 L2 <blank>
+        s.selection_begin(0, 0, SelectionMode::Linear);
+        s.selection_extend(1, 7);
+        s.selection_commit();
+        assert_eq!(
+            s.selection_text().as_deref(),
+            Some("L0\nL1"),
+            "fixture precondition: the user picked L0/L1"
+        );
+
+        // Two more lines push L0/L1 off the top of the live grid.
+        fill_lines(&mut s, 2);
+
+        assert_eq!(
+            s.selection_text(),
+            None,
+            "the selection must be dropped, not silently re-pointed at the \
+             rows that scrolled into (0,0)..(1,7)"
+        );
+        assert!(
+            s.selection().is_none(),
+            "and no highlight survives to be painted over unrelated rows"
+        );
+    }
+
+    /// Moving the viewport re-points every display row at a different grid
+    /// row, so the selection goes with it. Covers both viewport entry points.
+    #[test]
+    fn viewport_move_invalidates_selection() {
+        let mut s = Screen::with_geometry(8, 4);
+        fill_lines(&mut s, 10);
+        select_first_two_rows(&mut s);
+        s.scroll_view_by(2);
+        assert!(s.selection().is_none(), "wheel/page scroll clears");
+
+        select_first_two_rows(&mut s);
+        s.apply_view_cmd(ViewCmd::Live);
+        assert!(s.selection().is_none(), "Shift+End clears");
+    }
+
+    /// A `set_view_offset` that clamps to the value already in effect is not
+    /// a grid change (wheel-up at the top of history, wheel-down at the live
+    /// tail), so it must leave the selection alone.
+    #[test]
+    fn noop_view_offset_keeps_selection() {
+        let mut s = Screen::with_geometry(8, 4);
+        fill_lines(&mut s, 10);
+        s.set_view_offset(2);
+        select_first_two_rows(&mut s);
+
+        s.set_view_offset(2);
+        assert!(s.selection().is_some(), "same offset is not a change");
+
+        // An offset past the oldest retained line clamps to the top of
+        // history. The first such call really does move the view (and so
+        // clears); a second one is a no-op and must not.
+        s.set_view_offset(usize::MAX);
+        assert!(s.selection().is_none(), "the jump to the top did move");
+        select_first_two_rows(&mut s);
+        s.set_view_offset(usize::MAX);
+        assert!(
+            s.selection().is_some(),
+            "a clamped repeat at the top of history is not a change"
+        );
+    }
+
+    /// A resize both re-strides the buffer and drops out-of-range cells, so
+    /// the selection cannot be carried across. `resize` clears `view_dirty`
+    /// partway through (its own full re-emit supersedes the pending repaint),
+    /// so this also pins that the invalidation happens *after* that reset and
+    /// its repaint request is not swallowed.
+    #[test]
+    fn resize_invalidates_selection_and_leaves_view_dirty() {
+        let mut s = Screen::with_geometry(8, 4);
+        fill_lines(&mut s, 3);
+        select_first_two_rows(&mut s);
+        let _ = s.take_view_dirty();
+
+        let mut out = Vec::new();
+        s.resize(12, 6, &mut out);
+
+        assert!(s.selection().is_none(), "resize clears the selection");
+        assert!(
+            s.take_view_dirty(),
+            "the invalidation must run below resize's `view_dirty = false`"
+        );
+    }
+
+    /// Entering the alternate screen swaps the whole grid out from under the
+    /// display coordinates.
+    #[test]
+    fn alt_screen_switch_invalidates_selection() {
+        let mut s = Screen::with_geometry(8, 4);
+        fill_lines(&mut s, 3);
+        select_first_two_rows(&mut s);
+
+        let mut out = Vec::new();
+        s.switch_to_alt(&mut out);
+        assert!(s.selection().is_none());
+    }
+
+    /// One printable character overwrites a cell, which is enough to make the
+    /// selection stale — output does not have to scroll for the copy to lie.
+    #[test]
+    fn single_printable_char_invalidates_selection() {
+        let mut s = Screen::with_geometry(8, 4);
+        fill_lines(&mut s, 3);
+        select_first_two_rows(&mut s);
+
+        let mut out = Vec::new();
+        s.feed(b'x', &mut out);
+        assert!(s.selection().is_none());
+    }
+
+    /// Erase sequences reach the grid through `blank_cell` rather than
+    /// `put_char`, so they need the hook on that shared primitive.
+    #[test]
+    fn erase_sequences_invalidate_selection() {
+        // EL 2 — erase the cursor's line.
+        let mut s = Screen::with_geometry(8, 4);
+        fill_lines(&mut s, 3);
+        select_first_two_rows(&mut s);
+        let _ = feed_str(&mut s, "\x1b[2K");
+        assert!(s.selection().is_none(), "EL clears");
+
+        // ED 2 — erase the whole display.
+        let mut s = Screen::with_geometry(8, 4);
+        fill_lines(&mut s, 3);
+        select_first_two_rows(&mut s);
+        let _ = feed_str(&mut s, "\x1b[2J");
+        assert!(s.selection().is_none(), "ED clears");
+    }
+
+    /// ICH / DCH mutate the row through `active_buf_mut` directly, bypassing
+    /// `blank_cell`, so they carry their own hooks.
+    #[test]
+    fn insert_and_delete_chars_invalidate_selection() {
+        let mut s = Screen::with_geometry(8, 4);
+        fill_lines(&mut s, 3);
+        select_first_two_rows(&mut s);
+        let _ = feed_str(&mut s, "\x1b[3@"); // ICH
+        assert!(s.selection().is_none(), "ICH clears");
+
+        let mut s = Screen::with_geometry(8, 4);
+        fill_lines(&mut s, 3);
+        select_first_two_rows(&mut s);
+        let _ = feed_str(&mut s, "\x1b[3P"); // DCH
+        assert!(s.selection().is_none(), "DCH clears");
+    }
+
+    /// Cost guard: the invalidation hooks sit on the per-character path, so
+    /// they must ride on `selection_clear`'s "nothing selected" early-out.
+    /// If a hook ever raises `view_dirty` unconditionally, the main loop
+    /// re-runs `compose_view` — a full `rows * cols` PutGlyph frame — for
+    /// every single byte of output. This pins that it does not.
+    #[test]
+    fn output_without_a_selection_does_not_dirty_the_view() {
+        let mut s = Screen::with_geometry(8, 4);
+        fill_lines(&mut s, 3);
+        let _ = s.take_view_dirty();
+        assert!(s.selection().is_none(), "fixture: nothing selected");
+
+        let _ = feed_str(&mut s, "hello\r\nworld\x1b[2K\x1b[3@\x1b[3P");
+        assert!(
+            !s.take_view_dirty(),
+            "output with no selection must not force a full-frame repaint"
         );
     }
 
