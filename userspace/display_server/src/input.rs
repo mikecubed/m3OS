@@ -605,12 +605,20 @@ impl InputWiring {
                         current_pointer.1.saturating_add(ev.dy),
                     ),
                 };
-                // Stamp the compositor-maintained absolute position
-                // back into the event so any client that receives it
-                // via the Outbound branch (when a surface is under the
-                // cursor) sees the same coordinates the dispatcher
-                // hit-tested against.
+                // Stamp the compositor-maintained absolute position back
+                // into the event so the dispatcher hit-tests against the
+                // same coordinates the cursor is drawn at. This value is
+                // output-local; the Outbound branch below rebases it to
+                // surface-local before handing the event to a client.
                 ev.abs_position = Some(abs);
+                // The compositor is the only process that sees both the
+                // keyboard and the pointer stream, so it is the only one
+                // that can tell a client whether a click was a plain
+                // click or a Shift/Ctrl/Alt chord. Every pointer producer
+                // (`mouse_server`, `usb-hid`) hardcodes empty modifiers
+                // because none of them read the keyboard; stamp the
+                // dispatcher's live snapshot over that placeholder.
+                ev.modifiers = dispatcher.modifiers();
                 current_pointer = abs;
                 let mut state = CompositorState {
                     focused,
@@ -634,6 +642,33 @@ impl InputWiring {
                     });
                 }
                 if let Some(target_id) = decision.deliver_to {
+                    // Clients think in their own surface's coordinate
+                    // space: `term` divides by its cell size to find the
+                    // clicked glyph, `m3ui` compares against widget rects
+                    // laid out from (0,0). Rebase the screen-absolute
+                    // position onto the hit surface's origin so a window
+                    // that is not at the top-left corner of the output
+                    // (i.e. every window — the bar's exclusive zone alone
+                    // pushes tiles down 48 px) hit-tests correctly.
+                    //
+                    // The origin is the surface's *geometry* rect, which
+                    // for a Toplevel is its tile. `surface_screen_rect`
+                    // letterbox-centres a client's pixels inside that
+                    // tile when the buffer is smaller than the tile, so
+                    // between a `SurfaceResized` and the client's realloc
+                    // the transform is off by the centring delta. In
+                    // steady state the client has resized to the tile and
+                    // the delta is zero. Layer surfaces carry their paint
+                    // rect as their geometry, so they are always exact.
+                    //
+                    // `current_pointer` / `InputEffect::CursorMoved` stay
+                    // screen-absolute — they drive the cursor blit and
+                    // the next pass's hit-test, both of which work in
+                    // output coordinates.
+                    if let Some((ox, oy)) = decision.deliver_origin {
+                        ev.abs_position =
+                            Some((abs.0.saturating_sub(ox), abs.1.saturating_sub(oy)));
+                    }
                     effects.push(InputEffect::Outbound(target_id, ServerMessage::Pointer(ev)));
                 }
                 if let Some(target) = decision.focus_change {

@@ -1457,15 +1457,19 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         for effect in effects {
             match effect {
                 InputEffect::Outbound(target, msg) => {
-                    // E.3 seam: extract the pointer's `abs_position`
-                    // from any `Pointer` message the dispatcher
-                    // emitted, and forward it to the next compose
-                    // call's cursor blit.
-                    if let kernel_core::display::protocol::ServerMessage::Pointer(ev) = msg
-                        && let Some(abs) = ev.abs_position
-                    {
-                        pointer_position = abs;
-                    }
+                    // NB: the compositor must never read its own cursor
+                    // position back out of a client-bound `Pointer`
+                    // message. That message carries *surface-local*
+                    // coordinates (rebased onto the hit surface's origin
+                    // by the input wiring), while `pointer_position`
+                    // feeds the cursor blit and the next pass's hit-test,
+                    // which both work in output coordinates — taking it
+                    // back would drag the cursor toward the top-left by
+                    // the surface origin on every event. The authoritative
+                    // update is `InputEffect::CursorMoved` below, which
+                    // is emitted unconditionally, including when the
+                    // pointer is over no surface at all.
+                    //
                     // Phase 56 C.5 close-out — push the dispatcher's
                     // `Outbound` message onto the per-client queue.
                     // The client drains it via `LABEL_CLIENT_EVENT_PULL`

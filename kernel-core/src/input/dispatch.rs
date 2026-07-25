@@ -32,6 +32,19 @@
 //!     a focus change to that surface, *unless* an
 //!     [`crate::display::protocol::KeyboardInteractivity::Exclusive`]
 //!     layer is active.
+//!   * The hit surface's rect origin travels with the decision
+//!     (`deliver_origin`) so the caller can subtract it from the
+//!     output-local pointer position and hand the client
+//!     surface-local coordinates.
+//!
+//! ## Modifier snapshot
+//!
+//! Pointer producers (`mouse_server`, `usb-hid`) see only the mouse;
+//! they cannot fill in [`crate::input::events::PointerEvent::modifiers`]
+//! because they never observe the keyboard. The dispatcher is the one
+//! place both streams meet, so it snapshots the modifier bitmask off
+//! every key edge ([`InputDispatcher::modifiers`]) for the caller to
+//! stamp onto outgoing pointer events.
 //!
 //! ## Resource discipline
 //!
@@ -54,7 +67,21 @@
 
 use crate::display::protocol::{LayerConfig, Rect, SurfaceId, SurfaceRole};
 use crate::input::bind_table::{BindId, BindTable, GrabState};
-use crate::input::events::{KeyEvent, KeyEventKind, PointerButton, PointerEvent};
+use crate::input::events::{
+    KeyEvent, KeyEventKind, MOD_ALT, MOD_CTRL, MOD_SHIFT, MOD_SUPER, ModifierState, PointerButton,
+    PointerEvent,
+};
+
+/// Modifier bits that describe a *chord* — a key or button pressed
+/// while these are physically held.
+///
+/// Deliberately excludes [`crate::input::events::MOD_CAPS`] /
+/// [`crate::input::events::MOD_NUM`]:
+/// [`crate::input::keymap::ModifierTracker::state`] ORs the held bits
+/// with the lock latches, so an unmasked snapshot would report "Caps
+/// Lock is on" as if it were a held modifier and turn every click into
+/// a modified click for as long as the lock stays latched.
+const CHORD_MODIFIERS: u16 = MOD_SHIFT | MOD_CTRL | MOD_ALT | MOD_SUPER;
 
 /// Per-decision routing outcome produced by
 /// [`InputDispatcher::route_key_event`].
@@ -153,6 +180,15 @@ pub struct PointerRouteDecision {
     /// Surface to deliver the event to; `None` means "suppress" (the
     /// cursor is over no surface).
     pub deliver_to: Option<SurfaceId>,
+    /// Top-left corner of `deliver_to`'s rect, in output-local
+    /// coordinates. `Some` exactly when `deliver_to` is `Some`.
+    ///
+    /// Clients expect pointer coordinates relative to their own
+    /// surface, so the caller sends `pointer_position - deliver_origin`.
+    /// The origin is reported rather than the already-subtracted
+    /// coordinates because the dispatcher does not own the pointer
+    /// position it hit-tested against.
+    pub deliver_origin: Option<(i32, i32)>,
     /// If `Some`, the dispatcher requests a focus change to this
     /// surface. Only emitted on `PointerButton::Down` on a `Toplevel`
     /// when no `Exclusive` layer is active.
@@ -166,6 +202,7 @@ impl PointerRouteDecision {
         Self {
             enter_leave: EnterLeaveBuf::new(),
             deliver_to: None,
+            deliver_origin: None,
             focus_change: None,
         }
     }
@@ -275,13 +312,20 @@ pub struct InputDispatcher {
     /// matching leave yet). `None` means the pointer is not over any
     /// surface or the dispatcher has not yet seen a pointer event.
     hovered: Option<SurfaceId>,
+    /// Modifier bitmask carried by the most recent key event, masked to
+    /// [`CHORD_MODIFIERS`]. Physical keyboard state, not a routing
+    /// decision — see the module-level "Modifier snapshot" section.
+    last_modifiers: ModifierState,
 }
 
 impl InputDispatcher {
     /// Construct a dispatcher in the initial state (no hovered
-    /// surface).
+    /// surface, no modifiers held).
     pub const fn new() -> Self {
-        Self { hovered: None }
+        Self {
+            hovered: None,
+            last_modifiers: ModifierState::empty(),
+        }
     }
 
     /// Reset hover tracking. Call this when the compositor knows the
@@ -299,6 +343,22 @@ impl InputDispatcher {
         self.hovered
     }
 
+    /// Modifiers held as of the last key event the dispatcher saw,
+    /// masked to [`CHORD_MODIFIERS`]. The caller stamps this onto
+    /// pointer events, whose producers cannot observe the keyboard.
+    pub const fn modifiers(&self) -> ModifierState {
+        self.last_modifiers
+    }
+
+    /// Drop the modifier snapshot. Call this whenever the keyboard
+    /// stream is interrupted — session lock, VT switch, `kbd_server`
+    /// restart — because the key-up edges that would have cleared the
+    /// held bits are lost across the gap, and a stale bit would
+    /// otherwise mark every later click as modified.
+    pub fn forget_modifiers(&mut self) {
+        self.last_modifiers = ModifierState::empty();
+    }
+
     /// Route a key event. See module docs for the exact decision
     /// order.
     pub fn route_key_event(
@@ -306,6 +366,14 @@ impl InputDispatcher {
         ev: &KeyEvent,
         state: &mut CompositorState<'_>,
     ) -> RouteDecision {
+        // Snapshot physical modifier state before any routing runs: it
+        // must be recorded for every edge (Down, Repeat *and* Up) and
+        // whether the key is grabbed, delivered or dropped, because it
+        // describes the keyboard rather than this event's fate. Skipping
+        // it on the grabbed/dropped paths would strand a modifier as
+        // permanently "held" once a bind swallows its key-up.
+        self.last_modifiers = ModifierState(ev.modifiers.bits() & CHORD_MODIFIERS);
+
         match ev.kind {
             KeyEventKind::Down => self.route_key_down(ev, state),
             KeyEventKind::Repeat => self.route_key_repeat(ev, state),
@@ -399,8 +467,16 @@ impl InputDispatcher {
             self.hovered = hit;
         }
 
-        // 3. Delivery target: the hovered surface, if any.
+        // 3. Delivery target: the hovered surface, if any, together
+        //    with its origin so the caller can rebase the pointer
+        //    position into that surface's coordinate space. The two
+        //    fields are set together and must stay that way — a
+        //    delivery whose origin went missing would silently place
+        //    the click at the output origin instead.
         decision.deliver_to = hit;
+        decision.deliver_origin = hit
+            .and_then(|id| find_geometry(state.surface_geometry, id))
+            .map(|geom| (geom.rect.x, geom.rect.y));
 
         // 4. Click-to-focus: a button-down on a Toplevel requests
         //    focus change, unless an exclusive layer is active.
@@ -513,7 +589,8 @@ mod tests {
     };
     use crate::input::bind_table::{BindKey, BindTable, GrabState};
     use crate::input::events::{
-        KeyEvent, KeyEventKind, MOD_SUPER, ModifierState, PointerButton, PointerEvent,
+        KeyEvent, KeyEventKind, MOD_CAPS, MOD_CTRL, MOD_NUM, MOD_SHIFT, MOD_SUPER, ModifierState,
+        PointerButton, PointerEvent,
     };
     use proptest::prelude::*;
 
@@ -729,6 +806,155 @@ mod tests {
         assert_eq!(result, RouteDecision::DeliverTo(surf(7)));
     }
 
+    // --- Modifier snapshot --------------------------------------------------
+
+    #[test]
+    fn key_down_records_modifiers_and_key_up_clears_them() {
+        let bt = BindTable::new();
+        let mut gs = GrabState::new();
+        let geom = [SurfaceGeometry::toplevel(surf(7), rect(0, 0, 10, 10))];
+        let mut d = InputDispatcher::new();
+        assert_eq!(d.modifiers(), ModifierState::empty());
+
+        // Shift goes down: the snapshot picks it up.
+        {
+            let mut state = build_state(Some(surf(7)), None, (0, 0), &geom, &bt, &mut gs);
+            d.route_key_event(&key_down(MOD_SHIFT, b'a' as u32), &mut state);
+        }
+        assert!(d.modifiers().contains(MOD_SHIFT));
+
+        // Repeat still carries Shift — the snapshot must not be cleared.
+        {
+            let mut state = build_state(Some(surf(7)), None, (0, 0), &geom, &bt, &mut gs);
+            d.route_key_event(&key_repeat(MOD_SHIFT, b'a' as u32), &mut state);
+        }
+        assert!(d.modifiers().contains(MOD_SHIFT));
+
+        // Shift released: kbd_server reports the post-release mask.
+        {
+            let mut state = build_state(Some(surf(7)), None, (0, 0), &geom, &bt, &mut gs);
+            d.route_key_event(&key_up(0, b'a' as u32), &mut state);
+        }
+        assert_eq!(d.modifiers(), ModifierState::empty());
+    }
+
+    #[test]
+    fn modifier_snapshot_is_recorded_for_grabbed_and_dropped_keys() {
+        let mut bt = BindTable::new();
+        bt.register(BindKey {
+            modifier_mask: MOD_SUPER,
+            keycode: b'q' as u32,
+        })
+        .unwrap();
+        let mut gs = GrabState::new();
+        let geom: [SurfaceGeometry; 0] = [];
+        let mut d = InputDispatcher::new();
+
+        // A grabbed chord never reaches a client, but the modifiers it
+        // carried are still physically held.
+        {
+            let mut state = build_state(None, None, (0, 0), &geom, &bt, &mut gs);
+            assert!(matches!(
+                d.route_key_event(&key_down(MOD_SUPER, b'q' as u32), &mut state),
+                RouteDecision::Grab(_)
+            ));
+        }
+        assert!(d.modifiers().contains(MOD_SUPER));
+
+        // Likewise for a key dropped for want of focus.
+        {
+            let mut state = build_state(None, None, (0, 0), &geom, &bt, &mut gs);
+            assert_eq!(
+                d.route_key_event(&key_down(MOD_CTRL, b'x' as u32), &mut state),
+                RouteDecision::Drop
+            );
+        }
+        assert!(d.modifiers().contains(MOD_CTRL));
+    }
+
+    #[test]
+    fn lock_latches_do_not_enter_the_modifier_snapshot() {
+        let bt = BindTable::new();
+        let mut gs = GrabState::new();
+        let geom = [SurfaceGeometry::toplevel(surf(7), rect(0, 0, 10, 10))];
+        let mut d = InputDispatcher::new();
+        let mut state = build_state(Some(surf(7)), None, (0, 0), &geom, &bt, &mut gs);
+        d.route_key_event(
+            &key_down(MOD_SHIFT | MOD_CAPS | MOD_NUM, b'a' as u32),
+            &mut state,
+        );
+        // Caps/Num are lock latches, not held chord modifiers.
+        assert_eq!(d.modifiers(), ModifierState(MOD_SHIFT));
+    }
+
+    #[test]
+    fn forget_modifiers_resets_the_snapshot() {
+        let bt = BindTable::new();
+        let mut gs = GrabState::new();
+        let geom = [SurfaceGeometry::toplevel(surf(7), rect(0, 0, 10, 10))];
+        let mut d = InputDispatcher::new();
+        {
+            let mut state = build_state(Some(surf(7)), None, (0, 0), &geom, &bt, &mut gs);
+            d.route_key_event(&key_down(MOD_CTRL | MOD_ALT, b'a' as u32), &mut state);
+        }
+        assert_eq!(d.modifiers(), ModifierState(MOD_CTRL | MOD_ALT));
+        d.forget_modifiers();
+        assert_eq!(d.modifiers(), ModifierState::empty());
+    }
+
+    /// The compositor's half of `term`'s xterm-convention Shift-drag: the
+    /// modifier snapshot taken from a key-down must survive an arbitrary
+    /// run of pointer events, because `display_server` stamps
+    /// [`InputDispatcher::modifiers`] onto every pointer event it delivers
+    /// (pointer producers hardcode empty modifiers — none of them read the
+    /// keyboard). A `route_pointer_event` that reset or narrowed the
+    /// snapshot would silently turn every Shift-held drag into a plain one,
+    /// which is exactly the failure `term-daily-driver-smoke`'s Shift-drag
+    /// arm exists to catch — and this test catches it without QEMU.
+    #[test]
+    fn pointer_events_after_a_shift_down_still_see_the_held_modifier() {
+        let bt = BindTable::new();
+        let mut gs = GrabState::new();
+        let geom = [SurfaceGeometry::toplevel(surf(7), rect(0, 0, 100, 100))];
+        let mut d = InputDispatcher::new();
+        {
+            let mut state = build_state(Some(surf(7)), None, (0, 0), &geom, &bt, &mut gs);
+            d.route_key_event(&key_down(MOD_SHIFT, b'a' as u32), &mut state);
+        }
+        assert!(d.modifiers().contains(MOD_SHIFT));
+
+        // A whole drag: press, motion samples, release — the shape
+        // `qmp::modifier_drag_plan` emits.
+        for (i, button) in [
+            PointerButton::Down(0),
+            PointerButton::None,
+            PointerButton::None,
+            PointerButton::None,
+            PointerButton::Up(0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let pos = (10 + i as i32 * 10, 10 + i as i32 * 10);
+            let mut state = build_state(Some(surf(7)), None, pos, &geom, &bt, &mut gs);
+            let mut ev = empty_pointer(pos.0, pos.1);
+            ev.button = button;
+            d.route_pointer_event(&ev, &mut state);
+            assert!(
+                d.modifiers().contains(MOD_SHIFT),
+                "pointer event {i} cleared the held-modifier snapshot the \
+                 compositor stamps onto pointer events"
+            );
+        }
+
+        // Only the matching key-up ends the hold.
+        {
+            let mut state = build_state(Some(surf(7)), None, (0, 0), &geom, &bt, &mut gs);
+            d.route_key_event(&key_up(0, b'a' as u32), &mut state);
+        }
+        assert_eq!(d.modifiers(), ModifierState::empty());
+    }
+
     // --- Hit-test cases (4 boundary cases + miss + stacking) ---------------
 
     #[test]
@@ -872,6 +1098,77 @@ mod tests {
         );
         assert_eq!(r.deliver_to, Some(surf(1)));
         assert!(r.enter_leave.is_empty());
+    }
+
+    // --- Surface-local origin ----------------------------------------------
+
+    #[test]
+    fn pointer_delivery_reports_the_hit_surface_origin() {
+        let bt = BindTable::new();
+        let mut gs = GrabState::new();
+        // Origin deliberately away from (0,0) so a caller that forgot
+        // to subtract it would land somewhere visibly wrong.
+        let geom = [SurfaceGeometry::toplevel(surf(3), rect(120, 45, 200, 100))];
+        let mut d = InputDispatcher::new();
+        let mut state = build_state(None, None, (130, 50), &geom, &bt, &mut gs);
+        let r = d.route_pointer_event(&empty_pointer(130, 50), &mut state);
+        assert_eq!(r.deliver_to, Some(surf(3)));
+        assert_eq!(r.deliver_origin, Some((120, 45)));
+        // Surface-local coordinates the caller derives from the origin.
+        let (ox, oy) = r.deliver_origin.unwrap();
+        assert_eq!((130 - ox, 50 - oy), (10, 5));
+    }
+
+    #[test]
+    fn pointer_over_no_surface_reports_no_origin() {
+        let bt = BindTable::new();
+        let mut gs = GrabState::new();
+        let geom = [SurfaceGeometry::toplevel(surf(3), rect(120, 45, 200, 100))];
+        let mut d = InputDispatcher::new();
+        let mut state = build_state(None, None, (5, 5), &geom, &bt, &mut gs);
+        let r = d.route_pointer_event(&empty_pointer(5, 5), &mut state);
+        assert_eq!(r.deliver_to, None);
+        assert_eq!(r.deliver_origin, None);
+    }
+
+    #[test]
+    fn stacked_surfaces_report_the_top_of_stack_origin() {
+        let bt = BindTable::new();
+        let mut gs = GrabState::new();
+        // Both rects contain the probe point; the top of stack wins and
+        // its origin — not the one underneath — must be reported.
+        let geom = [
+            SurfaceGeometry::toplevel(surf(1), rect(0, 0, 400, 400)),
+            SurfaceGeometry::toplevel(surf(2), rect(60, 70, 100, 100)),
+        ];
+        let mut d = InputDispatcher::new();
+        let mut state = build_state(None, None, (80, 90), &geom, &bt, &mut gs);
+        let r = d.route_pointer_event(&empty_pointer(80, 90), &mut state);
+        assert_eq!(r.deliver_to, Some(surf(2)));
+        assert_eq!(r.deliver_origin, Some((60, 70)));
+    }
+
+    #[test]
+    fn moved_surface_reports_its_new_origin() {
+        let bt = BindTable::new();
+        let mut gs = GrabState::new();
+        let mut d = InputDispatcher::new();
+        // The origin is read from the geometry slice on every event, so
+        // a surface the compositor moved reports its current position
+        // rather than a value cached at hover time.
+        {
+            let geom = [SurfaceGeometry::toplevel(surf(4), rect(10, 10, 100, 100))];
+            let mut state = build_state(None, None, (50, 50), &geom, &bt, &mut gs);
+            let r = d.route_pointer_event(&empty_pointer(50, 50), &mut state);
+            assert_eq!(r.deliver_origin, Some((10, 10)));
+        }
+        {
+            let geom = [SurfaceGeometry::toplevel(surf(4), rect(30, 25, 100, 100))];
+            let mut state = build_state(None, None, (50, 50), &geom, &bt, &mut gs);
+            let r = d.route_pointer_event(&empty_pointer(50, 50), &mut state);
+            assert_eq!(r.deliver_to, Some(surf(4)));
+            assert_eq!(r.deliver_origin, Some((30, 25)));
+        }
     }
 
     // --- Click-to-focus ----------------------------------------------------
@@ -1053,6 +1350,11 @@ mod tests {
         ///   4. KeyRepeat / KeyUp for a grabbed keycode are suppressed
         ///      until KeyUp clears the grab.
         ///   5. Focus changes only target live surfaces.
+        ///   6. `deliver_origin` is present exactly when `deliver_to`
+        ///      is, and always equals that surface's current rect
+        ///      origin.
+        ///   7. The modifier snapshot tracks the last key edge seen and
+        ///      never carries the CAPS/NUM lock latches.
         #[test]
         fn prop_dispatcher_invariants(
             ops in proptest::collection::vec(arb_op(), 0..120)
@@ -1125,6 +1427,13 @@ mod tests {
                                 let _ = grab_state.is_grabbed(keycode);
                             }
                         }
+                        // (7) Every edge — grabbed, delivered or dropped
+                        // — refreshes the snapshot, minus the locks.
+                        prop_assert_eq!(
+                            dispatcher.modifiers(),
+                            ModifierState(modifiers & CHORD_MODIFIERS)
+                        );
+                        prop_assert_eq!(dispatcher.modifiers().bits() & (MOD_CAPS | MOD_NUM), 0);
                     }
                     Op::Pointer { x, y, button } => {
                         pointer = (x, y);
@@ -1152,11 +1461,19 @@ mod tests {
                             grab_state: &mut grab_state,
                         };
                         let r = dispatcher.route_pointer_event(&ev, &mut state);
-                        if let Some(id) = r.deliver_to {
-                            prop_assert!(
-                                surfaces.iter().any(|s| s.id == id),
-                                "Pointer delivery to destroyed surface {:?}", id
-                            );
+                        match r.deliver_to {
+                            Some(id) => {
+                                let target = surfaces.iter().find(|s| s.id == id);
+                                prop_assert!(
+                                    target.is_some(),
+                                    "Pointer delivery to destroyed surface {:?}", id
+                                );
+                                // (6) The origin must accompany the
+                                // delivery and match the live rect.
+                                let rect = target.unwrap().rect;
+                                prop_assert_eq!(r.deliver_origin, Some((rect.x, rect.y)));
+                            }
+                            None => prop_assert_eq!(r.deliver_origin, None),
                         }
                         if let Some(id) = r.focus_change {
                             prop_assert!(
