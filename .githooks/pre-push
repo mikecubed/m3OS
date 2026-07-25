@@ -354,13 +354,16 @@ fi
 # Phase 112 — terminal daily-driver gate. Opt-in behind
 # M3OS_TERM_POLISH_REGRESSION=1 because it boots the graphical stack
 # headlessly with an extra usb-tablet (QMP + VNC) and drives the scrollback
-# viewport, a mouse selection, and the compositor clipboard, asserting on
-# the composited framebuffer rather than on serial sentinels. Set the env
-# var on branches that touch userspace/term, the display clipboard
-# protocol, or the mouse/keyboard input path.
+# viewport, a mouse selection, the compositor clipboard, and the wheel's two
+# destinations (term's own viewport vs. a mouse-tracking app on the alternate
+# screen), asserting on the composited framebuffer rather than on serial
+# sentinels. Set the env var on branches that touch userspace/term, the
+# display clipboard protocol, or the mouse/keyboard input path — including
+# display_server's pointer routing, which now rebases pointer coordinates
+# onto the hit surface's origin.
 if [ "${M3OS_TERM_POLISH_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask term-daily-driver-smoke..."
-    cargo xtask term-daily-driver-smoke --timeout 360
+    cargo xtask term-daily-driver-smoke --timeout 480
 fi
 
 # Phase 105 — m3ui toolkit render gate. Gated behind M3OS_M3UI_REGRESSION=1

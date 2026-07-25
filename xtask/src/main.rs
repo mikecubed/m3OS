@@ -1828,11 +1828,22 @@ fn main() {
             });
             cmd_htop_render_probe(&probe_args);
         }
-        // Phase 112 Track C.2 — scrollback viewport + selection/clipboard
-        // proof on the composited framebuffer (QMP/PPM), plus a clipboard
-        // read-back from an independent client.
+        // Phase 112 Track C.2 — scrollback viewport, selection/clipboard and
+        // wheel routing proved on the composited framebuffer (QMP/PPM), with
+        // a clipboard read-back from an independent client and an
+        // alternate-screen application as the second wheel destination.
         Some("term-daily-driver-smoke") => {
-            let probe_args = parse_less_render_probe_args(&args[2..]).unwrap_or_else(|err| {
+            // Six arms, each of which waits for the screen to stop moving
+            // before it asserts, so this gate is materially slower than the
+            // other QMP/PPM probes — hence its own default budget and its
+            // own artefact directory (it writes ~18 PPMs plus a serial log).
+            let probe_args = parse_probe_args_with_defaults(
+                &args[2..],
+                "term-daily-driver-smoke",
+                480,
+                "m3os-term-daily-driver-smoke",
+            )
+            .unwrap_or_else(|err| {
                 eprintln!("Error: {err}");
                 eprintln!("Usage: {}", usage());
                 std::process::exit(1);
@@ -21032,11 +21043,13 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
 #[derive(Debug, Clone)]
 struct LessRenderProbeArgs {
     /// Global wall-clock budget for the entire probe. Boot + login +
-    /// screendump + diff fits comfortably in 240 s on TCG; slower
+    /// screendump + diff fits comfortably in the per-command default (240 s
+    /// for the single-shot probes, more for the multi-arm gates); slower
     /// hosts can override via `--timeout`.
     timeout_secs: u64,
-    /// Directory to write the captured PPMs into. Defaults to
-    /// `$TMPDIR/m3os-less-render-probe`. Existing files at these names
+    /// Directory to write the captured PPMs into. Defaults to a
+    /// per-command `$TMPDIR/m3os-<command>` (see
+    /// [`parse_probe_args_with_defaults`]). Existing files at these names
     /// are overwritten so successive runs replace last run's artefacts.
     out_dir: PathBuf,
     /// When set, leave QEMU running on success / failure so the caller
@@ -21046,7 +21059,25 @@ struct LessRenderProbeArgs {
 }
 
 fn parse_less_render_probe_args(args: &[String]) -> Result<LessRenderProbeArgs, String> {
-    let mut timeout_secs = 240u64;
+    parse_probe_args_with_defaults(args, "less-render-probe", 240, "m3os-less-render-probe")
+}
+
+/// Shared `--timeout` / `--out` / `--keep-qemu` parser for every QMP/PPM
+/// probe command.
+///
+/// The defaults are per-command rather than global on purpose. Several
+/// probes write a `serial.log` and a numbered PPM series under their out
+/// dir; sharing one directory means the last gate to run silently
+/// overwrites the artefacts the previous failure left behind, which is
+/// exactly when they are wanted. `command` only feeds the error message,
+/// so an unknown flag names the command the user actually typed.
+fn parse_probe_args_with_defaults(
+    args: &[String],
+    command: &str,
+    default_timeout_secs: u64,
+    default_dir_name: &str,
+) -> Result<LessRenderProbeArgs, String> {
+    let mut timeout_secs = default_timeout_secs;
     let mut out_dir: Option<PathBuf> = None;
     let mut keep_qemu = false;
     let mut i = 0;
@@ -21067,13 +21098,13 @@ fn parse_less_render_probe_args(args: &[String]) -> Result<LessRenderProbeArgs, 
                 ));
             }
             "--keep-qemu" => keep_qemu = true,
-            other => return Err(format!("unknown less-render-probe flag: {other}")),
+            other => return Err(format!("unknown {command} flag: {other}")),
         }
         i += 1;
     }
     let out_dir = out_dir.unwrap_or_else(|| {
         let mut p = std::env::temp_dir();
-        p.push("m3os-less-render-probe");
+        p.push(default_dir_name);
         p
     });
     Ok(LessRenderProbeArgs {
@@ -21131,9 +21162,19 @@ fn wait_for_serial_pattern(
 // Phase 112 Track C.2 — term-daily-driver-smoke
 // ---------------------------------------------------------------------------
 
-/// Phase 112 Track C.2 — capture screendumps until two consecutive frames
-/// are identical, i.e. the guest has stopped painting. Returns the settled
-/// frame.
+/// Phase 112 Track C.2 — the most scanlines two frames of a *quiet* screen
+/// may differ by.
+///
+/// `term` blinks the cursor on a 500 ms tick, so a frame taken at a live
+/// prompt is never pixel-identical to its predecessor: one cell
+/// (`CELL_WIDTH` × `CELL_HEIGHT` = 24 × 48 px) flips on and off. 96 is two
+/// text rows' worth — enough to absorb the cursor plus a glyph the shell
+/// repainted under it, and two orders of magnitude below the ~1000
+/// scanlines a scrollback page-up or a full repaint moves.
+const TERM_QUIET_SCANLINES: u32 = 96;
+
+/// Phase 112 Track C.2 — capture screendumps until the screen stops moving,
+/// i.e. until nothing but the cursor is changing. Returns the settled frame.
 ///
 /// Every scrollback assertion in this gate has to run against a *quiet*
 /// screen, and not for the usual flakiness reasons. Snap-to-bottom is a
@@ -21143,6 +21184,11 @@ fn wait_for_serial_pattern(
 /// snapped back down by the next output line — a correct behaviour that
 /// looks exactly like "the key did nothing". Waiting for quiescence is
 /// what makes the assertion measure the binding rather than the race.
+///
+/// Quiet means "two consecutive gaps under [`TERM_QUIET_SCANLINES`]", not
+/// "byte-identical": the blinking cursor guarantees a live prompt never
+/// reaches byte-identical, and an exact-match loop would burn `max_wait` in
+/// full on every one of this gate's ~14 settle points.
 fn capture_settled(
     q: &mut qmp::QmpClient,
     out_dir: &Path,
@@ -21150,21 +21196,28 @@ fn capture_settled(
     max_wait: std::time::Duration,
 ) -> Result<ppm::PpmFrame, String> {
     const SETTLE_GAP_MS: u64 = 700;
+    /// Consecutive quiet gaps required. Two (i.e. three consecutive frames)
+    /// rather than one, so a pause between two chunks of PTY output cannot
+    /// masquerade as the end of the output.
+    const QUIET_GAPS_REQUIRED: u32 = 2;
     let deadline = std::time::Instant::now() + max_wait;
-    capture_frame(q, out_dir, tag)?;
-    let mut prev = ppm::read_ppm(&out_dir.join(format!("{tag}.ppm")))?;
+    let mut prev = capture_term_frame(q, out_dir, tag)?;
+    let mut quiet_gaps = 0u32;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(SETTLE_GAP_MS));
-        capture_frame(q, out_dir, tag)?;
-        let now = ppm::read_ppm(&out_dir.join(format!("{tag}.ppm")))?;
+        let now = capture_term_frame(q, out_dir, tag)?;
         let moved = changed_rows_in_band(&prev, &now, 0.0, 1.0);
-        if moved == 0 {
-            return Ok(now);
+        if moved <= TERM_QUIET_SCANLINES {
+            quiet_gaps += 1;
+            if quiet_gaps >= QUIET_GAPS_REQUIRED {
+                return Ok(now);
+            }
+        } else {
+            quiet_gaps = 0;
         }
         if std::time::Instant::now() >= deadline {
             // Not fatal on its own — return the latest frame and let the
-            // caller's own assertion decide. A blinking cursor alone can
-            // keep a frame from ever being pixel-identical.
+            // caller's own assertion decide.
             println!(
                 "term-daily-driver-smoke: {tag} still moving ({moved} scanlines) at settle deadline"
             );
@@ -21174,8 +21227,143 @@ fn capture_settled(
     }
 }
 
-/// Phase 112 Track C.2 — headless QMP/PPM proof of the scrollback viewport
-/// and the selection/clipboard round trip.
+/// Phase 112 Track C.2 — screendump and parse in one step.
+///
+/// Deliberately not [`capture_frame`]: that helper is shared by four probes
+/// and prints a `less-render-probe:` prefix on every line, so a CI log from
+/// this gate would attribute all ~18 of its frames to a different tool.
+fn capture_term_frame(
+    q: &mut qmp::QmpClient,
+    out_dir: &Path,
+    tag: &str,
+) -> Result<ppm::PpmFrame, String> {
+    let path = out_dir.join(format!("{tag}.ppm"));
+    q.screendump(&path)
+        .map_err(|e| format!("screendump {tag}: {e}"))?;
+    println!("term-daily-driver-smoke: captured {}", path.display());
+    ppm::read_ppm(&path)
+}
+
+/// Count pixels inside the vertical band `[y0_frac, y1_frac)` that satisfy
+/// `pred`, which receives `(r, g, b)`.
+///
+/// The `tui-smoke mouse-live` probe paints a saturated colour band per wheel
+/// notch, so counting band pixels of a given hue is how this gate tells
+/// "the application repainted for a wheel-up" from "the application
+/// repainted for a wheel-down" — a scanline-diff can see that *something*
+/// changed but not which of the two it was.
+fn band_pixels_matching(
+    frame: &ppm::PpmFrame,
+    y0_frac: f64,
+    y1_frac: f64,
+    pred: fn(u8, u8, u8) -> bool,
+) -> u32 {
+    if frame.height == 0 || frame.width == 0 {
+        return 0;
+    }
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    let y0 = ((y0_frac.clamp(0.0, 1.0) * h as f64) as usize).min(h);
+    let y1 = ((y1_frac.clamp(0.0, 1.0) * h as f64) as usize).min(h);
+    let mut count = 0u32;
+    for y in y0..y1 {
+        let rs = y * w * 3;
+        for x in 0..w {
+            let i = rs + x * 3;
+            if i + 2 >= frame.pixels.len() {
+                break;
+            }
+            if pred(frame.pixels[i], frame.pixels[i + 1], frame.pixels[i + 2]) {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Saturated red — the background `tui-smoke mouse-live` floods the top half
+/// of the grid with on a wheel-**up** notch (SGR `48;2;255;0;0`).
+///
+/// Tolerant rather than exact so the check survives any future scaling or
+/// gamma in the capture path; the compositor's own chrome (teal desktop,
+/// grey bar) is nowhere near this corner of the cube.
+fn is_wheel_up_red(r: u8, g: u8, b: u8) -> bool {
+    r > 180 && g < 70 && b < 70
+}
+
+/// Saturated blue — the wheel-**down** band (SGR `48;2;0;0;255`).
+fn is_wheel_down_blue(r: u8, g: u8, b: u8) -> bool {
+    b > 180 && r < 70 && g < 70
+}
+
+/// Largest index `<= idx` that is a UTF-8 char boundary of `s`.
+///
+/// Serial transcripts are decoded with `from_utf8_lossy`, so a truncated
+/// or corrupt byte run becomes a 3-byte U+FFFD. Slicing such a string at a
+/// fixed byte offset panics when the offset lands inside one — and a panic
+/// inside this gate's driver closure would skip the QEMU teardown below it
+/// and leak the process. (`str::floor_char_boundary` is still unstable.)
+fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Everything one `clip-smoke --paste` run printed after its sentinel, as
+/// delimited by a unique `anchor` string the caller arranged to be printed
+/// on serial *after* that run finished.
+///
+/// The anchor exists because of a race with a wrong answer, not a flake.
+/// `clip-smoke` emits the sentinel and the clipboard payload as two
+/// separate `serial_print` calls, and the kernel logger emits one complete
+/// record per call — so the payload is *guaranteed* to be on a later serial
+/// line than the sentinel that announces it. A reader that waits for
+/// `CLIP_PASTE:` and then inspects the transcript is therefore reading it
+/// before the payload has arrived, and would report an empty clipboard as a
+/// broker failure. Waiting for something that can only be printed after the
+/// payload — the gate runs `echo-args <anchor>`, which mirrors its argv to
+/// serial — is what makes the read total.
+///
+/// Anchored from the *end* of the transcript rather than by counting runs
+/// from the start: `serial_history` is a rolling window (see
+/// `append_serial_chunk`), so occurrence counts taken minutes apart do not
+/// refer to the same events.
+fn clip_payload_before_anchor<'a>(
+    transcript: &'a str,
+    sentinel: &str,
+    anchor: &str,
+) -> Option<&'a str> {
+    /// The clipboard is capped at `CLIPBOARD_MAX_BYTES` (3900), but nothing
+    /// caps how much unrelated kernel logging interleaves before the
+    /// anchor — and the whole window goes into the failure message. Trim on
+    /// a char boundary: the transcript is `from_utf8_lossy` output, so a
+    /// fixed offset can land inside a 3-byte U+FFFD and panic, which inside
+    /// this gate's driver closure would skip the QEMU teardown below it and
+    /// leak the process.
+    const MAX_WINDOW: usize = 8192;
+    let anchor_at = transcript.rfind(anchor)?;
+    let start = transcript[..anchor_at].rfind(sentinel)? + sentinel.len();
+    let end = floor_char_boundary(transcript, anchor_at.min(start + MAX_WINDOW));
+    transcript.get(start..end.max(start))
+}
+
+/// True when some line of `window` is exactly `want` once trailing
+/// whitespace (and the `\r` a serial transcript may carry) is removed.
+///
+/// Stricter than `window.contains(want)` on purpose: `term`'s selection
+/// copies whole rows and trims trailing blanks, so the row holding the
+/// echoed marker must arrive as a line of its own. A `contains` check would
+/// also pass on the *command* line (`echo M3OS_COPY_ME`) one row above it,
+/// i.e. it cannot tell "the selection captured the output" from "the
+/// selection captured the command that produced it".
+fn window_has_exact_line(window: &str, want: &str) -> bool {
+    window.lines().any(|line| line.trim_end() == want)
+}
+
+/// Phase 112 Track C.2 — headless QMP/PPM proof of the scrollback viewport,
+/// the selection/clipboard round trip, and the wheel's two destinations.
 ///
 /// A serial `Wait` proves a program ran, not that the screen scrolled or a
 /// highlight painted, so every assertion here is on the composited
@@ -21183,20 +21371,44 @@ fn capture_settled(
 ///
 /// Arms, in order:
 ///
-/// 1. **Scrollback** (every lane): fill well past one page with `dmesg`,
-///    Shift+PageUp, and assert the frame *changed* — i.e. rows that had
-///    scrolled off are on screen again. Then press a key and assert the
-///    frame returns to the live tail (snap-to-bottom).
-/// 2. **Wheel** (Report-protocol lane only): the same assertion driven by
-///    `send_wheel` against the `usb-tablet` attached below. On a lane with
-///    no Report-protocol pointer this would be inert by construction — the
-///    PS/2 path never carries a wheel — so the gate always attaches one.
+/// 1. **Scrollback**: fill well past one page with `dmesg`, Shift+PageUp,
+///    and assert the frame *changed* — i.e. rows that had scrolled off are
+///    on screen again. Then type an ordinary printable key and assert the
+///    frame is back at the live tail. Both halves are asserted: that the
+///    frame moved off the scrolled-back view *and* that where it moved to
+///    is the tail frame captured before the page-up. The keystroke is a
+///    bare `x`, not Return, because Return's echoed newline scrolls the
+///    primary region — and `scroll_region_up` snaps the viewport on any
+///    primary scroll, so a Return would pass this arm even with the
+///    snap-on-keystroke path deleted.
+/// 2. **Wheel → viewport** (Report-protocol lane only): the same viewport
+///    assertion driven by `send_wheel` against the `usb-tablet` attached
+///    below. On a lane with no Report-protocol pointer this would be inert
+///    by construction — the PS/2 path never carries a wheel — so the gate
+///    always attaches one.
 /// 3. **Selection + clipboard**: drag over known text, which copies on
 ///    release, then read the compositor's `ClipboardStore` back from an
-///    **independent** client (`clip-smoke --paste`) and assert exact
-///    bytes. Finally Ctrl+Shift+V and assert the bracketed-paste framing
-///    arrives on the PTY, observed through `cat -v` so `ESC[200~` renders
-///    as visible `^[[200~`.
+///    **independent** client (`clip-smoke --paste`) and assert the marker
+///    arrived as a *whole line*, not as a substring of the command that
+///    printed it.
+/// 4. **Paste**: Ctrl+Shift+V into a `cat` sink and assert the payload
+///    reached the PTY. The `ESC[200~` / `ESC[201~` framing is *not*
+///    asserted here — see the arm's own comment for why it is not
+///    observable on this lane.
+/// 5. **Wheel → application** (alternate screen): `tui-smoke mouse-live`
+///    takes the alternate screen, enables `?1000h`+`?1006h`, and repaints
+///    a saturated colour band per decoded notch. Asserts the app saw the
+///    report (serial sentinel), that the *right* band painted (hue +
+///    region on the PPM, so up and down are distinguishable), and that the
+///    terminal is left showing its live tail afterwards. Together with arm
+///    2 this is the discrimination that matters: the same injected notch
+///    scrolls `term`'s own viewport when nothing is tracking and reaches
+///    the application when something is.
+/// 6. **Shift-drag override**, run while that app still holds the mouse: an
+///    unshifted drag must produce no local highlight (it belongs to the
+///    application), while a Shift-held drag must select in `term` and land
+///    in the compositor clipboard — the xterm convention, and the only arm
+///    that exercises the compositor's live-modifier stamping.
 #[allow(clippy::zombie_processes)]
 fn cmd_term_polish_smoke(args: &LessRenderProbeArgs) {
     /// Minimum changed scanlines across the terminal band for a frame to
@@ -21207,6 +21419,46 @@ fn cmd_term_polish_smoke(args: &LessRenderProbeArgs) {
     const MIN_CHANGED_SCANLINES: u32 = 20;
     /// Text selected by the drag and expected to reach the clipboard.
     const COPY_MARKER: &str = "M3OS_COPY_ME";
+    /// Sentinel `clip-smoke --paste` prints before the clipboard payload.
+    const CLIP_SENTINEL: &str = "CLIP_PASTE:";
+    /// Per-read-back anchors, echoed to serial by `echo-args` after the
+    /// clipboard payload has been printed. Distinct strings so each read
+    /// back is located from the end of the transcript without counting
+    /// runs — `serial_history` is a rolling window, so counts taken minutes
+    /// apart are not comparable.
+    const CLIP_ANCHOR_COPY: &str = "CLIPSYNCA";
+    const CLIP_ANCHOR_SHIFT: &str = "CLIPSYNCB";
+    /// Where the pointer is parked whenever a frame is captured.
+    ///
+    /// The compositor blits its cursor into the frame, so a capture taken
+    /// with the pointer somewhere else differs from its predecessor by the
+    /// cursor's own pixels — enough to trip a "did anything change?"
+    /// threshold on its own. Parking at one fixed spot before every capture
+    /// keeps the cursor out of every diff. The middle of the screen also
+    /// guarantees the pointer is over `term`'s surface, which is what makes
+    /// a wheel notch route there at all (the compositor hit-tests the
+    /// cursor position, not the event).
+    const POINTER_PARK: (i32, i32) = (960, 540);
+    /// How long to wait after a drag's button-release before moving the
+    /// pointer again. QEMU coalesces a motion into a queued event with the
+    /// same button state, so parking too soon rewrites the release's
+    /// coordinate — see the selection arm for the full explanation.
+    const POINTER_RELEASE_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
+    /// Endpoints of the selection drags, in screen pixels — see
+    /// [`qmp::QmpClient::send_pointer_abs`] for why these are literal
+    /// pixels and not QEMU's 0..0x7FFF normalized range.
+    const DRAG_FROM: (i32, i32) = (60, 200);
+    const DRAG_TO: (i32, i32) = (1800, 1000);
+    /// Minimum band pixels of the expected hue for a `mouse-live` repaint to
+    /// count. The probe floods half the grid, which is ~10⁵–10⁶ pixels even
+    /// on a small surface; 20 000 is ~1.5 full-width text rows, far below
+    /// any real repaint and far above the stray red/blue in the compositor's
+    /// own chrome.
+    const MIN_BAND_PIXELS: u32 = 20_000;
+    /// Settle budget for an ordinary capture. Generous for a couple of text
+    /// rows on TCG, and only reached when the screen genuinely will not stop
+    /// moving (see [`capture_settled`]).
+    const SETTLE: std::time::Duration = std::time::Duration::from_secs(8);
 
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
@@ -21335,6 +21587,13 @@ fn cmd_term_polish_smoke(args: &LessRenderProbeArgs) {
         println!("term-daily-driver-smoke: QMP handshake complete");
         std::thread::sleep(std::time::Duration::from_millis(500));
 
+        // Park the pointer once, up front: every capture in this gate is
+        // compared against another capture, and the compositor's cursor is
+        // part of the frame. See POINTER_PARK.
+        q.send_pointer_abs(POINTER_PARK.0, POINTER_PARK.1)
+            .map_err(|e| format!("park pointer: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
         // ---- Arm 1: scrollback viewport ------------------------------
         // `dmesg` emits hundreds of lines, so the early ones are long gone
         // from the 25-row live grid and can only come back from the ring.
@@ -21353,8 +21612,7 @@ fn cmd_term_polish_smoke(args: &LessRenderProbeArgs) {
         q.press_chord(&["shift", "pgup"], 30)
             .map_err(|e| format!("shift+pgup: {e}"))?;
         std::thread::sleep(std::time::Duration::from_millis(1500));
-        capture_frame(&mut q, &args.out_dir, "11-scrolled-back")?;
-        let scrolled = ppm::read_ppm(&args.out_dir.join("11-scrolled-back.ppm"))?;
+        let scrolled = capture_term_frame(&mut q, &args.out_dir, "11-scrolled-back")?;
         let scrolled_rows = changed_rows_in_band(&live_tail, &scrolled, 0.0, 1.0);
         println!(
             "term-daily-driver-smoke: shift+pgup changed {scrolled_rows} scanlines vs the live tail"
@@ -21366,20 +21624,20 @@ fn cmd_term_polish_smoke(args: &LessRenderProbeArgs) {
             ));
         }
 
-        // A keystroke that reaches the shell must snap back to the live
-        // tail. A bare Return re-prints the prompt, so compare against a
-        // fresh baseline rather than the pre-scroll frame.
-        q.press_key("ret", 30)
-            .map_err(|e| format!("press ret: {e}"))?;
-        let snapped = capture_settled(
-            &mut q,
-            &args.out_dir,
-            "12-snapped-back",
-            std::time::Duration::from_secs(20),
-        )?;
+        // A keystroke that reaches the shell must snap the viewport back to
+        // the live tail. `x` rather than Return: an ordinary printable key
+        // puts bytes on the PTY without scrolling the primary region, so
+        // the snap can only come from the keystroke path itself. Return's
+        // echoed newline scrolls, and `scroll_region_up` snaps on any
+        // primary scroll — which would make this arm pass even with the
+        // snap-on-keystroke code deleted.
+        q.press_key("x", 30).map_err(|e| format!("press x: {e}"))?;
+        let snapped = capture_settled(&mut q, &args.out_dir, "12-snapped-back", SETTLE)?;
         let still_scrolled = changed_rows_in_band(&scrolled, &snapped, 0.0, 1.0);
+        let tail_drift = changed_rows_in_band(&live_tail, &snapped, 0.0, 1.0);
         println!(
-            "term-daily-driver-smoke: keystroke changed {still_scrolled} scanlines vs the scrolled frame"
+            "term-daily-driver-smoke: keystroke changed {still_scrolled} scanlines vs the \
+             scrolled frame, {tail_drift} vs the live tail"
         );
         if still_scrolled < MIN_CHANGED_SCANLINES {
             return Err(format!(
@@ -21387,17 +21645,29 @@ fn cmd_term_polish_smoke(args: &LessRenderProbeArgs) {
                  view ({still_scrolled} changed scanlines); snap-to-bottom did not fire"
             ));
         }
+        // "It moved" is not "it went home": without this, any repaint at
+        // all — including one that left the viewport parked somewhere else
+        // in history — would satisfy the check above. The snapped frame is
+        // the live-tail frame plus the echoed `x` and the cursor one cell
+        // further right, i.e. inside one text row of drift.
+        if tail_drift > TERM_QUIET_SCANLINES {
+            return Err(format!(
+                "scrollback arm: after a keystroke the frame differs from the live tail by \
+                 {tail_drift} scanlines (max {TERM_QUIET_SCANLINES}); the viewport moved but \
+                 did not snap back to the bottom"
+            ));
+        }
+        // Erase the `x` so the shell is left at a clean prompt.
+        q.press_key("backspace", 30)
+            .map_err(|e| format!("press backspace: {e}"))?;
 
-        // ---- Arm 2: wheel (Report-protocol pointer) ------------------
-        let wheel_base = capture_settled(
-            &mut q,
-            &args.out_dir,
-            "20-wheel-base",
-            std::time::Duration::from_secs(20),
-        )?;
-        // Park the pointer over the terminal so the wheel routes to term's
-        // surface: the compositor hit-tests the *cursor* position, not the
-        // event, so a wheel with the cursor off-surface is dropped.
+        // ---- Arm 2: wheel -> viewport (Report-protocol pointer) ------
+        // The pointer has to be over the terminal *before* the baseline is
+        // captured, not just before the notch: the compositor hit-tests the
+        // cursor position rather than the event, so the park is mandatory —
+        // and erasing the cursor from wherever it booted is itself a
+        // multi-scanline change that would otherwise land in this arm's
+        // diff and count as "the wheel scrolled the viewport".
         //
         // Coordinates are screen pixels, not QEMU's usual 0..0x7FFF
         // normalized range. QEMU scales `input-send-event` abs values into
@@ -21408,13 +21678,13 @@ fn cmd_term_polish_smoke(args: &LessRenderProbeArgs) {
         // 0x4000 would land at (16384, 16384), far outside the 1920x1080
         // framebuffer, hit-test nothing, and silently drop the event.
         // See the Phase 112 note on the unscaled tablet path.
-        q.send_pointer_abs(960, 540)
+        q.send_pointer_abs(POINTER_PARK.0, POINTER_PARK.1)
             .map_err(|e| format!("park pointer: {e}"))?;
         std::thread::sleep(std::time::Duration::from_millis(300));
+        let wheel_base = capture_settled(&mut q, &args.out_dir, "20-wheel-base", SETTLE)?;
         q.send_wheel(5).map_err(|e| format!("wheel up: {e}"))?;
         std::thread::sleep(std::time::Duration::from_millis(1200));
-        capture_frame(&mut q, &args.out_dir, "21-wheel-scrolled")?;
-        let wheel_scrolled = ppm::read_ppm(&args.out_dir.join("21-wheel-scrolled.ppm"))?;
+        let wheel_scrolled = capture_term_frame(&mut q, &args.out_dir, "21-wheel-scrolled")?;
         let wheel_rows = changed_rows_in_band(&wheel_base, &wheel_scrolled, 0.0, 1.0);
         println!("term-daily-driver-smoke: wheel-up changed {wheel_rows} scanlines");
         if wheel_rows < MIN_CHANGED_SCANLINES {
@@ -21423,104 +21693,141 @@ fn cmd_term_polish_smoke(args: &LessRenderProbeArgs) {
                  {MIN_CHANGED_SCANLINES}); the Report-protocol wheel did not reach the viewport"
             ));
         }
-        // Return to the live tail for the selection arm.
+        // Return to the live tail for the selection arm, and assert we got
+        // there. Shift+End writes no PTY bytes, so if the frame does not
+        // come back to the pre-wheel baseline the viewport is stuck in
+        // history and every later arm would be selecting evicted rows.
         q.press_chord(&["shift", "end"], 30)
             .map_err(|e| format!("shift+end: {e}"))?;
-        std::thread::sleep(std::time::Duration::from_millis(800));
+        let wheel_home = capture_settled(&mut q, &args.out_dir, "22-wheel-home", SETTLE)?;
+        let wheel_home_drift = changed_rows_in_band(&wheel_base, &wheel_home, 0.0, 1.0);
+        println!(
+            "term-daily-driver-smoke: shift+end returned to within {wheel_home_drift} scanlines \
+             of the pre-wheel frame"
+        );
+        if wheel_home_drift > TERM_QUIET_SCANLINES {
+            return Err(format!(
+                "wheel arm: Shift+End left the frame {wheel_home_drift} scanlines from the \
+                 pre-wheel view (max {TERM_QUIET_SCANLINES}); the viewport did not return to \
+                 the live tail"
+            ));
+        }
 
         // ---- Arm 3: selection + clipboard ----------------------------
         // Put a known marker on screen, on its own line, then drag across
         // it. Release copies (copy-on-release).
         q.type_text(&format!("echo {COPY_MARKER}\n"))
             .map_err(|e| format!("type marker: {e}"))?;
-        let marker_frame = capture_settled(
-            &mut q,
-            &args.out_dir,
-            "30-marker",
-            std::time::Duration::from_secs(20),
-        )?;
+        let marker_frame = capture_settled(&mut q, &args.out_dir, "30-marker", SETTLE)?;
 
-        // Drag a tall band across most of the terminal (screen pixels —
-        // see the wheel arm's note on the unscaled tablet path). A Linear
-        // selection covers every row between its endpoints in full, so a
-        // tall band captures the marker line wherever the compositor
-        // happens to have placed term's surface; the assertion below is on
-        // the clipboard *containing* the marker, not on an exact cell span.
-        q.drag_abs((60, 200), (1800, 1000))
+        // Drag a tall band across most of the terminal. A Linear selection
+        // covers every row between its endpoints in full, so a tall band
+        // captures the marker line wherever the compositor happens to have
+        // placed term's surface — the gate never has to know the surface
+        // geometry. The rows above and below the marker come along with it,
+        // which is why the assertion below is "one of the copied lines is
+        // exactly the marker" rather than an exact whole-payload compare.
+        q.drag_abs(DRAG_FROM, DRAG_TO)
             .map_err(|e| format!("drag: {e}"))?;
+        // Let the button-release land before moving the pointer away.
+        //
+        // QEMU's HID device coalesces a motion into an already-queued event
+        // carrying the same button state, so parking immediately after the
+        // drag folds the park coordinate into the pending release. `term`
+        // commits the selection at the release event's own `abs_position`
+        // (`term::mouse`), so the selection would end at POINTER_PARK
+        // instead of DRAG_TO — a *smaller* highlight that still copies text,
+        // which is why this reads as an off-by-half-a-screen flake rather
+        // than an outright failure (384 changed scanlines instead of 816).
+        std::thread::sleep(POINTER_RELEASE_SETTLE);
+        q.send_pointer_abs(POINTER_PARK.0, POINTER_PARK.1)
+            .map_err(|e| format!("re-park pointer: {e}"))?;
         std::thread::sleep(std::time::Duration::from_millis(1000));
-        capture_frame(&mut q, &args.out_dir, "31-selected")?;
-        let selected = ppm::read_ppm(&args.out_dir.join("31-selected.ppm"))?;
+        let selected = capture_term_frame(&mut q, &args.out_dir, "31-selected")?;
         let hl_rows = changed_rows_in_band(&marker_frame, &selected, 0.0, 1.0);
         println!("term-daily-driver-smoke: selection highlight changed {hl_rows} scanlines");
-        if hl_rows == 0 {
-            return Err(
-                "selection arm: the drag produced no visible highlight on the framebuffer".into(),
-            );
+        // The highlight is an fg/bg swap over every selected cell, i.e. a
+        // solid block across most of the terminal — well clear of the
+        // cursor-blink floor a bare `> 0` would sit on.
+        if hl_rows < MIN_CHANGED_SCANLINES {
+            return Err(format!(
+                "selection arm: the drag changed only {hl_rows} scanlines (min \
+                 {MIN_CHANGED_SCANLINES}); no selection highlight painted"
+            ));
         }
 
         // Read the compositor's ClipboardStore back from an INDEPENDENT
         // client. Copying and pasting in the same client would prove
         // nothing about the broker.
+        //
+        // The `echo-args` chaser is load-bearing, not decoration: the
+        // payload lands on serial one log record *after* the sentinel, so a
+        // wait that stops at `CLIP_PASTE:` reads a transcript that cannot
+        // contain it yet. `echo-args` mirrors its argv to serial, so the
+        // anchor can only be printed once `clip-smoke` has exited — see
+        // `clip_payload_before_anchor`.
         q.type_text("/bin/clip-smoke --paste\n")
             .map_err(|e| format!("type clip-smoke: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        q.type_text(&format!("/bin/echo-args {CLIP_ANCHOR_COPY}\n"))
+            .map_err(|e| format!("type echo-args: {e}"))?;
         wait_for_serial_pattern(
             &rx,
             &mut serial_buf,
             &mut serial_history,
-            "CLIP_PASTE:",
+            CLIP_ANCHOR_COPY,
             std::time::Duration::from_secs(30),
             global_start,
             global_timeout,
         )?;
-        let pasted = strip_ansi(&serial_history);
-        // The offer is a multi-row selection, so the payload spans several
-        // serial lines after the sentinel. Search the window following the
-        // *last* `CLIP_PASTE:` rather than a single line.
-        let at = pasted
-            .rfind("CLIP_PASTE:")
+        let transcript = strip_ansi(&serial_history);
+        let window = clip_payload_before_anchor(&transcript, CLIP_SENTINEL, CLIP_ANCHOR_COPY)
             .ok_or("clipboard arm: CLIP_PASTE sentinel vanished from the transcript")?;
-        let window = &pasted[at..(at + 4096).min(pasted.len())];
-        if !window.contains(COPY_MARKER) {
+        if !window_has_exact_line(window, COPY_MARKER) {
             return Err(format!(
-                "clipboard arm: the compositor's clipboard does not contain the selected text \
-                 {COPY_MARKER:?}. Second client read back:\n{}",
+                "clipboard arm: the compositor's clipboard has no line equal to the selected \
+                 text {COPY_MARKER:?} (a line merely containing it would be the echoed \
+                 command, not the copied output). Second client read back:\n{}",
                 tail_lines(window, 12)
             ));
         }
         println!(
             "term-daily-driver-smoke: independent client read {COPY_MARKER:?} back from the \
-             compositor ClipboardStore"
+             compositor ClipboardStore as a whole line"
         );
 
         // ---- Arm 4: paste reaches the PTY ----------------------------
         // Paste into a bare `cat`, which echoes stdin and never executes
-        // it. This is not cosmetic: `ion` does not enable bracketed-paste
-        // mode (`?2004h`), so `wrap_paste` correctly passes the payload
-        // through unframed — and a multi-row selection pasted at a *shell
-        // prompt* would run every line in it and take the shell down with
-        // it. (That is precisely the hazard bracketed paste exists to
+        // it. This is not cosmetic: a multi-row selection pasted at a
+        // *shell prompt* would run every line in it and take the shell down
+        // with it. (That is precisely the hazard bracketed paste exists to
         // prevent, and this gate reproduced it before the sink was added.)
         //
-        // The `ESC[200~` / `ESC[201~` framing itself is therefore not
-        // observable on this lane — it is conditioned on the application
-        // enabling the mode — and is covered by the `wrap_paste` host
-        // tests in `term::input` instead. What this arm owns is the live
-        // path: clipboard -> IPC -> `wrap_paste` -> PTY -> echo.
+        // WHAT THIS ARM DOES NOT ASSERT, and why. The `ESC[200~` /
+        // `ESC[201~` framing is emitted only when the *application* has set
+        // `?2004h`, and no program in the image does: a tree-wide grep for
+        // `2004` finds the mode bit in `term::screen`, the framing in
+        // `term::input::wrap_paste`, and nothing else — not `ion`, not the
+        // editor, not `tui-smoke`. So on this lane `wrap_paste` correctly
+        // passes the payload through unframed and there is no framing on
+        // the wire to observe. Nor could the gate read it if there were:
+        // the pasted bytes land on the PTY, whose only sink is the
+        // framebuffer, and a PPM cannot be OCR'd. The framed form is
+        // covered by the `wrap_paste` host tests in `term::input`.
+        //
+        // What this arm owns is the live path — clipboard -> IPC ->
+        // `wrap_paste` -> PTY -> `cat` echo -> glyphs on screen — and, by
+        // asserting the payload rendered at all, the unframed half of the
+        // bracketed-paste contract.
         q.type_text("cat\n").map_err(|e| format!("type cat: {e}"))?;
-        let cat_base = capture_settled(
-            &mut q,
-            &args.out_dir,
-            "40-cat",
-            std::time::Duration::from_secs(20),
-        )?;
+        let cat_base = capture_settled(&mut q, &args.out_dir, "40-cat", SETTLE)?;
         q.press_chord(&["ctrl", "shift", "v"], 40)
             .map_err(|e| format!("ctrl+shift+v: {e}"))?;
         let pasted_frame = capture_settled(
             &mut q,
             &args.out_dir,
             "41-pasted",
-            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(12),
         )?;
         let paste_rows = changed_rows_in_band(&cat_base, &pasted_frame, 0.0, 1.0);
         // `term` paints a black background; the compositor's is teal. A
@@ -21539,14 +21846,315 @@ fn cmd_term_polish_smoke(args: &LessRenderProbeArgs) {
                  it painted the pasted text"
             ));
         }
-        if paste_rows == 0 {
-            return Err(
-                "paste arm: Ctrl+Shift+V produced no visible change; nothing reached the PTY"
-                    .into(),
-            );
+        // The offer is the whole tall drag — dozens of rows, each echoed by
+        // `cat`. A one-row change would mean the payload was truncated to
+        // its first line, so hold this to the same floor as the other arms
+        // rather than the `> 0` it used to carry.
+        if paste_rows < MIN_CHANGED_SCANLINES {
+            return Err(format!(
+                "paste arm: Ctrl+Shift+V changed only {paste_rows} scanlines (min \
+                 {MIN_CHANGED_SCANLINES}); the multi-row clipboard offer did not reach the PTY"
+            ));
         }
         // Close `cat`'s stdin so it exits cleanly and leaves a live shell.
-        let _ = q.press_chord(&["ctrl", "d"], 30);
+        //
+        // Enter first, and it is not cosmetic. The pasted offer does not end
+        // in a newline, so it sits in the line discipline's canonical-mode
+        // edit buffer as a partial line. VEOF (Ctrl+D) on a *non-empty* line
+        // flushes that line to the reader instead of signalling EOF — the
+        // standard tty rule — so a lone Ctrl+D here left `cat` running, and
+        // every later arm typed its command into `cat` instead of the shell.
+        // Enter terminates the partial line; the Ctrl+D that follows then
+        // lands on an empty one and actually closes stdin. (Sending Ctrl+D
+        // twice would also work here but is unsafe in general: on an already
+        // empty line the second one reaches the shell and logs it out.)
+        q.press_key("ret", 30)
+            .map_err(|e| format!("terminate cat's partial line: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        q.press_chord(&["ctrl", "d"], 30)
+            .map_err(|e| format!("close cat stdin: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(800));
+
+        // ---- Arm 5: wheel -> application (alternate screen) ----------
+        // `tui-smoke mouse-live` is the counterpart to arm 2: it takes the
+        // alternate screen, enables `?1000h` + `?1006h` itself, decodes
+        // `term`'s SGR reports, and floods half the grid with a saturated
+        // colour per notch. That gives two independent oracles for the same
+        // event — a serial sentinel proving the *application* decoded the
+        // report, and a hue-plus-region check on the PPM proving it
+        // repainted for the right direction.
+        //
+        // A ported TUI would not do: htop's process list can legitimately
+        // change zero pixels on a scroll, nothing guarantees ncurses turns
+        // mouse tracking on under `TERM=m3os-term`, and pulling a port build
+        // into this gate would cost minutes.
+        q.type_text("/bin/tui-smoke mouse-live\n")
+            .map_err(|e| format!("type tui-smoke: {e}"))?;
+        // Injecting before this sentinel is a race with a wrong answer, not
+        // just a flake: until `?1000h` has reached `term`, a notch is
+        // consumed by term's own scrollback viewport and never reported.
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "TUI_SMOKE:mouse-live:ready",
+            std::time::Duration::from_secs(60),
+            global_start,
+            global_timeout,
+        )?;
+        println!("term-daily-driver-smoke: mouse-live probe is tracking the mouse");
+        let alt_base = capture_settled(&mut q, &args.out_dir, "50-alt-base", SETTLE)?;
+        let base_red = band_pixels_matching(&alt_base, 0.0, 0.5, is_wheel_up_red);
+        let base_blue = band_pixels_matching(&alt_base, 0.5, 1.0, is_wheel_down_blue);
+
+        // One notch, not five: the probe emits one report per event, so the
+        // `up=` / `down=` totals it prints on exit are directly comparable
+        // to what was injected.
+        q.send_wheel(1).map_err(|e| format!("alt wheel up: {e}"))?;
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "TUI_SMOKE:mouse-live:cb=64",
+            std::time::Duration::from_secs(20),
+            global_start,
+            global_timeout,
+        )?;
+        let alt_up = capture_settled(&mut q, &args.out_dir, "51-alt-wheel-up", SETTLE)?;
+        let up_rows = changed_rows_in_band(&alt_base, &alt_up, 0.0, 1.0);
+        let up_red_top = band_pixels_matching(&alt_up, 0.0, 0.5, is_wheel_up_red);
+        let up_red_bottom = band_pixels_matching(&alt_up, 0.5, 1.0, is_wheel_up_red);
+        println!(
+            "term-daily-driver-smoke: wheel-up changed {up_rows} scanlines; band = \
+             {up_red_top} red px in the top half ({up_red_bottom} in the bottom, baseline \
+             {base_red})"
+        );
+        // Coarse check first, so a frame that did not move at all is
+        // reported as such rather than as a colour mismatch.
+        if up_rows < MIN_CHANGED_SCANLINES {
+            return Err(format!(
+                "alt-screen arm: the wheel-up notch changed only {up_rows} scanlines (min \
+                 {MIN_CHANGED_SCANLINES}); the probe decoded the report on serial but nothing \
+                 reached the framebuffer"
+            ));
+        }
+        if up_red_top.saturating_sub(base_red) < MIN_BAND_PIXELS {
+            return Err(format!(
+                "alt-screen arm: the wheel-up repaint left only {up_red_top} saturated-red \
+                 pixels in the top half (baseline {base_red}, min delta {MIN_BAND_PIXELS}); \
+                 the probe reported the notch on serial but the frame does not show its band"
+            ));
+        }
+        // The band is the top half of term's *grid*, which starts a few
+        // pixels below the top of the screen, so a little of it spills past
+        // the screen's midpoint. Requiring the top half to dominate — not
+        // requiring the bottom half to be empty — is what distinguishes a
+        // wheel-up repaint from a wheel-down one without pinning the
+        // compositor's tile geometry.
+        if up_red_top <= up_red_bottom {
+            return Err(format!(
+                "alt-screen arm: the wheel-up band is not in the top half \
+                 ({up_red_top} px top vs {up_red_bottom} px bottom); the app repainted, but \
+                 not for a wheel-up"
+            ));
+        }
+
+        q.send_wheel(-1)
+            .map_err(|e| format!("alt wheel down: {e}"))?;
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "TUI_SMOKE:mouse-live:cb=65",
+            std::time::Duration::from_secs(20),
+            global_start,
+            global_timeout,
+        )?;
+        let alt_down = capture_settled(&mut q, &args.out_dir, "52-alt-wheel-down", SETTLE)?;
+        let down_blue_bottom = band_pixels_matching(&alt_down, 0.5, 1.0, is_wheel_down_blue);
+        let down_blue_top = band_pixels_matching(&alt_down, 0.0, 0.5, is_wheel_down_blue);
+        let down_red_top = band_pixels_matching(&alt_down, 0.0, 0.5, is_wheel_up_red);
+        println!(
+            "term-daily-driver-smoke: wheel-down band = {down_blue_bottom} blue px in the \
+             bottom half ({down_blue_top} in the top, baseline {base_blue}); red left over \
+             {down_red_top}"
+        );
+        if down_blue_bottom.saturating_sub(base_blue) < MIN_BAND_PIXELS {
+            return Err(format!(
+                "alt-screen arm: the wheel-down repaint left only {down_blue_bottom} \
+                 saturated-blue pixels in the bottom half (baseline {base_blue}, min delta \
+                 {MIN_BAND_PIXELS}); the app did not repaint for the downward notch"
+            ));
+        }
+        if down_blue_bottom <= down_blue_top {
+            return Err(format!(
+                "alt-screen arm: the wheel-down band is not in the bottom half \
+                 ({down_blue_bottom} px bottom vs {down_blue_top} px top)"
+            ));
+        }
+        // Each repaint erases the screen first, so the up band must be gone
+        // — the two frames differ in region *and* hue, which is what makes
+        // this pair impossible to satisfy with a single generic repaint.
+        if down_red_top.saturating_sub(base_red) >= MIN_BAND_PIXELS {
+            return Err(format!(
+                "alt-screen arm: the wheel-up band is still on screen after the wheel-down \
+                 notch ({down_red_top} red px, baseline {base_red}); the app is not \
+                 repainting per notch"
+            ));
+        }
+
+        // ---- Arm 6: Shift-drag override ------------------------------
+        // Same surface, same drag, one modifier apart — and the app still
+        // holds the mouse, which is the only state in which the two
+        // outcomes differ. Unshifted, the press/release belong to the
+        // application (`mouse-live` decodes button reports and ignores
+        // anything that is not a wheel pseudo-button, so it paints
+        // nothing); Shift-held, `term` must keep the drag for itself and
+        // paint a selection.
+        //
+        // Both drags are paced edge by edge — see `qmp::GESTURE_STEP_PACING`.
+        // Fired back to back, the guest's single HID poll loop reads the
+        // keyboard's queued Shift *break* before the tablet's queued button
+        // press, so the compositor stamps the whole gesture with no
+        // modifiers and this arm reads a false negative: both drags change
+        // zero scanlines and the failure looks like a missing capability.
+        q.drag_abs(DRAG_FROM, DRAG_TO)
+            .map_err(|e| format!("alt plain drag: {e}"))?;
+        // See the selection arm: park only after the release has landed.
+        std::thread::sleep(POINTER_RELEASE_SETTLE);
+        q.send_pointer_abs(POINTER_PARK.0, POINTER_PARK.1)
+            .map_err(|e| format!("re-park pointer: {e}"))?;
+        let alt_plain_drag = capture_settled(&mut q, &args.out_dir, "53-alt-drag-plain", SETTLE)?;
+        let plain_rows = changed_rows_in_band(&alt_down, &alt_plain_drag, 0.0, 1.0);
+        println!("term-daily-driver-smoke: unshifted drag changed {plain_rows} scanlines");
+        if plain_rows > TERM_QUIET_SCANLINES {
+            return Err(format!(
+                "shift-drag arm: an UNSHIFTED drag changed {plain_rows} scanlines (max \
+                 {TERM_QUIET_SCANLINES}); `term` painted a selection over a mouse-tracking \
+                 application instead of reporting the drag to it"
+            ));
+        }
+
+        q.drag_abs_with_mods(&["shift"], DRAG_FROM, DRAG_TO)
+            .map_err(|e| format!("alt shift drag: {e}"))?;
+        // See the selection arm: park only after the release has landed.
+        std::thread::sleep(POINTER_RELEASE_SETTLE);
+        q.send_pointer_abs(POINTER_PARK.0, POINTER_PARK.1)
+            .map_err(|e| format!("re-park pointer: {e}"))?;
+        let alt_shift_drag = capture_settled(&mut q, &args.out_dir, "54-alt-drag-shift", SETTLE)?;
+        let shift_rows = changed_rows_in_band(&alt_plain_drag, &alt_shift_drag, 0.0, 1.0);
+        println!("term-daily-driver-smoke: shift-drag changed {shift_rows} scanlines");
+        if shift_rows < MIN_CHANGED_SCANLINES {
+            return Err(format!(
+                "shift-drag arm: a SHIFT-held drag changed only {shift_rows} scanlines (min \
+                 {MIN_CHANGED_SCANLINES}); the xterm force-select override did not fire. \
+                 Either the compositor is not stamping live modifiers onto pointer events or \
+                 `term` is not honouring MOD_SHIFT while the app has the mouse"
+            ));
+        }
+
+        // Quit the probe and collect its own tally. `up=1` / `down=1` are
+        // exact: a duplicated or dropped notch fails here rather than
+        // quietly widening what the frame checks above were measuring.
+        q.type_text("q").map_err(|e| format!("type q: {e}"))?;
+        for sentinel in [
+            "TUI_SMOKE:mouse-live:up=1",
+            "TUI_SMOKE:mouse-live:down=1",
+            "TUI_SMOKE:mouse-live:ok",
+        ] {
+            wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                sentinel,
+                std::time::Duration::from_secs(20),
+                global_start,
+                global_timeout,
+            )
+            .map_err(|e| {
+                format!(
+                    "alt-screen arm: {sentinel} never arrived — the probe's own tally \
+                     disagrees with what was injected, or it exited on a \
+                     `TUI_SMOKE:mouse-live:fail` line in the transcript below.\n{e}"
+                )
+            })?;
+        }
+
+        // The probe's teardown leaves the alternate screen, restoring the
+        // primary buffer. Two things must hold afterwards. First, `term` is
+        // still on screen at all.
+        let primary = capture_settled(&mut q, &args.out_dir, "55-primary-restored", SETTLE)?;
+        let primary_black = primary.black_pixel_ratio();
+        if primary_black < 0.15 {
+            return Err(format!(
+                "alt-screen arm: after the probe exited the terminal is not on screen \
+                 (black-ratio {primary_black:.2}); leaving the alternate screen killed it"
+            ));
+        }
+        // Second, the terminal is showing its live tail — nothing left the
+        // viewport parked in history. Shift+End writes no PTY bytes and is
+        // a no-op when the viewport is already home, so a frame that
+        // changes here is a frame that was scrolled back.
+        //
+        // Note what this does and does not prove. `set_view_offset` returns
+        // early on the alternate screen, so a notch *delivered while the
+        // app was tracking* could not have moved the viewport even if term
+        // had also consumed it; that half is what arm 2 plus the `cb=`
+        // sentinels above establish. What this checks is the end state — no
+        // notch leaked into the viewport around the probe's entry or exit,
+        // when the primary buffer was live again.
+        q.press_chord(&["shift", "end"], 30)
+            .map_err(|e| format!("post-probe shift+end: {e}"))?;
+        let primary_home = capture_settled(&mut q, &args.out_dir, "56-primary-live-tail", SETTLE)?;
+        let primary_drift = changed_rows_in_band(&primary, &primary_home, 0.0, 1.0);
+        println!(
+            "term-daily-driver-smoke: restored primary sits {primary_drift} scanlines from its \
+             live tail"
+        );
+        if primary_drift > TERM_QUIET_SCANLINES {
+            return Err(format!(
+                "alt-screen arm: after the probe exited, snapping to the live tail changed \
+                 {primary_drift} scanlines (max {TERM_QUIET_SCANLINES}); the wheel left \
+                 `term`'s own viewport scrolled back instead of going only to the application"
+            ));
+        }
+
+        // The Shift-drag copied on release, so the compositor's offer must
+        // no longer be arm 3's marker. Read it back from the independent
+        // client again, with its own anchor so the window cannot resolve to
+        // the earlier read-back.
+        q.type_text("/bin/clip-smoke --paste\n")
+            .map_err(|e| format!("type clip-smoke: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        q.type_text(&format!("/bin/echo-args {CLIP_ANCHOR_SHIFT}\n"))
+            .map_err(|e| format!("type echo-args: {e}"))?;
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            CLIP_ANCHOR_SHIFT,
+            std::time::Duration::from_secs(30),
+            global_start,
+            global_timeout,
+        )?;
+        let transcript = strip_ansi(&serial_history);
+        let window = clip_payload_before_anchor(&transcript, CLIP_SENTINEL, CLIP_ANCHOR_SHIFT)
+            .ok_or("shift-drag arm: CLIP_PASTE sentinel vanished from the transcript")?;
+        // The alternate screen carries no text of its own — the probe
+        // paints coloured spaces — so the copied rows are blanks. What
+        // matters is that the store was *replaced*: if the Shift-drag had
+        // not copied, arm 3's marker would still be the standing offer.
+        if window_has_exact_line(window, COPY_MARKER) {
+            return Err(format!(
+                "shift-drag arm: the compositor's clipboard still holds arm 3's {COPY_MARKER:?} \
+                 offer, so the Shift-held drag selected on screen but never copied on release. \
+                 Second client read back:\n{}",
+                tail_lines(window, 12)
+            ));
+        }
+        println!(
+            "term-daily-driver-smoke: the Shift-held drag replaced the compositor clipboard offer"
+        );
         Ok(())
     })();
 
@@ -21565,11 +22173,16 @@ fn cmd_term_polish_smoke(args: &LessRenderProbeArgs) {
     match result {
         Ok(()) => {
             println!(
-                "term-daily-driver-smoke: PASSED — scrollback viewport (Shift+PageUp + \
-                 Report-protocol wheel, with snap-to-bottom), selection highlight, compositor \
-                 clipboard round trip read back by an independent client, and Ctrl+Shift+V \
-                 delivering the offer to the PTY. (The ESC[200~ framing itself is host-tested: \
-                 ion does not enable ?2004, so it is not observable on this lane.) Frames in {}",
+                "term-daily-driver-smoke: PASSED — scrollback viewport (Shift+PageUp, \
+                 Report-protocol wheel, snap-to-bottom asserted against the live-tail frame), \
+                 selection highlight, compositor clipboard round trip read back line-exact by \
+                 an independent client, Ctrl+Shift+V delivering the offer to the PTY, the \
+                 wheel reaching a mouse-tracking application on the alternate screen (per-notch \
+                 hue + region on the PPM, plus the app's own serial tally), and the Shift-drag \
+                 override discriminating from an unshifted drag while that app held the mouse. \
+                 (The ESC[200~ framing itself is NOT asserted: no program in the image enables \
+                 ?2004h, and PTY bytes have no sink but the framebuffer — it is covered by the \
+                 `term::input::wrap_paste` host tests.) Frames in {}",
                 args.out_dir.display()
             );
         }
@@ -40207,6 +40820,189 @@ mod tests {
 
     fn string_args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| part.to_string()).collect()
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 112 Track C.2 — term-daily-driver-smoke helpers
+    // -----------------------------------------------------------------
+
+    /// Every QMP/PPM probe shares one arg parser, so the per-command
+    /// defaults have to survive it: two gates writing `serial.log` into the
+    /// same directory means the second one to run destroys the evidence the
+    /// first one left behind.
+    #[test]
+    fn probe_arg_defaults_are_per_command() {
+        let term = parse_probe_args_with_defaults(
+            &[],
+            "term-daily-driver-smoke",
+            480,
+            "m3os-term-daily-driver-smoke",
+        )
+        .expect("empty args parse");
+        assert_eq!(term.timeout_secs, 480);
+        assert_eq!(
+            term.out_dir.file_name().unwrap(),
+            "m3os-term-daily-driver-smoke"
+        );
+        assert!(!term.keep_qemu);
+
+        // The legacy wrapper keeps the old defaults for the four probes
+        // that still call it.
+        let legacy = parse_less_render_probe_args(&[]).expect("empty args parse");
+        assert_eq!(legacy.timeout_secs, 240);
+        assert_eq!(
+            legacy.out_dir.file_name().unwrap(),
+            "m3os-less-render-probe"
+        );
+
+        // Explicit flags still win over both defaults.
+        let overridden = parse_probe_args_with_defaults(
+            &string_args(&["--timeout", "60", "--out", "/tmp/x", "--keep-qemu"]),
+            "term-daily-driver-smoke",
+            480,
+            "m3os-term-daily-driver-smoke",
+        )
+        .expect("flags parse");
+        assert_eq!(overridden.timeout_secs, 60);
+        assert_eq!(overridden.out_dir, PathBuf::from("/tmp/x"));
+        assert!(overridden.keep_qemu);
+
+        // An unknown flag names the command the user typed, not whichever
+        // probe happens to own the parser.
+        let err = parse_probe_args_with_defaults(
+            &string_args(&["--nope"]),
+            "term-daily-driver-smoke",
+            480,
+            "d",
+        )
+        .expect_err("unknown flag rejected");
+        assert!(err.contains("term-daily-driver-smoke"), "{err}");
+    }
+
+    /// The bug this window exists to kill: `clip-smoke` prints its sentinel
+    /// and its payload as two `serial_print` calls, so the payload is
+    /// always a *later* serial line. A reader that stops at the sentinel
+    /// reads a transcript that does not contain the payload yet — the
+    /// anchor is what makes the read total.
+    #[test]
+    fn clip_payload_window_runs_from_the_sentinel_to_the_anchor() {
+        let transcript = "[INFO] [userspace] CLIP_PASTE:\n\
+                          [INFO] [userspace] stale run\n\
+                          [INFO] [userspace] echo-args: argv[1]=CLIPSYNCA\n\
+                          [INFO] [userspace] CLIP_PASTE:\n\
+                          [INFO] [userspace] noise\n\
+                          M3OS_COPY_ME\n\
+                          tail row\n\
+                          [INFO] [userspace] echo-args: argv[1]=CLIPSYNCB\n";
+        let window = clip_payload_before_anchor(transcript, "CLIP_PASTE:", "CLIPSYNCB")
+            .expect("anchored window");
+        assert!(window.contains("M3OS_COPY_ME"));
+        // The window starts at the LAST sentinel before its anchor, so an
+        // earlier read-back's payload cannot leak into this one's verdict.
+        assert!(
+            !window.contains("stale run"),
+            "window ran past the preceding read back: {window:?}"
+        );
+        // The earlier anchor still selects the earlier run.
+        let earlier = clip_payload_before_anchor(transcript, "CLIP_PASTE:", "CLIPSYNCA")
+            .expect("earlier window");
+        assert!(earlier.contains("stale run"));
+        assert!(!earlier.contains("M3OS_COPY_ME"));
+        // Without the anchor there is no window at all: "not printed yet"
+        // must not be mistaken for "not in the clipboard".
+        assert!(
+            clip_payload_before_anchor("[INFO] CLIP_PASTE:\n", "CLIP_PASTE:", "CLIPSYNCA")
+                .is_none()
+        );
+    }
+
+    /// A transcript is `from_utf8_lossy` output, so a corrupt byte run
+    /// becomes a 3-byte U+FFFD. The window's length cap must land on a char
+    /// boundary — a panic here would skip the gate's QEMU teardown and leak
+    /// the process.
+    #[test]
+    fn clip_payload_window_cap_lands_on_a_char_boundary() {
+        let mut transcript = String::from("CLIP_PASTE:");
+        // Fill past the 8 KiB cap with a multi-byte char so that *some*
+        // offset in the region is guaranteed to be a non-boundary.
+        for _ in 0..5000 {
+            transcript.push('\u{FFFD}');
+        }
+        transcript.push_str("CLIPSYNCA");
+        let window = clip_payload_before_anchor(&transcript, "CLIP_PASTE:", "CLIPSYNCA")
+            .expect("anchored window");
+        assert!(window.len() <= 8192);
+        assert!(window.chars().all(|c| c == '\u{FFFD}'));
+
+        assert_eq!(floor_char_boundary("aé", 2), 1);
+        assert_eq!(floor_char_boundary("aé", 3), 3);
+        assert_eq!(floor_char_boundary("abc", 99), 3);
+    }
+
+    /// `contains` cannot tell the copied *output* row from the command row
+    /// that produced it — both contain the marker. Whole-line equality can.
+    #[test]
+    fn window_exact_line_rejects_a_substring_only_match() {
+        assert!(window_has_exact_line("a\nM3OS_COPY_ME\nb", "M3OS_COPY_ME"));
+        // Trailing whitespace / CR from the serial transcript is not a
+        // mismatch; a prefix (the shell's echo of the command) is.
+        assert!(window_has_exact_line("M3OS_COPY_ME  \r\n", "M3OS_COPY_ME"));
+        assert!(!window_has_exact_line(
+            "$ echo M3OS_COPY_ME\n",
+            "M3OS_COPY_ME"
+        ));
+        assert!(!window_has_exact_line("", "M3OS_COPY_ME"));
+    }
+
+    /// Build a frame whose top half is saturated red and bottom half
+    /// saturated blue — the two bands `tui-smoke mouse-live` paints.
+    fn two_band_frame(width: u32, height: u32) -> ppm::PpmFrame {
+        let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for _ in 0..width {
+                if y < height / 2 {
+                    pixels.extend_from_slice(&[255, 0, 0]);
+                } else {
+                    pixels.extend_from_slice(&[0, 0, 255]);
+                }
+            }
+        }
+        ppm::PpmFrame {
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    /// A scanline diff can see that the app repainted but not *which* notch
+    /// it repainted for; the hue-in-a-band count is what separates the two.
+    #[test]
+    fn band_pixel_counts_separate_the_wheel_bands() {
+        let frame = two_band_frame(10, 20);
+        assert_eq!(band_pixels_matching(&frame, 0.0, 0.5, is_wheel_up_red), 100);
+        assert_eq!(band_pixels_matching(&frame, 0.5, 1.0, is_wheel_up_red), 0);
+        assert_eq!(
+            band_pixels_matching(&frame, 0.5, 1.0, is_wheel_down_blue),
+            100
+        );
+        assert_eq!(
+            band_pixels_matching(&frame, 0.0, 0.5, is_wheel_down_blue),
+            0
+        );
+
+        // The compositor's own chrome must not read as either band: teal
+        // desktop, grey bar, black terminal.
+        for (r, g, b) in [(0u8, 128u8, 128u8), (60, 60, 60), (0, 0, 0)] {
+            assert!(!is_wheel_up_red(r, g, b), "{r},{g},{b}");
+            assert!(!is_wheel_down_blue(r, g, b), "{r},{g},{b}");
+        }
+        // A degenerate frame counts nothing rather than panicking.
+        let empty = ppm::PpmFrame {
+            width: 0,
+            height: 0,
+            pixels: Vec::new(),
+        };
+        assert_eq!(band_pixels_matching(&empty, 0.0, 1.0, is_wheel_up_red), 0);
     }
 
     #[test]

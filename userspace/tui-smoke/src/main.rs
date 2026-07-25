@@ -26,6 +26,13 @@
 //! - `paste` — `wrap_paste(b"abc", true)` returns
 //!   `\x1b[200~abc\x1b[201~`; passthrough when disabled.
 //! - `term-env` — `getenv("TERM") == "m3os-term"`.
+//! - `mouse-live` — the only *interactive* subcommand. It puts stdin in
+//!   raw mode, enters the alternate screen, turns on `?1000` tracking +
+//!   `?1006` SGR encoding, and then decodes the reports `term` writes
+//!   back on the PTY. Each wheel notch (`\x1b[<64;Px;PyM` up,
+//!   `\x1b[<65;Px;PyM` down) repaints half the screen in a solid colour
+//!   and mirrors a `cb=` sentinel to the serial console. `q` tears the
+//!   modes down and reports `:ok`.
 
 #![no_std]
 #![no_main]
@@ -82,6 +89,7 @@ fn program_main(args: &[&str], env: &[&str]) -> i32 {
         "alt-screen" => run_alt_screen(),
         "colors" => run_colors(),
         "mouse" => run_mouse(),
+        "mouse-live" => run_mouse_live(),
         "cursor" => run_cursor(),
         "resize" => run_resize(),
         "paste" => run_paste(),
@@ -95,7 +103,8 @@ fn program_main(args: &[&str], env: &[&str]) -> i32 {
             syscall_lib::write_str(
                 STDOUT_FILENO,
                 "tui-smoke: missing subcommand. Use one of: alt-screen, \
-                 colors, mouse, cursor, resize, paste, term-env, utf8, fonts\n",
+                 colors, mouse, mouse-live, cursor, resize, paste, term-env, \
+                 utf8, fonts\n",
             );
             return 2;
         }
@@ -238,13 +247,17 @@ fn run_colors() -> Result<(), &'static str> {
 
 fn run_mouse() -> Result<(), &'static str> {
     use kernel_core::input::events::{ModifierState, PointerButton, PointerEvent};
-    // Mirror the literals in `term::mouse::compute_cell_position`.
-    // The `term::display` module is gated behind `os-binary`, so we
-    // duplicate the literals here as the in-crate mouse tests do —
-    // mismatching them would mis-project the synthetic pixel input
-    // onto the cell grid and produce a stale wire string.
-    const CELL_W_PX: i32 = 16;
-    const CELL_H_PX: i32 = 32;
+    // Phase 112 — read the cell size from `term`'s crate root, the same
+    // constants `term::mouse::compute_cell_position` projects with.
+    //
+    // These used to be private `16` / `32` literals duplicated here.
+    // Phase 73 moved the real cell to 24×48 and this copy was missed, so
+    // the synthetic pixel input was projected onto a grid 1.5× too fine
+    // and the expected wire string below only held by coincidence.
+    // Sourcing them makes the `(11, 6)` assertion true by construction at
+    // any cell size.
+    const CELL_W_PX: i32 = term::CELL_WIDTH as i32;
+    const CELL_H_PX: i32 = term::CELL_HEIGHT as i32;
     let mut reporter = MouseReporter::new();
     // Off-state: disabled returns None.
     let event = PointerEvent {
@@ -271,6 +284,461 @@ fn run_mouse() -> Result<(), &'static str> {
         return Err("sgr-press-wire-mismatch");
     }
     Ok(())
+}
+
+// ===========================================================================
+// `mouse-live` — alternate-screen wheel-tracking probe
+// ===========================================================================
+//
+// The Phase 112 framebuffer gate needs an application that (a) runs on the
+// alternate screen, (b) has grabbed the mouse, and (c) reacts visibly to a
+// wheel notch. A ported TUI is a poor fit: htop's process list on m3OS is
+// short enough that a scroll can legitimately change zero pixels, and nothing
+// guarantees ncurses turns xterm mouse tracking on under `TERM=m3os-term`.
+// This probe enables tracking itself and repaints half the screen per notch,
+// so both the "did term report it" and "did the app see it" halves of the
+// contract are observable — the first on serial, the second on the
+// framebuffer.
+
+/// Sequences the probe writes on entry: alternate screen, button-event
+/// tracking, SGR encoding, cursor home, erase. `?1000` (which events are
+/// reported) and `?1006` (how they are encoded) are independent modes in
+/// `term`'s reporter, so both are required — `?1000h` alone would emit the
+/// legacy `\x1b[M` form this decoder does not accept.
+const MOUSE_LIVE_SETUP: &[u8] = b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[0m\x1b[H\x1b[2J";
+
+/// The exact inverse of [`MOUSE_LIVE_SETUP`], in reverse order: stop
+/// reporting before dropping the encoding, then leave the alternate screen so
+/// the primary buffer (and the shell prompt on it) comes back intact. The
+/// gate asserts the primary screen is restored, so this must run on *every*
+/// exit path, including the timeout one.
+const MOUSE_LIVE_TEARDOWN: &[u8] = b"\x1b[0m\x1b[?1000l\x1b[?1006l\x1b[?1049l";
+
+/// Prefix shared by every serial line this subcommand emits. `ok_or_fail`
+/// prints the same shape to stdout, but stdout here is `term`'s PTY — it
+/// renders to the framebuffer and never reaches the console the gate greps.
+const MOUSE_LIVE_PREFIX: &str = "TUI_SMOKE:mouse-live:";
+
+/// Idle polls tolerated before the probe gives up. Each read is a 100 ms
+/// VTIME poll, so this is ~30 s of silence — long enough for the harness to
+/// boot a viewer and inject, short enough that a broken gate fails rather
+/// than hanging until the outer QEMU timeout.
+const MOUSE_LIVE_IDLE_POLLS: u32 = 300;
+
+/// Hard ceiling on read iterations regardless of whether they carried data.
+/// Guards against a peer that streams bytes forever without ever sending `q`.
+const MOUSE_LIVE_READ_BUDGET: u32 = 6000;
+
+/// Fixed-capacity ASCII line builder. The probe formats a handful of short
+/// sentinels and cannot use `format!` (no `std`, and the serial call takes a
+/// `&str`), so numbers are rendered by hand into this buffer.
+struct LineBuf {
+    bytes: [u8; 96],
+    len: usize,
+}
+
+impl LineBuf {
+    fn new() -> Self {
+        Self {
+            bytes: [0; 96],
+            len: 0,
+        }
+    }
+
+    fn push_str(&mut self, s: &str) {
+        for &b in s.as_bytes() {
+            if self.len < self.bytes.len() {
+                self.bytes[self.len] = b;
+                self.len += 1;
+            }
+        }
+    }
+
+    fn push_u32(&mut self, value: u32) {
+        // `u32::MAX` is 10 digits; emit least-significant first into a
+        // scratch array, then reverse it into the line.
+        let mut digits = [0u8; 10];
+        let mut n = value;
+        let mut count = 0usize;
+        loop {
+            digits[count] = b'0' + (n % 10) as u8;
+            n /= 10;
+            count += 1;
+            if n == 0 {
+                break;
+            }
+        }
+        while count > 0 {
+            count -= 1;
+            if self.len < self.bytes.len() {
+                self.bytes[self.len] = digits[count];
+                self.len += 1;
+            }
+        }
+    }
+
+    /// Everything pushed above is ASCII by construction, so the conversion
+    /// cannot fail; the empty fallback keeps the helper panic-free anyway.
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
+    }
+}
+
+/// Emit `TUI_SMOKE:mouse-live:<tag><value>` on the serial console.
+fn mouse_live_serial(tag: &str, value: u32) {
+    let mut line = LineBuf::new();
+    line.push_str(MOUSE_LIVE_PREFIX);
+    line.push_str(tag);
+    line.push_u32(value);
+    line.push_str("\n");
+    syscall_lib::serial_print(line.as_str());
+}
+
+/// Emit `TUI_SMOKE:mouse-live:<text>` on the serial console.
+fn mouse_live_serial_str(text: &str) {
+    let mut line = LineBuf::new();
+    line.push_str(MOUSE_LIVE_PREFIX);
+    line.push_str(text);
+    syscall_lib::serial_print(line.as_str());
+}
+
+/// Which half of the alternate screen a wheel notch paints, and in which
+/// colour. The two arms differ in *both* the region covered and the colour so
+/// a PPM frame diff can tell scroll-up from scroll-down without decoding any
+/// text out of the framebuffer.
+#[derive(Clone, Copy)]
+enum WheelBand {
+    Up,
+    Down,
+}
+
+/// Decoder states for the SGR mouse reports arriving on stdin.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SgrState {
+    /// Between sequences — ordinary keystrokes (e.g. `q`) land here.
+    Ground,
+    /// Saw `ESC`.
+    Esc,
+    /// Saw `ESC [`; the next byte must be `<` for a mouse report.
+    Csi,
+    /// Inside `Pb ; Px ; Py`, waiting for the `M`/`m` final byte.
+    Params,
+}
+
+/// One decoded `\x1b[<Pb;Px;Py M|m` report.
+struct SgrMouseReport {
+    button: u32,
+    /// Lower-case `m` final byte — a button release. The wheel never
+    /// produces one (a notch has no release edge), so the probe drops these.
+    release: bool,
+}
+
+/// Incremental decoder for `term`'s SGR mouse reports. Byte-at-a-time and
+/// allocation-free: a malformed or unrecognised run resets to `Ground` rather
+/// than accumulating, so a stray escape sequence on stdin cannot wedge it.
+struct SgrMouseDecoder {
+    state: SgrState,
+    params: [u32; 3],
+    param_idx: usize,
+}
+
+impl SgrMouseDecoder {
+    fn new() -> Self {
+        Self {
+            state: SgrState::Ground,
+            params: [0; 3],
+            param_idx: 0,
+        }
+    }
+
+    /// True when no escape sequence is in flight, i.e. the next byte is a
+    /// plain keystroke. The quit key is only honoured here so that a `q`
+    /// appearing inside a (hypothetical) escape sequence is not mistaken for
+    /// one.
+    fn is_ground(&self) -> bool {
+        self.state == SgrState::Ground
+    }
+
+    fn feed(&mut self, byte: u8) -> Option<SgrMouseReport> {
+        match self.state {
+            SgrState::Ground => {
+                if byte == 0x1b {
+                    self.state = SgrState::Esc;
+                }
+                None
+            }
+            SgrState::Esc => {
+                self.state = match byte {
+                    b'[' => SgrState::Csi,
+                    // A second ESC restarts the sequence rather than
+                    // discarding the one that is about to begin.
+                    0x1b => SgrState::Esc,
+                    _ => SgrState::Ground,
+                };
+                None
+            }
+            SgrState::Csi => {
+                match byte {
+                    b'<' => {
+                        self.params = [0; 3];
+                        self.param_idx = 0;
+                        self.state = SgrState::Params;
+                    }
+                    0x1b => self.state = SgrState::Esc,
+                    // Any other CSI (cursor reports, DA replies, …) is not
+                    // ours; drop it and wait for the next ESC.
+                    _ => self.state = SgrState::Ground,
+                }
+                None
+            }
+            SgrState::Params => match byte {
+                b'0'..=b'9' => {
+                    if self.param_idx < self.params.len() {
+                        let slot = &mut self.params[self.param_idx];
+                        *slot = slot
+                            .saturating_mul(10)
+                            .saturating_add(u32::from(byte - b'0'));
+                    }
+                    None
+                }
+                b';' => {
+                    // Clamp instead of wrapping: a report with more than the
+                    // three xterm parameters keeps the ones we already have.
+                    if self.param_idx + 1 < self.params.len() {
+                        self.param_idx += 1;
+                    }
+                    None
+                }
+                b'M' | b'm' => {
+                    let report = SgrMouseReport {
+                        button: self.params[0],
+                        release: byte == b'm',
+                    };
+                    self.state = SgrState::Ground;
+                    Some(report)
+                }
+                0x1b => {
+                    self.state = SgrState::Esc;
+                    None
+                }
+                _ => {
+                    self.state = SgrState::Ground;
+                    None
+                }
+            },
+        }
+    }
+}
+
+/// Append `value` as decimal ASCII to `out`.
+fn push_u16_decimal(out: &mut Vec<u8>, value: u16) {
+    let mut digits = [0u8; 5];
+    let mut n = value;
+    let mut count = 0usize;
+    loop {
+        digits[count] = b'0' + (n % 10) as u8;
+        n /= 10;
+        count += 1;
+        if n == 0 {
+            break;
+        }
+    }
+    while count > 0 {
+        count -= 1;
+        out.push(digits[count]);
+    }
+}
+
+/// Write every byte of `bytes` to `fd`, looping over short writes.
+///
+/// A full-screen repaint is a couple of kilobytes — larger than the PTY's
+/// slave-to-master ring — so a single `write` can legitimately place fewer
+/// bytes than asked and leave the band half-painted. The spin bound stops a
+/// wedged reader (one that keeps accepting zero bytes) from hanging the gate.
+fn write_all(fd: i32, bytes: &[u8]) -> bool {
+    let mut offset = 0usize;
+    let mut stalls = 0u32;
+    while offset < bytes.len() {
+        let n = syscall_lib::write(fd, &bytes[offset..]);
+        if n < 0 {
+            return false;
+        }
+        if n == 0 {
+            stalls += 1;
+            if stalls > 10_000 {
+                return false;
+            }
+            continue;
+        }
+        stalls = 0;
+        offset += n as usize;
+    }
+    true
+}
+
+/// Repaint the alternate screen for one wheel notch: erase, then flood half
+/// the grid with spaces on a saturated background colour.
+///
+/// Spaces are used deliberately — the renderer fills each cell's background
+/// before blitting its glyph, so a run of coloured spaces is a solid block of
+/// pixels and the frame diff is a large contiguous region rather than a few
+/// stroke pixels.
+fn paint_wheel_band(band: WheelBand, rows: u16, cols: u16) -> bool {
+    let mut out: Vec<u8> = Vec::new();
+    // Reset SGR *before* erasing: `ED 2` blanks with the currently selected
+    // background, so clearing while the previous band's colour is still
+    // active would repaint the whole screen in it instead of wiping it.
+    out.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J");
+    let half = (rows / 2).max(1);
+    // Black on saturated red / blue. The foreground is set explicitly only
+    // because the renderer falls back to a default background whenever a
+    // cell's fg and bg are equal; black can never collide with either band.
+    let (first_row, color) = match band {
+        WheelBand::Up => (1u16, &b"\x1b[38;2;0;0;0m\x1b[48;2;255;0;0m"[..]),
+        WheelBand::Down => (
+            rows.saturating_sub(half).saturating_add(1),
+            &b"\x1b[38;2;0;0;0m\x1b[48;2;0;0;255m"[..],
+        ),
+    };
+    out.extend_from_slice(color);
+    // Stop one column short of the right edge. Writing the final column arms
+    // the wrap path, and a wrap on the last row would scroll the band out
+    // from under itself.
+    let width = cols.saturating_sub(1);
+    let mut row = first_row;
+    while row < first_row.saturating_add(half) {
+        out.extend_from_slice(b"\x1b[");
+        push_u16_decimal(&mut out, row);
+        out.extend_from_slice(b";1H");
+        out.extend(core::iter::repeat_n(b' ', usize::from(width)));
+        row += 1;
+    }
+    // Park the cursor at home with default colours so the next repaint (and
+    // the teardown) start from a known state.
+    out.extend_from_slice(b"\x1b[0m\x1b[H");
+    write_all(STDOUT_FILENO, &out)
+}
+
+/// Body of the probe, run with stdin already in raw mode. Split out from
+/// [`run_mouse_live`] so every early return still passes through the mode
+/// teardown there.
+fn mouse_live_session(rows: u16, cols: u16) -> Result<(), &'static str> {
+    if !write_all(STDOUT_FILENO, MOUSE_LIVE_SETUP) {
+        return Err("setup-write-failed");
+    }
+    // The harness waits for this before injecting: a wheel event delivered
+    // before `?1000h` reaches `term` would scroll `term`'s own scrollback
+    // viewport instead of being reported to us.
+    mouse_live_serial_str("ready\n");
+
+    let mut decoder = SgrMouseDecoder::new();
+    let mut up = 0u32;
+    let mut down = 0u32;
+    let mut idle = 0u32;
+    let mut buf = [0u8; 64];
+    for _ in 0..MOUSE_LIVE_READ_BUDGET {
+        let n = syscall_lib::read(STDIN_FILENO, &mut buf);
+        if n < 0 {
+            return Err("stdin-read-failed");
+        }
+        if n == 0 {
+            // Zero bytes means either the VTIME poll expired or the PTY
+            // master closed; neither is distinguishable here and both are
+            // covered by the same budget.
+            idle += 1;
+            if idle >= MOUSE_LIVE_IDLE_POLLS {
+                return Err("no-input-before-deadline");
+            }
+            continue;
+        }
+        idle = 0;
+        for &byte in &buf[..n as usize] {
+            if decoder.is_ground() && (byte == b'q' || byte == b'Q') {
+                mouse_live_serial("up=", up);
+                mouse_live_serial("down=", down);
+                return Ok(());
+            }
+            let report = match decoder.feed(byte) {
+                Some(r) => r,
+                None => continue,
+            };
+            if report.release {
+                continue;
+            }
+            let band = if report.button == u32::from(term::mouse::WHEEL_UP) {
+                up += 1;
+                WheelBand::Up
+            } else if report.button == u32::from(term::mouse::WHEEL_DOWN) {
+                down += 1;
+                WheelBand::Down
+            } else {
+                // A real button press (selection drag, click) — not what this
+                // probe measures, and repainting on it would fight the
+                // selection highlight.
+                continue;
+            };
+            if !paint_wheel_band(band, rows, cols) {
+                return Err("band-write-failed");
+            }
+            // Emitted after the repaint so a sentinel on serial implies the
+            // framebuffer has already been asked to change.
+            mouse_live_serial("cb=", report.button);
+        }
+    }
+    Err("read-budget-exhausted")
+}
+
+/// Phase 112 — `tui-smoke mouse-live`.
+///
+/// Proves the wheel reaches a mouse-tracking application on the alternate
+/// screen: `term` must project the pointer onto the cell grid, encode the
+/// notch as the xterm 64/65 pseudo-button, and deliver it on the PTY instead
+/// of consuming it for its own scrollback viewport.
+fn run_mouse_live() -> Result<(), &'static str> {
+    let saved = match syscall_lib::tcgetattr(STDIN_FILENO) {
+        Ok(t) => t,
+        Err(_) => return Err("stdin-not-a-tty"),
+    };
+    let mut raw = saved;
+    syscall_lib::cfmakeraw(&mut raw);
+    // `cfmakeraw` leaves VMIN=1 / VTIME=0, i.e. a read with no input parks
+    // forever — which would wedge the gate whenever the harness fails to
+    // inject. VMIN=0 / VTIME=1 makes each read a 100 ms poll that returns 0
+    // on expiry, which is what gives the idle budget something to count.
+    raw.c_cc[syscall_lib::VMIN] = 0;
+    raw.c_cc[syscall_lib::VTIME] = 1;
+    if syscall_lib::tcsetattr(STDIN_FILENO, &raw).is_err() {
+        return Err("raw-mode-set-failed");
+    }
+    // Fall back to the classic 80×25 when stdin cannot report a size, or
+    // reports a degenerate one (a PTY whose winsize was never set reads back
+    // as 0×0). A smaller-than-real band still paints thousands of pixels; a
+    // zero-sized one would paint nothing and the gate would see no change.
+    let (rows, cols) = match syscall_lib::get_window_size(STDIN_FILENO) {
+        Ok((r, c)) if r > 0 && c > 1 => (r, c),
+        _ => (25, 80),
+    };
+
+    let outcome = mouse_live_session(rows, cols);
+
+    let _ = write_all(STDOUT_FILENO, MOUSE_LIVE_TEARDOWN);
+    let _ = syscall_lib::tcsetattr(STDIN_FILENO, &saved);
+
+    // Mirror the verdict to serial in the same shape `ok_or_fail` uses. The
+    // caller's stdout copy renders into `term`, so without this the gate
+    // would have no machine-readable outcome to wait on.
+    match outcome {
+        Ok(()) => mouse_live_serial_str("ok\n"),
+        Err(reason) => {
+            let mut line = LineBuf::new();
+            line.push_str(MOUSE_LIVE_PREFIX);
+            line.push_str("fail ");
+            line.push_str(reason);
+            line.push_str("\n");
+            syscall_lib::serial_print(line.as_str());
+        }
+    }
+    outcome
 }
 
 fn run_cursor() -> Result<(), &'static str> {
@@ -548,14 +1016,13 @@ fn run_fonts_startup() -> Result<(), &'static str> {
     if bytes.len() < 1024 {
         return Err("font-too-small");
     }
-    // Cell metrics MUST match `term::display::CELL_WIDTH` /
-    // `CELL_HEIGHT` (16 × 32) — the `term::display` module is gated
-    // behind `os-binary` and not reachable from this smoke binary,
-    // so we duplicate the literals. Using a smaller cell here would
-    // exercise a different rasterization path than the production
-    // terminal and a 16 × 32-only regression could pass.
-    const CELL_W: u8 = 16;
-    const CELL_H: u8 = 32;
+    // Cell metrics MUST match the production terminal's — rasterizing at
+    // a different cell size exercises a different path than `term` and a
+    // regression at the real size could pass here. Phase 112 moved the
+    // constants to `term`'s crate root (ungated), so source them instead
+    // of duplicating literals that silently went stale in Phase 73.
+    const CELL_W: u8 = term::CELL_WIDTH;
+    const CELL_H: u8 = term::CELL_HEIGHT;
     let atlas = kernel_core::font::Atlas::new(
         bytes,
         CELL_W,
@@ -605,11 +1072,11 @@ fn run_fonts_branch_icon() -> Result<(), &'static str> {
             return Err("branch-icon-not-in-font-cmap");
         }
     }
-    // Mirror term::display::CELL_WIDTH / CELL_HEIGHT — see the
-    // `run_fonts_startup` rationale comment for why the runtime
-    // metrics live here as duplicated literals.
-    const CELL_W: u8 = 16;
-    const CELL_H: u8 = 32;
+    // Sourced from `term`'s crate root — see the `run_fonts_startup`
+    // rationale comment for why the runtime metrics must match the
+    // production terminal exactly.
+    const CELL_W: u8 = term::CELL_WIDTH;
+    const CELL_H: u8 = term::CELL_HEIGHT;
     let mut atlas = kernel_core::font::Atlas::new(
         bytes,
         CELL_W,
@@ -668,10 +1135,10 @@ fn run_fonts_emoji() -> Result<(), &'static str> {
     if cell.codepoint != 0x1F600 {
         return Err("emoji-cell-codepoint-mismatch");
     }
-    // Mirror term::display::CELL_WIDTH / CELL_HEIGHT — see
-    // `run_fonts_startup` for the rationale.
-    const CELL_W: u8 = 16;
-    const CELL_H: u8 = 32;
+    // Sourced from `term`'s crate root — see `run_fonts_startup` for
+    // the rationale.
+    const CELL_W: u8 = term::CELL_WIDTH;
+    const CELL_H: u8 = term::CELL_HEIGHT;
     let mut atlas = kernel_core::font::Atlas::new(
         bytes,
         CELL_W,
@@ -721,10 +1188,10 @@ fn run_fonts_adversarial() -> Result<(), &'static str> {
     if covered.len() < 2 * CAP {
         return Err("adversarial-font-too-sparse-for-eviction");
     }
-    // Mirror term::display::CELL_WIDTH / CELL_HEIGHT — see
-    // `run_fonts_startup` for the rationale.
-    const CELL_W: u8 = 16;
-    const CELL_H: u8 = 32;
+    // Sourced from `term`'s crate root — see `run_fonts_startup` for
+    // the rationale.
+    const CELL_W: u8 = term::CELL_WIDTH;
+    const CELL_H: u8 = term::CELL_HEIGHT;
     let mut atlas = kernel_core::font::Atlas::new(bytes, CELL_W, CELL_H, CAP)
         .map_err(|_| "atlas-construct-failed")?;
     for &cp in &covered {
