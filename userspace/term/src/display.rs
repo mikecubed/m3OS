@@ -54,8 +54,8 @@
 use alloc::vec::Vec;
 use kernel_core::display::pixel_chunk::cell_pixel_offset;
 use kernel_core::display::protocol::{
-    BufferId, CLIPBOARD_MAX_BYTES, ClientMessage, MimeTag, PROTOCOL_VERSION, Rect, ServerMessage,
-    SurfaceId, SurfaceRole,
+    BufferId, CLIPBOARD_REPLY_BUF_LEN, ClientMessage, MimeTag, PROTOCOL_VERSION, Rect,
+    ServerMessage, SurfaceId, SurfaceRole, clipboard_reply_span,
 };
 use kernel_core::font::GlyphView;
 use syscall_lib::STDOUT_FILENO;
@@ -393,7 +393,8 @@ impl DisplayClient {
 
     /// Phase 112 Track B.2 — publish `text` as the compositor clipboard
     /// offer (`text/plain;charset=utf-8`). Returns `false` when the text
-    /// exceeds [`CLIPBOARD_MAX_BYTES`] or the IPC send fails.
+    /// exceeds [`kernel_core::display::protocol::CLIPBOARD_MAX_BYTES`] or
+    /// the IPC send fails.
     ///
     /// This mirrors `desktop_client::set_clipboard`, but is implemented
     /// inline and rides the **same** `"display"` handle `term` already
@@ -442,9 +443,17 @@ impl DisplayClient {
     ///
     /// Returns `Some(bytes)` on success — including `Some(vec![])` when
     /// the clipboard is legitimately **empty**, which is distinct from
-    /// `None` (the request failed or the reply was malformed). Pasting an
-    /// empty clipboard is a no-op, not an error, and the caller should not
-    /// have to guess which happened.
+    /// `None` (the request failed or the reply was malformed). "Nothing to
+    /// paste" and "the paste failed" are different outcomes, and a caller
+    /// that wants to report the failure (as `paste_clipboard` does) needs
+    /// the distinction rather than having both collapse to the same
+    /// result.
+    ///
+    /// A reply is rejected outright — never truncated — if it announces
+    /// more bytes than this client's transport buffer and the copy-side
+    /// cap allow, or more bytes than actually arrived in the bulk; see
+    /// [`kernel_core::display::protocol::clipboard_reply_span`] for the
+    /// exact rule and why it lives in `kernel-core` rather than here.
     pub fn get_clipboard(&self) -> Option<Vec<u8>> {
         let msg = ClientMessage::RequestClipboard {
             mime_tag: MimeTag::TextPlainUtf8,
@@ -455,7 +464,7 @@ impl DisplayClient {
         if reply == u64::MAX {
             return None;
         }
-        let mut buf = [0u8; CLIPBOARD_MAX_BYTES + 16];
+        let mut buf = [0u8; CLIPBOARD_REPLY_BUF_LEN];
         let got = syscall_lib::ipc_take_pending_bulk(&mut buf);
         if got == u64::MAX {
             return None;
@@ -466,16 +475,8 @@ impl DisplayClient {
             ServerMessage::ClipboardData { len, .. } => len as usize,
             _ => return None,
         };
-        if len == 0 {
-            return Some(Vec::new());
-        }
-        // Clamp to what actually arrived: a truncated bulk must not be
-        // read past its end.
-        let end = (consumed + len).min(got);
-        if end <= consumed {
-            return None;
-        }
-        Some(buf[consumed..end].to_vec())
+        let (start, end) = clipboard_reply_span(consumed, len, got)?;
+        Some(buf[start..end].to_vec())
     }
 
     /// Current surface pixel width. Reflects either the initial

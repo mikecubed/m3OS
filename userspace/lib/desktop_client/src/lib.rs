@@ -19,8 +19,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use kernel_core::display::protocol::{
-    BufferId, ClientMessage, KeyboardInteractivity, Layer, LayerConfig, MimeTag, PROTOCOL_VERSION,
-    Rect, ServerMessage, SurfaceId, SurfaceRole,
+    BufferId, CLIPBOARD_REPLY_BUF_LEN, ClientMessage, KeyboardInteractivity, Layer, LayerConfig,
+    MimeTag, PROTOCOL_VERSION, Rect, ServerMessage, SurfaceId, SurfaceRole, clipboard_reply_span,
 };
 use kernel_core::input::events::KeyEvent;
 use kernel_core::session::font::{BasicBitmapFont, FontProvider, Glyph};
@@ -223,6 +223,14 @@ impl DisplayConnection {
     /// `None` when the clipboard is empty or the request fails. The
     /// compositor answers synchronously with `[ClipboardData frame][bytes]`
     /// staged as the reply bulk.
+    ///
+    /// A reply is rejected outright — never truncated — if it announces
+    /// more bytes than this client's transport buffer and the copy-side
+    /// cap allow, or more bytes than actually arrived in the bulk; see
+    /// [`kernel_core::display::protocol::clipboard_reply_span`] for the
+    /// exact rule. This is the reader `clip-smoke --paste` uses to verify
+    /// the compositor clipboard round-trip, so a truncated reply here must
+    /// fail the check rather than quietly hand back a short prefix.
     pub fn get_clipboard(&self) -> Option<Vec<u8>> {
         let msg = ClientMessage::RequestClipboard {
             mime_tag: MimeTag::TextPlainUtf8,
@@ -233,7 +241,7 @@ impl DisplayConnection {
         if reply == u64::MAX {
             return None;
         }
-        let mut buf = [0u8; CLIPBOARD_MAX_BYTES + 16];
+        let mut buf = [0u8; CLIPBOARD_REPLY_BUF_LEN];
         let got = syscall_lib::ipc_take_pending_bulk(&mut buf);
         if got == 0 || got == u64::MAX {
             return None;
@@ -248,11 +256,8 @@ impl DisplayConnection {
         if len == 0 {
             return None; // empty clipboard
         }
-        let end = (consumed + len).min(got);
-        if end <= consumed {
-            return None;
-        }
-        Some(buf[consumed..end].to_vec())
+        let (start, end) = clipboard_reply_span(consumed, len, got)?;
+        Some(buf[start..end].to_vec())
     }
 
     /// Phase 105 Track C — capture the composited screen into an owned

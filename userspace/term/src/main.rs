@@ -442,7 +442,9 @@ fn program_main(_args: &[&str]) -> i32 {
                         }
                         // Phase 112 Track B.3 — Ctrl+Shift+V.
                         KeyOutcome::Paste => {
-                            paste_clipboard(&mut screen, renderer.fb_mut(), primary_fd);
+                            if !paste_clipboard(&mut screen, renderer.fb_mut(), primary_fd) {
+                                ring_bell(&mut bell_audio, &mut bell_unavail, clock.now_ms());
+                            }
                         }
                         KeyOutcome::None => {}
                     }
@@ -1102,19 +1104,33 @@ fn copy_selection(screen: &Screen, display: &DisplayClient) -> bool {
 /// inside the frame drops the closing `ESC[201~`, leaving the application
 /// stuck in bracketed-paste mode and treating everything the user
 /// subsequently types as pasted text.
+///
+/// Returns `false` when the paste did not land cleanly — either the
+/// compositor reply was *rejected* by `get_clipboard`, or the PTY write
+/// came up short and dropped the closing `ESC[201~`. An empty or absent
+/// clipboard is not a failure and reports success, because there was
+/// nothing to lose. Mirrors `copy_selection`'s contract: the caller rings
+/// the bell on `false`, which is the only user-visible signal available
+/// here — both failure modes are otherwise silent from the user's seat,
+/// and the short write is the more damaging of the two (it leaves the
+/// application stuck in bracketed-paste mode), so it must not be quieter
+/// than the outright rejection.
 #[cfg(not(test))]
-fn paste_clipboard(screen: &mut Screen, display: &DisplayClient, primary_fd: i32) {
+fn paste_clipboard(screen: &mut Screen, display: &DisplayClient, primary_fd: i32) -> bool {
     let Some(bytes) = display.get_clipboard() else {
-        return;
+        syscall_lib::write_str(STDOUT_FILENO, "term: clipboard paste rejected\n");
+        return false;
     };
     if bytes.is_empty() {
-        return;
+        return true;
     }
     screen.view_to_live();
     let framed = term::input::wrap_paste(&bytes, screen.bracketed_paste_enabled());
     if !write_all_bounded(primary_fd, &framed) {
         syscall_lib::write_str(STDOUT_FILENO, "term: paste truncated\n");
+        return false;
     }
+    true
 }
 
 /// `-EAGAIN` as the non-blocking PTY primary reports it: the slave's

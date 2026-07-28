@@ -40,7 +40,9 @@ mod workspace;
 use core::alloc::Layout;
 use kernel_core::display::clipboard::ClipboardStore;
 use kernel_core::display::fb_owner::FramebufferOwner;
-use kernel_core::display::protocol::{Rect, ServerMessage, SurfaceId, SurfaceRole};
+use kernel_core::display::protocol::{
+    CLIPBOARD_DATA_BODY_LEN, FRAME_HEADER_SIZE, Rect, ServerMessage, SurfaceId, SurfaceRole,
+};
 use kernel_core::display::stats::FrameStatsRing;
 use kernel_core::input::bind_table::{BindTable, GrabState};
 use kernel_core::input::dispatch::SurfaceGeometry;
@@ -924,9 +926,17 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                     mime_tag: tag,
                     len: bytes.len() as u32,
                 };
-                // Frame (9 bytes) + the offer bytes into one reply buffer.
-                let mut reply = alloc::vec::Vec::with_capacity(16 + bytes.len());
-                let mut frame = [0u8; 16];
+                // Frame (`FRAME_HEADER_SIZE + CLIPBOARD_DATA_BODY_LEN` = 9
+                // bytes) + the offer bytes into one reply buffer. Sized off
+                // the real `ClipboardData` frame constants rather than a
+                // locally duplicated `16`, so this can't under-size the
+                // buffer and silently drop the reply (`encode` returning
+                // `Err(Truncated)`, no bulk staged, both clients seeing a
+                // rejected reply) if the frame body ever grows.
+                let mut reply = alloc::vec::Vec::with_capacity(
+                    FRAME_HEADER_SIZE + CLIPBOARD_DATA_BODY_LEN + bytes.len(),
+                );
+                let mut frame = [0u8; FRAME_HEADER_SIZE + CLIPBOARD_DATA_BODY_LEN];
                 if let Ok(n) = hdr.encode(&mut frame) {
                     reply.extend_from_slice(&frame[..n]);
                     reply.extend_from_slice(bytes);
