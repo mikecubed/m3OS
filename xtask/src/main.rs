@@ -2196,6 +2196,9 @@ fn build_userspace_bins() {
         // Phase 78c: ring-3 USB HID Boot-Protocol class driver (kbd + mouse).
         // `needs_alloc = true` for kernel-core + usb-core deps.
         ("usb_hid", "usb_hid", true),
+        // Phase 102 Track D: ring-3 I2C-HID touchpad driver (Intel LPSS DW I2C).
+        // `needs_alloc = true` for the kernel-core i2c/hid_report logic.
+        ("i2c_hid", "i2c_hid", true),
         // Phase 92 Track D: ring-3 USB Mass Storage (BOT) class driver.
         // `needs_alloc = true` for kernel-core (mass_storage) + usb-core deps.
         ("usb_storage", "usb_storage", true),
@@ -32301,6 +32304,9 @@ fn populate_ext2_files(
     // Phase 78c — ring-3 USB HID class driver. Depends on xhci_driver so it
     // can look up the `usb` service the host controller registers.
     let usb_hid_conf = "name=usb_hid\ncommand=/drivers/usb-hid\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n";
+    // Phase 102 Track D — ring-3 I2C-HID touchpad driver. Depends on acpid so
+    // the `acpi` device-discovery service is up before it probes for DLL0945.
+    let i2c_hid_conf = "name=i2c_hid\ncommand=/drivers/i2c-hid\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=acpid\n";
     // Phase 92 Track D — ring-3 USB Mass Storage (BOT) class driver. Depends on
     // xhci_driver so it can look up the `usb` service the host controller registers.
     let usb_storage_conf = "name=usb_storage\ncommand=/drivers/usb-storage\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n";
@@ -32758,6 +32764,7 @@ fn populate_ext2_files(
     let powerd_conf_tmp = output_dir.join("_tmp_powerd_conf");
     let usbhub_conf_tmp = output_dir.join("_tmp_usbhub_conf");
     let usb_hid_conf_tmp = output_dir.join("_tmp_usb_hid_conf");
+    let i2c_hid_conf_tmp = output_dir.join("_tmp_i2c_hid_conf");
     let usb_storage_conf_tmp = output_dir.join("_tmp_usb_storage_conf");
     let usb_net_conf_tmp = output_dir.join("_tmp_usb_net_conf");
     let usb_audio_conf_tmp = output_dir.join("_tmp_usb_audio_conf");
@@ -32848,6 +32855,7 @@ fn populate_ext2_files(
     fs::write(&powerd_conf_tmp, powerd_conf).expect("write temp powerd.conf");
     fs::write(&usbhub_conf_tmp, usbhub_conf).expect("write temp usbhub.conf");
     fs::write(&usb_hid_conf_tmp, usb_hid_conf).expect("write temp usb-hid.conf");
+    fs::write(&i2c_hid_conf_tmp, i2c_hid_conf).expect("write temp i2c-hid.conf");
     fs::write(&usb_storage_conf_tmp, usb_storage_conf).expect("write temp usb-storage.conf");
     fs::write(&usb_net_conf_tmp, usb_net_conf).expect("write temp usb-net.conf");
     fs::write(&usb_audio_conf_tmp, usb_audio_conf).expect("write temp usb-audio.conf");
@@ -33785,6 +33793,10 @@ fn populate_ext2_files(
          sif etc/services.d/usb-hid.conf mode 0x81A4\n\
          sif etc/services.d/usb-hid.conf uid 0\n\
          sif etc/services.d/usb-hid.conf gid 0\n\
+         write \"{i2c_hid_conf}\" etc/services.d/i2c-hid.conf\n\
+         sif etc/services.d/i2c-hid.conf mode 0x81A4\n\
+         sif etc/services.d/i2c-hid.conf uid 0\n\
+         sif etc/services.d/i2c-hid.conf gid 0\n\
          write \"{usb_storage_conf}\" etc/services.d/usb-storage.conf\n\
          sif etc/services.d/usb-storage.conf mode 0x81A4\n\
          sif etc/services.d/usb-storage.conf uid 0\n\
@@ -33883,6 +33895,7 @@ fn populate_ext2_files(
         powerd_conf = powerd_conf_tmp.display(),
         usbhub_conf = usbhub_conf_tmp.display(),
         usb_hid_conf = usb_hid_conf_tmp.display(),
+        i2c_hid_conf = i2c_hid_conf_tmp.display(),
         usb_storage_conf = usb_storage_conf_tmp.display(),
         usb_net_conf = usb_net_conf_tmp.display(),
         usb_audio_conf = usb_audio_conf_tmp.display(),

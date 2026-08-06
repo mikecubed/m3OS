@@ -261,6 +261,8 @@ static USBHUB_ELF: &[u8] = generated_initrd_asset!("usbhub");
 static ACPID_ELF: &[u8] = generated_initrd_asset!("acpid");
 /// Phase 78c: ring-3 USB HID Boot-Protocol class driver (keyboard + mouse).
 static USB_HID_ELF: &[u8] = generated_initrd_asset!("usb_hid");
+/// Phase 102 Track D: ring-3 I2C-HID touchpad driver (Intel LPSS DesignWare I2C).
+static I2C_HID_ELF: &[u8] = generated_initrd_asset!("i2c_hid");
 /// Phase 92 Track D: ring-3 USB Mass Storage (Bulk-Only Transport) class driver.
 static USB_STORAGE_ELF: &[u8] = generated_initrd_asset!("usb_storage");
 /// Phase 92e Track G: ring-3 USB-Ethernet (CDC-ECM/NCM) RemoteNic class driver.
@@ -1629,6 +1631,15 @@ static DRIVERS_ENTRIES: &[(&str, RamdiskNode)] = &[
         "usb-hid",
         RamdiskNode::File {
             content: USB_HID_ELF,
+        },
+    ),
+    // Phase 102 Track D: ring-3 I2C-HID touchpad driver, under /drivers/ so the
+    // is_authorized_driver_process gate admits it (and the `/drivers/` exec-path
+    // gate for SYS_ACPI_MEM_* + mouse_server inject).
+    (
+        "i2c-hid",
+        RamdiskNode::File {
+            content: I2C_HID_ELF,
         },
     ),
     // Phase 92 Track D: ring-3 USB Mass Storage (BOT) class driver, under
