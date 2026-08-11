@@ -148,6 +148,39 @@ type SharedChan = Rc<RefCell<Option<ChanHandle>>>;
 type SharedNotify = Rc<Notify>;
 type SharedOutputLock = Rc<Mutex<()>>;
 
+/// The per-connection environment every spawned session task captures: the
+/// client socket plus the five `Rc` handles the tasks share. `executor::spawn`
+/// needs `'static` futures, so each task takes its own clone of the bundle
+/// rather than borrowing from `async_session`.
+///
+/// This exists so `progress_task` and `channel_relay_task` take a bundle plus
+/// their one distinguishing argument instead of eight positional handles —
+/// the call sites clone one struct rather than seven fields in a fixed order.
+/// Both tasks destructure it into the same bindings on entry.
+struct SessionCtx {
+    sock_fd: i32,
+    runner: SharedRunner,
+    state: SharedState,
+    chan: SharedChan,
+    progress_notify: SharedNotify,
+    session_notify: SharedNotify,
+    output_lock: SharedOutputLock,
+}
+
+impl Clone for SessionCtx {
+    fn clone(&self) -> Self {
+        Self {
+            sock_fd: self.sock_fd,
+            runner: self.runner.clone(),
+            state: self.state.clone(),
+            chan: self.chan.clone(),
+            progress_notify: self.progress_notify.clone(),
+            session_notify: self.session_notify.clone(),
+            output_lock: self.output_lock.clone(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WaitWake helper
 // ---------------------------------------------------------------------------
@@ -254,14 +287,16 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
     // task owns it ('static bound required by spawn).
     let host_sign_key = host_key.key.clone();
     let _prog = executor::spawn(progress_task(
-        sock_fd,
-        runner.clone(),
-        state.clone(),
-        chan.clone(),
+        SessionCtx {
+            sock_fd,
+            runner: runner.clone(),
+            state: state.clone(),
+            chan: chan.clone(),
+            progress_notify: progress_notify.clone(),
+            session_notify: session_notify.clone(),
+            output_lock: output_lock.clone(),
+        },
         host_sign_key,
-        progress_notify.clone(),
-        session_notify.clone(),
-        output_lock.clone(),
     ));
 
     // Main loop: wait for session completion, check shell exit status.
@@ -570,16 +605,16 @@ enum ProgressAction {
     Defunct,
 }
 
-async fn progress_task(
-    sock_fd: i32,
-    runner: SharedRunner,
-    state: SharedState,
-    chan: SharedChan,
-    host_sign_key: sunset::SignKey,
-    progress_notify: SharedNotify,
-    session_notify: SharedNotify,
-    output_lock: SharedOutputLock,
-) {
+async fn progress_task(ctx: SessionCtx, host_sign_key: sunset::SignKey) {
+    let SessionCtx {
+        sock_fd,
+        runner,
+        state,
+        chan,
+        progress_notify,
+        session_notify,
+        output_lock,
+    } = ctx.clone();
     let mut continue_count = 0u64;
     let mut loop_continue_count = 0u64;
     let mut yield_count = 0u64;
@@ -821,15 +856,15 @@ async fn progress_task(
                     );
                     log_sshd_step("session shell request");
                     // Allocate PTY if not already done.
-                    if state.borrow().pty_master.is_none() {
-                        if let Ok((m, s)) = syscall_lib::openpty() {
-                            set_nonblocking(m);
-                            let mut st = state.borrow_mut();
-                            st.pty_master = Some(m);
-                            st.pty_slave = Some(s);
-                            log_sshd_step_u64("session shell lazy pty master", "fd", m as u64);
-                            log_sshd_step_u64("session shell lazy pty slave", "fd", s as u64);
-                        }
+                    if state.borrow().pty_master.is_none()
+                        && let Ok((m, s)) = syscall_lib::openpty()
+                    {
+                        set_nonblocking(m);
+                        let mut st = state.borrow_mut();
+                        st.pty_master = Some(m);
+                        st.pty_slave = Some(s);
+                        log_sshd_step_u64("session shell lazy pty master", "fd", m as u64);
+                        log_sshd_step_u64("session shell lazy pty slave", "fd", s as u64);
                     }
                     if state.borrow().shell_spawned {
                         log_sshd_step("session shell already spawned");
@@ -867,7 +902,7 @@ async fn progress_task(
                                         close(fd);
                                     }
                                 }
-                                spawn_shell(slave, &info);
+                                spawn_shell(slave, info);
                             } else {
                                 // Parent.
                                 log_sshd_step_u64(
@@ -990,16 +1025,7 @@ async fn progress_task(
             }
             ProgressAction::SpawnRelay(pty_master) => {
                 log_sshd_step_u64("progress_task:spawn relay", "pty_master", pty_master as u64);
-                executor::spawn(channel_relay_task(
-                    sock_fd,
-                    pty_master,
-                    runner.clone(),
-                    state.clone(),
-                    chan.clone(),
-                    progress_notify.clone(),
-                    session_notify.clone(),
-                    output_lock.clone(),
-                ));
+                executor::spawn(channel_relay_task(ctx.clone(), pty_master));
             }
             ProgressAction::Fatal => {
                 state.borrow_mut().session_done = true;
@@ -1028,16 +1054,16 @@ async fn progress_task(
 // Task 3: Channel Relay Task — PTY ↔ runner channel
 // ---------------------------------------------------------------------------
 
-async fn channel_relay_task(
-    sock_fd: i32,
-    pty_fd: i32,
-    runner: SharedRunner,
-    state: SharedState,
-    chan: SharedChan,
-    progress_notify: SharedNotify,
-    session_notify: SharedNotify,
-    output_lock: SharedOutputLock,
-) {
+async fn channel_relay_task(ctx: SessionCtx, pty_fd: i32) {
+    let SessionCtx {
+        sock_fd,
+        runner,
+        state,
+        chan,
+        progress_notify,
+        session_notify,
+        output_lock,
+    } = ctx;
     log_sshd_step_u64("channel_relay:start", "pty_fd", pty_fd as u64);
     let mut chan_buf = [0u8; 4096];
     let mut pty_buf = [0u8; 4096];
@@ -1122,10 +1148,17 @@ async fn channel_relay_task(
             }
         }
 
-        if pty_write_pending_len == 0 {
+        // Probe `chan` through a temporary borrow, then take the runner lock,
+        // and only then hold a `Ref` — never the other way round. A `Ref` held
+        // across `runner.lock().await` stays alive while this task is
+        // suspended, so a sibling task's `borrow_mut()` (the `OpenSession`
+        // accept, or the `take()` in `send_clean_channel_close`) would panic
+        // with `BorrowMutError`. Same discipline `send_clean_channel_close`
+        // spells out for itself.
+        if pty_write_pending_len == 0 && chan.borrow().is_some() {
+            let mut guard = runner.lock().await;
             let ch_ref = chan.borrow();
             if let Some(ref ch) = *ch_ref {
-                let mut guard = runner.lock().await;
                 loop {
                     match guard.read_channel(ch, ChanData::Normal, &mut chan_buf) {
                         Ok(0) => break,
@@ -1171,51 +1204,51 @@ async fn channel_relay_task(
 
         // Drain pending PTY data first.
         while pty_pending_len > 0 {
-            let ch_ref = chan.borrow();
-            if let Some(ref ch) = *ch_ref {
+            // See the borrow-ordering note above.
+            let write_res = {
                 let mut guard = runner.lock().await;
-                match guard.write_channel(ch, ChanData::Normal, &pty_pending[..pty_pending_len]) {
-                    Ok(0) => {
-                        relay_pty_pending_zero_write_count =
-                            relay_pty_pending_zero_write_count.saturating_add(1);
-                        log_sshd_loop_counter(
-                            "channel_relay:pty pending zero write",
-                            relay_pty_pending_zero_write_count,
-                        );
-                        drop(guard);
-                        drop(ch_ref);
-                        if !flush_output_locked(&runner, sock_fd, &output_lock).await {
-                            state.borrow_mut().session_done = true;
-                            state.borrow_mut().exit_code = 1;
-                            session_notify.signal();
-                            return;
-                        }
-                        break;
+                let ch_ref = chan.borrow();
+                match *ch_ref {
+                    Some(ref ch) => {
+                        guard.write_channel(ch, ChanData::Normal, &pty_pending[..pty_pending_len])
                     }
-                    Ok(w) => {
-                        relay_pty_pending_flush_count =
-                            relay_pty_pending_flush_count.saturating_add(1);
-                        log_sshd_loop_counter(
-                            "channel_relay:pty pending flush",
-                            relay_pty_pending_flush_count,
-                        );
-                        pty_pending.copy_within(w..pty_pending_len, 0);
-                        pty_pending_len -= w;
-                        drop(guard);
-                        drop(ch_ref);
-                        if !flush_output_locked(&runner, sock_fd, &output_lock).await {
-                            state.borrow_mut().session_done = true;
-                            state.borrow_mut().exit_code = 1;
-                            session_notify.signal();
-                            return;
-                        }
-                        progress_notify.signal();
-                        session_notify.signal();
-                    }
-                    Err(_) => break,
+                    None => break,
                 }
-            } else {
-                break;
+            };
+            match write_res {
+                Ok(0) => {
+                    relay_pty_pending_zero_write_count =
+                        relay_pty_pending_zero_write_count.saturating_add(1);
+                    log_sshd_loop_counter(
+                        "channel_relay:pty pending zero write",
+                        relay_pty_pending_zero_write_count,
+                    );
+                    if !flush_output_locked(&runner, sock_fd, &output_lock).await {
+                        state.borrow_mut().session_done = true;
+                        state.borrow_mut().exit_code = 1;
+                        session_notify.signal();
+                        return;
+                    }
+                    break;
+                }
+                Ok(w) => {
+                    relay_pty_pending_flush_count = relay_pty_pending_flush_count.saturating_add(1);
+                    log_sshd_loop_counter(
+                        "channel_relay:pty pending flush",
+                        relay_pty_pending_flush_count,
+                    );
+                    pty_pending.copy_within(w..pty_pending_len, 0);
+                    pty_pending_len -= w;
+                    if !flush_output_locked(&runner, sock_fd, &output_lock).await {
+                        state.borrow_mut().session_done = true;
+                        state.borrow_mut().exit_code = 1;
+                        session_notify.signal();
+                        return;
+                    }
+                    progress_notify.signal();
+                    session_notify.signal();
+                }
+                Err(_) => break,
             }
         }
 
@@ -1228,50 +1261,54 @@ async fn channel_relay_task(
                 let data = &pty_buf[..n as usize];
                 let mut sent = 0;
                 while sent < data.len() {
-                    let ch_ref = chan.borrow();
-                    if let Some(ref ch) = *ch_ref {
+                    // See the borrow-ordering note above. The lock and the
+                    // `chan` borrow both live inside this block, so both are
+                    // released before any of the awaits in the arms below —
+                    // structurally, not by a `drop()` the reader has to trace.
+                    let write_res = {
                         let mut guard = runner.lock().await;
-                        match guard.write_channel(ch, ChanData::Normal, &data[sent..]) {
-                            Ok(0) => {
-                                relay_pty_to_chan_backpressure_count =
-                                    relay_pty_to_chan_backpressure_count.saturating_add(1);
-                                log_sshd_loop_counter(
-                                    "channel_relay:pty->chan backpressure",
-                                    relay_pty_to_chan_backpressure_count,
-                                );
-                                drop(guard);
-                                drop(ch_ref);
-                                if !flush_output_locked(&runner, sock_fd, &output_lock).await {
-                                    state.borrow_mut().session_done = true;
-                                    state.borrow_mut().exit_code = 1;
-                                    session_notify.signal();
-                                    return;
-                                }
-                                break;
+                        let ch_ref = chan.borrow();
+                        match *ch_ref {
+                            Some(ref ch) => {
+                                guard.write_channel(ch, ChanData::Normal, &data[sent..])
                             }
-                            Ok(w) => {
-                                relay_pty_to_chan_bytes_count =
-                                    relay_pty_to_chan_bytes_count.saturating_add(1);
-                                log_sshd_loop_counter(
-                                    "channel_relay:pty->chan bytes",
-                                    relay_pty_to_chan_bytes_count,
-                                );
-                                sent += w;
-                                drop(guard);
-                                drop(ch_ref);
-                                if !flush_output_locked(&runner, sock_fd, &output_lock).await {
-                                    state.borrow_mut().session_done = true;
-                                    state.borrow_mut().exit_code = 1;
-                                    session_notify.signal();
-                                    return;
-                                }
-                                progress_notify.signal();
-                                session_notify.signal();
-                            }
-                            Err(_) => break,
+                            None => break,
                         }
-                    } else {
-                        break;
+                    };
+                    match write_res {
+                        Ok(0) => {
+                            relay_pty_to_chan_backpressure_count =
+                                relay_pty_to_chan_backpressure_count.saturating_add(1);
+                            log_sshd_loop_counter(
+                                "channel_relay:pty->chan backpressure",
+                                relay_pty_to_chan_backpressure_count,
+                            );
+                            if !flush_output_locked(&runner, sock_fd, &output_lock).await {
+                                state.borrow_mut().session_done = true;
+                                state.borrow_mut().exit_code = 1;
+                                session_notify.signal();
+                                return;
+                            }
+                            break;
+                        }
+                        Ok(w) => {
+                            relay_pty_to_chan_bytes_count =
+                                relay_pty_to_chan_bytes_count.saturating_add(1);
+                            log_sshd_loop_counter(
+                                "channel_relay:pty->chan bytes",
+                                relay_pty_to_chan_bytes_count,
+                            );
+                            sent += w;
+                            if !flush_output_locked(&runner, sock_fd, &output_lock).await {
+                                state.borrow_mut().session_done = true;
+                                state.borrow_mut().exit_code = 1;
+                                session_notify.signal();
+                                return;
+                            }
+                            progress_notify.signal();
+                            session_notify.signal();
+                        }
+                        Err(_) => break,
                     }
                 }
                 if sent < data.len() {
@@ -1594,37 +1631,40 @@ async fn drain_pty_locked(
         let data_len = n as usize;
         let mut sent = 0;
         while sent < data_len {
-            let ch_ref = chan.borrow();
-            if let Some(ref ch) = *ch_ref {
+            // Lock, then borrow, and let both go out of scope with the block —
+            // never hold a `Ref` across an await. See the note in
+            // `channel_relay_task`.
+            let write_res = {
                 let mut guard = runner.lock().await;
-                match guard.write_channel(ch, ChanData::Normal, &buf[sent..data_len]) {
-                    Ok(0) => {
-                        drop(guard);
-                        drop(ch_ref);
-                        if !flush_output_locked(runner, sock_fd, output_lock).await {
-                            return;
-                        }
-                        // Retry once.
-                        let ch_ref2 = chan.borrow();
-                        if let Some(ref ch2) = *ch_ref2 {
-                            let mut g2 = runner.lock().await;
-                            match g2.write_channel(ch2, ChanData::Normal, &buf[sent..data_len]) {
-                                Ok(0) | Err(_) => break,
-                                Ok(w) => sent += w,
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                    Ok(w) => {
-                        sent += w;
-                        drop(guard);
-                        drop(ch_ref);
-                    }
-                    Err(_) => break,
+                let ch_ref = chan.borrow();
+                match *ch_ref {
+                    Some(ref ch) => guard.write_channel(ch, ChanData::Normal, &buf[sent..data_len]),
+                    None => break,
                 }
-            } else {
-                break;
+            };
+            match write_res {
+                Ok(0) => {
+                    if !flush_output_locked(runner, sock_fd, output_lock).await {
+                        return;
+                    }
+                    // Retry once.
+                    let retry_res = {
+                        let mut g2 = runner.lock().await;
+                        let ch_ref2 = chan.borrow();
+                        match *ch_ref2 {
+                            Some(ref ch2) => {
+                                g2.write_channel(ch2, ChanData::Normal, &buf[sent..data_len])
+                            }
+                            None => break,
+                        }
+                    };
+                    match retry_res {
+                        Ok(0) | Err(_) => break,
+                        Ok(w) => sent += w,
+                    }
+                }
+                Ok(w) => sent += w,
+                Err(_) => break,
             }
             if !flush_output_locked(runner, sock_fd, output_lock).await {
                 return;
@@ -1679,7 +1719,7 @@ fn cleanup(shell_pid: Option<isize>, pty_master: Option<i32>, pty_slave: Option<
         if !reaped {
             // Last resort: the shell ignored EOF. SIGKILL is unblockable.
             log_sshd_step_u64("cleanup:escalate SIGKILL", "child_pid", pid as u64);
-            syscall_lib::kill(pid as i32, syscall_lib::SIGKILL as i32);
+            syscall_lib::kill(pid as i32, syscall_lib::SIGKILL);
             for _ in 0..40 {
                 if waitpid(pid as i32, &mut status, syscall_lib::WNOHANG) > 0 {
                     reaped = true;
