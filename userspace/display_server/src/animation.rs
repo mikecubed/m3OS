@@ -619,7 +619,7 @@ mod tests {
             let t = i as f32 / 20.0;
             let v = Curve::Spring.eval(t);
             assert!(
-                v >= 0.0 && v <= 1.0,
+                (0.0..=1.0).contains(&v),
                 "spring value {} out of [0,1] at t={}",
                 v,
                 t

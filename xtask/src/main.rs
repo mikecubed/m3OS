@@ -34,6 +34,11 @@ const QEMU_ISA_DEBUG_EXIT_DEVICE: &str = "isa-debug-exit,iobase=0xf4,iosize=0x04
 ///
 /// `term` builds via its `[lib]` target — the binary is `#![no_main]` and
 /// cannot link on the host, so `--lib` is required to skip the bin.
+/// Conversely, the bin-only crates (`xhci_driver`, `display_server`,
+/// `usb_hid`, `usbhub`) keep their tests inside `main.rs` and gate
+/// `no_std`/`no_main`/the lang-item handlers behind `cfg(not(test))`, so their
+/// *binary* unit-test target must be built — passing `--lib` there would find
+/// no target and skip the tests entirely.
 ///
 /// Each entry is `(package, extra cargo args)`. `passwd` is intentionally not
 /// listed here; it needs `--no-default-features --features host-tests --test
@@ -111,6 +116,30 @@ const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
     // byte slices with fixture-driven decode + round-trip tests; the
     // screenshot path and greeter both depend on them, so gate them here.
     ("imagefmt", &[]),
+    // Phase 112 review-resolution — three bin-only crates whose `#[cfg(test)]`
+    // estates existed but had never once compiled, so ~75 already-written unit
+    // tests were dead weight. Each crate now carries the same
+    // `#![cfg_attr(not(test), no_std)]` / `no_main` / `alloc_error_handler`
+    // treatment as `xhci_driver` above: under `cfg(test)` the crate becomes a
+    // normal `std` test binary so `std` supplies the panic + alloc-error lang
+    // items (the duplicate-lang-item conflict was the reason they could never
+    // build), while the OS build is byte-for-byte unchanged. NOTE: unlike the
+    // `--lib` entries, none of these three has a lib target at all — their
+    // tests live inside `main.rs`, so the bin target is exactly what must be
+    // built and no extra args may be passed.
+    //
+    // display_server: the compositor's animation/config/decoration/keybind/
+    // workspace logic (48 tests) — the pure-logic core behind tiling, focus,
+    // and keybind dispatch that no serial smoke test can assert on.
+    ("display_server", &[]),
+    // usb_hid: HID interface role classification and the Report-descriptor
+    // length walk (21 tests), including the Phase 92 rule that a
+    // Report-Protocol pointer is never collapsed into the boot-mouse decode.
+    ("usb_hid", &[]),
+    // usbhub: hub-interface classification and the `hid_poll` backoff curve
+    // (6 tests). Its `program_main` had also lost its `#[cfg(not(test))]` to a
+    // drifted attribute, which is what kept the test build from linking.
+    ("usbhub", &[]),
 ];
 
 /// QEMU arguments enabling an emulated Intel VT-d IOMMU on the q35 machine.
@@ -7293,7 +7322,7 @@ fn cmd_check() {
     stat_assembly_gate();
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core (incl. usb::uvc + camera_ipc), passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, m3ctl, xhci_driver, usb-core, pkg-format, xtask, and pkg host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass; stat-assembly gate pass"
+        "check passed: clippy clean, formatting correct, kernel-core (incl. usb::uvc + camera_ipc), passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, display_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, m3ctl, xhci_driver, display_server, usb_hid, usbhub, usb-core, imagefmt, pkg-format, xtask, and pkg host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass; stat-assembly gate pass"
     );
 }
 

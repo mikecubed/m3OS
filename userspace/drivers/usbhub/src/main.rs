@@ -520,20 +520,6 @@ fn enumerate_hub(usb_ep: u32, notice: &AttachNotice) -> Option<u8> {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Hub daemon main — Phase 92 Track A / Phase 100 Track D.3.
-///
-/// Logs [`BOOT_LOG_MARKER`], waits on the `usb` service, walks the `NextAttach`
-/// cursor for a `CLASS_HUB` interface, and drives each hub through its descriptor
-/// read + per-port `PORT_POWER`/`PORT_RESET` bring-up. Exits cleanly when no hub
-/// is present (the common machine) so init's `on-failure` policy marks the
-/// service stopped rather than looping.
-///
-/// Phase 100 Track D.3: after initial enumeration, enters a steady-state
-/// port-monitoring loop with adaptive backoff so the walker no longer pins a
-/// core at idle. Full notification-driven port-status changes (using the hub's
-/// interrupt-IN endpoint for status-change notifications) are deferred to
-/// Phase 103 (USB runtime power management).
-#[cfg(not(test))]
 /// One full `NextAttach` walk collecting hub-class interfaces. Returns the hubs
 /// found plus whether the walk was cut short by a server **timeout** (busy —
 /// retry) rather than reaching the end of the attach table.
@@ -566,6 +552,24 @@ fn enumerate_hubs_once(usb_ep: u32) -> (Vec<AttachNotice>, bool) {
     }
 }
 
+/// Hub daemon main — Phase 92 Track A / Phase 100 Track D.3.
+///
+/// Logs [`BOOT_LOG_MARKER`], waits on the `usb` service, walks the `NextAttach`
+/// cursor for a `CLASS_HUB` interface, and drives each hub through its descriptor
+/// read + per-port `PORT_POWER`/`PORT_RESET` bring-up. Exits cleanly when no hub
+/// is present (the common machine) so init's `on-failure` policy marks the
+/// service stopped rather than looping.
+///
+/// Phase 100 Track D.3: after initial enumeration, enters a steady-state
+/// port-monitoring loop with adaptive backoff so the walker no longer pins a
+/// core at idle. Full notification-driven port-status changes (using the hub's
+/// interrupt-IN endpoint for status-change notifications) are deferred to
+/// Phase 103 (USB runtime power management).
+///
+/// Gated `not(test)`: this is the `entry_point!` target and its body is pure
+/// syscall plumbing (`STDOUT_FILENO`, the `usb` IPC service, the control-transfer
+/// helpers), none of which exists in a host `std` test build.
+#[cfg(not(test))]
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, BOOT_LOG_MARKER);
 
@@ -729,7 +733,13 @@ mod tests {
     fn hub_backoff_grows_after_threshold() {
         let base = hub_next_backoff_ns(0);
         let grown = hub_next_backoff_ns(4);
-        assert!(grown >= base, "backoff must be non-decreasing");
+        // Strictly greater, not `>=`: the point of the backoff is that an idle
+        // hub polls *less* often, so a curve flattened to a constant is the
+        // regression this test exists to catch — and `>=` would pass for it.
+        assert!(
+            grown > base,
+            "backoff must grow once the idle threshold is crossed: {base} -> {grown}"
+        );
     }
 
     #[test]

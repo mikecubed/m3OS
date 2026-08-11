@@ -184,21 +184,14 @@ impl InjectKeyPolicy {
 
 /// IPC label `display_server` accepts on the `"display-control"`
 /// endpoint when the bulk carries an encoded [`ControlCommand`].
-///
-/// `#[allow(dead_code)]` is set because the per-iteration recv on the
-/// control endpoint is gated on the C.5-bulk-drain follow-up; the
-/// constant is consumed by `serve_control_iter` once that lands.
-#[allow(dead_code)]
 pub const LABEL_CTL_CMD: u64 = 1;
 
 /// IPC reply label `display_server` returns when the dispatched verb
 /// produced an encoded [`ControlEvent`] in the reply bulk.
-#[allow(dead_code)]
 pub const LABEL_CTL_REPLY: u64 = 2;
 
 /// Maximum bulk size accepted on the control endpoint. Matches the
 /// kernel's `MAX_BULK_LEN`.
-#[allow(dead_code)]
 pub const MAX_BULK_BYTES: usize = 4096;
 
 // ---------------------------------------------------------------------------

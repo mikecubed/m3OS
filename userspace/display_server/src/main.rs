@@ -18,11 +18,28 @@
 //!     and surface-buffer transport (pure-logic cores already in
 //!     `kernel-core::input::mouse`, `kernel-core::display::frame_tick`,
 //!     `kernel-core::display::buffer`).
-#![no_std]
-#![no_main]
-#![feature(alloc_error_handler)]
+//!
+//! `cfg(not(test))` gates protect the OS-only crate attributes, the
+//! `_start` entry point, the `BrkAllocator` and the panic / alloc-error
+//! lang items so `cargo test -p display_server --target
+//! x86_64-unknown-linux-gnu` builds the crate as an ordinary `std` test
+//! binary (`std` then supplies those lang items). The `cfg(not(test))`
+//! build is unchanged.
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
+#![cfg_attr(not(test), feature(alloc_error_handler))]
+// `_start`/`program_main` — the only reachability root this binary has — is
+// `cfg(not(test))`, so under the test cfg rustc's reachability analysis
+// starts from the `#[test]` fns alone and reports essentially every
+// production item as dead. That signal is meaningless here, so it is
+// silenced for the test cfg only; the OS build
+// (`cargo clippy --target x86_64-m3os.json`) keeps full `dead_code`
+// enforcement, which is the lane that actually ships.
+#![cfg_attr(test, allow(dead_code))]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 mod animation;
 mod borders;
@@ -37,6 +54,8 @@ mod keybind;
 mod surface;
 mod workspace;
 
+// Only the `cfg(not(test))` alloc-error handler needs `Layout`.
+#[cfg(not(test))]
 use core::alloc::Layout;
 use kernel_core::display::clipboard::ClipboardStore;
 use kernel_core::display::fb_owner::FramebufferOwner;
@@ -48,6 +67,8 @@ use kernel_core::input::bind_table::{BindTable, GrabState};
 use kernel_core::input::dispatch::SurfaceGeometry;
 use syscall_lib::IpcMessage;
 use syscall_lib::STDOUT_FILENO;
+// Only the `cfg(not(test))` `#[global_allocator]` names `BrkAllocator`.
+#[cfg(not(test))]
 use syscall_lib::heap::BrkAllocator;
 
 use crate::client::{FatalReason, InboundFrame, dispatch};
@@ -112,9 +133,14 @@ use crate::fb::KernelFramebufferOwner;
 use crate::input::{InputEffect, InputWiring};
 use crate::surface::SurfaceRegistry;
 
+// The `brk`-backed allocator and the alloc-error lang item exist only in
+// the OS build; under `cfg(test)` the host test harness links `std`,
+// which already provides both.
+#[cfg(not(test))]
 #[global_allocator]
 static ALLOCATOR: BrkAllocator = BrkAllocator::new();
 
+#[cfg(not(test))]
 #[alloc_error_handler]
 fn alloc_error(_layout: Layout) -> ! {
     syscall_lib::write_str(STDOUT_FILENO, "display_server: alloc error\n");
@@ -132,6 +158,9 @@ fn alloc_error(_layout: Layout) -> ! {
 /// teal background.
 pub const BG_PIXEL: u32 = 0x002B_5A4Bu32;
 
+// `_start` is the ring-3 ELF entry point; under `cfg(test)` the test
+// harness supplies `main` instead.
+#[cfg(not(test))]
 syscall_lib::entry_point_with_env!(program_main);
 
 /// Phase 56 Track F.2 — debug-crash gate. The dispatcher consults this
@@ -1923,7 +1952,6 @@ where
 /// success, or `0` if even the error event won't fit in `reply_buf`.
 /// `0` lets the caller send a label-only reply so the client at
 /// least observes a roundtrip.
-#[allow(dead_code)]
 fn encode_event_or_drop(
     evt: &kernel_core::display::control::ControlEvent,
     reply_buf: &mut [u8],
@@ -3147,6 +3175,8 @@ fn publish_to_subscribers_workspace(subs: &mut control::ControlSubscriptions, wo
     );
 }
 
+// `std` owns `panic_impl` in the host test build.
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     syscall_lib::write_str(STDOUT_FILENO, "display_server: PANIC\n");

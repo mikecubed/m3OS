@@ -381,7 +381,7 @@ mod tests {
         {
             let bid = table
                 .table
-                .match_bind(MOD_SUPER, kc.0 as u32)
+                .match_bind(MOD_SUPER, kc.0)
                 .expect("super+digit bound");
             assert_eq!(
                 table.action(bid),
@@ -394,11 +394,11 @@ mod tests {
     fn push_resize_mode_overlays_table() {
         let mut stack = BindStack::new();
         // No `H` binding in default mode.
-        assert!(stack.active_table().match_bind(0, KEY_H.0 as u32).is_none());
+        assert!(stack.active_table().match_bind(0, KEY_H.0).is_none());
         stack.push_mode(BindMode::Resize);
         let bid = stack
             .active_table()
-            .match_bind(0, KEY_H.0 as u32)
+            .match_bind(0, KEY_H.0)
             .expect("H bound in resize mode");
         assert!(matches!(
             stack.lookup_action(bid),
@@ -408,7 +408,7 @@ mod tests {
             })
         ));
         stack.pop_mode();
-        assert!(stack.active_table().match_bind(0, KEY_H.0 as u32).is_none());
+        assert!(stack.active_table().match_bind(0, KEY_H.0).is_none());
     }
 
     #[test]
@@ -428,7 +428,7 @@ mod tests {
         stack.push_mode(BindMode::Resize);
         let bid = stack
             .active_table()
-            .match_bind(0, KEY_H.0 as u32)
+            .match_bind(0, KEY_H.0)
             .expect("H bound in resize mode");
         match stack.lookup_action(bid) {
             Some(KeybindAction::ResizeFocused { step, .. }) => {

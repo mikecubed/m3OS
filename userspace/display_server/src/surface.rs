@@ -1436,8 +1436,10 @@ impl Default for SurfaceRegistry {
     }
 }
 
-// NB: a `#[cfg(test)]` placeholder module was here. `display_server` is
-// `no_std` + `no_main`, so the std `test` harness cannot compile it.
-// The pure-logic invariants of this shim are covered by the
-// kernel-core `surface` state-machine tests; end-to-end verification is
-// the Phase 56 G.1 regression test in QEMU.
+// NB: a `#[cfg(test)]` placeholder module was here, removed back when the
+// crate's ungated `no_std` / `no_main` attributes kept the std `test`
+// harness from compiling it. `main.rs` now uses `cfg_attr(not(test), ..)`,
+// so host tests for this file do compile and run. The pure-logic
+// invariants of this shim remain covered by the kernel-core `surface`
+// state-machine tests; end-to-end verification is the Phase 56 G.1
+// regression test in QEMU.
