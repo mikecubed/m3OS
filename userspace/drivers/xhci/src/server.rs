@@ -172,13 +172,14 @@ pub fn device_info_from_ctx(ctx: &EnumContext) -> Option<AttachNotice> {
             3
         } else if bulk_surfaceable && i.b_interface_class == CLASS_VENDOR_SPECIFIC {
             2
-        } else if bulk_surfaceable {
-            1
-        } else if hub_surfaceable {
-            1
-        } else if audio_surfaceable {
-            1
-        } else if video_surfaceable {
+        } else if bulk_surfaceable || hub_surfaceable || audio_surfaceable || video_surfaceable {
+            // One shared bottom tier. These were four separate `else if` arms
+            // all yielding 1; where two of them overlap (a CLASS_VIDEO
+            // interface that also has a bulk pair, say) the arm order was
+            // never observable, so they fold into one condition. All four rank
+            // equally below the HID (3) and vendor-specific-bulk (2) tiers, and
+            // a tie between two interfaces of a composite device is broken by
+            // descriptor order (`priority > *p` below is strict).
             1
         } else {
             continue;

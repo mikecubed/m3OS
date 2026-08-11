@@ -117,7 +117,9 @@ pub fn parse_patch(input: &[u8]) -> Result<Vec<FilePatch>, &'static str> {
                         hunk.lines.push(HunkLine { kind, text });
                         i += 1;
                     }
-                    b'@' | b'-' if hl.starts_with(b"@@ ") => break,
+                    // Only `b'@'` can reach here: the arm above already
+                    // consumed `b'-'` (and space / plus) as hunk body lines.
+                    b'@' if hl.starts_with(b"@@ ") => break,
                     _ => break,
                 }
             }

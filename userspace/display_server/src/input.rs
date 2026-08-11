@@ -102,6 +102,13 @@ pub const KBD_EVENT_PULL: u64 = 2;
 /// distinguishable from real syscall failures, so future
 /// observability can count them separately. Must be kept in sync
 /// with `KBD_EVENT_NONE` in `userspace/kbd_server/src/main.rs`.
+///
+/// Not read: the drain path recognises "no event" by the reply label not being
+/// `KBD_EVENT_PULL`, so it never compares against this value. Kept because it
+/// is half of a cross-process wire contract — deleting it would leave label 3
+/// documented only in `kbd_server`, and silently reusable here for something
+/// else.
+#[allow(dead_code)]
 pub const KBD_EVENT_NONE: u64 = 3;
 
 /// Service-registry name for the pointer/mouse service. Set by
@@ -118,6 +125,10 @@ pub const MOUSE_EVENT_PULL: u64 = 1;
 /// "no event this tick" path (mirrors `KBD_EVENT_NONE`). Must be
 /// kept in sync with `MOUSE_EVENT_NONE` in
 /// `userspace/mouse_server/src/main.rs`.
+///
+/// Unread for the same reason as [`KBD_EVENT_NONE`], and kept for the same
+/// reason: it pins label 2 of the `mouse_server` reply ABI on this side.
+#[allow(dead_code)]
 pub const MOUSE_EVENT_NONE: u64 = 2;
 
 /// Throttle for the lazy reconnect path inside `KbdInputSource` /

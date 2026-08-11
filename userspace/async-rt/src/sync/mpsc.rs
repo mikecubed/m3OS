@@ -145,10 +145,10 @@ impl<T> Future for SendFuture<'_, T> {
         let inner = &this.sender.inner;
 
         // Channel closed — return the unsent value.
-        if inner.closed.get() {
-            if let Some(val) = this.value.take() {
-                return Poll::Ready(Err(SendError(val)));
-            }
+        if inner.closed.get()
+            && let Some(val) = this.value.take()
+        {
+            return Poll::Ready(Err(SendError(val)));
         }
 
         let mut buf = inner.buffer.borrow_mut();

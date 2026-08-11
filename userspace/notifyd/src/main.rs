@@ -13,7 +13,7 @@
 extern crate alloc;
 
 use alloc::collections::VecDeque;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use core::alloc::Layout;
 
 use desktop_client::{
@@ -170,7 +170,7 @@ fn program_main(_args: &[&str]) -> i32 {
             dirty = false;
         }
 
-        let _ = syscall_lib::nanosleep_for(0, (tick_ms as u32) * 1_000_000);
+        let _ = syscall_lib::nanosleep_for(0, tick_ms * 1_000_000);
 
         // Decrement timers and pop expired notifications. A repaint
         // is needed whenever a notification dismisses (so the panel

@@ -377,11 +377,14 @@ pub fn run_io_loop(
                             // `mapped_bytes > kernel_mapping_size` and then
                             // reading past the mapping.
                             let required_pages = pcm_len.div_ceil(4096);
-                            if streams.open.is_none() {
-                                DispatchOutcome::SubmitError(AudioError::InvalidArgument)
-                            } else if idx >= n_caps {
-                                DispatchOutcome::SubmitError(AudioError::InvalidArgument)
-                            } else if *n_pages as usize != required_pages {
+                            // Three distinct client protocol violations — no
+                            // open stream, a cap slot the frame never carried,
+                            // or a page count that disagrees with `pcm_len` —
+                            // all of which are `InvalidArgument`.
+                            if streams.open.is_none()
+                                || idx >= n_caps
+                                || *n_pages as usize != required_pages
+                            {
                                 DispatchOutcome::SubmitError(AudioError::InvalidArgument)
                             } else {
                                 let cap = frame.cap_slots[idx];

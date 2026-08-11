@@ -149,10 +149,10 @@ fn program_main(_args: &[&str]) -> i32 {
     // 1. Register an IPC presence beacon so session_manager and
     //    `m3ctl` can observe us.
     let ep = syscall_lib::create_endpoint();
-    if ep != u64::MAX {
-        if let Ok(ep_u32) = u32::try_from(ep) {
-            let _ = syscall_lib::ipc_register_service(ep_u32, SERVICE_NAME);
-        }
+    if ep != u64::MAX
+        && let Ok(ep_u32) = u32::try_from(ep)
+    {
+        let _ = syscall_lib::ipc_register_service(ep_u32, SERVICE_NAME);
     }
 
     // 2. Connect to display_server.
@@ -585,7 +585,7 @@ struct Background {
 fn load_background_image(config: &GreeterConfig) -> Option<Background> {
     let candidates: Vec<&str> = match &config.background {
         Some(p) => alloc::vec![p.as_str()],
-        None => DEFAULT_BACKGROUND_PATHS.iter().copied().collect(),
+        None => DEFAULT_BACKGROUND_PATHS.to_vec(),
     };
     for path in candidates {
         let mut path_buf = [0u8; 256];
@@ -865,7 +865,7 @@ fn run_auth_loop(
         // Pass the submitted username through so the password-prompt
         // frame keeps it visible — otherwise the user types blind
         // into a form that has just discarded their identity.
-        let password = match read_field(
+        let password = read_field(
             handle,
             shm_id,
             ActiveField::Password,
@@ -873,10 +873,7 @@ fn run_auth_loop(
             pixels,
             background,
             config,
-        ) {
-            Some(s) => s,
-            None => return None,
-        };
+        )?;
         // Commit a "checking..." frame so the user gets feedback.
         let checking = LoginUiState {
             config,
@@ -1116,18 +1113,18 @@ fn handle_key(ev: &KeyEvent, buf: &mut String) -> KeyAction {
         return KeyAction::Cancel;
     }
     // For Ctrl+C / Ctrl+D — also cancel.
-    if ev.modifiers.bits() & kernel_core::input::events::MOD_CTRL != 0 {
-        if let Some(ch) = char::from_u32(ev.symbol) {
-            if ch == 'c' || ch == 'C' || ch == 'd' || ch == 'D' {
-                return KeyAction::Cancel;
-            }
-        }
+    if ev.modifiers.bits() & kernel_core::input::events::MOD_CTRL != 0
+        && let Some(ch) = char::from_u32(ev.symbol)
+        && (ch == 'c' || ch == 'C' || ch == 'd' || ch == 'D')
+    {
+        return KeyAction::Cancel;
     }
     // Printable characters from the keymap.
-    if let Some(ch) = char::from_u32(ev.symbol) {
-        if (ev.symbol >= 0x20 && ev.symbol < 0x7F) && buf.len() < 128 {
-            buf.push(ch);
-        }
+    if let Some(ch) = char::from_u32(ev.symbol)
+        && (ev.symbol >= 0x20 && ev.symbol < 0x7F)
+        && buf.len() < 128
+    {
+        buf.push(ch);
     }
     KeyAction::Continue
 }

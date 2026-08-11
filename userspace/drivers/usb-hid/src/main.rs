@@ -106,12 +106,6 @@ pub const READY_SENTINEL: &str = "usb-hid: polling\n";
 const KBD_EVENT_INJECT: u64 = 5;
 const MOUSE_EVENT_INJECT: u64 = 3;
 
-/// Fast interrupt-IN poll cadence — active while reports are arriving.
-/// Boot devices report at ~10 ms (`bInterval`); a 5 ms poll keeps input
-/// latency below one report period.  Matches `HID_POLL_FAST_NS` in
-/// `kernel_core::input::hid_poll`.
-const POLL_INTERVAL_NS: u32 = 5_000_000;
-
 /// Hot-plug reconcile interval (ms). Kept time-based so the cadence is
 /// independent of the adaptive-backoff sleep duration.
 const RECONCILE_INTERVAL_MS: u64 = 200;
@@ -426,7 +420,7 @@ fn inject_pointer(mouse_ep: u32, ev: &PointerEvent) {
         let n = INJECTED_PTR_COUNT
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
-        if n == 1 || n % 64 == 0 {
+        if n == 1 || n.is_multiple_of(64) {
             syscall_lib::write_str(STDOUT_FILENO, "USB_HID:pointer-injected count=");
             write_u32_dec(n);
             syscall_lib::write_str(STDOUT_FILENO, "\n");
@@ -1346,7 +1340,7 @@ fn program_main(_args: &[&str]) -> i32 {
 
             // Periodic idle-occupancy sentinel — falsifiable evidence that the
             // driver is no longer pinning a core at idle (Phase 100 D.2 acceptance).
-            if consecutive_empty > 0 && consecutive_empty % IDLE_LOG_EVERY == 0 {
+            if consecutive_empty > 0 && consecutive_empty.is_multiple_of(IDLE_LOG_EVERY) {
                 let sleep_ns = next_hid_backoff_ns(consecutive_empty);
                 syscall_lib::write_str(STDOUT_FILENO, "USB_HID:idle ticks=");
                 write_u32_dec(consecutive_empty);

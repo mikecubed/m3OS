@@ -91,10 +91,8 @@ pub fn apply_tr(input: &[u8], map: &[u8; 256], delete: &[bool; 256], squeeze: bo
             continue;
         }
         let out = map[b as usize];
-        if squeeze {
-            if Some(out) == last_out {
-                continue;
-            }
+        if squeeze && Some(out) == last_out {
+            continue;
         }
         result.push(out);
         last_out = Some(out);

@@ -68,15 +68,13 @@
 extern crate alloc;
 
 use kernel_core::display::control::{
-    ControlCommand, ControlError, ControlErrorCode, ControlEvent, EventKind, FrameStatSample,
+    ControlCommand, ControlError, ControlErrorCode, ControlEvent, FrameStatSample,
     PROTOCOL_VERSION, SurfaceId, SurfaceRoleTag, encode_event,
 };
 use kernel_core::display::protocol::{KeyboardInteractivity, SurfaceRole};
 use kernel_core::display::stats::FrameStatsRing;
 pub use kernel_core::display::subscription::{
-    ClientId, ControlSubscriptions, FlushError, MAX_OUTBOUND_PER_SUBSCRIBER,
-    MAX_SUBSCRIBERS_PER_KIND, flush_subscriber_ring, null_subscriber_sender,
-    publish_to_subscribers,
+    ClientId, ControlSubscriptions, FlushError, null_subscriber_sender, publish_to_subscribers,
 };
 use kernel_core::input::bind_table::{BindError, BindKey, BindTable};
 
@@ -238,6 +236,19 @@ pub const MAX_BULK_BYTES: usize = 4096;
 /// The reply is encoded into `reply_buf`. The function returns the
 /// number of bytes written (or `None`). The caller is responsible for
 /// staging that slice as the IPC reply bulk.
+///
+/// The parameter list is the control protocol's whole authority surface, not an
+/// accidental accumulation: every verb needs the command and its client, the
+/// three pieces of server state a verb may read or mutate (`registry`,
+/// `bind_table`, `subscriptions`), the observability ring, one gate per
+/// privileged verb family (`debug_crash` / `readback` / `inject_key_policy` —
+/// each defaults to disabled and is enabled independently), the two effect
+/// callbacks that keep this function pure with respect to the framebuffer and
+/// the input pipeline, and the caller-owned reply buffer. Bundling them into a
+/// context struct would only move the same twelve bindings to the single call
+/// site in `serve_one_control_request`, and would hand the dispatcher a struct
+/// it could mutate wholesale in place of the deliberate `&`/`&mut` split.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_command<F, I>(
     cmd: &ControlCommand,
     client: ClientId,
@@ -413,7 +424,7 @@ where
                     KeyEvent, KeyEventKind, ModifierSide, ModifierState,
                 };
                 match *kind {
-                    0 | 1 | 2 => {
+                    0..=2 => {
                         let kind_enum = match *kind {
                             0 => KeyEventKind::Down,
                             1 => KeyEventKind::Up,
@@ -558,6 +569,13 @@ pub fn publish_bind_triggered<F>(
 /// `Layer`-role surface (re)configuration. Subscribers re-layout
 /// around the new anchor / exclusive-zone / keyboard-interactivity
 /// bits.
+///
+/// No caller yet. `main.rs` wires the sibling publishers
+/// (`publish_surface_created` / `_destroyed` / `publish_focus_changed` /
+/// `publish_bind_triggered`) but has no Layer-role reconfiguration hook to
+/// publish from — see the report accompanying this lint pass. Kept because it
+/// is the encode half of a `ControlEvent` variant the protocol already defines.
+#[allow(dead_code)]
 pub fn publish_layer_event<F>(
     subs: &mut ControlSubscriptions,
     surface_id: SurfaceId,
@@ -582,6 +600,10 @@ pub fn publish_layer_event<F>(
 
 /// Phase 68 Track A.3 — publish a `CursorEvent` describing a pointer
 /// cursor visibility or hotspot transition.
+///
+/// No caller yet, for the same reason as `publish_layer_event`: nothing in
+/// `main.rs` observes cursor visibility/hotspot changes as a publishable event.
+#[allow(dead_code)]
 pub fn publish_cursor_event<F>(
     subs: &mut ControlSubscriptions,
     visible: bool,

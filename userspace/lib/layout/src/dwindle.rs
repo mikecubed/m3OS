@@ -81,10 +81,10 @@ impl TiledLayoutPolicy for DwindleLayout {
         // window splits the previous "tail" rect along the current
         // axis. `depth` tracks split depth so we alternate axes.
         let mut tail = output;
-        for i in 0..n {
+        for (i, window) in windows.iter().enumerate() {
             if i == n - 1 {
                 // Last window inherits the remaining tail.
-                out.push((windows[i].id, tail));
+                out.push((window.id, tail));
                 break;
             }
             let depth = i;
@@ -169,7 +169,7 @@ impl TiledLayoutPolicy for DwindleLayout {
                 let tail_g = shrink_vertical(new_tail_after_carve, half_inner, true, false);
                 (carved_g, tail_g)
             };
-            out.push((windows[i].id, carved_g));
+            out.push((window.id, carved_g));
             tail = tail_g;
         }
         out

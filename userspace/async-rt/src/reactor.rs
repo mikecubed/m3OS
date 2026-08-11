@@ -26,6 +26,12 @@ pub struct Reactor {
     pub(crate) interests: Vec<Interest>,
 }
 
+impl Default for Reactor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Reactor {
     /// Create a new reactor with a self-pipe for waker signalling.
     pub fn new() -> Self {
@@ -102,23 +108,23 @@ impl Reactor {
 
         let mut ready_count = 0;
 
-        // Check interest FDs
-        for i in 0..n {
-            let revents = pollfds[i].revents;
+        // Check interest FDs (zip stops at `n` — `interests` is the shorter of
+        // the two; `pollfds` carries an extra self-pipe entry at index `n`).
+        for (interest, pfd) in self.interests.iter().zip(&pollfds) {
+            let revents = pfd.revents;
             if revents == 0 {
                 continue;
             }
-            let interest = &self.interests[i];
 
-            if (revents & (Self::pollin() | Self::pollhup() | Self::pollerr())) != 0 {
-                if let Some(ref waker) = interest.read_waker {
-                    waker.wake_by_ref();
-                }
+            if (revents & (Self::pollin() | Self::pollhup() | Self::pollerr())) != 0
+                && let Some(ref waker) = interest.read_waker
+            {
+                waker.wake_by_ref();
             }
-            if (revents & Self::pollout()) != 0 {
-                if let Some(ref waker) = interest.write_waker {
-                    waker.wake_by_ref();
-                }
+            if (revents & Self::pollout()) != 0
+                && let Some(ref waker) = interest.write_waker
+            {
+                waker.wake_by_ref();
             }
             ready_count += 1;
         }
@@ -192,7 +198,7 @@ impl Reactor {
 
     #[cfg(feature = "std")]
     fn pollin() -> i16 {
-        libc::POLLIN as i16
+        libc::POLLIN
     }
     #[cfg(not(feature = "std"))]
     fn pollin() -> i16 {
@@ -201,7 +207,7 @@ impl Reactor {
 
     #[cfg(feature = "std")]
     fn pollout() -> i16 {
-        libc::POLLOUT as i16
+        libc::POLLOUT
     }
     #[cfg(not(feature = "std"))]
     fn pollout() -> i16 {
@@ -210,7 +216,7 @@ impl Reactor {
 
     #[cfg(feature = "std")]
     fn pollhup() -> i16 {
-        libc::POLLHUP as i16
+        libc::POLLHUP
     }
     #[cfg(not(feature = "std"))]
     fn pollhup() -> i16 {
@@ -219,7 +225,7 @@ impl Reactor {
 
     #[cfg(feature = "std")]
     fn pollerr() -> i16 {
-        libc::POLLERR as i16
+        libc::POLLERR
     }
     #[cfg(not(feature = "std"))]
     fn pollerr() -> i16 {

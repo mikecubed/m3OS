@@ -317,12 +317,12 @@ fn write_u32_dec(n: u32) {
 fn hub_ports_have_change(usb_ep: u32, slot_id: u8, nports: u8) -> bool {
     for port in 1..=nports {
         let setup = setup_to_bytes(get_port_status(port));
-        if let Some(st) = control(usb_ep, slot_id, setup, 4) {
-            if st.len() >= 4 {
-                let change_word = u16::from_le_bytes([st[2], st[3]]);
-                if change_word != 0 {
-                    return true;
-                }
+        if let Some(st) = control(usb_ep, slot_id, setup, 4)
+            && st.len() >= 4
+        {
+            let change_word = u16::from_le_bytes([st[2], st[3]]);
+            if change_word != 0 {
+                return true;
             }
         }
     }
@@ -644,7 +644,7 @@ fn program_main(_args: &[&str]) -> i32 {
         // within the smoke window — it never would while the C_PORT_CONNECTION
         // re-enumeration bug was live) and then periodically thereafter.
         if consecutive_idle == 1
-            || (consecutive_idle > 0 && consecutive_idle % HUB_IDLE_LOG_EVERY == 0)
+            || (consecutive_idle > 0 && consecutive_idle.is_multiple_of(HUB_IDLE_LOG_EVERY))
         {
             syscall_lib::write_str(STDOUT_FILENO, "USB_HUB:idle ticks=");
             write_u32_dec(consecutive_idle);

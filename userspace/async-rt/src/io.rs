@@ -43,12 +43,11 @@ impl AsyncFd {
 fn check_fd_readable(fd: i32) -> bool {
     let mut pfd = libc::pollfd {
         fd,
-        events: libc::POLLIN as i16,
+        events: libc::POLLIN,
         revents: 0,
     };
     let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
-    ret > 0
-        && (pfd.revents & (libc::POLLIN as i16 | libc::POLLHUP as i16 | libc::POLLERR as i16)) != 0
+    ret > 0 && (pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0
 }
 
 #[cfg(not(feature = "std"))]
@@ -67,11 +66,11 @@ fn check_fd_readable(fd: i32) -> bool {
 fn check_fd_writable(fd: i32) -> bool {
     let mut pfd = libc::pollfd {
         fd,
-        events: libc::POLLOUT as i16,
+        events: libc::POLLOUT,
         revents: 0,
     };
     let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
-    ret > 0 && (pfd.revents & libc::POLLOUT as i16) != 0
+    ret > 0 && (pfd.revents & libc::POLLOUT) != 0
 }
 
 #[cfg(not(feature = "std"))]

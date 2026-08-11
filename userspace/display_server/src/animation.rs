@@ -25,8 +25,15 @@ use alloc::vec::Vec;
 use kernel_core::display::protocol::{Rect, SurfaceId};
 
 /// Animation easing / timing curve.
+///
+/// `Linear` is the identity curve: it completes the easing set and is what the
+/// `curve_eval` unit tests below pin `eval` against, but no animation kind
+/// currently selects it (`default_curve` picks `EaseOut`/`Spring`). Dropping it
+/// would leave `eval` with no test-anchored reference point and force a config
+/// or kind that wants a straight ramp to reintroduce it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Curve {
+    #[allow(dead_code)]
     Linear,
     EaseOut,
     /// Critically-damped spring approximation. We use a simple
@@ -59,6 +66,12 @@ impl Curve {
     }
 
     /// Convenience: interpolate `start → end` at normalised time `t`.
+    ///
+    /// Scalar counterpart to the free `lerp_rect` the engine actually drives;
+    /// no caller needs the scalar form today, but it is the piece any
+    /// non-geometric animation (opacity, scale) would interpolate through, so
+    /// it stays next to `eval` rather than being re-derived at the call site.
+    #[allow(dead_code)]
     pub fn lerp(self, start: f32, end: f32, t: f32) -> f32 {
         start + (end - start) * self.eval(t)
     }
@@ -72,12 +85,26 @@ impl Curve {
 /// Workspace transitions are *not* per-surface animations — they live
 /// in [`WorkspaceSlide`] and apply a uniform x-offset to every
 /// Toplevel in the workspace. See the module docs.
+// The shared `Window` prefix is load-bearing, not noise: this module also
+// animates at workspace granularity (`WorkspaceSlide`, and the
+// `AnimationKind::WorkspaceSwitch` variant that preceded it), and the prefix is
+// what tells a reader which of the two scopes a kind acts on. Dropping it would
+// leave `AnimationKind::Move` sitting beside `WorkspaceSlide` with nothing to
+// say that one is per-surface and the other is per-workspace.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AnimationKind {
     /// Slide + fade from 90% scale / 20% opacity to 100% / 100%.
     WindowOpen,
     /// Fade from 100% opacity to 0%; the engine signals completion so
     /// the caller can drop the surface.
+    ///
+    /// Implemented end-to-end here (duration, curve, `transform_for`) but not
+    /// yet started by anything: `main.rs` drops a Toplevel's state the moment
+    /// the client disconnects, so there is no surviving pixel source to animate
+    /// out. Wiring it needs the retained post-destroy snapshot `transform_for`
+    /// refers to; the kind is kept so that work is a caller change only.
+    #[allow(dead_code)]
     WindowClose,
     /// Smooth tile reposition.
     WindowMove,
@@ -240,6 +267,12 @@ impl WorkspaceSlide {
     /// workspace this frame. Starts at `0` and lerps to `-output_width
     /// * direction` as the slide completes — i.e. the outgoing
     /// workspace slides off in the opposite direction of `direction`.
+    ///
+    /// The `from_` / `to_` prefixes here name this slide's `from_ws` / `to_ws`
+    /// endpoints — they are not the conversion conventions
+    /// `wrong_self_convention` is looking for, and renaming either one would
+    /// break the pairing with the fields they read.
+    #[allow(clippy::wrong_self_convention)]
     pub fn from_offset_x(&self) -> i32 {
         let t = self.eased();
         let mag = (t * self.output_width as f32) as i32;
@@ -249,6 +282,10 @@ impl WorkspaceSlide {
     /// X-offset to apply to every tile in the incoming (`to_ws`)
     /// workspace this frame. Starts at `output_width * direction` (off
     /// screen on the entry side) and lerps to `0` (in place).
+    ///
+    /// `to_` names the slide's `to_ws` endpoint — see `from_offset_x`. Taking
+    /// `&self` keeps the pair symmetric.
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_offset_x(&self) -> i32 {
         let t = self.eased();
         let mag = ((1.0 - t) * self.output_width as f32) as i32;
@@ -280,11 +317,18 @@ impl AnimationEngine {
     }
 
     /// Borrow the current animation list — useful for tests / debug.
+    ///
+    /// The compose loop only ever asks `is_empty()` / `transform_for()`, so
+    /// these two read-only accessors exist for the unit tests below and for
+    /// debug dumps. Keeping them costs nothing and avoids tests reaching into
+    /// the private `animations` vec.
+    #[allow(dead_code)]
     pub fn animations(&self) -> &[Animation] {
         &self.animations
     }
 
     /// Number of in-flight animations.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.animations.len()
     }
@@ -356,9 +400,16 @@ impl AnimationEngine {
     }
 
     /// Cancel any in-flight workspace slide without producing damage.
-    /// Used when the compose loop detects state that invalidates the
-    /// slide entirely (e.g. the framebuffer was reclaimed from a
-    /// fullscreen takeover and the previous slide context is stale).
+    /// Intended for the case where the compose loop detects state that
+    /// invalidates the slide entirely (e.g. the framebuffer was reclaimed from
+    /// a fullscreen takeover and the previous slide context is stale).
+    ///
+    /// No caller yet: the Tier 1 reclaim handler in `main.rs` marks every
+    /// surface dirty and requests a post-reclaim background fill, but leaves a
+    /// slide that was in flight across the takeover running. Kept because that
+    /// is the operation the reclaim path needs if the stale-slide case is ever
+    /// observed — see the report accompanying this lint pass.
+    #[allow(dead_code)]
     pub fn clear_workspace_slide(&mut self) {
         self.slide = None;
     }
@@ -449,9 +500,9 @@ impl AnimationEngine {
                 Some(scale_about_centre(tile, scale))
             }
             AnimationKind::WindowClose => {
-                // Mirror of open: 1.0 → 0.4. Renders via the
-                // ghost-snapshot mechanism in main.rs so the surface
-                // keeps painting after the client has disconnected.
+                // Mirror of open: 1.0 → 0.4. Unreachable today — see the
+                // note on `AnimationKind::WindowClose`; nothing retains a
+                // pixel source past client disconnect to feed this.
                 let scale = 1.0 - 0.6 * t;
                 Some(scale_about_centre(tile, scale))
             }

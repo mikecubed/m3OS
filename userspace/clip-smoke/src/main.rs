@@ -60,7 +60,7 @@ fn program_main(args: &[&str]) -> i32 {
     // copy performed in `term` really landed in the compositor's
     // `ClipboardStore` — read back by an independent client, not by the
     // same one that wrote it (which would prove nothing about the broker).
-    if args.iter().any(|a| *a == "--paste") {
+    if args.contains(&"--paste") {
         let conn = match DisplayConnection::connect_auto() {
             Some(c) => c,
             None => {

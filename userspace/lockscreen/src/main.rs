@@ -237,11 +237,13 @@ fn handle_key(ev: &KeyEvent, state: &mut UiState) -> bool {
     }
     // Append printable ASCII. The kbd_server resolves keymap + shift,
     // so `symbol` is the final char value.
-    if ev.symbol >= 0x20 && ev.symbol < 0x7F && state.password.len() < MAX_PASSWORD_LEN {
-        if let Some(ch) = char::from_u32(ev.symbol) {
-            state.password.push(ch);
-            return true;
-        }
+    if ev.symbol >= 0x20
+        && ev.symbol < 0x7F
+        && state.password.len() < MAX_PASSWORD_LEN
+        && let Some(ch) = char::from_u32(ev.symbol)
+    {
+        state.password.push(ch);
+        return true;
     }
     false
 }

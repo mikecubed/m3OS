@@ -70,6 +70,11 @@ pub enum BindMode {
 
 /// One mode's binding table plus its `BindId → KeybindAction` map.
 pub struct BindModeTable {
+    /// Which mode this table belongs to. Only [`BindStack::active_mode`] reads
+    /// it — the stack identifies the active table by position, not by tag — but
+    /// it is what makes a popped or logged table self-describing, and
+    /// `active_mode` is the accessor a caller that needs the tag goes through.
+    #[allow(dead_code)]
     pub mode: BindMode,
     pub table: BindTable,
     pub actions: Vec<(BindId, KeybindAction)>,
@@ -96,7 +101,7 @@ impl BindModeTable {
     ) -> Result<BindId, BindError> {
         let id = self.table.register(BindKey {
             modifier_mask: mask,
-            keycode: keycode.0 as u32,
+            keycode: keycode.0,
         })?;
         if let Some(slot) = self.actions.iter_mut().find(|(b, _)| *b == id) {
             slot.1 = action;
@@ -108,6 +113,13 @@ impl BindModeTable {
 
     /// Look up the action registered against `id`. `None` if the bind
     /// was unregistered or never existed.
+    ///
+    /// Typed counterpart to `BindStack::lookup_action_raw`, which is what the
+    /// dispatcher actually calls: `BindTriggered` carries a raw `u32` because
+    /// `BindId` has no public constructor, so the typed lookup is only
+    /// reachable from code that already holds a `BindId`. Kept as the
+    /// type-safe form and as what `BindStack::lookup_action` delegates to.
+    #[allow(dead_code)]
     pub fn action(&self, id: BindId) -> Option<KeybindAction> {
         self.actions
             .iter()
@@ -158,7 +170,9 @@ impl BindStack {
     }
 
     /// Currently-active resize step. Useful for tests and debug
-    /// surfaces.
+    /// surfaces — the compositor only ever writes the step (from config
+    /// reload), never reads it back, so this getter has no production caller.
+    #[allow(dead_code)]
     pub fn resize_step_px(&self) -> i16 {
         self.resize_step_px
     }
@@ -169,16 +183,27 @@ impl BindStack {
     }
 
     /// Borrow the active mode's table mutably.
+    ///
+    /// Mutating counterpart to `active_table`. Registration goes through
+    /// `register` / `reload_default` on the stack itself, so nothing needs
+    /// raw mutable access today; kept so the accessor pair stays symmetric.
+    #[allow(dead_code)]
     pub fn active_table_mut(&mut self) -> &mut BindTable {
         &mut self.stack.last_mut().expect("BindStack never empty").table
     }
 
-    /// Active mode tag.
+    /// Active mode tag. Sole reader of `BindModeTable::mode`; the compositor
+    /// branches on `non_default_active()` rather than on the tag, so this is
+    /// currently a test/diagnostic accessor.
+    #[allow(dead_code)]
     pub fn active_mode(&self) -> BindMode {
         self.stack.last().expect("BindStack never empty").mode
     }
 
     /// Look up the action for a `BindId` matched by the active table.
+    /// See `BindModeTable::action` for why the raw-id form is what the
+    /// dispatcher uses.
+    #[allow(dead_code)]
     pub fn lookup_action(&self, id: BindId) -> Option<KeybindAction> {
         self.stack.last()?.action(id)
     }
@@ -207,6 +232,12 @@ impl BindStack {
     }
 
     /// Pop the topmost mode. No-op when only the default mode remains.
+    ///
+    /// The compositor's `ExitResize` / `Escape` handlers call `pop_to_default`
+    /// instead, which drains the whole stack, so the single-level pop has no
+    /// production caller. Kept because nesting a second transient mode on top
+    /// of resize needs exactly this, and `pop_to_default` would over-drain.
+    #[allow(dead_code)]
     pub fn pop_mode(&mut self) {
         if self.stack.len() > 1 {
             self.stack.pop();
@@ -220,9 +251,15 @@ impl BindStack {
         }
     }
 
-    /// True iff a non-default mode is active (e.g. resize). Resize
-    /// mode suppresses text input to clients per the spec — the
-    /// dispatcher consults this to gate forwarding.
+    /// True iff a non-default mode is active (e.g. resize).
+    ///
+    /// The spec has resize mode suppress text input to clients, and this is the
+    /// predicate that gate would read — but `main.rs`'s key path does not
+    /// consult it today, so keys still reach the focused client while resize
+    /// mode is active. Left as-is and reported rather than wired here, since
+    /// adding the gate changes what clients receive. See the report
+    /// accompanying this lint pass.
+    #[allow(dead_code)]
     pub fn non_default_active(&self) -> bool {
         self.stack.len() > 1
     }

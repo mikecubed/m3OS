@@ -13,7 +13,7 @@
 //!    a. Fork a child that execs `service kill nvme_driver`.
 //!    b. Wait for the child to exit (SIGKILL delivered).
 //!    c. After the first 5 kills: wait for `nvme_driver` to return to `running`
-//!       (up to RESTART_WAIT_SECS seconds) before issuing the next kill.
+//!    (up to RESTART_WAIT_SECS seconds) before issuing the next kill.
 //!    d. After the 6th kill: wait for status to be `permanently-stopped`.
 //! 3. Emit `MAX_RESTART_SMOKE:PASS` on success or
 //!    `MAX_RESTART_SMOKE:FAIL <reason>` on any sub-step failure.

@@ -280,11 +280,11 @@ pub struct DisplayClient {
 }
 
 impl DisplayClient {
-    /// Look up `display_server`, send the `Hello` + `CreateSurface`
-    /// + `SetSurfaceRole(Toplevel)` round-trip, allocate **two**
-    /// ~4 MiB shared-memory regions (front + back) sized for the
-    /// 1280 × 800 BGRA8888 surface, and return a ready-to-submit
-    /// `DisplayClient`.
+    /// Look up `display_server`, send the `Hello` + `CreateSurface` +
+    /// `SetSurfaceRole(Toplevel)` round-trip, allocate **two** ~4 MiB
+    /// shared-memory regions (front + back) sized for the 1280 × 800
+    /// BGRA8888 surface, and return a ready-to-submit `DisplayClient`.
+    ///
     /// Returns a typed error if the lookup, encode, `ipc_call_buf`,
     /// or SHM allocation fails.
     pub fn connect() -> Result<Self, TermError> {

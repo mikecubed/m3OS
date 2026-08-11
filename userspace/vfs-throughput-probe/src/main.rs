@@ -293,10 +293,10 @@ fn read_blkstats() -> Result<(u64, u64, u64), &'static str> {
             if let Ok(v) = rest.trim().parse::<u64>() {
                 write_calls = Some(v);
             }
-        } else if let Some(rest) = line.strip_prefix("inkernel_root_reads ") {
-            if let Ok(v) = rest.trim().parse::<u64>() {
-                inkernel_root_reads = v;
-            }
+        } else if let Some(rest) = line.strip_prefix("inkernel_root_reads ")
+            && let Ok(v) = rest.trim().parse::<u64>()
+        {
+            inkernel_root_reads = v;
         }
     }
 
@@ -352,9 +352,10 @@ fn measure_ipc_rtt() {
 
     print_kv("VFS_THRPUT:ipc_rtt_ops=", done);
     print_kv("VFS_THRPUT:ipc_rtt_total_us=", elapsed / 1000);
-    if done > 0 {
-        // Per-op latency in microseconds: total_ns / ops / 1000.
-        print_kv("VFS_THRPUT:ipc_rtt_us_per_op=", (elapsed / done) / 1000);
+    // Per-op latency in microseconds: total_ns / ops / 1000. `checked_div`
+    // skips the line entirely when no op completed.
+    if let Some(ns_per_op) = elapsed.checked_div(done) {
+        print_kv("VFS_THRPUT:ipc_rtt_us_per_op=", ns_per_op / 1000);
     }
 }
 
@@ -454,14 +455,11 @@ fn measure_manyfiles() {
     print_kv("VFS_THRPUT:manyfiles_first_batch_wr=", first_batch_wr);
     print_kv("VFS_THRPUT:manyfiles_last_batch_rd=", last_batch_rd);
     print_kv("VFS_THRPUT:manyfiles_last_batch_wr=", last_batch_wr);
-    if total_ms > 0 {
-        print_kv("VFS_THRPUT:manyfiles_per_sec=", created * 1000 / total_ms);
+    if let Some(per_sec) = (created * 1000).checked_div(total_ms) {
+        print_kv("VFS_THRPUT:manyfiles_per_sec=", per_sec);
     }
-    if created > 0 {
-        print_kv(
-            "VFS_THRPUT:manyfiles_us_per_file=",
-            total_ns / created / 1000,
-        );
+    if let Some(ns_per_file) = total_ns.checked_div(created) {
+        print_kv("VFS_THRPUT:manyfiles_us_per_file=", ns_per_file / 1000);
     }
 }
 
@@ -475,18 +473,20 @@ fn report_phase(name: &str, bytes: u64, elapsed_ns: u64, blockops: u64) {
     emit("_ms=");
     syscall_lib::write_u64(STDOUT_FILENO, ms);
     emit("\n");
-    if elapsed_ns > 0 {
-        // KB/s = (bytes/1024) * 1e9 / elapsed_ns.
-        let kbps = (bytes / 1024).wrapping_mul(1_000_000_000) / elapsed_ns;
+    // KB/s = (bytes/1024) * 1e9 / elapsed_ns.
+    if let Some(kbps) = (bytes / 1024)
+        .wrapping_mul(1_000_000_000)
+        .checked_div(elapsed_ns)
+    {
         emit("VFS_THRPUT:");
         emit(name);
         emit("_kbps=");
         syscall_lib::write_u64(STDOUT_FILENO, kbps);
         emit("\n");
     }
-    if blockops > 0 {
-        // Per-block-op latency in µs = elapsed_ns / blockops / 1000.
-        let us = (elapsed_ns / blockops) / 1000;
+    // Per-block-op latency in µs = elapsed_ns / blockops / 1000.
+    if let Some(ns_per_op) = elapsed_ns.checked_div(blockops) {
+        let us = ns_per_op / 1000;
         emit("VFS_THRPUT:");
         emit(name);
         emit("_us_per_blockop=");

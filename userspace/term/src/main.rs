@@ -910,8 +910,8 @@ enum PulledEvent {
 ///
 /// Disconnect is the only non-Key variant that changes behaviour:
 /// it asks term to exit. Every other variant is dropped with no
-/// state change because term's contract today is "Toplevel surface
-/// + keyboard-focused PTY" — pointer events, focus changes, and
+/// state change because term's contract today is "Toplevel surface +
+/// keyboard-focused PTY" — pointer events, focus changes, and
 /// buffer-released are not load-bearing for that contract. A
 /// future track that adds e.g. mouse-aware shell selection would
 /// thread `Pointer` into the input handler here.
@@ -1263,8 +1263,8 @@ fn handle_surface_resize<F: term::render::FramebufferOwner>(
     if width == 0 || height == 0 {
         return;
     }
-    let mut cols = (width / GLYPH_W).max(1).min(MAX_CELLS_PER_AXIS) as u16;
-    let mut rows = (height / GLYPH_H).max(1).min(MAX_CELLS_PER_AXIS) as u16;
+    let mut cols = (width / GLYPH_W).clamp(1, MAX_CELLS_PER_AXIS) as u16;
+    let mut rows = (height / GLYPH_H).clamp(1, MAX_CELLS_PER_AXIS) as u16;
     // Per-axis cap above bounds the product at `MAX_CELLS_PER_AXIS^2 =
     // ~1M`, which already satisfies the total-cell budget — but if the
     // axis cap is later relaxed, halve the larger axis until the total

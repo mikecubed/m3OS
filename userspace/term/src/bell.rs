@@ -519,11 +519,9 @@ mod tests {
         // G.6 acceptance: bell must not block the render loop for
         // more than ~50 ms. The tone duration drives the worst-case
         // submit/drain time, so pin it under the budget.
-        assert!(
-            BELL_DURATION_MS < 50,
-            "bell tone duration {} ms must be < 50 ms",
-            BELL_DURATION_MS
-        );
+        // Both sides are compile-time constants, so this is a `const`
+        // assertion: a regression fails the build rather than the run.
+        const { assert!(BELL_DURATION_MS < 50, "bell tone duration must be < 50 ms") };
     }
 
     #[test]

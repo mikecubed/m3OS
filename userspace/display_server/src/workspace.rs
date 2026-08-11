@@ -151,6 +151,13 @@ impl Workspace {
 
     /// Forward focus changes to the active policy so e.g.
     /// `TabbedLayout` updates its `focused` slot.
+    ///
+    /// Not called by the compositor today: `main.rs` publishes focus changes to
+    /// control subscribers but never tells the layout, so a policy that keys
+    /// off focus (`TabbedLayout`) sees a stale slot. Left unwired and reported
+    /// rather than hooked up here — calling it changes tiling output. See the
+    /// report accompanying this lint pass.
+    #[allow(dead_code)]
     pub fn on_focus_changed(&mut self, id: Option<SurfaceId>) {
         self.policies.on_focus_changed(self.policy, id);
     }
@@ -225,6 +232,9 @@ impl PolicySet {
         }
     }
 
+    /// Policy-kind demux behind [`WorkspaceLayoutAdapter::on_focus_changed`];
+    /// unreachable for the same reason that one is.
+    #[allow(dead_code)]
     pub fn on_focus_changed(&mut self, kind: PolicyKind, id: Option<SurfaceId>) {
         match kind {
             PolicyKind::MasterStack => {
@@ -328,6 +338,11 @@ impl WorkspaceManager {
 
     /// 1-based workspace number as exposed by the keybind and `m3ctl`
     /// (`SUPER+1` = `current_number() == 1`).
+    ///
+    /// The compositor converts with `current_index() + 1` at the two sites that
+    /// need the 1-based form, so this named accessor is exercised only by the
+    /// unit tests below; it is where the off-by-one convention is stated once.
+    #[allow(dead_code)]
     pub fn current_number(&self) -> u8 {
         (self.current + 1) as u8
     }
@@ -446,6 +461,12 @@ impl WorkspaceManager {
     /// are applied internally before delegating to the active
     /// `TiledLayoutPolicy`. Returns the per-window rectangles ready
     /// for the compose loop's blit phase.
+    ///
+    /// Phase 73 added `arrange_current_with_exclusive` and the compose loop
+    /// moved to it wholesale (it always has a zone list, possibly empty), so
+    /// this zero-zone form has no caller. Kept as the plain entry point:
+    /// it is what a caller with no Layer-shell surfaces should reach for.
+    #[allow(dead_code)]
     pub fn arrange_current(&mut self, output: Rect, gaps: GapConfig) -> Vec<(SurfaceId, Rect)> {
         self.arrange_current_with_exclusive(output, gaps, &[])
     }

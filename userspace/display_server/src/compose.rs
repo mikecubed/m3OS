@@ -120,6 +120,11 @@ impl ComposeContext {
 
     /// Phase 68 Track B — exposed for diagnostics and tests so a
     /// reviewer can confirm the tracker is being populated each frame.
+    ///
+    /// Read-only view onto private state; the compose loop drives the tracker
+    /// through `ComposeContext` and never needs to look at it, so this is a
+    /// diagnostics-only accessor with no caller in the shipped binary.
+    #[allow(dead_code)]
     pub fn damage_tracker(&self) -> &DamageTracker {
         &self.damage_tracker
     }
@@ -198,6 +203,13 @@ impl Default for ComposeContext {
 /// Phase 56 E.3 contract: the cursor is **always** rendered. If the
 /// caller passes `None` for `client_cursor`, a [`DefaultArrowCursor`]
 /// stands in. This prevents an invisible pointer at boot.
+///
+/// Unfiltered convenience wrapper over [`run_compose_filtered`]: composes every
+/// mapped surface with no arrangement override. `main.rs` always needs the
+/// filtered form (it composes per workspace), so this one has no caller — it is
+/// kept as the "compose everything" entry point the filtered signature would
+/// otherwise force every future caller to spell out.
+#[allow(dead_code)]
 pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
     owner: &mut O,
     layout: &mut L,
@@ -493,7 +505,18 @@ where
         // union the post-flip visible half would show frame N-2's
         // pixels in any region the cursor union does not cover.
         if needs_buffer_age {
-            cursor_repaint.extend_from_slice(&ctx.prev_frame_damage);
+            // NOTE: `cursor_repaint` is the `HeaplessVec<Rect, 2>` returned by
+            // `cursor_damage`, and `prev_frame_damage` is an unbounded `Vec`,
+            // so this fold is all-or-nothing and fails whenever the two rects
+            // of a non-overlapping cursor move already filled the capacity.
+            // The discard is deliberate here only in the sense that it is the
+            // pre-existing behaviour — the `Err` was never inspected. The
+            // stale region is still cleared to background by the
+            // `needs_buffer_age` arm of the cursor-trail clear above, so the
+            // failure mode is a missing surface re-blit, not frame N-2 pixels.
+            // Flagged for follow-up rather than changed here: widening the
+            // capacity alters what the flip backend composes.
+            let _ = cursor_repaint.extend_from_slice(&ctx.prev_frame_damage);
         }
 
         // Per-surface damage = cursor union translated into surface-
@@ -833,13 +856,12 @@ where
         // arrangement-assigned tile (move animations lerp the rect
         // through positions that may partially leave the natural
         // tile).
-        let anim_forced_idx = matches!(
-            animations.and_then(|eng| {
+        let anim_forced_idx = animations
+            .and_then(|eng| {
                 tile_for_entry(entry, arrangement)
                     .and_then(|nat| eng.effective_transform(entry.id, nat))
-            }),
-            Some(_)
-        );
+            })
+            .is_some();
         let (damage_slice, clip_rect): (&[Rect], Option<Rect>) = if scaled_flags[idx] {
             (scaled_damages[idx].as_slice(), None)
         } else if anim_forced_idx {
@@ -1127,8 +1149,7 @@ fn nearest_neighbour_scale(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h
         let sy = ((dy * src_h_usize) / scaled_h).min(src_h_usize - 1);
         let src_row_start = sy * src_stride;
         let dst_row_start = (dy + off_y) * dst_stride;
-        for dx in 0..scaled_w {
-            let sx = src_cols[dx];
+        for (dx, &sx) in src_cols.iter().enumerate() {
             let src_off = src_row_start + sx * BPP;
             let dst_off = dst_row_start + (dx + off_x) * BPP;
             if src_off + BPP <= src.len() && dst_off + BPP <= out.len() {
@@ -1243,9 +1264,7 @@ fn blit_cursor<O: FramebufferOwner>(
                 // only supports 4-bpp formats but the saturating
                 // path keeps the math defensive.
                 if bpp_usize > bytes.len() {
-                    for _ in bytes.len()..bpp_usize {
-                        run_pixels.push(0);
-                    }
+                    run_pixels.extend(core::iter::repeat_n(0u8, bpp_usize - bytes.len()));
                 }
                 cx += 1;
             }
@@ -1326,11 +1345,9 @@ fn clear_rect_to_background<O: FramebufferOwner>(owner: &mut O, rect: Rect) -> R
     for _ in 0..pixel_count {
         let take = bpp.min(pixel_bytes.len());
         buf.extend_from_slice(&pixel_bytes[..take]);
-        for _ in take..bpp {
-            buf.push(0);
-        }
+        buf.extend(core::iter::repeat_n(0u8, bpp - take));
     }
-    let stride = (rect.w as u32).saturating_mul(bpp as u32);
+    let stride = rect.w.saturating_mul(bpp as u32);
     owner.write_pixels(rect, &buf, stride)
 }
 
@@ -1365,6 +1382,12 @@ pub fn fill_background<O: FramebufferOwner>(owner: &mut O) -> Result<(), FbError
 
 /// Construct the default Phase 56 layout policy. Re-exported as a named
 /// factory so future phases can replace it without changing callers.
+///
+/// Phase 72 moved the shipped compositor onto the tiling policies in
+/// `workspace.rs`, so `main.rs` no longer builds a `FloatingLayout` and this
+/// factory has no caller. Kept because it is the single place that names which
+/// policy "default" means for the `LayoutPolicy` seam.
+#[allow(dead_code)]
 pub fn default_layout() -> impl LayoutPolicy {
     FloatingLayout::new()
 }

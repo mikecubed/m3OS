@@ -414,6 +414,16 @@ pub fn fill(pixels: &mut [u32], color: u32) {
 }
 
 /// Fill an axis-aligned rectangle.
+//
+// The software-rasterizer primitives below all take the classic blit
+// signature: destination surface (`pixels` + its `stride`/`height`
+// geometry), the target rectangle, then the paint. Callers splat these
+// straight out of a `SharedSurface`'s fields, so folding them into a
+// `Canvas`/`Rect` pair would add two constructions at each of ~60 call
+// sites across every compositor client for no readability gain — and
+// the argument order is the one every framebuffer blit in the tree
+// already uses.
+#[allow(clippy::too_many_arguments)]
 pub fn fill_rect(
     pixels: &mut [u32],
     stride: u32,
@@ -444,6 +454,8 @@ pub fn fill_rect(
 }
 
 /// Draw a 1-pixel border around a rectangle.
+// Blit signature — see the note on `fill_rect`.
+#[allow(clippy::too_many_arguments)]
 pub fn stroke_rect(
     pixels: &mut [u32],
     stride: u32,
@@ -466,6 +478,8 @@ pub fn stroke_rect(
 /// Draw an ASCII string with the bundled 8×16 bitmap font at native
 /// scale. Returns the rendered width in pixels. Codepoints outside
 /// ASCII fall back to the centred-dot glyph.
+// Blit signature — see the note on `fill_rect`.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_text(
     pixels: &mut [u32],
     stride: u32,
@@ -484,6 +498,8 @@ pub fn draw_text(
 /// Used by HiDPI surfaces (1080p+) so the text matches the
 /// framebuffer's higher pixel density. Returns the rendered width
 /// in pixels (`8 * scale * text.len()` if nothing clipped).
+// Blit signature — see the note on `fill_rect`.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_text_scaled(
     pixels: &mut [u32],
     stride: u32,
@@ -512,6 +528,8 @@ pub fn draw_text_scaled(
     cx - x
 }
 
+// Blit signature — see the note on `fill_rect`.
+#[allow(clippy::too_many_arguments)]
 fn draw_glyph_alpha(
     pixels: &mut [u32],
     stride: u32,

@@ -77,6 +77,12 @@ impl CompositorConfig {
     /// still returned as `Err` because they indicate a real syntax
     /// problem the user can fix. The `Vec<ConfigWarning>` carries the
     /// ignored entries so the caller can log them.
+    ///
+    /// The shipped compositor calls `parse_with_warnings` so it can log what it
+    /// skipped, leaving this warning-discarding form to the unit tests below —
+    /// which is most of what they assert against, since a test that cares about
+    /// warnings asks for them explicitly.
+    #[allow(dead_code)]
     pub fn parse(input: &str) -> Result<Self, ConfigError> {
         Self::parse_with_warnings(input).map(|(cfg, _)| cfg)
     }
@@ -163,7 +169,9 @@ enum Section {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigError {
-    UnknownSection { name: String, line: usize },
+    // No `UnknownSection` here on purpose: an unrecognised `[section]` header
+    // is log-and-ignore (see `parse_with_warnings`), so it is reported as
+    // `ConfigWarning::UnknownSection` and never aborts the parse.
     UnknownKey { key: String, line: usize },
     BadValue { key: String, line: usize },
     MalformedLine { line: usize },
@@ -196,9 +204,11 @@ fn strip_comment(line: &str) -> &str {
 
 fn strip_quotes(value: &str) -> &str {
     let v = value.trim();
-    if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
-        &v[1..v.len() - 1]
-    } else if v.len() >= 2 && v.starts_with('\'') && v.ends_with('\'') {
+    // Either quote style strips the same way; the pairing matters, so a value
+    // that opens with one style and closes with the other is left untouched.
+    let wrapped =
+        (v.starts_with('"') && v.ends_with('"')) || (v.starts_with('\'') && v.ends_with('\''));
+    if v.len() >= 2 && wrapped {
         &v[1..v.len() - 1]
     } else {
         v
@@ -234,6 +244,11 @@ fn parse_color(key: &str, value: &str, line: usize) -> Result<u32, ConfigError> 
     })
 }
 
+/// Float-valued key parser, sibling to `parse_u8` / `parse_u16` / `parse_color`.
+/// No `f32` key exists in `compositor.conf` yet (gaps, widths and colours are
+/// all integral), so nothing calls it; kept so the numeric-parser set stays
+/// complete and a future ratio/opacity key reports `BadValue` identically.
+#[allow(dead_code)]
 fn parse_f32(key: &str, value: &str, line: usize) -> Result<f32, ConfigError> {
     value.parse::<f32>().map_err(|_| ConfigError::BadValue {
         key: key.to_string(),

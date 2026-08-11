@@ -114,7 +114,7 @@ impl RecordingPainter {
 
     /// Whether any drawn text equals `s`.
     pub fn drew_text(&self, s: &str) -> bool {
-        self.texts().iter().any(|t| *t == s)
+        self.texts().contains(&s)
     }
 }
 

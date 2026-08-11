@@ -718,15 +718,15 @@ impl Ext2State {
     /// bitmap read-modify-write for the whole run instead of one per block — the
     /// dominant remaining write cost and the driver of WRITE-request latency.
     fn allocate_block(&mut self, preferred_group: u32) -> Result<u32, u64> {
-        if let Some((next, remaining)) = self.block_reservation {
-            if remaining > 0 {
-                self.block_reservation = if remaining == 1 {
-                    None
-                } else {
-                    Some((next + 1, remaining - 1))
-                };
-                return Ok(next);
-            }
+        if let Some((next, remaining)) = self.block_reservation
+            && remaining > 0
+        {
+            self.block_reservation = if remaining == 1 {
+                None
+            } else {
+                Some((next + 1, remaining - 1))
+            };
+            return Ok(next);
         }
         self.claim_block_run(preferred_group)
     }
@@ -2378,7 +2378,7 @@ fn handle_request(
     }
 }
 
-fn decode_path<'a>(recv_buf: &'a [u8], path_len: usize) -> Result<&'a str, u64> {
+fn decode_path(recv_buf: &[u8], path_len: usize) -> Result<&str, u64> {
     if path_len == 0 || path_len > recv_buf.len() {
         return Err(NEG_EINVAL);
     }

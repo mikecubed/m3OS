@@ -7,7 +7,7 @@
 //! 2. Fork a child that calls `service kill nvme_driver` while the I/O is
 //!    in flight (or shortly after it completes).
 //! 3. Observe the IPC transport failure that the kill produces.
-//! 3.5 (F.3c): Call `sys_block_read` from the kernel facade during the crash
+//!    3.5 (F.3c): Call `sys_block_read` from the kernel facade during the crash
 //!    window and assert it returns `EAGAIN` (-11) — the
 //!    `BlockDriverError::DriverRestarting` byte (5) propagated via
 //!    `block_error_to_neg_errno`.  This is the EAGAIN observation that was

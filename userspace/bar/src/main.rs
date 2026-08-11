@@ -205,12 +205,12 @@ fn program_main(_args: &[&str]) -> i32 {
             }
             if let Some(h) = control_handle
                 && let Some(active) = query_active_workspace(h)
+                && active != last_workspace
+                && (1..=9).contains(&active)
             {
-                if active != last_workspace && active >= 1 && active <= 9 {
-                    state.active_workspace = active;
-                    last_workspace = active;
-                    needs_render = true;
-                }
+                state.active_workspace = active;
+                last_workspace = active;
+                needs_render = true;
             }
         }
 

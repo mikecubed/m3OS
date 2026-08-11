@@ -790,7 +790,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             compose_ctx.force_full_repaint_clearing_background();
         }
         if let Some(focused_id) = focused
-            && outcome.destroyed.iter().any(|id| *id == focused_id)
+            && outcome.destroyed.contains(&focused_id)
         {
             focused = None;
             publish_focus_changed(&mut control_subs, focused, null_subscriber_sender);
@@ -1182,10 +1182,8 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                         }
                         rendered_surfaces.insert(*sid);
                     }
-                    Some(prev) if prev != *rect => {
-                        if !slide_in_flight {
-                            animation_engine.animate_move(*sid, prev, *rect);
-                        }
+                    Some(prev) if prev != *rect && !slide_in_flight => {
+                        animation_engine.animate_move(*sid, prev, *rect);
                     }
                     _ => {}
                 }
@@ -1831,6 +1829,11 @@ fn serve_one_control_request(
 /// The Phase 56 close-out wires this from `serve_one_control_request`
 /// using the new `SYS_IPC_TRY_RECV_MSG` syscall to multiplex frame-tick
 /// driving and control-endpoint serving in the same single-threaded loop.
+///
+/// The parameter list is `control::dispatch_command`'s, minus the decoded
+/// command this function decodes itself — see the rationale there. Bundling
+/// here without bundling there would just add a pack/unpack step.
+#[allow(clippy::too_many_arguments)]
 fn serve_control_iter<F, I>(
     bulk: &[u8],
     client: control::ClientId,
@@ -2148,8 +2151,7 @@ impl RecentFrames {
     /// scanners see the failing frame at the bottom and its predecessor
     /// just above it.
     fn dump(&self) {
-        let mut age = 0;
-        for offset in 0..RECENT_FRAMES_CAP {
+        for (age, offset) in (0..RECENT_FRAMES_CAP).enumerate() {
             let idx = (self.next + offset) % RECENT_FRAMES_CAP;
             if let Some(entry) = &self.entries[idx] {
                 syscall_lib::write_str(STDOUT_FILENO, "display_server:   recent[-");
@@ -2168,7 +2170,6 @@ impl RecentFrames {
                 syscall_lib::write_str(STDOUT_FILENO, recent_outcome_name(entry.outcome));
                 syscall_lib::write_str(STDOUT_FILENO, "\n");
             }
-            age += 1;
         }
     }
 }
@@ -2684,6 +2685,15 @@ fn run_autostart(entries: &[alloc::string::String]) {
 /// Phase 72 — execute a typed `KeybindAction` against the live
 /// compositor state. Each arm is a small state-machine step the
 /// main loop folds into its existing focus / publish helpers.
+///
+/// Seven of the eight parameters are `&mut` borrows of *disjoint* locals in
+/// `program_main`'s event loop — workspace manager, bind stack, focus slot,
+/// subscription registry, client event queue, compose context — plus the
+/// immutable config. They are separate parameters precisely so the borrow
+/// checker can see they do not alias; folding them into one struct would make
+/// every arm below borrow the whole struct mutably and force the loop to
+/// reconstruct it each iteration, for no readability gain at the one call site.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_keybind_action(
     action: keybind::KeybindAction,
     workspace_mgr: &mut workspace::WorkspaceManager,
@@ -2698,18 +2708,18 @@ fn dispatch_keybind_action(
     match action {
         KeybindAction::SwitchWorkspace(n) => {
             let idx = (n.saturating_sub(1)) as usize;
-            if let Ok(transition) = workspace_mgr.switch_workspace(idx) {
-                if transition.switched {
-                    syscall_lib::write_str(STDOUT_FILENO, "display_server: workspace switched to ");
-                    write_u32(n as u32);
-                    syscall_lib::write_str(STDOUT_FILENO, "\n");
-                    // Pick focus from the new workspace; falls back
-                    // to None if it is empty.
-                    *focused = workspace_mgr.next_focus(None);
-                    publish_focus_changed(control_subs, *focused, null_subscriber_sender);
-                    compose_ctx.invalidate_arrangement_cache();
-                    compose_ctx.force_full_repaint_clearing_background();
-                }
+            if let Ok(transition) = workspace_mgr.switch_workspace(idx)
+                && transition.switched
+            {
+                syscall_lib::write_str(STDOUT_FILENO, "display_server: workspace switched to ");
+                write_u32(n as u32);
+                syscall_lib::write_str(STDOUT_FILENO, "\n");
+                // Pick focus from the new workspace; falls back
+                // to None if it is empty.
+                *focused = workspace_mgr.next_focus(None);
+                publish_focus_changed(control_subs, *focused, null_subscriber_sender);
+                compose_ctx.invalidate_arrangement_cache();
+                compose_ctx.force_full_repaint_clearing_background();
             }
         }
         KeybindAction::MoveToWorkspace(n) => {
@@ -2845,13 +2855,13 @@ fn dispatch_keybind_action(
                 // mode active — the user might press H/J/K/L after
                 // focusing a window. Log a one-line warning so the
                 // failure mode is visible.
-                if let Err(other) = result.as_ref() {
-                    if !matches!(other, layout::LayoutError::Unsupported) {
-                        syscall_lib::write_str(
-                            STDOUT_FILENO,
-                            "display_server: resize keystroke ignored (no focused window?)\n",
-                        );
-                    }
+                if let Err(other) = result.as_ref()
+                    && !matches!(other, layout::LayoutError::Unsupported)
+                {
+                    syscall_lib::write_str(
+                        STDOUT_FILENO,
+                        "display_server: resize keystroke ignored (no focused window?)\n",
+                    );
                 }
                 // On a successful resize the policy state changed under
                 // the same id set, so the arrangement cache would

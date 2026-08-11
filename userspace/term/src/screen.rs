@@ -91,10 +91,9 @@ const SGR_BRIGHT_PALETTE: [u32; 8] = [
 /// - 0..=7    : 8 standard ANSI colors (matches [`SGR_PALETTE`]).
 /// - 8..=15   : 8 bright ANSI colors (matches [`SGR_BRIGHT_PALETTE`]).
 /// - 16..=231 : 6×6×6 RGB cube. Index `16 + 36r + 6g + b` maps each
-///              component to one of the six steps `{0, 95, 135, 175,
-///              215, 255}`.
+///   component to one of the six steps `{0, 95, 135, 175, 215, 255}`.
 /// - 232..=255: 24-step greyscale ramp from `(8,8,8)` to `(238,238,238)`
-///              in steps of 10.
+///   in steps of 10.
 pub const XTERM_256_PALETTE: [u32; 256] = build_xterm_256_palette();
 
 const fn build_xterm_256_palette() -> [u32; 256] {
@@ -1899,17 +1898,19 @@ impl Screen {
                 // record nothing and the call site rolls forward.
                 _ => (None, None),
             };
-            if let Some(fg) = new_fg {
-                if self.fg != fg {
-                    self.fg = fg;
-                    changed = true;
-                }
+            // Only a *different* colour dirties the state: an SGR run that
+            // re-states the current colour must not emit a `SetColor`.
+            if let Some(fg) = new_fg
+                && self.fg != fg
+            {
+                self.fg = fg;
+                changed = true;
             }
-            if let Some(bg) = new_bg {
-                if self.bg != bg {
-                    self.bg = bg;
-                    changed = true;
-                }
+            if let Some(bg) = new_bg
+                && self.bg != bg
+            {
+                self.bg = bg;
+                changed = true;
             }
         }
         if changed {
@@ -2510,7 +2511,7 @@ mod tests {
                 RenderCommand::PutGlyph { codepoint, .. } => Some(*codepoint),
                 _ => None,
             })
-            .last();
+            .next_back();
         assert_eq!(last_glyph, Some(REPLACEMENT_CHARACTER));
     }
 

@@ -379,6 +379,14 @@ pub fn drain_rx<M: MmioOps, P: FnMut(&[u8])>(
 /// - [`NetDriverError::RingFull`] when the next slot has `cmd != 0`
 ///   and `DD` is still clear (hardware is still DMA'ing).
 /// - [`NetDriverError::InvalidFrame`] for empty / oversize frames.
+// The parameter list mirrors the e1000 TX ring's hardware layout — descriptor
+// array, per-slot DMA buffers, their IOVAs, and the producer cursor are each
+// borrowed piecewise out of `E1000Device::tx` by `send_frame` (they cannot be
+// re-bundled into one struct without fighting the borrow splitter), and the two
+// `AtomicBool`s are process-global driver state, not ring state. The unit tests
+// below assemble the same pieces standalone; a wrapper struct would only make
+// every call site longer. Same shape as `igc::io::handle_tx`.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_tx<M: MmioOps>(
     mmio: &M,
     descs: &mut [E1000TxDesc],
@@ -713,7 +721,7 @@ pub fn run_io_loop(
         let _ = net_server.handle_next(
             |req| {
                 let mut dev = device.borrow_mut();
-                let status = match send_frame(&mut *dev, &req.frame) {
+                let status = match send_frame(&mut dev, &req.frame) {
                     Ok(()) => NetDriverError::Ok,
                     Err(e) => e,
                 };
@@ -729,7 +737,7 @@ pub fn run_io_loop(
         let bits = irq_bits.get();
         if bits != 0 {
             let mut dev = device.borrow_mut();
-            let _ = handle_irq_and_drain(&mut *dev, &net_server);
+            let _ = handle_irq_and_drain(&mut dev, &net_server);
             drop(dev);
             let _ = irq.ack(bits);
         }

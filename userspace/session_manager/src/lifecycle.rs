@@ -85,13 +85,21 @@ pub trait KernelClock {
     fn now_ms(&self) -> u64;
 }
 
+/// A [`SignalSink::send_signal`] delivery the kernel refused. Carries
+/// no payload on purpose: the state machine only ever distinguishes
+/// "accepted" from "not accepted", and maps the failure to
+/// [`StopError::TermFailed`] / [`StopError::KillFailed`] depending on
+/// which signal it was issuing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalError;
+
 /// Signal-delivery seam. Production: `syscall_lib::kill`. Test: a
 /// recording fake.
 pub trait SignalSink {
     /// Send `sig` to `pid`. Return `Ok(())` if the kernel accepted
-    /// the request; `Err(())` is treated by the state machine as a
-    /// transport-level failure that aborts the stop.
-    fn send_signal(&mut self, pid: Pid, sig: i32) -> Result<(), ()>;
+    /// the request; [`SignalError`] is treated by the state machine as
+    /// a transport-level failure that aborts the stop.
+    fn send_signal(&mut self, pid: Pid, sig: i32) -> Result<(), SignalError>;
 }
 
 /// Non-blocking reap seam. Production: a `kill(pid, 0)` liveness probe
@@ -344,7 +352,7 @@ pub fn record_restart_attempt(
 /// uses this gate to decide whether a `BudgetExhausted` outcome should
 /// fire text-fallback.
 pub fn is_display_critical(service: &str) -> bool {
-    DISPLAY_CRITICAL_SERVICES.iter().any(|s| *s == service)
+    DISPLAY_CRITICAL_SERVICES.contains(&service)
 }
 
 #[cfg(test)]
@@ -381,10 +389,10 @@ mod tests {
         reject_next: bool,
     }
     impl SignalSink for FakeSink {
-        fn send_signal(&mut self, pid: Pid, sig: i32) -> Result<(), ()> {
+        fn send_signal(&mut self, pid: Pid, sig: i32) -> Result<(), SignalError> {
             if self.reject_next {
                 self.reject_next = false;
-                return Err(());
+                return Err(SignalError);
             }
             self.sent.push((pid, sig));
             Ok(())
