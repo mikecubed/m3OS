@@ -6510,6 +6510,368 @@ fn normalize_run_qemu_exit(code: Option<i32>) -> i32 {
     }
 }
 
+// The userspace crates clippy-checked by `cargo xtask check` on the
+// hardware-float `x86_64-m3os` target in ONE combined invocation.
+//
+// EVERY workspace userspace crate is linted; which list it lands in is decided
+// by cargo feature unification, not by taste.
+// [`USERSPACE_ALLOC_TAINTED_CLIPPY_PKGS`] holds the crates that reach
+// `syscall-lib/argon2` — the only syscall-lib feature that *uses* the `alloc`
+// crate rather than merely providing a `GlobalAlloc` impl — and mixing one of
+// those into this list makes every allocator-less binary here
+// (`exit0`/`ping`/`whoami`/…) fail with "no global memory allocator found".
+//
+// Keep this list exhaustive: `userspace_clippy_lists_cover_every_workspace_crate`
+// fails the build if a workspace member is in none of the lists. It sat at ~29
+// packages for a long time, which silently exempted ~100 crates from
+// `-D warnings` and let a clippy backlog accumulate.
+const USERSPACE_CLIPPY_PKGS: &[&str] = &[
+    "syscall-lib",
+    "exit0",
+    "fork-test",
+    "echo-args",
+    "init",
+    "shell",
+    "ping",
+    "ping6",
+    "ipv6-smoke",
+    "edit",
+    "id",
+    "whoami",
+    "pty-test",
+    "unix-socket-test",
+    "thread-test",
+    "crypto-lib",
+    "crypto-test",
+    "coreutils-rs",
+    // Phase 85a Track C — the in-OS package installer. `--features
+    // os-binary` below builds its `_start` bin half; the host-side
+    // `pkg-format` halves are linted on the host target further down.
+    "pkg",
+    // Shared userspace libraries (`userspace/lib/*`).
+    "audio_client",
+    "audio_client_ffi",
+    "audio_mixer",
+    "desktop_client",
+    "display_client_ffi",
+    // Phase 55b Track C.1 — ring-3 driver runtime library
+    "driver_runtime",
+    "imagefmt",
+    "layout",
+    "m3ui",
+    "shadow",
+    // Phase 56 Track B.4 — userspace surface-buffer helper
+    "surface_buffer",
+    "usb-core",
+    // Phase 76 Track E — dynamic linker (no_std PIE).
+    "ld-musl-x86_64-so-1",
+    // Ring-3 device drivers (`userspace/drivers/*`). `mt792x_driver` is the
+    // one exception — it is alloc-tainted via `wifi-core`, see below.
+    "ac97_driver",
+    "acpid",
+    "ahci_driver",
+    "e1000_driver",
+    "e1000e_driver",
+    "hda_driver",
+    "igb_driver",
+    "igc_driver",
+    // Phase 55b Track D.1 — ring-3 NVMe driver scaffold
+    "nvme_driver",
+    "r8125_driver",
+    "r8169_driver",
+    "ure_driver",
+    "usb_audio",
+    "usb_hid",
+    "usb_net",
+    "usb_storage",
+    "usb_video",
+    "usbhub",
+    "xhci_driver",
+    // Ring-3 servers and daemons.
+    "audio_server",
+    "camera_server",
+    "console_server",
+    "crond",
+    "display_server",
+    "fat_server",
+    "kbd_server",
+    "mouse_server",
+    "net_server",
+    "notifyd",
+    "powerd",
+    "session_manager",
+    "sshd",
+    "stdin_feeder",
+    "syslogd",
+    "usb-logsink",
+    "vfs_server",
+    // Compositor clients and graphical apps.
+    "audio-demo",
+    "audio-stats",
+    "bar",
+    "gfx-demo",
+    "imgview",
+    "launcher",
+    "lockscreen",
+    "m3ui-demo",
+    "screenshot",
+    "settings",
+    "wallpaper",
+    // Debug / introspection tools.
+    "ktrace",
+    "m3gdbserver",
+    // Smoke, probe and PoC binaries — the gate arms in the table in
+    // AGENTS.md. They are small, but they are also where hand-written
+    // syscall glue lives, so they get the same `-D warnings` bar.
+    "acpi-sub-smoke",
+    "aslr-probe",
+    "clip-smoke",
+    "crash_stub",
+    "display-multi-client-smoke",
+    "display-server-crash-smoke",
+    "doom-concurrent",
+    "e1000-crash-smoke",
+    "epoll-smoke",
+    "fork-cet-poc",
+    "grab-hook-smoke",
+    "kstack-overflow-test",
+    "max-restart-smoke",
+    "meltdown-poc",
+    "nested-sig-cet-poc",
+    "nvme-crash-smoke",
+    "page-grant-test",
+    "panic-test",
+    "perf-bench",
+    "pku-smoke",
+    "ptrace-test",
+    "ptrace-tracee",
+    "rop-cet-poc",
+    "sendmsg-test",
+    "smoke-runner",
+    "stack-smash",
+    "tcsmoke",
+    "udp-smoke",
+    "usb-mount-smoke",
+    "vfs-throughput-probe",
+    "winsize-bang",
+    "wx-violation",
+];
+
+/// Crates in [`USERSPACE_CLIPPY_PKGS`] whose `[[bin]]` carries
+/// `required-features = ["os-binary"]`. Without these, cargo silently skips the
+/// bin target and only the `[lib]` half is linted — so the `_start`-bearing
+/// `main.rs` that actually ships would never be seen by clippy. `os-binary` is
+/// an empty feature everywhere except `r8125_driver` (which forwards it to
+/// `r8169_driver`), so turning it on costs nothing but coverage.
+const USERSPACE_OS_BINARY_FEATURES: &str = "ac97_driver/os-binary,\
+     ahci_driver/os-binary,audio_server/os-binary,e1000_driver/os-binary,\
+     e1000e_driver/os-binary,hda_driver/os-binary,igb_driver/os-binary,\
+     igc_driver/os-binary,pkg/os-binary,r8125_driver/os-binary,\
+     r8169_driver/os-binary,session_manager/os-binary";
+
+/// The userspace crates that must be clippy-checked in their OWN `x86_64-m3os`
+/// invocation, separate from [`USERSPACE_CLIPPY_PKGS`] (Phase 110 Track C for
+/// the auth binaries, Phase 81 for the Wi-Fi pair).
+///
+/// This is the transitive closure of "reaches `syscall-lib/argon2`":
+///   - `login`/`su`/`passwd`/`adduser` enable it directly for argon2id;
+///   - `wifi-core` enables `crypto-lib/alloc`, which implies it, and
+///     `m3ctl`/`mt792x_driver` depend on `wifi-core`;
+///   - `term`/`greeter`/`installer` link the `passwd` lib for its
+///     `/etc/passwd` + hash-field helpers, `tui-smoke`/`bell-test` link `term`,
+///     and `fb-takeover` links `m3ctl`.
+///
+/// `argon2` is the one syscall-lib feature that *uses* the alloc crate (the
+/// argon2id memory matrix), so unifying any of these into the combined
+/// invocation breaks every allocator-less binary in it with "no global memory
+/// allocator found". Every crate here carries its own `#[global_allocator]`,
+/// so they are safe together.
+const USERSPACE_ALLOC_TAINTED_CLIPPY_PKGS: &[&str] = &[
+    "login",
+    "su",
+    "passwd",
+    "adduser",
+    "wifi-core",
+    "mt792x_driver",
+    "m3ctl",
+    "fb-takeover",
+    "term",
+    "tui-smoke",
+    "bell-test",
+    "greeter",
+    "installer",
+];
+
+/// `os-binary` for the alloc-tainted crates whose `[[bin]]` is gated on it —
+/// same reason as [`USERSPACE_OS_BINARY_FEATURES`]: without it clippy sees only
+/// the `[lib]` half (`term`'s `display` module, for one, is bin-only).
+const ALLOC_TAINTED_OS_BINARY_FEATURES: &str = "greeter/os-binary,term/os-binary,\
+     m3ctl/os-binary,fb-takeover/os-binary,mt792x_driver/os-binary";
+
+/// The userspace crates that are `std`, not `no_std`: host-side test/executor
+/// code rather than ring-3 binaries. They fail with "can't find crate for
+/// `std`" on the bare-metal target, so they are linted on the host target
+/// instead of being dropped from the gate.
+const USERSPACE_STD_CLIPPY_PKGS: &[&str] = &["async-rt", "coreutils-tests"];
+
+/// Workspace members that are not userspace crates and are clippy-checked by
+/// their own dedicated invocations in [`cmd_check`] (`kernel` on
+/// `x86_64-unknown-none`; `kernel-core`/`xtask`/`pkg-format` on the host).
+///
+/// Test-only: those invocations spell their own package out, because each needs
+/// a different target and feature set. This is the ledger the coverage test
+/// below reads so those four do not show up as "unlinted".
+#[cfg(test)]
+const NON_USERSPACE_CLIPPY_PKGS: &[&str] = &["kernel", "kernel-core", "xtask", "pkg-format"];
+
+/// Workspace members deliberately exempt from `-D warnings`, with the reason.
+/// An *undocumented* omission is what let the last clippy backlog grow, so the
+/// coverage test below demands an entry here rather than silence.
+#[cfg(test)]
+const CLIPPY_EXEMPT_PKGS: &[(&str, &str)] = &[(
+    "sunset",
+    "vendored upstream crates.io source for the SSH stack (`sunset-local/`); \
+     third-party code we do not edit, so holding it to our lint bar would only \
+     produce churn on the next vendor bump",
+)];
+
+// Userspace code that carries no cargo package at all, and so cannot appear in
+// any list above:
+//
+//  - `userspace/{calc,hello,httpd,sysinfo,todo}-rust` are NOT workspace
+//    members. They are the musl demo binaries built by `build_musl_rust_bins()`
+//    against `x86_64-unknown-linux-musl` with their own lockfiles, so
+//    `cargo clippy -p <name>` from this workspace cannot resolve them. Lint them
+//    from their own directories if they ever grow beyond demo size.
+//  - The C / assembly userspace (`userspace/{coreutils,doom,hello-c,musl-bins,…}`)
+//    is built by the `build_*` helpers, not by cargo.
+
+#[cfg(test)]
+mod clippy_coverage {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// Package name of every `[workspace] members` entry in the root manifest.
+    ///
+    /// Deliberately a hand-rolled scan rather than `cargo metadata`: xtask has
+    /// no TOML dependency, and the two shapes involved are one array of quoted
+    /// paths and one `name = "…"` per member manifest.
+    fn workspace_member_package_names(root: &Path) -> BTreeSet<String> {
+        let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("read root Cargo.toml");
+        let start = manifest
+            .find("members = [")
+            .expect("root Cargo.toml has a [workspace] members list");
+        let end = start
+            + manifest[start..]
+                .find(']')
+                .expect("members list is terminated");
+
+        let mut names = BTreeSet::new();
+        for line in manifest[start..end].lines() {
+            let line = line.trim();
+            if line.starts_with('#') {
+                continue;
+            }
+            let Some(open) = line.find('"') else { continue };
+            let Some(len) = line[open + 1..].find('"') else {
+                continue;
+            };
+            let member = &line[open + 1..open + 1 + len];
+            let member_manifest = fs::read_to_string(root.join(member).join("Cargo.toml"))
+                .unwrap_or_else(|e| panic!("read {member}/Cargo.toml: {e}"));
+            // `[package]` is the first table in every member manifest, so the
+            // first bare `name =` is the package name (not a `[[bin]]` one).
+            let name = member_manifest
+                .lines()
+                .find_map(|l| {
+                    let rest = l.trim().strip_prefix("name")?.trim_start();
+                    Some(rest.strip_prefix('=')?.trim().trim_matches('"').to_string())
+                })
+                .unwrap_or_else(|| panic!("no package `name` in {member}/Cargo.toml"));
+            names.insert(name);
+        }
+        names
+    }
+
+    /// The gate that keeps the next clippy backlog from accruing: every
+    /// workspace member must be named by one of `cmd_check`'s clippy
+    /// invocations, or be exempt *with a written reason*. The old list covered
+    /// ~29 of 133 packages, and the ~100 it silently skipped went unlinted for
+    /// long enough to build up a real backlog.
+    #[test]
+    fn userspace_clippy_lists_cover_every_workspace_crate() {
+        let root = workspace_root();
+        let members = workspace_member_package_names(&root);
+
+        let mut covered: BTreeSet<&str> = BTreeSet::new();
+        for list in [
+            USERSPACE_CLIPPY_PKGS,
+            USERSPACE_ALLOC_TAINTED_CLIPPY_PKGS,
+            USERSPACE_STD_CLIPPY_PKGS,
+            NON_USERSPACE_CLIPPY_PKGS,
+        ] {
+            for pkg in list {
+                assert!(
+                    covered.insert(pkg),
+                    "`{pkg}` appears in two clippy invocations — pick the one its \
+                     feature set requires and delete the other"
+                );
+            }
+        }
+        let exempt: BTreeSet<&str> = CLIPPY_EXEMPT_PKGS.iter().map(|(pkg, _)| *pkg).collect();
+
+        let unlinted: Vec<&str> = members
+            .iter()
+            .map(String::as_str)
+            .filter(|m| !covered.contains(m) && !exempt.contains(m))
+            .collect();
+        assert!(
+            unlinted.is_empty(),
+            "workspace members not clippy-checked by `cargo xtask check`: {unlinted:?} — \
+             add each to USERSPACE_CLIPPY_PKGS, or to the alloc-tainted / std / \
+             exempt list if its features or target demand it"
+        );
+
+        let stale: Vec<&str> = covered
+            .iter()
+            .copied()
+            .filter(|pkg| !members.contains(*pkg))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "clippy package lists name packages that are not workspace members: {stale:?}"
+        );
+    }
+
+    /// The two `--features` strings are written across source lines with `\`
+    /// continuations, which strip the newline *and* the following indentation.
+    /// Guard that: a stray space would make cargo read `" ahci_driver"` as a
+    /// package name and abort the whole gate.
+    #[test]
+    fn os_binary_feature_strings_are_whitespace_free() {
+        for features in [
+            USERSPACE_OS_BINARY_FEATURES,
+            ALLOC_TAINTED_OS_BINARY_FEATURES,
+        ] {
+            assert!(
+                !features.contains(char::is_whitespace),
+                "`--features {features}` contains whitespace"
+            );
+            for spec in features.split(',') {
+                let (pkg, feature) = spec
+                    .split_once('/')
+                    .unwrap_or_else(|| panic!("`{spec}` is not a `package/feature` spec"));
+                assert_eq!(feature, "os-binary", "unexpected feature in `{spec}`");
+                assert!(
+                    USERSPACE_CLIPPY_PKGS.contains(&pkg)
+                        || USERSPACE_ALLOC_TAINTED_CLIPPY_PKGS.contains(&pkg),
+                    "`{pkg}` gets `os-binary` but is in no clippy package list"
+                );
+            }
+        }
+    }
+}
+
 fn cmd_check() {
     let root = workspace_root();
     // Phase 100 made the kernel `include_bytes!` the (gitignored) Nerd Font
@@ -6585,47 +6947,6 @@ fn cmd_check() {
     let userspace_target = root.join("x86_64-m3os.json");
     let userspace_target_str = userspace_target.to_str().unwrap().to_string();
 
-    // Clippy for all userspace crates (hardware-float x86_64-m3os target).
-    let userspace_pkgs = [
-        "syscall-lib",
-        "exit0",
-        "fork-test",
-        "echo-args",
-        "init",
-        "shell",
-        "ping",
-        "ping6",
-        "ipv6-smoke",
-        "edit",
-        // NOTE: Phase 110 Track C — `login`/`su`/`passwd`/`adduser` are
-        // clippy-checked in a SEPARATE invocation below. They enable
-        // `syscall-lib/argon2`, which pulls the `alloc` crate into `syscall-lib`;
-        // feature unification in this combined invocation would drag that into
-        // the allocator-less binaries here (`exit0`/`ping`/`whoami`/…), which have
-        // no `#[global_allocator]`. (The generic `alloc` feature that `edit`/
-        // `init` enable stays harmless — it gates only the BrkAllocator impl.)
-        "id",
-        "whoami",
-        "pty-test",
-        "unix-socket-test",
-        "thread-test",
-        "crypto-lib",
-        "crypto-test",
-        "coreutils-rs",
-        // Phase 55b Track C.1 — ring-3 driver runtime library
-        "driver_runtime",
-        // Phase 55b Track D.1 — ring-3 NVMe driver scaffold
-        "nvme_driver",
-        // Phase 56 Track B.4 — userspace surface-buffer helper
-        "surface_buffer",
-        // Phase 76 Track E — dynamic linker (no_std PIE).
-        "ld-musl-x86_64-so-1",
-        // NOTE: Phase 81 `wifi-core` / `mt792x_driver` are clippy-checked in a
-        // SEPARATE invocation below — they pull `crypto-lib/alloc`, and cargo's
-        // feature unification in this combined invocation would otherwise turn
-        // `alloc` on for `crypto-lib` in `coreutils-rs` too, breaking its
-        // no-allocator `genkey` bin.
-    ];
     let mut clippy_args = vec![
         "clippy".to_string(),
         "--target".to_string(),
@@ -6633,10 +6954,12 @@ fn cmd_check() {
         "-Zbuild-std=core,compiler_builtins,alloc".to_string(),
         "-Zbuild-std-features=compiler-builtins-mem".to_string(),
         "-Zjson-target-spec".to_string(),
+        "--features".to_string(),
+        USERSPACE_OS_BINARY_FEATURES.to_string(),
     ];
-    for pkg in &userspace_pkgs {
+    for pkg in USERSPACE_CLIPPY_PKGS {
         clippy_args.push("--package".to_string());
-        clippy_args.push(pkg.to_string());
+        clippy_args.push((*pkg).to_string());
     }
     clippy_args.extend(["--".to_string(), "-D".to_string(), "warnings".to_string()]);
 
@@ -6648,34 +6971,6 @@ fn cmd_check() {
 
     if !status.success() {
         eprintln!("userspace clippy reported errors");
-        std::process::exit(1);
-    }
-
-    // Phase 81: clippy the Wi-Fi crates in their OWN invocation. They depend on
-    // `crypto-lib/alloc`; isolating them keeps cargo feature unification from
-    // turning `alloc` on for `crypto-lib` in the combined invocation above (which
-    // would break `coreutils-rs`'s no-allocator `genkey` bin).
-    let status = Command::new(env!("CARGO"))
-        .current_dir(&root)
-        .args([
-            "clippy",
-            "--package",
-            "wifi-core",
-            "--package",
-            "mt792x_driver",
-            "--target",
-            userspace_target_str.as_str(),
-            "-Zbuild-std=core,compiler_builtins,alloc",
-            "-Zbuild-std-features=compiler-builtins-mem",
-            "-Zjson-target-spec",
-            "--",
-            "-D",
-            "warnings",
-        ])
-        .status()
-        .expect("failed to run Phase 81 Wi-Fi clippy");
-    if !status.success() {
-        eprintln!("wifi-core / mt792x_driver clippy reported errors");
         std::process::exit(1);
     }
 
@@ -6706,50 +7001,61 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
-    // Phase 110 Track C — clippy the argon2-using auth binaries in their OWN
-    // invocation. They enable `syscall-lib/argon2` (alloc-crate usage); each
-    // carries a `#[global_allocator]`, so isolating them keeps feature
-    // unification from dragging that into the allocator-less binaries in the
-    // combined invocation above.
+    // The alloc-tainted userspace crates, in their OWN invocation — see the
+    // rationale on [`USERSPACE_ALLOC_TAINTED_CLIPPY_PKGS`].
+    let mut tainted_args = vec![
+        "clippy".to_string(),
+        "--features".to_string(),
+        ALLOC_TAINTED_OS_BINARY_FEATURES.to_string(),
+        "--target".to_string(),
+        userspace_target_str.clone(),
+        "-Zbuild-std=core,compiler_builtins,alloc".to_string(),
+        "-Zbuild-std-features=compiler-builtins-mem".to_string(),
+        "-Zjson-target-spec".to_string(),
+    ];
+    for pkg in USERSPACE_ALLOC_TAINTED_CLIPPY_PKGS {
+        tainted_args.push("--package".to_string());
+        tainted_args.push((*pkg).to_string());
+    }
+    tainted_args.extend(["--".to_string(), "-D".to_string(), "warnings".to_string()]);
+
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
-        .args([
-            "clippy",
-            "--package",
-            "login",
-            "--package",
-            "su",
-            "--package",
-            "passwd",
-            "--package",
-            "adduser",
-            "--target",
-            userspace_target_str.as_str(),
-            "-Zbuild-std=core,compiler_builtins,alloc",
-            "-Zbuild-std-features=compiler-builtins-mem",
-            "-Zjson-target-spec",
-            "--",
-            "-D",
-            "warnings",
-        ])
+        .args(&tainted_args)
         .status()
-        .expect("failed to run auth-binary clippy");
+        .expect("failed to run alloc-tainted userspace clippy");
 
     if !status.success() {
-        eprintln!("auth-binary (argon2) clippy reported errors");
+        eprintln!("alloc-tainted userspace clippy reported errors");
         std::process::exit(1);
     }
 
-    // Phase 85a — clippy the package-management crates with `-D warnings`.
-    //
-    // `pkg-format` is checked on the host target for BOTH feature surfaces:
-    // the default (`std`) host packer/unpacker, and `--no-default-features`
-    // for the `no_std` parse/verify surface the in-OS installer links. `pkg`
-    // is checked on the userspace `x86_64-m3os` target with
-    // `--features os-binary` (so the `[[bin]]` `_start` path is linted, not
-    // just the host-testable `[lib]`), in its OWN invocation — mirroring the
-    // Wi-Fi block above so cargo feature unification cannot leak `pkg`'s
-    // `syscall-lib/alloc` onto the combined userspace clippy run.
+    // The `std` userspace crates, on the host target — see
+    // [`USERSPACE_STD_CLIPPY_PKGS`].
+    let mut std_args = vec!["clippy", "--target", KERNEL_CORE_HOST_TARGET];
+    for pkg in USERSPACE_STD_CLIPPY_PKGS {
+        std_args.extend(["--package", pkg]);
+    }
+    std_args.extend(["--", "-D", "warnings"]);
+
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args(&std_args)
+        .status()
+        .expect("failed to run std userspace clippy");
+
+    if !status.success() {
+        eprintln!("std userspace (async-rt / coreutils-tests) clippy reported errors");
+        std::process::exit(1);
+    }
+
+    // Phase 85a — clippy `pkg-format` on the host target for BOTH feature
+    // surfaces: the default (`std`) host packer/unpacker, and
+    // `--no-default-features` for the `no_std` parse/verify surface the in-OS
+    // installer links. (The `pkg` installer itself rides the combined
+    // `x86_64-m3os` invocation above with `pkg/os-binary`; it only ever needed
+    // `syscall-lib/alloc`, which is the harmless BrkAllocator-impl gate, not
+    // the alloc-crate-using `argon2` one.)
     for (pkg, extra) in [
         ("pkg-format", &["--no-default-features"][..]),
         ("pkg-format", &[][..]),
@@ -6772,30 +7078,6 @@ fn cmd_check() {
             eprintln!("pkg-format clippy reported errors (features: {extra:?})");
             std::process::exit(1);
         }
-    }
-
-    let status = Command::new(env!("CARGO"))
-        .current_dir(&root)
-        .args([
-            "clippy",
-            "--package",
-            "pkg",
-            "--features",
-            "os-binary",
-            "--target",
-            userspace_target_str.as_str(),
-            "-Zbuild-std=core,compiler_builtins,alloc",
-            "-Zbuild-std-features=compiler-builtins-mem",
-            "-Zjson-target-spec",
-            "--",
-            "-D",
-            "warnings",
-        ])
-        .status()
-        .expect("failed to run pkg clippy");
-    if !status.success() {
-        eprintln!("pkg clippy reported errors");
-        std::process::exit(1);
     }
 
     // Host-side allocator/property coverage uses:
