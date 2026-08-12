@@ -58,12 +58,25 @@ fn alloc_error(_layout: Layout) -> ! {
 
 // `KNOWN_CONFIGS` below lists the service paths (Phase 73's 25 + the 78a/78b/78c
 // USB driver configs + Phase 80 `ac97_driver`/`hda_driver` + Phase 82
-// `ahci_driver`). The fallback loader (`load_services_from_known_configs`) and
-// the dir-scan path both stop adding services once `self.count >= MAX_SERVICES`,
-// so the ceiling must exceed the number of `.conf` files actually present (the
-// ext2 staging now writes 33) or the last entries are silently dropped. Sized
-// with headroom for future additions; the extra slots cost a few hundred bytes.
-const MAX_SERVICES: usize = 36;
+// `ahci_driver` + Phase 101 `acpid` + Phase 103 `powerd`). The fallback loader
+// (`load_services_from_known_configs`) and the dir-scan path both stop adding
+// services once `self.count >= MAX_SERVICES`, so the ceiling must exceed the
+// number of `.conf` files actually present or the last entries are silently
+// dropped — no diagnostic, the service simply never starts.
+//
+// That is not hypothetical: Phase 101 raised this to 36 when it added
+// `acpid.conf`, and Phase 103 then added `powerd.conf` without raising it
+// again. A serial/autologin boot stages 36 confs and fit exactly, so every
+// regression gate stayed green; the graphical boot stages three more
+// (`wallpaper`/`bar`/`notifyd`, written only when `graphical_login` is set)
+// and silently lost all three — `cargo xtask run-gui` came up with no top
+// bar, no wallpaper, and no notification daemon. The `const _` below makes
+// the next such overflow a build error instead of a blank desktop.
+//
+// Sized to clear `KNOWN_CONFIGS` with headroom; each slot is a `ServiceDef`
+// (~300 bytes) in the stack-allocated `ServiceManager`, so the margin is
+// cheap.
+const MAX_SERVICES: usize = 48;
 const MAX_DISCOVERED_DISABLED: usize = 24;
 const MAX_PIDS: usize = 64;
 const MAX_DEPS: usize = 4;
@@ -269,6 +282,17 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/bar.conf\0",
     b"/etc/services.d/notifyd.conf\0",
 ];
+
+// The loaders drop anything past `MAX_SERVICES` without a diagnostic, so a
+// `KNOWN_CONFIGS` that outgrows the table costs a service at runtime and
+// nothing at build time. Turn that into a compile error: whoever adds the
+// next `.conf` here is forced to raise the ceiling in the same commit.
+const _: () = assert!(
+    KNOWN_CONFIGS.len() <= MAX_SERVICES,
+    "MAX_SERVICES is smaller than KNOWN_CONFIGS: init would silently drop the \
+     trailing service configs (this is how `bar`/`wallpaper`/`notifyd` went \
+     missing from the graphical boot). Raise MAX_SERVICES.",
+);
 
 // ---------------------------------------------------------------------------
 // Service types and status
