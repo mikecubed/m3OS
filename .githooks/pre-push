@@ -366,6 +366,21 @@ if [ "${M3OS_TERM_POLISH_REGRESSION:-0}" = "1" ]; then
     cargo xtask term-daily-driver-smoke --timeout 480
 fi
 
+# Graphical-login boot gate. Opt-in behind M3OS_GRAPHICAL_BOOT_REGRESSION=1
+# because it rebuilds the data disk and boots the full GUI stack headlessly
+# (QMP + VNC). This is the ONLY harness that boots the `graphical_login = true`
+# lane `cargo xtask run-gui` takes: that lane stages three service confs the
+# serial/autologin lane does not (wallpaper/bar/notifyd), and init drops any
+# conf past MAX_SERVICES with no diagnostic — which is exactly how the top bar
+# went missing for two phases while every other gate stayed green. Set the env
+# var on branches that touch userspace/init's service table or KNOWN_CONFIGS,
+# the ext2 service-conf staging in xtask, greeter's session-marker handshake,
+# or any of the Phase 73 desktop daemons.
+if [ "${M3OS_GRAPHICAL_BOOT_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask graphical-boot-smoke..."
+    cargo xtask graphical-boot-smoke --timeout 420
+fi
+
 # Phase 105 — m3ui toolkit render gate. Gated behind M3OS_M3UI_REGRESSION=1
 # because it boots the graphical stack headlessly (QMP + VNC), launches the
 # m3ui-demo Toplevel, and asserts on the composited framebuffer that the

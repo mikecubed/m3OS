@@ -1879,6 +1879,24 @@ fn main() {
             });
             cmd_term_polish_smoke(&probe_args);
         }
+        // The `graphical_login = true` lane. Every other harness here boots
+        // `graphical_login = false`, which stages three fewer service confs —
+        // so the desktop daemons (`wallpaper`/`bar`/`notifyd`) had no coverage
+        // at all until this gate existed.
+        Some("graphical-boot-smoke") => {
+            let probe_args = parse_probe_args_with_defaults(
+                &args[2..],
+                "graphical-boot-smoke",
+                420,
+                "m3os-graphical-boot-smoke",
+            )
+            .unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_graphical_boot_smoke(&probe_args);
+        }
         Some("compositor-stress") => {
             let stress_args = parse_compositor_stress_args(&args[2..]).unwrap_or_else(|err| {
                 eprintln!("Error: {err}");
@@ -2057,7 +2075,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|debug [--fresh] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|argon2-smoke [--timeout <secs>] [--display]|aslr-smoke [--timeout <secs>] [--display]|stack-smash-smoke [--timeout <secs>] [--display]|meltdown-poc-smoke [--timeout <secs>] [--display]|rop-cet-poc-smoke [--timeout <secs>] [--display]|nested-sig-cet-poc-smoke [--timeout <secs>] [--display]|debug-substrate-smoke [--timeout <secs>] [--display]|kpti-selftest-smoke [--timeout <secs>] [--display]|kgdb-smoke [--timeout <secs>] [--display]|ptrace-smoke [--timeout <secs>] [--display]|ptrace-gdbserver-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|term-daily-driver-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|debug [--fresh] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|argon2-smoke [--timeout <secs>] [--display]|aslr-smoke [--timeout <secs>] [--display]|stack-smash-smoke [--timeout <secs>] [--display]|meltdown-poc-smoke [--timeout <secs>] [--display]|rop-cet-poc-smoke [--timeout <secs>] [--display]|nested-sig-cet-poc-smoke [--timeout <secs>] [--display]|debug-substrate-smoke [--timeout <secs>] [--display]|kpti-selftest-smoke [--timeout <secs>] [--display]|kgdb-smoke [--timeout <secs>] [--display]|ptrace-smoke [--timeout <secs>] [--display]|ptrace-gdbserver-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|term-daily-driver-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|graphical-boot-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm.\n\
      USB passthrough: --usb-passthrough <vid:pid> (e.g. `--usb-passthrough 0bda:8156`) passes a physical USB device into the guest's emulated xHCI (qemu-xhci,id=xhci_pt). The QEMU process must have access to the USB device node — add a udev rule granting the user/group read-write on the device, or run with sudo. The device is claimed from the host kernel while QEMU runs and is released on exit."
@@ -22500,6 +22518,361 @@ fn cmd_term_polish_smoke(args: &LessRenderProbeArgs) {
         Err(msg) => {
             eprintln!(
                 "term-daily-driver-smoke: FAILED\n{msg}\nFrames + serial log in {}",
+                args.out_dir.display()
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// graphical-boot-smoke — the `graphical_login = true` lane
+// ---------------------------------------------------------------------------
+
+/// `bar`'s Layer-surface height, mirroring `BAR_HEIGHT_PX` in
+/// `userspace/bar/src/main.rs`. The bar anchors to TOP and stretches to the
+/// output width, so rows `0..BAR_BAND_PX` are the bar's exclusive zone on
+/// every output size.
+const BAR_BAND_PX: usize = 48;
+
+/// `display_server`'s `BG_PIXEL` (`0x002B_5A4B`) as RGB. Anything the
+/// compositor has not painted a surface over reads back as this colour, so
+/// "the band is no longer background" is the framebuffer-level proof that a
+/// surface actually composited there.
+const COMPOSITOR_BG_RGB: (u8, u8, u8) = (0x2B, 0x5A, 0x4B);
+
+/// Fraction of pixels in rows `y0..y1` that match `rgb` (within a small
+/// tolerance, so a scaled/blended edge pixel doesn't count as a miss).
+fn band_colour_ratio(frame: &ppm::PpmFrame, y0: usize, y1: usize, rgb: (u8, u8, u8)) -> f64 {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    let y1 = y1.min(h);
+    if w == 0 || y0 >= y1 {
+        return 0.0;
+    }
+    let mut hits = 0usize;
+    let mut total = 0usize;
+    for y in y0..y1 {
+        for x in 0..w {
+            let i = (y * w + x) * 3;
+            if i + 2 >= frame.pixels.len() {
+                break;
+            }
+            let d = (frame.pixels[i] as i32 - rgb.0 as i32).abs()
+                + (frame.pixels[i + 1] as i32 - rgb.1 as i32).abs()
+                + (frame.pixels[i + 2] as i32 - rgb.2 as i32).abs();
+            if d <= 12 {
+                hits += 1;
+            }
+            total += 1;
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        hits as f64 / total as f64
+    }
+}
+
+/// Number of distinct RGB triples in rows `y0..y1`. A painted bar carries a
+/// panel background, workspace cells, an active-workspace highlight and text
+/// glyphs, so it is comfortably polychrome; a band the compositor merely
+/// cleared to background is monochrome. Counting colours rather than asserting
+/// specific hexes keeps the gate from breaking when the bar is re-themed.
+fn band_distinct_colours(frame: &ppm::PpmFrame, y0: usize, y1: usize) -> usize {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    let y1 = y1.min(h);
+    let mut seen = std::collections::HashSet::new();
+    for y in y0..y1.min(h) {
+        for x in 0..w {
+            let i = (y * w + x) * 3;
+            if i + 2 >= frame.pixels.len() {
+                break;
+            }
+            seen.insert((frame.pixels[i], frame.pixels[i + 1], frame.pixels[i + 2]));
+        }
+    }
+    seen.len()
+}
+
+/// `graphical-boot-smoke` — boot the **`graphical_login = true`** lane that
+/// `cargo xtask run-gui` actually takes, drive the greeter login over QMP, and
+/// assert on the composited framebuffer that the Phase 73 desktop daemons came
+/// up and painted.
+///
+/// Why this gate exists: every other harness in this file calls
+/// `create_data_disk(.., graphical_login = false)`. That path stages 36
+/// service confs; the graphical path stages three more — `wallpaper.conf`,
+/// `bar.conf`, `notifyd.conf`, written only when `graphical_login` is set.
+/// init's loaders stop at `MAX_SERVICES` **without a diagnostic**, so when the
+/// ceiling stopped clearing the conf count (Phase 101 raised it to 36 for
+/// `acpid.conf`; Phase 103 then added `powerd.conf` and did not), the
+/// graphical boot silently lost all three daemons — no top bar, no wallpaper,
+/// no notification daemon — while every gate stayed green because the
+/// autologin lane still fit. `init`'s `const _` assertion now catches the
+/// `KNOWN_CONFIGS`-side overflow at build time; this gate catches the
+/// runtime-side one (a conf staged into the ext2 image that init's table has
+/// no room for, which no compile-time check can see) and, beyond mere
+/// startup, proves the bar reaches the screen.
+///
+/// The `SUPER+RETURN` arm at the end is not incidental: the graphical lane
+/// deliberately omits `[autostart]`, so that chord is the *only* way a user
+/// reaches a terminal after a GUI login. If it regresses, `run-gui` becomes
+/// an unusable desktop even with every daemon running.
+#[allow(clippy::zombie_processes)]
+fn cmd_graphical_boot_smoke(args: &LessRenderProbeArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    // Always rebuild the data disk: the graphical conf set is what is under
+    // test, and a disk left by a previous serial-lane run has none of it.
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        true, // graphical_login — the whole point of this gate
+    );
+    let ovmf = find_ovmf();
+    if let Err(e) = std::fs::create_dir_all(&args.out_dir) {
+        eprintln!(
+            "graphical-boot-smoke: cannot create out dir {}: {e}",
+            args.out_dir.display()
+        );
+        std::process::exit(1);
+    }
+
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let vnc_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&vnc_socket);
+
+    let mut qemu_args = qemu_args_with_devices(
+        &uefi_image,
+        &ovmf,
+        QemuDisplayMode::Headless,
+        DeviceSet::default(),
+    );
+    let mut idx = 0;
+    while idx + 1 < qemu_args.len() {
+        if qemu_args[idx] == "-display" && qemu_args[idx + 1] == "none" {
+            qemu_args[idx + 1] = format!("vnc=unix:{}", vnc_socket.display());
+            break;
+        }
+        idx += 1;
+    }
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+    qemu_args.push("-vga".to_string());
+    qemu_args.push("std".to_string());
+    // Mirror `run-gui` exactly: it passes the launch-time boot mode through
+    // `fw_cfg`, which the kernel prefers over the on-disk marker. Both agree
+    // here, but matching the flag keeps this gate on the same code path the
+    // user's command takes rather than a marker-only variant of it.
+    qemu_args.push("-fw_cfg".to_string());
+    qemu_args.push("name=opt/m3os/boot-mode,string=graphical".to_string());
+
+    println!(
+        "graphical-boot-smoke: launching QEMU on the graphical-login lane (timeout {}s, qmp {})",
+        args.timeout_secs,
+        qmp_socket.display()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+
+    let result: Result<(), String> = (|| {
+        let step = std::time::Duration::from_secs(args.timeout_secs.min(180));
+        let wait = |pattern: &str, buf: &mut String, hist: &mut String| -> Result<(), String> {
+            wait_for_serial_pattern(&rx, buf, hist, pattern, step, global_start, global_timeout)
+        };
+
+        // Arm 1 — init must LOAD all three graphical-only daemons. This is the
+        // direct `MAX_SERVICES` guard: an overflow drops the trailing confs
+        // here, before anything is spawned, and prints nothing at all.
+        for svc in ["wallpaper", "bar", "notifyd"] {
+            wait(
+                &format!("init: loaded service '{svc}'"),
+                &mut serial_buf,
+                &mut serial_history,
+            )
+            .map_err(|e| {
+                format!(
+                    "init never loaded the '{svc}' service ({e}). The graphical lane stages three \
+                     more confs than the serial lane; if init's MAX_SERVICES no longer clears the \
+                     number of .conf files staged into /etc/services.d, the trailing ones are \
+                     dropped silently and the desktop comes up with no bar / wallpaper / notifyd."
+                )
+            })?;
+        }
+        println!("graphical-boot-smoke: init loaded wallpaper + bar + notifyd");
+
+        // Arm 2 — and each must actually start and reach its own main().
+        for pat in ["wallpaper: starting", "bar: starting", "notifyd: starting"] {
+            wait(pat, &mut serial_buf, &mut serial_history)
+                .map_err(|e| format!("daemon never started: {pat:?} ({e})"))?;
+        }
+        // On the graphical lane the bar must *defer* — piercing the login
+        // screen with a 48 px panel before authentication is the bug this
+        // handshake was added to prevent.
+        wait(
+            "bar: waiting for login session",
+            &mut serial_buf,
+            &mut serial_history,
+        )
+        .map_err(|e| {
+            format!(
+                "bar did not defer to the greeter ({e}) — on a graphical boot it must wait for \
+                 /run/m3os-current-session before declaring its Layer surface"
+            )
+        })?;
+        println!("graphical-boot-smoke: all three daemons started; bar deferred to the greeter");
+
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+        println!("graphical-boot-smoke: QMP handshake complete");
+
+        // Let the greeter paint before we capture or type at it.
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        // Not `capture_frame`: that shared helper hardcodes a
+        // `less-render-probe:` prefix on its progress line, which would
+        // mislabel this gate's output.
+        let greeter_path = args.out_dir.join("00-greeter.ppm");
+        q.screendump(&greeter_path)
+            .map_err(|e| format!("screendump greeter: {e}"))?;
+        println!("graphical-boot-smoke: captured {}", greeter_path.display());
+
+        // Arm 3 — drive the GUI login exactly as a user would.
+        q.type_text("root").map_err(|e| format!("type user: {e}"))?;
+        q.press_key("ret", 40)
+            .map_err(|e| format!("submit user: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        q.type_text("root")
+            .map_err(|e| format!("type password: {e}"))?;
+        q.press_key("ret", 40)
+            .map_err(|e| format!("submit password: {e}"))?;
+        wait("greeter: auth ok", &mut serial_buf, &mut serial_history)
+            .map_err(|e| format!("greeter did not authenticate root/root ({e})"))?;
+        // The session marker is the greeter->bar handshake; without it the bar
+        // waits forever in `wait_for_session_marker` and never paints.
+        wait(
+            "bar: session active; connecting",
+            &mut serial_buf,
+            &mut serial_history,
+        )
+        .map_err(|e| {
+            format!(
+                "bar never observed the login session ({e}) — greeter authenticated but the \
+                 /run/m3os-current-session handshake did not reach the bar, which polls for it \
+                 with no timeout and would hang here forever"
+            )
+        })?;
+        println!("graphical-boot-smoke: greeter authenticated; bar picked up the session");
+
+        // Arm 4 — the bar must reach the SCREEN, not merely run. Give the
+        // compositor a moment to composite the newly-mapped Layer surface.
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        let desktop_path = args.out_dir.join("01-desktop.ppm");
+        q.screendump(&desktop_path)
+            .map_err(|e| format!("screendump desktop: {e}"))?;
+        println!("graphical-boot-smoke: captured {}", desktop_path.display());
+        let desktop = ppm::read_ppm(&desktop_path)?;
+        let bg_ratio = band_colour_ratio(&desktop, 0, BAR_BAND_PX, COMPOSITOR_BG_RGB);
+        let colours = band_distinct_colours(&desktop, 0, BAR_BAND_PX);
+        if bg_ratio > 0.25 {
+            return Err(format!(
+                "the top {BAR_BAND_PX} px are still {:.0}% compositor background — the bar \
+                 process is running but its surface never composited to the screen",
+                bg_ratio * 100.0
+            ));
+        }
+        if colours < 4 {
+            return Err(format!(
+                "the top {BAR_BAND_PX} px hold only {colours} distinct colour(s) — something \
+                 painted the band but it carries no workspace cells / glyphs, so the bar did not \
+                 render its widgets"
+            ));
+        }
+        println!(
+            "graphical-boot-smoke: bar band is {:.1}% background with {colours} distinct colours",
+            bg_ratio * 100.0
+        );
+
+        // Arm 5 — the graphical lane omits `[autostart]` by design, so
+        // SUPER+RETURN is the only route to a terminal after login.
+        q.press_chord(&["meta_l", "ret"], 60)
+            .map_err(|e| format!("super+return: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        let term_path = args.out_dir.join("02-term-spawned.ppm");
+        q.screendump(&term_path)
+            .map_err(|e| format!("screendump term: {e}"))?;
+        println!("graphical-boot-smoke: captured {}", term_path.display());
+        let with_term = ppm::read_ppm(&term_path)?;
+        // Compare the desktop body (below the bar) before and after the chord.
+        let body_changed = changed_rows_in_band(
+            &desktop,
+            &with_term,
+            BAR_BAND_PX as f64 / desktop.height as f64,
+            1.0,
+        );
+        if body_changed < 100 {
+            return Err(format!(
+                "SUPER+RETURN changed only {body_changed} scanlines below the bar — no terminal \
+                 window appeared. The graphical lane ships no [autostart], so this chord is the \
+                 only way to reach a shell after a GUI login"
+            ));
+        }
+        println!(
+            "graphical-boot-smoke: SUPER+RETURN spawned a window ({body_changed} scanlines changed)"
+        );
+        Ok(())
+    })();
+
+    while let Ok(chunk) = rx.try_recv() {
+        append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+    }
+    if !args.keep_qemu {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&qmp_socket);
+        let _ = std::fs::remove_file(&vnc_socket);
+    }
+    let serial_log = args.out_dir.join("serial.log");
+    let _ = std::fs::write(&serial_log, &serial_history);
+
+    match result {
+        Ok(()) => {
+            println!(
+                "graphical-boot-smoke: PASSED — the graphical-login lane boots with wallpaper + \
+                 bar + notifyd loaded and started (the MAX_SERVICES overflow guard), the bar \
+                 defers to the greeter and picks up the session marker after a root/root GUI \
+                 login, its Layer surface composites over the top {BAR_BAND_PX} px with real \
+                 widgets, and SUPER+RETURN still spawns a terminal onto the otherwise-empty \
+                 desktop. Frames in {}",
+                args.out_dir.display()
+            );
+        }
+        Err(msg) => {
+            eprintln!(
+                "graphical-boot-smoke: FAILED\n{msg}\nFrames + serial log in {}",
                 args.out_dir.display()
             );
             std::process::exit(1);
