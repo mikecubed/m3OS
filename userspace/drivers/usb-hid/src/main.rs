@@ -35,14 +35,30 @@
 //! `mouse_server`. Report-Protocol keyboards additionally drive their Caps /
 //! Num / Scroll Lock LEDs via `SET_REPORT` (B.4), and the resident walk
 //! re-checks `NextAttach` so a hot-unplugged device's state is released (C.4).
+//!
+//! `cfg(not(test))` gates protect the OS-only entry point (allocator, panic /
+//! alloc-error handlers, `_start`) so
+//! `cargo test -p usb_hid --target x86_64-unknown-linux-gnu`
+//! compiles the daemon body as a plain host `std` test binary — `std` supplies
+//! those lang items, so leaving ours in scope is a duplicate-lang-item error.
 
-#![no_std]
-#![no_main]
-#![feature(alloc_error_handler)]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
+#![cfg_attr(not(test), feature(alloc_error_handler))]
+// Under `cfg(test)` the `entry_point!` below is gated out, so nothing calls
+// `program_main` and — transitively — none of the daemon body. That is expected
+// for a binary crate whose logic is exercised by unit tests rather than by a
+// caller, so silence `dead_code` for the test build only. The production
+// (`cfg(not(test))`) build keeps the lint fully live.
+#![cfg_attr(test, allow(dead_code))]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 use alloc::vec::Vec;
+// Only the `cfg(not(test))` alloc-error handler names `Layout`.
+#[cfg(not(test))]
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -60,13 +76,18 @@ use kernel_core::usb::hid_report::{
     parse_report_descriptor,
 };
 use syscall_lib::STDOUT_FILENO;
+// Only the `cfg(not(test))` `#[global_allocator]` names `BrkAllocator`; under
+// `cfg(test)` the host `std` allocator is used instead.
+#[cfg(not(test))]
 use syscall_lib::heap::BrkAllocator;
 use usb_core::protocol::{USB_MSG_MAX, USB_REQ_LABEL, USB_SERVICE_NAME, UsbReply, UsbRequest};
 use usb_core::{PROTOCOL_HID_KEYBOARD, PROTOCOL_HID_MOUSE};
 
+#[cfg(not(test))]
 #[global_allocator]
 static ALLOCATOR: BrkAllocator = BrkAllocator::new();
 
+#[cfg(not(test))]
 #[alloc_error_handler]
 fn alloc_error(_layout: Layout) -> ! {
     // Mirror to the kernel log ring so a bare-metal OOM death is visible in
@@ -76,6 +97,7 @@ fn alloc_error(_layout: Layout) -> ! {
     syscall_lib::exit(99)
 }
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     klog("usb-hid: PANIC\n");
@@ -93,6 +115,7 @@ fn klog(msg: &str) {
     syscall_lib::serial_print(msg);
 }
 
+#[cfg(not(test))]
 syscall_lib::entry_point!(program_main);
 
 /// Boot-log marker written when the daemon starts.
@@ -105,12 +128,6 @@ pub const READY_SENTINEL: &str = "usb-hid: polling\n";
 /// IPC inject labels (pinned contract with `kbd_server` / `mouse_server`).
 const KBD_EVENT_INJECT: u64 = 5;
 const MOUSE_EVENT_INJECT: u64 = 3;
-
-/// Fast interrupt-IN poll cadence — active while reports are arriving.
-/// Boot devices report at ~10 ms (`bInterval`); a 5 ms poll keeps input
-/// latency below one report period.  Matches `HID_POLL_FAST_NS` in
-/// `kernel_core::input::hid_poll`.
-const POLL_INTERVAL_NS: u32 = 5_000_000;
 
 /// Hot-plug reconcile interval (ms). Kept time-based so the cadence is
 /// independent of the adaptive-backoff sleep duration.
@@ -426,7 +443,7 @@ fn inject_pointer(mouse_ep: u32, ev: &PointerEvent) {
         let n = INJECTED_PTR_COUNT
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
-        if n == 1 || n % 64 == 0 {
+        if n == 1 || n.is_multiple_of(64) {
             syscall_lib::write_str(STDOUT_FILENO, "USB_HID:pointer-injected count=");
             write_u32_dec(n);
             syscall_lib::write_str(STDOUT_FILENO, "\n");
@@ -1346,7 +1363,7 @@ fn program_main(_args: &[&str]) -> i32 {
 
             // Periodic idle-occupancy sentinel — falsifiable evidence that the
             // driver is no longer pinning a core at idle (Phase 100 D.2 acceptance).
-            if consecutive_empty > 0 && consecutive_empty % IDLE_LOG_EVERY == 0 {
+            if consecutive_empty > 0 && consecutive_empty.is_multiple_of(IDLE_LOG_EVERY) {
                 let sleep_ns = next_hid_backoff_ns(consecutive_empty);
                 syscall_lib::write_str(STDOUT_FILENO, "USB_HID:idle ticks=");
                 write_u32_dec(consecutive_empty);
@@ -1429,4 +1446,295 @@ fn write_u32_hex(n: u32) {
     // SAFETY: `buf` contains only ASCII hex digits.
     let s = unsafe { core::str::from_utf8_unchecked(&buf) };
     syscall_lib::write_str(STDOUT_FILENO, s);
+}
+
+// ---------------------------------------------------------------------------
+// Host-side unit tests
+// ---------------------------------------------------------------------------
+//
+// This crate previously could not be compiled for the host at all (its
+// allocator / `#[panic_handler]` / `#[alloc_error_handler]` were ungated, so
+// `cargo test` hit a duplicate-lang-item error). With the `cfg(not(test))`
+// gates above in place the daemon body builds as a plain `std` test binary,
+// which lets the pure decision logic — the interface classifier and the HID
+// descriptor walk — be covered without QEMU. Everything else in this file is
+// syscall/IPC-bound and stays gate-covered (`usb-smoke`, `usb-report-smoke`).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use usb_core::protocol::AttachNotice;
+
+    /// An `AttachNotice` with every field zeroed but the class triple, which is
+    /// all `classify_role` reads.
+    fn notice(class: u8, sub_class: u8, protocol: u8) -> AttachNotice {
+        AttachNotice {
+            port: 1,
+            slot_id: 1,
+            interface_class: class,
+            interface_sub_class: sub_class,
+            interface_protocol: protocol,
+            attached: true,
+            ep_in_dci: 3,
+            ep_in_mps: 8,
+            ep_in_interval: 8,
+            interface_num: 0,
+            vendor_id: 0,
+            product_id: 0,
+            bulk_in_dci: 0,
+            bulk_in_mps: 0,
+            bulk_out_dci: 0,
+            bulk_out_mps: 0,
+        }
+    }
+
+    /// A `ReportField` carrying only the usage page/usage the classifier reads.
+    fn field(usage_page: u16, usage: u16) -> ReportField {
+        ReportField {
+            usage_page,
+            usage,
+            bit_offset: 0,
+            bit_size: 8,
+            report_id: 0,
+            is_relative: true,
+        }
+    }
+
+    // -- classify_role ------------------------------------------------------
+
+    #[test]
+    fn boot_subclass_keyboard_is_boot_keyboard() {
+        let n = notice(CLASS_HID, SUBCLASS_HID_BOOT, PROTOCOL_HID_KEYBOARD);
+        assert!(matches!(classify_role(&n, &[]), DeviceRole::BootKeyboard));
+    }
+
+    #[test]
+    fn boot_subclass_mouse_is_boot_mouse() {
+        let n = notice(CLASS_HID, SUBCLASS_HID_BOOT, PROTOCOL_HID_MOUSE);
+        assert!(matches!(classify_role(&n, &[]), DeviceRole::BootMouse));
+    }
+
+    /// The boot protocol field is authoritative under the Boot subclass even
+    /// when a Report layout was parsed — the fixed-format decode wins.
+    #[test]
+    fn boot_subclass_mouse_beats_parsed_pointer_layout() {
+        let n = notice(CLASS_HID, SUBCLASS_HID_BOOT, PROTOCOL_HID_MOUSE);
+        let fields = [field(USAGE_PAGE_GENERIC_DESKTOP, 0x30)];
+        assert!(matches!(classify_role(&n, &fields), DeviceRole::BootMouse));
+    }
+
+    /// A non-Boot-subclass interface that still declares protocol 1 is a
+    /// keyboard (USB HID §4.3) and is driven through `SET_PROTOCOL(0)`.
+    #[test]
+    fn report_subclass_keyboard_protocol_is_boot_keyboard() {
+        let n = notice(CLASS_HID, 0, PROTOCOL_HID_KEYBOARD);
+        assert!(matches!(classify_role(&n, &[]), DeviceRole::BootKeyboard));
+    }
+
+    /// The keyboard relaxation is deliberately NOT extended to protocol 2: a
+    /// Report-Protocol pointer must keep its rich layout decode.
+    #[test]
+    fn report_subclass_mouse_protocol_is_not_collapsed_to_boot_mouse() {
+        let n = notice(CLASS_HID, 0, PROTOCOL_HID_MOUSE);
+        let fields = [field(USAGE_PAGE_GENERIC_DESKTOP, 0x31)];
+        assert!(matches!(
+            classify_role(&n, &fields),
+            DeviceRole::ReportPointer
+        ));
+    }
+
+    #[test]
+    fn non_hid_class_is_ignored() {
+        // Mass storage (0x08) with a HID-looking protocol byte.
+        let n = notice(0x08, 0, PROTOCOL_HID_MOUSE);
+        assert!(matches!(classify_role(&n, &[]), DeviceRole::Ignore));
+    }
+
+    #[test]
+    fn hid_class_without_layout_is_ignored() {
+        let n = notice(CLASS_HID, 0, 0);
+        assert!(matches!(classify_role(&n, &[]), DeviceRole::Ignore));
+    }
+
+    #[test]
+    fn button_page_alone_classifies_as_report_pointer() {
+        let n = notice(CLASS_HID, 0, 0);
+        let fields = [field(USAGE_PAGE_BUTTON, 1)];
+        assert!(matches!(
+            classify_role(&n, &fields),
+            DeviceRole::ReportPointer
+        ));
+    }
+
+    #[test]
+    fn consumer_page_alone_classifies_as_report_consumer() {
+        let n = notice(CLASS_HID, 0, 0);
+        let fields = [field(USAGE_PAGE_CONSUMER, 0xE9)];
+        assert!(matches!(
+            classify_role(&n, &fields),
+            DeviceRole::ReportConsumer
+        ));
+    }
+
+    #[test]
+    fn keyboard_page_alone_classifies_as_boot_keyboard() {
+        let n = notice(CLASS_HID, 0, 0);
+        let fields = [field(USAGE_PAGE_KEYBOARD, 0x04)];
+        assert!(matches!(
+            classify_role(&n, &fields),
+            DeviceRole::BootKeyboard
+        ));
+    }
+
+    /// A combo interface exposing both pointer axes and a keyboard collection
+    /// must keep driving `mouse_server` (pointer is tested first).
+    #[test]
+    fn pointer_wins_over_keyboard_on_a_combo_layout() {
+        let n = notice(CLASS_HID, 0, 0);
+        let fields = [
+            field(USAGE_PAGE_KEYBOARD, 0x04),
+            field(USAGE_PAGE_GENERIC_DESKTOP, 0x30),
+        ];
+        assert!(matches!(
+            classify_role(&n, &fields),
+            DeviceRole::ReportPointer
+        ));
+    }
+
+    // -- fields_have_pointer / fields_have_keyboard -------------------------
+
+    #[test]
+    fn pointer_detection_accepts_x_y_axes_and_buttons_only() {
+        assert!(fields_have_pointer(&[field(
+            USAGE_PAGE_GENERIC_DESKTOP,
+            0x30
+        )]));
+        assert!(fields_have_pointer(&[field(
+            USAGE_PAGE_GENERIC_DESKTOP,
+            0x31
+        )]));
+        assert!(fields_have_pointer(&[field(USAGE_PAGE_BUTTON, 3)]));
+        // Generic Desktop, but a non-axis usage (0x38 = Wheel) — a wheel alone
+        // is not enough to call the interface a pointer.
+        assert!(!fields_have_pointer(&[field(
+            USAGE_PAGE_GENERIC_DESKTOP,
+            0x38
+        )]));
+        assert!(!fields_have_pointer(&[]));
+    }
+
+    #[test]
+    fn keyboard_detection_matches_only_the_keyboard_page() {
+        assert!(fields_have_keyboard(&[field(USAGE_PAGE_KEYBOARD, 0x04)]));
+        assert!(!fields_have_keyboard(&[field(USAGE_PAGE_CONSUMER, 0xE9)]));
+        assert!(!fields_have_keyboard(&[]));
+    }
+
+    // -- hid_report_descriptor_len ------------------------------------------
+
+    /// 9-byte interface descriptor for `iface`.
+    fn iface_desc(iface: u8) -> [u8; 9] {
+        [9, 0x04, iface, 0, 1, CLASS_HID, 0, 0, 0]
+    }
+
+    /// 9-byte HID descriptor declaring one Report (0x22) entry of `len` bytes.
+    fn hid_desc(len: u16) -> [u8; 9] {
+        [
+            9,
+            0x21,
+            0x11,
+            0x01, // bcdHID 1.11
+            0,    // bCountryCode
+            1,    // bNumDescriptors
+            0x22, // Report descriptor
+            (len & 0xff) as u8,
+            (len >> 8) as u8,
+        ]
+    }
+
+    /// 7-byte endpoint descriptor, so the walk has to step over a trailing TLV.
+    const EP_DESC: [u8; 7] = [7, 0x05, 0x81, 0x03, 8, 0, 10];
+
+    fn config_blob(parts: &[&[u8]]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for p in parts {
+            v.extend_from_slice(p);
+        }
+        v
+    }
+
+    #[test]
+    fn report_len_found_for_the_requested_interface() {
+        let cfg = config_blob(&[&iface_desc(0), &hid_desc(52), &EP_DESC]);
+        assert_eq!(hid_report_descriptor_len(&cfg, 0), Some(52));
+    }
+
+    /// The HID descriptor of interface 0 must not answer a query for
+    /// interface 1 — `cur_iface` gates the match.
+    #[test]
+    fn report_len_is_scoped_to_its_interface() {
+        let cfg = config_blob(&[&iface_desc(0), &hid_desc(52), &EP_DESC]);
+        assert_eq!(hid_report_descriptor_len(&cfg, 1), None);
+    }
+
+    #[test]
+    fn report_len_walks_past_a_preceding_interface() {
+        let cfg = config_blob(&[
+            &iface_desc(0),
+            &hid_desc(52),
+            &EP_DESC,
+            &iface_desc(1),
+            &hid_desc(0x00c2),
+            &EP_DESC,
+        ]);
+        assert_eq!(hid_report_descriptor_len(&cfg, 0), Some(52));
+        assert_eq!(hid_report_descriptor_len(&cfg, 1), Some(0x00c2));
+    }
+
+    #[test]
+    fn report_len_handles_a_two_byte_length() {
+        let cfg = config_blob(&[&iface_desc(0), &hid_desc(0x1234)]);
+        assert_eq!(hid_report_descriptor_len(&cfg, 0), Some(0x1234));
+    }
+
+    /// A HID descriptor whose only class-descriptor entry is not a Report
+    /// (0x22) yields nothing rather than a bogus length.
+    #[test]
+    fn report_len_skips_non_report_class_descriptors() {
+        let mut hid = hid_desc(52);
+        hid[6] = 0x23; // Physical descriptor, not Report
+        let cfg = config_blob(&[&iface_desc(0), &hid, &EP_DESC]);
+        assert_eq!(hid_report_descriptor_len(&cfg, 0), None);
+    }
+
+    /// `bNumDescriptors` claiming more entries than fit inside the HID
+    /// descriptor's own `bLength` must fail closed, not read into the next TLV.
+    #[test]
+    fn report_len_fails_closed_on_overlong_num_descriptors() {
+        let mut hid = hid_desc(52);
+        hid[5] = 2; // bNumDescriptors = 2, but only one entry fits in bLength 9
+        hid[6] = 0x23; // make the one entry that does fit a non-Report
+        // The next descriptor is a Report-shaped decoy: an unbounded walk would
+        // read a length out of it.
+        let cfg = config_blob(&[&iface_desc(0), &hid, &[0x22, 0xff, 0xff]]);
+        assert_eq!(hid_report_descriptor_len(&cfg, 0), None);
+    }
+
+    /// A descriptor whose `bLength` runs past the end of the blob terminates
+    /// the walk instead of panicking.
+    #[test]
+    fn report_len_handles_a_truncated_blob() {
+        let full = config_blob(&[&iface_desc(0), &hid_desc(52)]);
+        let truncated = &full[..full.len() - 3];
+        assert_eq!(hid_report_descriptor_len(truncated, 0), None);
+    }
+
+    /// A zero/one-byte `bLength` would make the walk spin forever; it must
+    /// break out instead.
+    #[test]
+    fn report_len_rejects_a_degenerate_blength() {
+        let cfg = config_blob(&[&iface_desc(0), &[0, 0x21, 0, 0, 0, 1, 0x22, 52, 0]]);
+        assert_eq!(hid_report_descriptor_len(&cfg, 0), None);
+        assert_eq!(hid_report_descriptor_len(&[], 0), None);
+    }
 }

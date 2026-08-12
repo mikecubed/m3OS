@@ -111,6 +111,13 @@ pub struct PageGrantMapping {
     /// Byte length of the granted region. Always a multiple of 4096.
     pub len: usize,
     /// Number of 4 KiB pages backing the mapping. Equal to `len / 4096`.
+    ///
+    /// Recorded from the client's `AttachPageGrantBuffer` message rather than
+    /// re-derived, and never read back: every consumer works in bytes off
+    /// `len`. It is the page count a `sys_page_grant_release` would have to
+    /// hand back — the syscall the `Drop` impl below documents as missing — so
+    /// it stays with the mapping it describes.
+    #[allow(dead_code)]
     pub n_pages: u32,
 }
 
@@ -234,6 +241,13 @@ impl BufferStorage {
     /// For [`BufferStorage::Owned`] the slice is just a normal
     /// `&Vec<u8>` borrow and the safety conditions are vacuously
     /// satisfied; the unsafety lives entirely on the `Shared` arm.
+    ///
+    /// No caller: every compose path took the safe `snapshot` route this
+    /// doc-comment steers callers to, which is the outcome the safety
+    /// contract was written to encourage. Kept because it is the only
+    /// borrow-only accessor over all three storage arms, and because deleting
+    /// it would take the aliasing contract documented above with it.
+    #[allow(dead_code)]
     pub unsafe fn as_slice(&self) -> &[u8] {
         match self {
             BufferStorage::Owned(v) => v,
@@ -292,6 +306,10 @@ impl CommittedBuffer {
     /// shared-memory mapping and must be consumed before yielding to
     /// the producer. Most callers should prefer
     /// [`CommittedBuffer::pixels_snapshot`].
+    ///
+    /// Unused for the same reason as [`BufferStorage::as_slice`], which it
+    /// forwards to: callers take `pixels_snapshot`.
+    #[allow(dead_code)]
     pub unsafe fn pixels_slice(&self) -> &[u8] {
         unsafe { self.pixels.as_slice() }
     }
@@ -1244,7 +1262,7 @@ impl SurfaceRegistry {
         }
         // Stable order: by layer ascending (composer requires this),
         // then by surface id for determinism within a layer.
-        entries.sort_by(|a, b| (a.layer as u8, a.id.0).cmp(&(b.layer as u8, b.id.0)));
+        entries.sort_by_key(|e| (e.layer as u8, e.id.0));
         entries
     }
 
@@ -1418,8 +1436,10 @@ impl Default for SurfaceRegistry {
     }
 }
 
-// NB: a `#[cfg(test)]` placeholder module was here. `display_server` is
-// `no_std` + `no_main`, so the std `test` harness cannot compile it.
-// The pure-logic invariants of this shim are covered by the
-// kernel-core `surface` state-machine tests; end-to-end verification is
-// the Phase 56 G.1 regression test in QEMU.
+// NB: a `#[cfg(test)]` placeholder module was here, removed back when the
+// crate's ungated `no_std` / `no_main` attributes kept the std `test`
+// harness from compiling it. `main.rs` now uses `cfg_attr(not(test), ..)`,
+// so host tests for this file do compile and run. The pure-logic
+// invariants of this shim remain covered by the kernel-core `surface`
+// state-machine tests; end-to-end verification is the Phase 56 G.1
+// regression test in QEMU.

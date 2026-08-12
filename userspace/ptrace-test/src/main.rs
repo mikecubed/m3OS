@@ -19,6 +19,11 @@
 use syscall_lib::{fork, syscall4, waitpid, write};
 
 /// Linux ptrace request numbers (the subset the kernel implements).
+// `PTRACE_TRACEME` (request 0) is issued by the tracee's naked asm stub, which
+// passes the request in `edi` as a bare `xor edi, edi` (see `child_traced`) and
+// so cannot reference this symbol. Kept to document the full request-number ABI
+// alongside its siblings.
+#[allow(dead_code)]
 const PTRACE_TRACEME: u64 = 0;
 const PTRACE_PEEKTEXT: u64 = 1;
 const PTRACE_POKETEXT: u64 = 4;

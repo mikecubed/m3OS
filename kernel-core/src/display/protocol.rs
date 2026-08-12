@@ -69,6 +69,82 @@ pub const FRAME_HEADER_SIZE: usize = 4;
 /// [`ProtocolError::BodyTooLarge`].
 pub const MAX_FRAME_BODY_LEN: u16 = 4096;
 
+/// Phase 105 Track B — the largest clipboard offer carried in one IPC
+/// bulk. The frame + bytes must fit under the [`MAX_FRAME_BODY_LEN`]
+/// `decode_message` guard; 3900 leaves room for the 13-byte frame and a
+/// safety margin. Text clipboards are far smaller in practice; multi-frame
+/// transfer for larger blobs is a documented follow-up.
+///
+/// Phase 112 Track B.2 moved this next to the bound it is derived from.
+/// It previously lived in `desktop_client`, which `term` deliberately does
+/// not depend on (it keeps a single display connection and one client
+/// library), so the constant had to be reachable without that dep.
+/// `desktop_client` re-exports it, leaving its existing callers untouched.
+pub const CLIPBOARD_MAX_BYTES: usize = 3900;
+
+/// Wire size of a [`ServerMessage::ClipboardData`] body: a 1-byte
+/// `mime_tag` plus a 4-byte `len`. Named — and used by the encoder, the
+/// decoder's `expect_body_len` guard, and [`CLIPBOARD_REPLY_BUF_LEN`] —
+/// so none of the three can silently drift apart if the body ever grows a
+/// field. `pub` because `display_server`'s own reply-encode buffer needs
+/// it too (it is not a client of this crate's other clipboard helpers,
+/// which are display-*client*-side).
+pub const CLIPBOARD_DATA_BODY_LEN: usize = 5;
+
+/// Phase 112 Track B.4 — bytes a `ClipboardData` reply's frame plus its
+/// trailing bulk can occupy at the protocol maximum: the frame header, the
+/// `ClipboardData` body, and the largest legal offer
+/// ([`CLIPBOARD_MAX_BYTES`]). Both display clients (`term`, `desktop_client`)
+/// size their reply-read buffer to exactly this rather than a locally
+/// duplicated `CLIPBOARD_MAX_BYTES + 16`, so growing the reply frame can no
+/// longer under-size the buffer and turn a max-size paste into a silent
+/// failure.
+pub const CLIPBOARD_REPLY_BUF_LEN: usize =
+    FRAME_HEADER_SIZE + CLIPBOARD_DATA_BODY_LEN + CLIPBOARD_MAX_BYTES;
+
+/// Decide the valid byte span of a clipboard-reply bulk, or reject it.
+///
+/// `consumed` is the header length already parsed out of the bulk, `len` is
+/// the byte count the `ClipboardData` reply announced, and `got` is the
+/// bulk's actual total length. Returns `None` — never a clamped span —
+/// when:
+///
+/// - `len` exceeds [`CLIPBOARD_MAX_BYTES`]. That cap is enforced by the two
+///   client-side senders (`term`, `desktop_client`), not the wire itself —
+///   framing permits bodies up to `MAX_FRAME_BODY_LEN` / IPC bulks up to
+///   `MAX_BULK_LEN`, and the compositor's `ClipboardStore` holds offers up
+///   to 64 KiB — so a `len` past `CLIPBOARD_MAX_BYTES` here means more than
+///   this client's transport buffer and the copy-side cap allow, i.e. a
+///   malformed or hostile reply.
+/// - `consumed + len` exceeds `got`, meaning the bulk is shorter than
+///   announced (truncated). This also rejects a `len` of zero if `consumed`
+///   alone already exceeds `got`: an empty reply cannot claim to have
+///   consumed bytes that never arrived.
+///
+/// A `len` of zero that passes the above is a legitimate empty clipboard,
+/// not an error, and yields the empty-but-valid span `(consumed, consumed)`
+/// — that distinction is load-bearing at the call sites, which treat
+/// `Some(vec![])` (empty clipboard) and `None` (rejected reply)
+/// differently.
+///
+/// The check lives here, rather than duplicated inline in `term`'s and
+/// `desktop_client`'s `get_clipboard`, so it is reachable — and
+/// host-tested — from both without either depending on the other; `term`
+/// deliberately keeps a single display connection and does not pull in
+/// `desktop_client` for it. Both callers reject a short bulk rather than
+/// returning its prefix: silently truncating a paste is worse than failing
+/// it, because the user cannot see the cut.
+pub fn clipboard_reply_span(consumed: usize, len: usize, got: usize) -> Option<(usize, usize)> {
+    if len > CLIPBOARD_MAX_BYTES {
+        return None;
+    }
+    let end = consumed.checked_add(len)?;
+    if end > got {
+        return None;
+    }
+    Some((consumed, end))
+}
+
 /// Hard upper bound on `SurfaceListReply` / `FrameStatsReply` entry count.
 /// Decoder rejects larger counts with
 /// [`ProtocolError::ListTooLong`] so a malformed control-socket peer
@@ -1479,12 +1555,15 @@ impl ServerMessage {
                     body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
                 })
             }
-            Self::ClipboardData { mime_tag, len } => {
-                encode_fixed_body(buf, OP_SERVER_CLIPBOARD_DATA, 5, |body| {
+            Self::ClipboardData { mime_tag, len } => encode_fixed_body(
+                buf,
+                OP_SERVER_CLIPBOARD_DATA,
+                CLIPBOARD_DATA_BODY_LEN,
+                |body| {
                     body[0] = mime_tag.to_byte();
                     body[1..5].copy_from_slice(&len.to_le_bytes());
-                })
-            }
+                },
+            ),
             Self::CaptureReply { width, height } => {
                 encode_fixed_body(buf, OP_SERVER_CAPTURE_REPLY, 8, |body| {
                     body[0..4].copy_from_slice(&width.to_le_bytes());
@@ -1569,7 +1648,7 @@ impl ServerMessage {
                 }
             }
             OP_SERVER_CLIPBOARD_DATA => {
-                expect_body_len(body_len, 5)?;
+                expect_body_len(body_len, CLIPBOARD_DATA_BODY_LEN as u16)?;
                 Self::ClipboardData {
                     mime_tag: MimeTag::from_byte(*body.first().ok_or(ProtocolError::Truncated)?),
                     len: read_u32(body, 1)?,
@@ -3146,6 +3225,71 @@ mod tests {
                 }
             }),
         ]
+    }
+
+    #[test]
+    fn clipboard_reply_span_returns_the_exact_span_for_a_well_formed_reply() {
+        // A 9-byte frame (the real `ClipboardData` header size) followed by
+        // a 5-byte payload that all arrived.
+        assert_eq!(clipboard_reply_span(9, 5, 14), Some((9, 14)));
+    }
+
+    #[test]
+    fn clipboard_reply_span_rejects_a_bulk_shorter_than_the_announced_len() {
+        // Regression: this used to clamp to `got` and return the truncated
+        // prefix instead of failing closed. A reply that announces more
+        // bytes than actually arrived must be rejected, not truncated.
+        assert_eq!(clipboard_reply_span(9, 5, 11), None);
+    }
+
+    #[test]
+    fn clipboard_reply_span_rejects_len_over_the_protocol_cap() {
+        // The client-side cap, not the wire framing, is what's exceeded
+        // here — malformed or hostile, either way not something to trust.
+        assert_eq!(
+            clipboard_reply_span(0, CLIPBOARD_MAX_BYTES + 1, CLIPBOARD_MAX_BYTES + 1),
+            None
+        );
+    }
+
+    #[test]
+    fn clipboard_reply_span_accepts_exactly_the_cap_and_rejects_one_more() {
+        // An off-by-one on the cap guard (`>=` instead of `>`) would make
+        // the single largest legal clipboard `clipboard_payload_fits`
+        // accepts un-pasteable; pin both sides of the boundary.
+        assert_eq!(
+            clipboard_reply_span(0, CLIPBOARD_MAX_BYTES, CLIPBOARD_MAX_BYTES),
+            Some((0, CLIPBOARD_MAX_BYTES))
+        );
+        assert_eq!(
+            clipboard_reply_span(0, CLIPBOARD_MAX_BYTES + 1, CLIPBOARD_MAX_BYTES + 1),
+            None
+        );
+    }
+
+    #[test]
+    fn clipboard_reply_span_accepts_a_zero_len_as_an_empty_but_valid_span() {
+        // An empty clipboard is legitimately `Some(vec![])` at the call
+        // site, not an error — that distinction is load-bearing.
+        assert_eq!(clipboard_reply_span(9, 0, 9), Some((9, 9)));
+    }
+
+    #[test]
+    fn clipboard_reply_span_rejects_a_zero_len_reply_shorter_than_its_own_header() {
+        // `len == 0` alone must not short-circuit past the truncation
+        // check: a reply that didn't even deliver its own header bytes is
+        // still a truncated bulk, not a valid empty clipboard.
+        assert_eq!(clipboard_reply_span(9, 0, 4), None);
+    }
+
+    #[test]
+    fn clipboard_reply_span_does_not_overflow_on_a_hostile_len_near_usize_max() {
+        // `consumed + len` must not silently wrap. `len` here (1) is well
+        // under the cap, so this exercises the `checked_add` guard on its
+        // own: `consumed` pushed to `usize::MAX` genuinely overflows when
+        // anything is added to it, which a plain `+` would wrap instead of
+        // rejecting.
+        assert_eq!(clipboard_reply_span(usize::MAX, 1, usize::MAX), None);
     }
 
     proptest! {

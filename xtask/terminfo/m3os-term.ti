@@ -37,12 +37,26 @@
 #                             — CSI form (`\E[…`), not SS3 (`\EO…`),
 #                               since `special_key_sequence` returns the
 #                               CSI bytes for the four arrow keysyms.
-# Capabilities for keys the handler does not yet generate (`khome`,
-# `kend`, `kpp`, `knp`, `kich1`, `kdch1`, `kcbt`, function keys) are
-# intentionally omitted; advertising them would mislead curses input
-# parsers into expecting bytes that never arrive. The companion
-# follow-up that extends `InputHandler` to emit Home/End/PageUp/PageDown
-# can re-add the matching capabilities at that time.
+#   - `khome=\E[H` / `kend=\E[F` / `kpp=\E[5~` / `knp=\E[6~`
+#                             — Phase 112 Track A taught
+#                               `special_key_sequence` the navigation
+#                               cluster. Only the *unshifted* keys reach
+#                               the application: Shift+Home/End/PageUp/
+#                               PageDown are swallowed by `term` itself as
+#                               scrollback-viewport commands (the xterm
+#                               "talk to the terminal, not the app"
+#                               convention), so there is nothing to
+#                               advertise for the shifted variants.
+#   - `kdch1=\E[3~`           — Delete, matching the same sequence the
+#                               USB HID path
+#                               (`kernel_core::input::hid_poll`) emits.
+# Keys the handler still generates *nothing* for (`kich1` (Insert),
+# `kcbt` (Shift-Tab) and the function keys) stay omitted on purpose. A
+# curses input parser treats a `k*` capability as a promise: after seeing
+# the escape prefix it blocks waiting for the rest of the advertised
+# sequence, so advertising bytes the keyboard never sends turns a
+# harmless dead key into a stalled or mis-parsed input stream. Add each
+# capability in the same change that makes `InputHandler` emit it.
 
 m3os-term|m3OS Phase 69 terminal,
 	am, bce, msgr, npc, xenl,
@@ -59,7 +73,8 @@ m3os-term|m3OS Phase 69 terminal,
 	ind=\n, indn=\E[%p1%dS,
 	invis=\E[8m,
 	kbs=\177, kcub1=\E[D, kcud1=\E[B, kcuf1=\E[C, kcuu1=\E[A,
-	kmous=\E[<,
+	kdch1=\E[3~, kend=\E[F, khome=\E[H, kmous=\E[<,
+	knp=\E[6~, kpp=\E[5~,
 	op=\E[39;49m, rev=\E[7m,
 	rin=\E[%p1%dT, rmcup=\E[?1049l,
 	rmso=\E[27m, rmul=\E[24m,

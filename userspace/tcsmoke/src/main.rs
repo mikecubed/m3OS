@@ -24,9 +24,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use syscall_lib::heap::BrkAllocator;
 use syscall_lib::{
     ECHO, ECHOK, ECHONL, ICANON, ICRNL, IEXTEN, INLCR, ISIG, IUTF8, IXON, NCCS, ONLCR, OPOST,
-    STDOUT_FILENO, TCSANOW, Termios, VEOF, VINTR, VMIN, VTIME, cfmakeraw, close, fork, kill,
-    nanosleep_for, openpty, read, rt_sigaction_simple, tcgetattr, tcsetattr, tcsetattr_when,
-    waitpid, write,
+    STDOUT_FILENO, TCSANOW, VEOF, VINTR, VMIN, VTIME, cfmakeraw, close, fork, kill, nanosleep_for,
+    openpty, read, rt_sigaction_simple, tcgetattr, tcsetattr, tcsetattr_when, waitpid, write,
 };
 
 #[global_allocator]

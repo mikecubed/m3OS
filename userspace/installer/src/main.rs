@@ -523,11 +523,10 @@ fn read_line_tty(buf: &mut [u8]) -> usize {
 /// pattern). Returns `None` on empty input.
 fn read_password(prompt: &str) -> Option<Vec<u8>> {
     write_str(STDOUT_FILENO, prompt);
-    let saved = syscall_lib::tcgetattr(0).ok().map(|t| {
-        let mut raw = t;
+    let saved = syscall_lib::tcgetattr(0).ok().inspect(|t| {
+        let mut raw = *t;
         raw.c_lflag &= !(syscall_lib::ECHO | syscall_lib::ECHOE);
         let _ = syscall_lib::tcsetattr(0, &raw);
-        t
     });
     let mut buf = [0u8; 128];
     let n = read_line_tty(&mut buf);
@@ -991,13 +990,13 @@ syscall_lib::entry_point!(program_main);
 
 fn program_main(args: &[&str]) -> i32 {
     log("INSTALLER:start\n");
-    let no_reboot = args.iter().any(|a| *a == "--no-reboot");
-    let part = args.iter().any(|a| *a == "--part");
+    let no_reboot = args.contains(&"--no-reboot");
+    let part = args.contains(&"--part");
     // Track D.1 — first-user setup is the partition-mode default (the
     // installed workstation gets real accounts); `--no-user` keeps the
     // image's seeded credentials (dev/scripted installs). The raw mode is
     // a byte-clone by definition and never alters accounts.
-    let make_user = !args.iter().any(|a| *a == "--no-user");
+    let make_user = !args.contains(&"--no-user");
     if part {
         log("INSTALLER:mode part\n");
         install_part(no_reboot, make_user)

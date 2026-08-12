@@ -40,7 +40,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use session_manager::lifecycle::{KernelClock, ReapOutcome, Reaper, SignalSink};
+use session_manager::lifecycle::{KernelClock, ReapOutcome, Reaper, SignalError, SignalSink};
 use session_manager::table::Pid;
 
 /// Production [`KernelClock`] implementation. Reads the monotonic
@@ -105,14 +105,14 @@ impl KernelClock for SyscallClock {
 
 /// Production [`SignalSink`] implementation. Wraps `syscall_lib::kill`
 /// and maps a negative errno (`-ESRCH`, `-EPERM`, etc.) to a typed
-/// `Err(())`. The state machine's deadline-driven escalation handles
-/// the failure modes uniformly.
+/// [`SignalError`]. The state machine's deadline-driven escalation
+/// handles the failure modes uniformly.
 pub struct SyscallSignalSink;
 
 impl SignalSink for SyscallSignalSink {
-    fn send_signal(&mut self, pid: Pid, sig: i32) -> Result<(), ()> {
+    fn send_signal(&mut self, pid: Pid, sig: i32) -> Result<(), SignalError> {
         let rc = syscall_lib::kill(pid.0, sig);
-        if rc < 0 { Err(()) } else { Ok(()) }
+        if rc < 0 { Err(SignalError) } else { Ok(()) }
     }
 }
 

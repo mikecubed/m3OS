@@ -46,6 +46,125 @@ Gates are ordered identically to the AGENTS.md lean table.
 
 **Env var:** `M3OS_HTOP_REGRESSION=1`
 
+## term-daily-driver-smoke
+
+**Env var:** `M3OS_TERM_POLISH_REGRESSION=1`
+
+Phase 112. Boots the graphical stack headlessly (QMP + VNC) with a
+Report-protocol `usb-tablet` as the **only** pointer on the xHCI bus, then
+asserts on the **composited framebuffer** — a serial `Wait` proves a program
+ran, not that the screen scrolled or a highlight painted. Six arms.
+
+Two constants recur below. `MIN_CHANGED_SCANLINES = 20` is the floor for
+"the screen content moved"; `TERM_QUIET_SCANLINES = 96` is the ceiling for
+"nothing meaningful changed" (roughly one text row plus the blinking
+cursor). Every frame is captured through `capture_settled`, which waits for
+two consecutive inter-frame gaps under the quiet ceiling rather than for
+byte-identity — the 500 ms cursor blink means a live prompt is *never*
+byte-identical, so a byte-identity settle burns its full deadline at every
+capture point. The pointer is parked at a fixed spot before every capture,
+because the compositor blits its cursor into the frame and a cursor that
+moved between two captures is itself a multi-scanline diff.
+
+1. **Scrollback viewport.** `dmesg` fills far past the 25-row live grid, so
+   the early lines exist only in the ring. Shift+PageUp must change ≥20
+   scanlines versus the live-tail frame (evicted rows are back on screen).
+   A subsequent plain `x` must change ≥20 scanlines versus the scrolled
+   frame **and** land within 96 scanlines of the live-tail frame — "it
+   moved" is not "it went home", and without the second half any repaint
+   that left the viewport parked elsewhere in history would pass. `x` rather
+   than Return: a printable key writes PTY bytes without scrolling the
+   primary region, so the snap is attributable to the keystroke path;
+   Return's echoed newline scrolls, and `scroll_region_up` snaps on any
+   primary scroll, which would let this arm pass with the
+   snap-on-keystroke code deleted.
+2. **Report-protocol wheel → `term`'s viewport.** The same assertion driven
+   by QMP `send_wheel`, followed by a Shift+End that must return the frame
+   to within 96 scanlines of the pre-wheel baseline. The `usb-tablet` is
+   load-bearing, and so is *removing* the `usb-mouse` the xHCI device set
+   attaches: QEMU's `usb-mouse` is Boot-subclass and the boot decoder
+   discards the wheel byte, QMP `input-send-event` cannot be addressed at an
+   input device (its `device` argument names a *display* device), so with
+   both pointers present QEMU delivers the notch to whichever claims the
+   event class. Leaving exactly one pointer on the bus is the only way to
+   guarantee the notch lands on the Report-protocol path
+   (subclass 0 → `decode_pointer_report`) that actually carries `wheel_dy`.
+   The PS/2 path never carries a wheel at all — see the Phase 112 deferral
+   on IntelliMouse.
+3. **Selection + clipboard.** A QMP left-button drag over an
+   `echo M3OS_COPY_ME` line must paint a visible highlight (≥20 scanlines),
+   and copy-on-release must land the text in the compositor's
+   `ClipboardStore`. The read-back is done by an **independent** client
+   (`clip-smoke --paste`) rather than by `term` itself, so the assertion
+   covers the broker and not just `term`'s own memory, and it asserts a
+   *whole trimmed line* equal to the marker — a line merely containing it
+   would be the echoed command row, not the copied output. Sequencing uses
+   an `echo-args CLIPSYNCA` chaser rather than occurrence counting: the
+   payload lands on serial one log record after the `CLIP_PASTE:` sentinel,
+   and `serial_history` is a rolling 192 KiB window, so counts taken minutes
+   apart are not comparable.
+4. **Paste reaches the PTY.** Ctrl+Shift+V into a bare `cat` must change ≥20
+   scanlines *and* leave the terminal on screen (asserted via the frame's
+   black-pixel ratio ≥0.15 — term paints black, the compositor teal). The
+   `cat` sink is load-bearing: `ion` does not enable bracketed-paste mode,
+   so `wrap_paste` correctly passes the payload through unframed, and
+   pasting a multi-row selection at a shell prompt would execute every line
+   in it and take the shell down — which is exactly what this gate caught
+   before the sink was added, while a naive "did the frame change?" check
+   scored it a pass. The `ESC[200~` / `ESC[201~` framing is therefore not
+   observable on this lane (a tree-wide grep for `2004` finds the mode bit
+   in `term::screen` and the framing in `term::input::wrap_paste` and
+   nothing else — no program in the image enables it) and PTY bytes have no
+   sink but the framebuffer, which cannot be OCR'd. It is covered by the
+   `wrap_paste` host tests in `term::input`. Copy is likewise driven by
+   release only; the gate never presses Ctrl+Shift+C.
+5. **Wheel → the application (alternate screen).** The counterpart to arm 2:
+   the *same* injected notch, a different destination. `/bin/tui-smoke
+   mouse-live` takes the alternate screen, enables `?1000h` + `?1006h`
+   itself, decodes `term`'s SGR reports, and floods half the grid with a
+   saturated colour per notch. Injection waits on its
+   `TUI_SMOKE:mouse-live:ready` sentinel — injecting earlier is a race with
+   a *wrong answer*, because until `?1000h` reaches `term` the notch is
+   consumed by term's own viewport. Two independent oracles per notch: the
+   serial sentinel `cb=64` / `cb=65` proves the **application** decoded the
+   report, and a hue-plus-region pixel count on the PPM proves it repainted
+   for the right direction (≥20 000 saturated-red pixels appearing in the
+   top half for wheel-up, blue in the bottom half for wheel-down, each
+   dominating the opposite half, with the previous band gone — region *and*
+   hue differ, so no single generic repaint satisfies both). On `q` the
+   probe's own tally must read exactly `up=1` / `down=1` / `ok`. Afterwards
+   the primary buffer must be back and a Shift+End must change nothing, i.e.
+   no notch leaked into `term`'s viewport around the probe's entry or exit.
+   A ported TUI would not serve here: htop's process list can legitimately
+   change zero pixels on a scroll, nothing guarantees ncurses enables mouse
+   tracking under `TERM=m3os-term`, and pulling a port build into this gate
+   would cost minutes.
+6. **Shift-drag override.** Run while `mouse-live` still holds the mouse —
+   the only state in which the two outcomes differ. An unshifted drag must
+   leave the frame quiet (≤96 scanlines; the application owns the press and
+   ignores anything that is not a wheel pseudo-button), while the identical
+   drag via `drag_abs_with_mods(&["shift"], …)` must change ≥20 scanlines
+   **and** replace the compositor's standing clipboard offer (read back with
+   its own `CLIPSYNCB` anchor, asserting arm 3's marker is no longer the
+   offer). This is the only end-to-end proof that the compositor stamps live
+   keyboard modifiers onto pointer events; a failure here means either that
+   stamping or `term`'s `MOD_SHIFT` handling.
+
+**No skip branch.** The gate builds its own device set and unconditionally
+appends `-device usb-tablet,bus=xhci0.0`, so there is no PS/2-only mode and
+the wheel arms always run.
+
+**Known upstream limitation.** The tablet's absolute coordinates arrive
+unscaled: `usb-hid` injects the decoded logical value straight into
+`PointerEvent::abs_position` without mapping the report's logical range onto
+the framebuffer. QEMU's `usb-tablet` has a 0..0x7FFF logical range, so QMP
+abs values pass through 1:1 and this gate deliberately sends **screen-pixel**
+coordinates rather than the usual normalized range — sending 0x4000 would
+hit-test at (16384, 16384), miss every surface, and silently drop the event.
+Fixing this properly needs `ReportField` to carry logical min/max (it does
+not today) plus a framebuffer-size query in the driver; that is Phase 92b
+work, not Phase 112.
+
 ## toolkit-render-probe
 
 **Env var:** `M3OS_M3UI_REGRESSION=1`

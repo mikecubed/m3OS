@@ -107,10 +107,10 @@ fn server_loop_stdout(ep_handle: u32) -> ! {
         let reply_label = match msg.label {
             CONSOLE_WRITE => {
                 let len = (msg.data[1] as usize).min(MAX_CONSOLE_WRITE_LEN);
-                if len > 0 {
-                    if let Ok(text) = core::str::from_utf8(&buf[..len]) {
-                        syscall_lib::write_str(STDOUT_FILENO, text);
-                    }
+                if len > 0
+                    && let Ok(text) = core::str::from_utf8(&buf[..len])
+                {
+                    syscall_lib::write_str(STDOUT_FILENO, text);
                 }
                 0
             }
@@ -174,6 +174,12 @@ fn handle_console_write(renderer: &mut FbRenderer, data: &[u8]) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Packed framebuffer info struct matching the kernel's FbInfo layout.
+///
+/// Dormant with the rest of the framebuffer-takeover path (see the
+/// transitional note in `program_main`): the layout mirrors the kernel's
+/// `sys_framebuffer_info` reply, so it is kept verbatim rather than
+/// reconstructed when that path is switched on.
+#[allow(dead_code)]
 #[repr(C)]
 struct FbInfo {
     width: u32,
@@ -183,6 +189,8 @@ struct FbInfo {
     pixel_format: u32,
 }
 
+/// Dormant with [`FbInfo`] — the framebuffer-takeover entry point.
+#[allow(dead_code)]
 fn get_fb_info() -> Option<FbInfo> {
     let mut buf = [0u8; 20];
     let ret = syscall_lib::framebuffer_info(&mut buf);
@@ -192,11 +200,6 @@ fn get_fb_info() -> Option<FbInfo> {
     // SAFETY: buf is 20 bytes, matching the FbInfo struct layout.
     let info = unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const FbInfo) };
     Some(info)
-}
-
-/// Check if a syscall return value is an error (negative errno encoded as u64).
-fn is_error(val: u64) -> bool {
-    val > u64::MAX - 4096
 }
 
 // ---------------------------------------------------------------------------
@@ -543,6 +546,10 @@ struct FbRenderer {
 unsafe impl Send for FbRenderer {}
 
 impl FbRenderer {
+    /// Dormant with [`FbInfo`]/[`get_fb_info`] — the only constructor of the
+    /// framebuffer-takeover renderer, which `server_loop` (also dormant)
+    /// drives.
+    #[allow(dead_code)]
     fn new(buf: *mut u8, info: &FbInfo) -> Self {
         let bytes_per_pixel = info.bpp as usize;
         let byte_len = info.stride as usize * bytes_per_pixel * info.height as usize;

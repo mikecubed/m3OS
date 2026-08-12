@@ -326,6 +326,12 @@ pub struct SlotContext {
     /// xHCI Slot ID this context belongs to.
     pub slot_id: u8,
     /// Output Device Context — the controller writes state back here.
+    /// Never read through the CPU mapping: its IOVA is installed in the DCBAA
+    /// slot at Address Device time and only the controller touches it. The
+    /// field exists so the slot keeps owning the allocation for as long as the
+    /// DCBAA entry points at it — dropping it would leave the controller
+    /// DMA'ing into a reclaimable region.
+    #[allow(dead_code)]
     pub output_ctx: DmaBuffer<u8>,
     /// EP0 transfer ring (command and data TRBs).
     pub ep0_ring: DmaBuffer<u8>,
@@ -1018,6 +1024,16 @@ impl Controller {
     /// rings Doorbell `slot_id` at DCI 1 (EP0), then blocks for the Transfer
     /// Event. On success returns the received data bytes (or an empty Vec for
     /// OUT-only transfers). Returns `None` on timeout or error completion code.
+    // The parameter list is the USB control-transfer wire shape (USB 2.0 §9.3)
+    // — the 8-byte SETUP packet plus the data stage it describes (length,
+    // direction, OUT payload) — with `irq` and the `drain_others` re-entrancy
+    // callback supplying the caller's blocking context. The data-stage length
+    // and direction stay explicit rather than being re-derived from `setup`
+    // here: the IPC entry points (`control_request` / `control_write`) validate
+    // the peer-supplied length and direction against `wLength`/`bmRequestType`
+    // and fail closed on a mismatch, so the checked values are what must be
+    // programmed. Bundling these into a struct would only lengthen every call.
+    #[allow(clippy::too_many_arguments)]
     pub fn control_transfer(
         &mut self,
         irq: &IrqNotification,
@@ -1056,16 +1072,12 @@ impl Controller {
                         return None;
                     }
                 };
-                let Some(sc) = self.slots.iter_mut().find(|s| s.slot_id == slot_id) else {
-                    return None;
-                };
+                let sc = self.slots.iter_mut().find(|s| s.slot_id == slot_id)?;
                 sc.ep0_data_buf = Some(buf);
             }
             // Zero the scratch (so a stale IN read returns clean bytes) and copy
             // the host→device payload in for an OUT transfer.
-            let Some(sc) = self.slots.iter().find(|s| s.slot_id == slot_id) else {
-                return None;
-            };
+            let sc = self.slots.iter().find(|s| s.slot_id == slot_id)?;
             let buf = sc.ep0_data_buf.as_ref().expect("scratch grown above");
             zero_dma(buf);
             if !dir_in {
@@ -2829,11 +2841,6 @@ impl Controller {
             return Some(speed);
         }
         None
-    }
-
-    /// A.7 port reset (legacy path kept for the Port Status Change handler).
-    fn reset_port(&self, port_num: u8) {
-        self.reset_port_with_speed(port_num);
     }
 
     fn report_port_enabled(&self, port_num: u8, speed: port::PortSpeed) {

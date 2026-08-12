@@ -34,6 +34,11 @@ const QEMU_ISA_DEBUG_EXIT_DEVICE: &str = "isa-debug-exit,iobase=0xf4,iosize=0x04
 ///
 /// `term` builds via its `[lib]` target — the binary is `#![no_main]` and
 /// cannot link on the host, so `--lib` is required to skip the bin.
+/// Conversely, the bin-only crates (`xhci_driver`, `display_server`,
+/// `usb_hid`, `usbhub`) keep their tests inside `main.rs` and gate
+/// `no_std`/`no_main`/the lang-item handlers behind `cfg(not(test))`, so their
+/// *binary* unit-test target must be built — passing `--lib` there would find
+/// no target and skip the tests entirely.
 ///
 /// Each entry is `(package, extra cargo args)`. `passwd` is intentionally not
 /// listed here; it needs `--no-default-features --features host-tests --test
@@ -111,6 +116,30 @@ const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
     // byte slices with fixture-driven decode + round-trip tests; the
     // screenshot path and greeter both depend on them, so gate them here.
     ("imagefmt", &[]),
+    // Phase 112 review-resolution — three bin-only crates whose `#[cfg(test)]`
+    // estates existed but had never once compiled, so ~75 already-written unit
+    // tests were dead weight. Each crate now carries the same
+    // `#![cfg_attr(not(test), no_std)]` / `no_main` / `alloc_error_handler`
+    // treatment as `xhci_driver` above: under `cfg(test)` the crate becomes a
+    // normal `std` test binary so `std` supplies the panic + alloc-error lang
+    // items (the duplicate-lang-item conflict was the reason they could never
+    // build), while the OS build is byte-for-byte unchanged. NOTE: unlike the
+    // `--lib` entries, none of these three has a lib target at all — their
+    // tests live inside `main.rs`, so the bin target is exactly what must be
+    // built and no extra args may be passed.
+    //
+    // display_server: the compositor's animation/config/decoration/keybind/
+    // workspace logic (48 tests) — the pure-logic core behind tiling, focus,
+    // and keybind dispatch that no serial smoke test can assert on.
+    ("display_server", &[]),
+    // usb_hid: HID interface role classification and the Report-descriptor
+    // length walk (21 tests), including the Phase 92 rule that a
+    // Report-Protocol pointer is never collapsed into the boot-mouse decode.
+    ("usb_hid", &[]),
+    // usbhub: hub-interface classification and the `hid_poll` backoff curve
+    // (6 tests). Its `program_main` had also lost its `#[cfg(not(test))]` to a
+    // drifted attribute, which is what kept the test build from linking.
+    ("usbhub", &[]),
 ];
 
 /// QEMU arguments enabling an emulated Intel VT-d IOMMU on the q35 machine.
@@ -1828,6 +1857,46 @@ fn main() {
             });
             cmd_htop_render_probe(&probe_args);
         }
+        // Phase 112 Track C.2 — scrollback viewport, selection/clipboard and
+        // wheel routing proved on the composited framebuffer (QMP/PPM), with
+        // a clipboard read-back from an independent client and an
+        // alternate-screen application as the second wheel destination.
+        Some("term-daily-driver-smoke") => {
+            // Six arms, each of which waits for the screen to stop moving
+            // before it asserts, so this gate is materially slower than the
+            // other QMP/PPM probes — hence its own default budget and its
+            // own artefact directory (it writes ~18 PPMs plus a serial log).
+            let probe_args = parse_probe_args_with_defaults(
+                &args[2..],
+                "term-daily-driver-smoke",
+                480,
+                "m3os-term-daily-driver-smoke",
+            )
+            .unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_term_polish_smoke(&probe_args);
+        }
+        // The `graphical_login = true` lane. Every other harness here boots
+        // `graphical_login = false`, which stages three fewer service confs —
+        // so the desktop daemons (`wallpaper`/`bar`/`notifyd`) had no coverage
+        // at all until this gate existed.
+        Some("graphical-boot-smoke") => {
+            let probe_args = parse_probe_args_with_defaults(
+                &args[2..],
+                "graphical-boot-smoke",
+                420,
+                "m3os-graphical-boot-smoke",
+            )
+            .unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_graphical_boot_smoke(&probe_args);
+        }
         Some("compositor-stress") => {
             let stress_args = parse_compositor_stress_args(&args[2..]).unwrap_or_else(|err| {
                 eprintln!("Error: {err}");
@@ -2006,7 +2075,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|debug [--fresh] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|argon2-smoke [--timeout <secs>] [--display]|aslr-smoke [--timeout <secs>] [--display]|stack-smash-smoke [--timeout <secs>] [--display]|meltdown-poc-smoke [--timeout <secs>] [--display]|rop-cet-poc-smoke [--timeout <secs>] [--display]|nested-sig-cet-poc-smoke [--timeout <secs>] [--display]|debug-substrate-smoke [--timeout <secs>] [--display]|kpti-selftest-smoke [--timeout <secs>] [--display]|kgdb-smoke [--timeout <secs>] [--display]|ptrace-smoke [--timeout <secs>] [--display]|ptrace-gdbserver-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login] [--combined]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|debug [--fresh] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|argon2-smoke [--timeout <secs>] [--display]|aslr-smoke [--timeout <secs>] [--display]|stack-smash-smoke [--timeout <secs>] [--display]|meltdown-poc-smoke [--timeout <secs>] [--display]|rop-cet-poc-smoke [--timeout <secs>] [--display]|nested-sig-cet-poc-smoke [--timeout <secs>] [--display]|debug-substrate-smoke [--timeout <secs>] [--display]|kpti-selftest-smoke [--timeout <secs>] [--display]|kgdb-smoke [--timeout <secs>] [--display]|ptrace-smoke [--timeout <secs>] [--display]|ptrace-gdbserver-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|panic-test-smoke [--timeout <secs>] [--display] [--kvm] [-m <spec>|--memory <spec>]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|term-daily-driver-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|graphical-boot-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|clipboard-smoke [--timeout <secs>] [--display]|screenshot-smoke [--timeout <secs>] [--display]|imgview-smoke [--timeout <secs>] [--display]|settings-smoke [--timeout <secs>] [--out <dir>] [--keep-qemu]|symphonia-smoke [--timeout <secs>] [--display]|power-smoke [--timeout <secs>] [--display]|suspend-smoke [--timeout <secs>] [--display]|usb-root-smoke [--timeout <secs>] [--display]|nvme-rw-smoke [--timeout <secs>] [--display]|nvme-persist-smoke [--timeout <secs>] [--display]|nvme-install-smoke [--timeout <secs>] [--display]|nvme-install-part-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm.\n\
      USB passthrough: --usb-passthrough <vid:pid> (e.g. `--usb-passthrough 0bda:8156`) passes a physical USB device into the guest's emulated xHCI (qemu-xhci,id=xhci_pt). The QEMU process must have access to the USB device node — add a udev rule granting the user/group read-write on the device, or run with sudo. The device is claimed from the host kernel while QEMU runs and is released on exit."
@@ -6488,6 +6557,368 @@ fn normalize_run_qemu_exit(code: Option<i32>) -> i32 {
     }
 }
 
+// The userspace crates clippy-checked by `cargo xtask check` on the
+// hardware-float `x86_64-m3os` target in ONE combined invocation.
+//
+// EVERY workspace userspace crate is linted; which list it lands in is decided
+// by cargo feature unification, not by taste.
+// [`USERSPACE_ALLOC_TAINTED_CLIPPY_PKGS`] holds the crates that reach
+// `syscall-lib/argon2` — the only syscall-lib feature that *uses* the `alloc`
+// crate rather than merely providing a `GlobalAlloc` impl — and mixing one of
+// those into this list makes every allocator-less binary here
+// (`exit0`/`ping`/`whoami`/…) fail with "no global memory allocator found".
+//
+// Keep this list exhaustive: `userspace_clippy_lists_cover_every_workspace_crate`
+// fails the build if a workspace member is in none of the lists. It sat at ~29
+// packages for a long time, which silently exempted ~100 crates from
+// `-D warnings` and let a clippy backlog accumulate.
+const USERSPACE_CLIPPY_PKGS: &[&str] = &[
+    "syscall-lib",
+    "exit0",
+    "fork-test",
+    "echo-args",
+    "init",
+    "shell",
+    "ping",
+    "ping6",
+    "ipv6-smoke",
+    "edit",
+    "id",
+    "whoami",
+    "pty-test",
+    "unix-socket-test",
+    "thread-test",
+    "crypto-lib",
+    "crypto-test",
+    "coreutils-rs",
+    // Phase 85a Track C — the in-OS package installer. `--features
+    // os-binary` below builds its `_start` bin half; the host-side
+    // `pkg-format` halves are linted on the host target further down.
+    "pkg",
+    // Shared userspace libraries (`userspace/lib/*`).
+    "audio_client",
+    "audio_client_ffi",
+    "audio_mixer",
+    "desktop_client",
+    "display_client_ffi",
+    // Phase 55b Track C.1 — ring-3 driver runtime library
+    "driver_runtime",
+    "imagefmt",
+    "layout",
+    "m3ui",
+    "shadow",
+    // Phase 56 Track B.4 — userspace surface-buffer helper
+    "surface_buffer",
+    "usb-core",
+    // Phase 76 Track E — dynamic linker (no_std PIE).
+    "ld-musl-x86_64-so-1",
+    // Ring-3 device drivers (`userspace/drivers/*`). `mt792x_driver` is the
+    // one exception — it is alloc-tainted via `wifi-core`, see below.
+    "ac97_driver",
+    "acpid",
+    "ahci_driver",
+    "e1000_driver",
+    "e1000e_driver",
+    "hda_driver",
+    "igb_driver",
+    "igc_driver",
+    // Phase 55b Track D.1 — ring-3 NVMe driver scaffold
+    "nvme_driver",
+    "r8125_driver",
+    "r8169_driver",
+    "ure_driver",
+    "usb_audio",
+    "usb_hid",
+    "usb_net",
+    "usb_storage",
+    "usb_video",
+    "usbhub",
+    "xhci_driver",
+    // Ring-3 servers and daemons.
+    "audio_server",
+    "camera_server",
+    "console_server",
+    "crond",
+    "display_server",
+    "fat_server",
+    "kbd_server",
+    "mouse_server",
+    "net_server",
+    "notifyd",
+    "powerd",
+    "session_manager",
+    "sshd",
+    "stdin_feeder",
+    "syslogd",
+    "usb-logsink",
+    "vfs_server",
+    // Compositor clients and graphical apps.
+    "audio-demo",
+    "audio-stats",
+    "bar",
+    "gfx-demo",
+    "imgview",
+    "launcher",
+    "lockscreen",
+    "m3ui-demo",
+    "screenshot",
+    "settings",
+    "wallpaper",
+    // Debug / introspection tools.
+    "ktrace",
+    "m3gdbserver",
+    // Smoke, probe and PoC binaries — the gate arms in the table in
+    // AGENTS.md. They are small, but they are also where hand-written
+    // syscall glue lives, so they get the same `-D warnings` bar.
+    "acpi-sub-smoke",
+    "aslr-probe",
+    "clip-smoke",
+    "crash_stub",
+    "display-multi-client-smoke",
+    "display-server-crash-smoke",
+    "doom-concurrent",
+    "e1000-crash-smoke",
+    "epoll-smoke",
+    "fork-cet-poc",
+    "grab-hook-smoke",
+    "kstack-overflow-test",
+    "max-restart-smoke",
+    "meltdown-poc",
+    "nested-sig-cet-poc",
+    "nvme-crash-smoke",
+    "page-grant-test",
+    "panic-test",
+    "perf-bench",
+    "pku-smoke",
+    "ptrace-test",
+    "ptrace-tracee",
+    "rop-cet-poc",
+    "sendmsg-test",
+    "smoke-runner",
+    "stack-smash",
+    "tcsmoke",
+    "udp-smoke",
+    "usb-mount-smoke",
+    "vfs-throughput-probe",
+    "winsize-bang",
+    "wx-violation",
+];
+
+/// Crates in [`USERSPACE_CLIPPY_PKGS`] whose `[[bin]]` carries
+/// `required-features = ["os-binary"]`. Without these, cargo silently skips the
+/// bin target and only the `[lib]` half is linted — so the `_start`-bearing
+/// `main.rs` that actually ships would never be seen by clippy. `os-binary` is
+/// an empty feature everywhere except `r8125_driver` (which forwards it to
+/// `r8169_driver`), so turning it on costs nothing but coverage.
+const USERSPACE_OS_BINARY_FEATURES: &str = "ac97_driver/os-binary,\
+     ahci_driver/os-binary,audio_server/os-binary,e1000_driver/os-binary,\
+     e1000e_driver/os-binary,hda_driver/os-binary,igb_driver/os-binary,\
+     igc_driver/os-binary,pkg/os-binary,r8125_driver/os-binary,\
+     r8169_driver/os-binary,session_manager/os-binary";
+
+/// The userspace crates that must be clippy-checked in their OWN `x86_64-m3os`
+/// invocation, separate from [`USERSPACE_CLIPPY_PKGS`] (Phase 110 Track C for
+/// the auth binaries, Phase 81 for the Wi-Fi pair).
+///
+/// This is the transitive closure of "reaches `syscall-lib/argon2`":
+///   - `login`/`su`/`passwd`/`adduser` enable it directly for argon2id;
+///   - `wifi-core` enables `crypto-lib/alloc`, which implies it, and
+///     `m3ctl`/`mt792x_driver` depend on `wifi-core`;
+///   - `term`/`greeter`/`installer` link the `passwd` lib for its
+///     `/etc/passwd` + hash-field helpers, `tui-smoke`/`bell-test` link `term`,
+///     and `fb-takeover` links `m3ctl`.
+///
+/// `argon2` is the one syscall-lib feature that *uses* the alloc crate (the
+/// argon2id memory matrix), so unifying any of these into the combined
+/// invocation breaks every allocator-less binary in it with "no global memory
+/// allocator found". Every crate here carries its own `#[global_allocator]`,
+/// so they are safe together.
+const USERSPACE_ALLOC_TAINTED_CLIPPY_PKGS: &[&str] = &[
+    "login",
+    "su",
+    "passwd",
+    "adduser",
+    "wifi-core",
+    "mt792x_driver",
+    "m3ctl",
+    "fb-takeover",
+    "term",
+    "tui-smoke",
+    "bell-test",
+    "greeter",
+    "installer",
+];
+
+/// `os-binary` for the alloc-tainted crates whose `[[bin]]` is gated on it —
+/// same reason as [`USERSPACE_OS_BINARY_FEATURES`]: without it clippy sees only
+/// the `[lib]` half (`term`'s `display` module, for one, is bin-only).
+const ALLOC_TAINTED_OS_BINARY_FEATURES: &str = "greeter/os-binary,term/os-binary,\
+     m3ctl/os-binary,fb-takeover/os-binary,mt792x_driver/os-binary";
+
+/// The userspace crates that are `std`, not `no_std`: host-side test/executor
+/// code rather than ring-3 binaries. They fail with "can't find crate for
+/// `std`" on the bare-metal target, so they are linted on the host target
+/// instead of being dropped from the gate.
+const USERSPACE_STD_CLIPPY_PKGS: &[&str] = &["async-rt", "coreutils-tests"];
+
+/// Workspace members that are not userspace crates and are clippy-checked by
+/// their own dedicated invocations in [`cmd_check`] (`kernel` on
+/// `x86_64-unknown-none`; `kernel-core`/`xtask`/`pkg-format` on the host).
+///
+/// Test-only: those invocations spell their own package out, because each needs
+/// a different target and feature set. This is the ledger the coverage test
+/// below reads so those four do not show up as "unlinted".
+#[cfg(test)]
+const NON_USERSPACE_CLIPPY_PKGS: &[&str] = &["kernel", "kernel-core", "xtask", "pkg-format"];
+
+/// Workspace members deliberately exempt from `-D warnings`, with the reason.
+/// An *undocumented* omission is what let the last clippy backlog grow, so the
+/// coverage test below demands an entry here rather than silence.
+#[cfg(test)]
+const CLIPPY_EXEMPT_PKGS: &[(&str, &str)] = &[(
+    "sunset",
+    "vendored upstream crates.io source for the SSH stack (`sunset-local/`); \
+     third-party code we do not edit, so holding it to our lint bar would only \
+     produce churn on the next vendor bump",
+)];
+
+// Userspace code that carries no cargo package at all, and so cannot appear in
+// any list above:
+//
+//  - `userspace/{calc,hello,httpd,sysinfo,todo}-rust` are NOT workspace
+//    members. They are the musl demo binaries built by `build_musl_rust_bins()`
+//    against `x86_64-unknown-linux-musl` with their own lockfiles, so
+//    `cargo clippy -p <name>` from this workspace cannot resolve them. Lint them
+//    from their own directories if they ever grow beyond demo size.
+//  - The C / assembly userspace (`userspace/{coreutils,doom,hello-c,musl-bins,…}`)
+//    is built by the `build_*` helpers, not by cargo.
+
+#[cfg(test)]
+mod clippy_coverage {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// Package name of every `[workspace] members` entry in the root manifest.
+    ///
+    /// Deliberately a hand-rolled scan rather than `cargo metadata`: xtask has
+    /// no TOML dependency, and the two shapes involved are one array of quoted
+    /// paths and one `name = "…"` per member manifest.
+    fn workspace_member_package_names(root: &Path) -> BTreeSet<String> {
+        let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("read root Cargo.toml");
+        let start = manifest
+            .find("members = [")
+            .expect("root Cargo.toml has a [workspace] members list");
+        let end = start
+            + manifest[start..]
+                .find(']')
+                .expect("members list is terminated");
+
+        let mut names = BTreeSet::new();
+        for line in manifest[start..end].lines() {
+            let line = line.trim();
+            if line.starts_with('#') {
+                continue;
+            }
+            let Some(open) = line.find('"') else { continue };
+            let Some(len) = line[open + 1..].find('"') else {
+                continue;
+            };
+            let member = &line[open + 1..open + 1 + len];
+            let member_manifest = fs::read_to_string(root.join(member).join("Cargo.toml"))
+                .unwrap_or_else(|e| panic!("read {member}/Cargo.toml: {e}"));
+            // `[package]` is the first table in every member manifest, so the
+            // first bare `name =` is the package name (not a `[[bin]]` one).
+            let name = member_manifest
+                .lines()
+                .find_map(|l| {
+                    let rest = l.trim().strip_prefix("name")?.trim_start();
+                    Some(rest.strip_prefix('=')?.trim().trim_matches('"').to_string())
+                })
+                .unwrap_or_else(|| panic!("no package `name` in {member}/Cargo.toml"));
+            names.insert(name);
+        }
+        names
+    }
+
+    /// The gate that keeps the next clippy backlog from accruing: every
+    /// workspace member must be named by one of `cmd_check`'s clippy
+    /// invocations, or be exempt *with a written reason*. The old list covered
+    /// ~29 of 133 packages, and the ~100 it silently skipped went unlinted for
+    /// long enough to build up a real backlog.
+    #[test]
+    fn userspace_clippy_lists_cover_every_workspace_crate() {
+        let root = workspace_root();
+        let members = workspace_member_package_names(&root);
+
+        let mut covered: BTreeSet<&str> = BTreeSet::new();
+        for list in [
+            USERSPACE_CLIPPY_PKGS,
+            USERSPACE_ALLOC_TAINTED_CLIPPY_PKGS,
+            USERSPACE_STD_CLIPPY_PKGS,
+            NON_USERSPACE_CLIPPY_PKGS,
+        ] {
+            for pkg in list {
+                assert!(
+                    covered.insert(pkg),
+                    "`{pkg}` appears in two clippy invocations — pick the one its \
+                     feature set requires and delete the other"
+                );
+            }
+        }
+        let exempt: BTreeSet<&str> = CLIPPY_EXEMPT_PKGS.iter().map(|(pkg, _)| *pkg).collect();
+
+        let unlinted: Vec<&str> = members
+            .iter()
+            .map(String::as_str)
+            .filter(|m| !covered.contains(m) && !exempt.contains(m))
+            .collect();
+        assert!(
+            unlinted.is_empty(),
+            "workspace members not clippy-checked by `cargo xtask check`: {unlinted:?} — \
+             add each to USERSPACE_CLIPPY_PKGS, or to the alloc-tainted / std / \
+             exempt list if its features or target demand it"
+        );
+
+        let stale: Vec<&str> = covered
+            .iter()
+            .copied()
+            .filter(|pkg| !members.contains(*pkg))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "clippy package lists name packages that are not workspace members: {stale:?}"
+        );
+    }
+
+    /// The two `--features` strings are written across source lines with `\`
+    /// continuations, which strip the newline *and* the following indentation.
+    /// Guard that: a stray space would make cargo read `" ahci_driver"` as a
+    /// package name and abort the whole gate.
+    #[test]
+    fn os_binary_feature_strings_are_whitespace_free() {
+        for features in [
+            USERSPACE_OS_BINARY_FEATURES,
+            ALLOC_TAINTED_OS_BINARY_FEATURES,
+        ] {
+            assert!(
+                !features.contains(char::is_whitespace),
+                "`--features {features}` contains whitespace"
+            );
+            for spec in features.split(',') {
+                let (pkg, feature) = spec
+                    .split_once('/')
+                    .unwrap_or_else(|| panic!("`{spec}` is not a `package/feature` spec"));
+                assert_eq!(feature, "os-binary", "unexpected feature in `{spec}`");
+                assert!(
+                    USERSPACE_CLIPPY_PKGS.contains(&pkg)
+                        || USERSPACE_ALLOC_TAINTED_CLIPPY_PKGS.contains(&pkg),
+                    "`{pkg}` gets `os-binary` but is in no clippy package list"
+                );
+            }
+        }
+    }
+}
+
 fn cmd_check() {
     let root = workspace_root();
     // Phase 100 made the kernel `include_bytes!` the (gitignored) Nerd Font
@@ -6563,47 +6994,6 @@ fn cmd_check() {
     let userspace_target = root.join("x86_64-m3os.json");
     let userspace_target_str = userspace_target.to_str().unwrap().to_string();
 
-    // Clippy for all userspace crates (hardware-float x86_64-m3os target).
-    let userspace_pkgs = [
-        "syscall-lib",
-        "exit0",
-        "fork-test",
-        "echo-args",
-        "init",
-        "shell",
-        "ping",
-        "ping6",
-        "ipv6-smoke",
-        "edit",
-        // NOTE: Phase 110 Track C — `login`/`su`/`passwd`/`adduser` are
-        // clippy-checked in a SEPARATE invocation below. They enable
-        // `syscall-lib/argon2`, which pulls the `alloc` crate into `syscall-lib`;
-        // feature unification in this combined invocation would drag that into
-        // the allocator-less binaries here (`exit0`/`ping`/`whoami`/…), which have
-        // no `#[global_allocator]`. (The generic `alloc` feature that `edit`/
-        // `init` enable stays harmless — it gates only the BrkAllocator impl.)
-        "id",
-        "whoami",
-        "pty-test",
-        "unix-socket-test",
-        "thread-test",
-        "crypto-lib",
-        "crypto-test",
-        "coreutils-rs",
-        // Phase 55b Track C.1 — ring-3 driver runtime library
-        "driver_runtime",
-        // Phase 55b Track D.1 — ring-3 NVMe driver scaffold
-        "nvme_driver",
-        // Phase 56 Track B.4 — userspace surface-buffer helper
-        "surface_buffer",
-        // Phase 76 Track E — dynamic linker (no_std PIE).
-        "ld-musl-x86_64-so-1",
-        // NOTE: Phase 81 `wifi-core` / `mt792x_driver` are clippy-checked in a
-        // SEPARATE invocation below — they pull `crypto-lib/alloc`, and cargo's
-        // feature unification in this combined invocation would otherwise turn
-        // `alloc` on for `crypto-lib` in `coreutils-rs` too, breaking its
-        // no-allocator `genkey` bin.
-    ];
     let mut clippy_args = vec![
         "clippy".to_string(),
         "--target".to_string(),
@@ -6611,10 +7001,12 @@ fn cmd_check() {
         "-Zbuild-std=core,compiler_builtins,alloc".to_string(),
         "-Zbuild-std-features=compiler-builtins-mem".to_string(),
         "-Zjson-target-spec".to_string(),
+        "--features".to_string(),
+        USERSPACE_OS_BINARY_FEATURES.to_string(),
     ];
-    for pkg in &userspace_pkgs {
+    for pkg in USERSPACE_CLIPPY_PKGS {
         clippy_args.push("--package".to_string());
-        clippy_args.push(pkg.to_string());
+        clippy_args.push((*pkg).to_string());
     }
     clippy_args.extend(["--".to_string(), "-D".to_string(), "warnings".to_string()]);
 
@@ -6626,34 +7018,6 @@ fn cmd_check() {
 
     if !status.success() {
         eprintln!("userspace clippy reported errors");
-        std::process::exit(1);
-    }
-
-    // Phase 81: clippy the Wi-Fi crates in their OWN invocation. They depend on
-    // `crypto-lib/alloc`; isolating them keeps cargo feature unification from
-    // turning `alloc` on for `crypto-lib` in the combined invocation above (which
-    // would break `coreutils-rs`'s no-allocator `genkey` bin).
-    let status = Command::new(env!("CARGO"))
-        .current_dir(&root)
-        .args([
-            "clippy",
-            "--package",
-            "wifi-core",
-            "--package",
-            "mt792x_driver",
-            "--target",
-            userspace_target_str.as_str(),
-            "-Zbuild-std=core,compiler_builtins,alloc",
-            "-Zbuild-std-features=compiler-builtins-mem",
-            "-Zjson-target-spec",
-            "--",
-            "-D",
-            "warnings",
-        ])
-        .status()
-        .expect("failed to run Phase 81 Wi-Fi clippy");
-    if !status.success() {
-        eprintln!("wifi-core / mt792x_driver clippy reported errors");
         std::process::exit(1);
     }
 
@@ -6684,50 +7048,61 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
-    // Phase 110 Track C — clippy the argon2-using auth binaries in their OWN
-    // invocation. They enable `syscall-lib/argon2` (alloc-crate usage); each
-    // carries a `#[global_allocator]`, so isolating them keeps feature
-    // unification from dragging that into the allocator-less binaries in the
-    // combined invocation above.
+    // The alloc-tainted userspace crates, in their OWN invocation — see the
+    // rationale on [`USERSPACE_ALLOC_TAINTED_CLIPPY_PKGS`].
+    let mut tainted_args = vec![
+        "clippy".to_string(),
+        "--features".to_string(),
+        ALLOC_TAINTED_OS_BINARY_FEATURES.to_string(),
+        "--target".to_string(),
+        userspace_target_str.clone(),
+        "-Zbuild-std=core,compiler_builtins,alloc".to_string(),
+        "-Zbuild-std-features=compiler-builtins-mem".to_string(),
+        "-Zjson-target-spec".to_string(),
+    ];
+    for pkg in USERSPACE_ALLOC_TAINTED_CLIPPY_PKGS {
+        tainted_args.push("--package".to_string());
+        tainted_args.push((*pkg).to_string());
+    }
+    tainted_args.extend(["--".to_string(), "-D".to_string(), "warnings".to_string()]);
+
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
-        .args([
-            "clippy",
-            "--package",
-            "login",
-            "--package",
-            "su",
-            "--package",
-            "passwd",
-            "--package",
-            "adduser",
-            "--target",
-            userspace_target_str.as_str(),
-            "-Zbuild-std=core,compiler_builtins,alloc",
-            "-Zbuild-std-features=compiler-builtins-mem",
-            "-Zjson-target-spec",
-            "--",
-            "-D",
-            "warnings",
-        ])
+        .args(&tainted_args)
         .status()
-        .expect("failed to run auth-binary clippy");
+        .expect("failed to run alloc-tainted userspace clippy");
 
     if !status.success() {
-        eprintln!("auth-binary (argon2) clippy reported errors");
+        eprintln!("alloc-tainted userspace clippy reported errors");
         std::process::exit(1);
     }
 
-    // Phase 85a — clippy the package-management crates with `-D warnings`.
-    //
-    // `pkg-format` is checked on the host target for BOTH feature surfaces:
-    // the default (`std`) host packer/unpacker, and `--no-default-features`
-    // for the `no_std` parse/verify surface the in-OS installer links. `pkg`
-    // is checked on the userspace `x86_64-m3os` target with
-    // `--features os-binary` (so the `[[bin]]` `_start` path is linted, not
-    // just the host-testable `[lib]`), in its OWN invocation — mirroring the
-    // Wi-Fi block above so cargo feature unification cannot leak `pkg`'s
-    // `syscall-lib/alloc` onto the combined userspace clippy run.
+    // The `std` userspace crates, on the host target — see
+    // [`USERSPACE_STD_CLIPPY_PKGS`].
+    let mut std_args = vec!["clippy", "--target", KERNEL_CORE_HOST_TARGET];
+    for pkg in USERSPACE_STD_CLIPPY_PKGS {
+        std_args.extend(["--package", pkg]);
+    }
+    std_args.extend(["--", "-D", "warnings"]);
+
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args(&std_args)
+        .status()
+        .expect("failed to run std userspace clippy");
+
+    if !status.success() {
+        eprintln!("std userspace (async-rt / coreutils-tests) clippy reported errors");
+        std::process::exit(1);
+    }
+
+    // Phase 85a — clippy `pkg-format` on the host target for BOTH feature
+    // surfaces: the default (`std`) host packer/unpacker, and
+    // `--no-default-features` for the `no_std` parse/verify surface the in-OS
+    // installer links. (The `pkg` installer itself rides the combined
+    // `x86_64-m3os` invocation above with `pkg/os-binary`; it only ever needed
+    // `syscall-lib/alloc`, which is the harmless BrkAllocator-impl gate, not
+    // the alloc-crate-using `argon2` one.)
     for (pkg, extra) in [
         ("pkg-format", &["--no-default-features"][..]),
         ("pkg-format", &[][..]),
@@ -6750,30 +7125,6 @@ fn cmd_check() {
             eprintln!("pkg-format clippy reported errors (features: {extra:?})");
             std::process::exit(1);
         }
-    }
-
-    let status = Command::new(env!("CARGO"))
-        .current_dir(&root)
-        .args([
-            "clippy",
-            "--package",
-            "pkg",
-            "--features",
-            "os-binary",
-            "--target",
-            userspace_target_str.as_str(),
-            "-Zbuild-std=core,compiler_builtins,alloc",
-            "-Zbuild-std-features=compiler-builtins-mem",
-            "-Zjson-target-spec",
-            "--",
-            "-D",
-            "warnings",
-        ])
-        .status()
-        .expect("failed to run pkg clippy");
-    if !status.success() {
-        eprintln!("pkg clippy reported errors");
-        std::process::exit(1);
     }
 
     // Host-side allocator/property coverage uses:
@@ -6989,7 +7340,7 @@ fn cmd_check() {
     stat_assembly_gate();
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core (incl. usb::uvc + camera_ipc), passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, m3ctl, xhci_driver, usb-core, pkg-format, xtask, and pkg host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass; stat-assembly gate pass"
+        "check passed: clippy clean, formatting correct, kernel-core (incl. usb::uvc + camera_ipc), passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, display_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, m3ctl, xhci_driver, display_server, usb_hid, usbhub, usb-core, imagefmt, pkg-format, xtask, and pkg host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass; stat-assembly gate pass"
     );
 }
 
@@ -21021,11 +21372,13 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
 #[derive(Debug, Clone)]
 struct LessRenderProbeArgs {
     /// Global wall-clock budget for the entire probe. Boot + login +
-    /// screendump + diff fits comfortably in 240 s on TCG; slower
+    /// screendump + diff fits comfortably in the per-command default (240 s
+    /// for the single-shot probes, more for the multi-arm gates); slower
     /// hosts can override via `--timeout`.
     timeout_secs: u64,
-    /// Directory to write the captured PPMs into. Defaults to
-    /// `$TMPDIR/m3os-less-render-probe`. Existing files at these names
+    /// Directory to write the captured PPMs into. Defaults to a
+    /// per-command `$TMPDIR/m3os-<command>` (see
+    /// [`parse_probe_args_with_defaults`]). Existing files at these names
     /// are overwritten so successive runs replace last run's artefacts.
     out_dir: PathBuf,
     /// When set, leave QEMU running on success / failure so the caller
@@ -21035,7 +21388,25 @@ struct LessRenderProbeArgs {
 }
 
 fn parse_less_render_probe_args(args: &[String]) -> Result<LessRenderProbeArgs, String> {
-    let mut timeout_secs = 240u64;
+    parse_probe_args_with_defaults(args, "less-render-probe", 240, "m3os-less-render-probe")
+}
+
+/// Shared `--timeout` / `--out` / `--keep-qemu` parser for every QMP/PPM
+/// probe command.
+///
+/// The defaults are per-command rather than global on purpose. Several
+/// probes write a `serial.log` and a numbered PPM series under their out
+/// dir; sharing one directory means the last gate to run silently
+/// overwrites the artefacts the previous failure left behind, which is
+/// exactly when they are wanted. `command` only feeds the error message,
+/// so an unknown flag names the command the user actually typed.
+fn parse_probe_args_with_defaults(
+    args: &[String],
+    command: &str,
+    default_timeout_secs: u64,
+    default_dir_name: &str,
+) -> Result<LessRenderProbeArgs, String> {
+    let mut timeout_secs = default_timeout_secs;
     let mut out_dir: Option<PathBuf> = None;
     let mut keep_qemu = false;
     let mut i = 0;
@@ -21056,13 +21427,13 @@ fn parse_less_render_probe_args(args: &[String]) -> Result<LessRenderProbeArgs, 
                 ));
             }
             "--keep-qemu" => keep_qemu = true,
-            other => return Err(format!("unknown less-render-probe flag: {other}")),
+            other => return Err(format!("unknown {command} flag: {other}")),
         }
         i += 1;
     }
     let out_dir = out_dir.unwrap_or_else(|| {
         let mut p = std::env::temp_dir();
-        p.push("m3os-less-render-probe");
+        p.push(default_dir_name);
         p
     });
     Ok(LessRenderProbeArgs {
@@ -21112,6 +21483,1399 @@ fn wait_for_serial_pattern(
                     "serial disconnected while waiting for '{pattern}'\n--- last serial ---\n{tail}"
                 ));
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 112 Track C.2 — term-daily-driver-smoke
+// ---------------------------------------------------------------------------
+
+/// Phase 112 Track C.2 — the most scanlines two frames of a *quiet* screen
+/// may differ by.
+///
+/// `term` blinks the cursor on a 500 ms tick, so a frame taken at a live
+/// prompt is never pixel-identical to its predecessor: one cell
+/// (`CELL_WIDTH` × `CELL_HEIGHT` = 24 × 48 px) flips on and off. 96 is two
+/// text rows' worth — enough to absorb the cursor plus a glyph the shell
+/// repainted under it, and two orders of magnitude below the ~1000
+/// scanlines a scrollback page-up or a full repaint moves.
+const TERM_QUIET_SCANLINES: u32 = 96;
+
+/// Phase 112 Track C.2 — capture screendumps until the screen stops moving,
+/// i.e. until nothing but the cursor is changing. Returns the settled frame.
+///
+/// Every scrollback assertion in this gate has to run against a *quiet*
+/// screen, and not for the usual flakiness reasons. Snap-to-bottom is a
+/// real feature: any output that scrolls the primary region yanks the
+/// viewport back to the live tail. So if a Shift+PageUp lands while
+/// `dmesg` is still streaming, the viewport scrolls up and is immediately
+/// snapped back down by the next output line — a correct behaviour that
+/// looks exactly like "the key did nothing". Waiting for quiescence is
+/// what makes the assertion measure the binding rather than the race.
+///
+/// Quiet means "two consecutive gaps under [`TERM_QUIET_SCANLINES`]", not
+/// "byte-identical": the blinking cursor guarantees a live prompt never
+/// reaches byte-identical, and an exact-match loop would burn `max_wait` in
+/// full on every one of this gate's ~14 settle points.
+fn capture_settled(
+    q: &mut qmp::QmpClient,
+    out_dir: &Path,
+    tag: &str,
+    max_wait: std::time::Duration,
+) -> Result<ppm::PpmFrame, String> {
+    const SETTLE_GAP_MS: u64 = 700;
+    /// Consecutive quiet gaps required. Two (i.e. three consecutive frames)
+    /// rather than one, so a pause between two chunks of PTY output cannot
+    /// masquerade as the end of the output.
+    const QUIET_GAPS_REQUIRED: u32 = 2;
+    let deadline = std::time::Instant::now() + max_wait;
+    let mut prev = capture_term_frame(q, out_dir, tag)?;
+    let mut quiet_gaps = 0u32;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(SETTLE_GAP_MS));
+        let now = capture_term_frame(q, out_dir, tag)?;
+        let moved = changed_rows_in_band(&prev, &now, 0.0, 1.0);
+        if moved <= TERM_QUIET_SCANLINES {
+            quiet_gaps += 1;
+            if quiet_gaps >= QUIET_GAPS_REQUIRED {
+                return Ok(now);
+            }
+        } else {
+            quiet_gaps = 0;
+        }
+        if std::time::Instant::now() >= deadline {
+            // Not fatal on its own — return the latest frame and let the
+            // caller's own assertion decide.
+            println!(
+                "term-daily-driver-smoke: {tag} still moving ({moved} scanlines) at settle deadline"
+            );
+            return Ok(now);
+        }
+        prev = now;
+    }
+}
+
+/// Phase 112 Track C.2 — screendump and parse in one step.
+///
+/// Deliberately not [`capture_frame`]: that helper is shared by four probes
+/// and prints a `less-render-probe:` prefix on every line, so a CI log from
+/// this gate would attribute all ~18 of its frames to a different tool.
+fn capture_term_frame(
+    q: &mut qmp::QmpClient,
+    out_dir: &Path,
+    tag: &str,
+) -> Result<ppm::PpmFrame, String> {
+    let path = out_dir.join(format!("{tag}.ppm"));
+    q.screendump(&path)
+        .map_err(|e| format!("screendump {tag}: {e}"))?;
+    println!("term-daily-driver-smoke: captured {}", path.display());
+    ppm::read_ppm(&path)
+}
+
+/// Count pixels inside the vertical band `[y0_frac, y1_frac)` that satisfy
+/// `pred`, which receives `(r, g, b)`.
+///
+/// The `tui-smoke mouse-live` probe paints a saturated colour band per wheel
+/// notch, so counting band pixels of a given hue is how this gate tells
+/// "the application repainted for a wheel-up" from "the application
+/// repainted for a wheel-down" — a scanline-diff can see that *something*
+/// changed but not which of the two it was.
+fn band_pixels_matching(
+    frame: &ppm::PpmFrame,
+    y0_frac: f64,
+    y1_frac: f64,
+    pred: fn(u8, u8, u8) -> bool,
+) -> u32 {
+    if frame.height == 0 || frame.width == 0 {
+        return 0;
+    }
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    let y0 = ((y0_frac.clamp(0.0, 1.0) * h as f64) as usize).min(h);
+    let y1 = ((y1_frac.clamp(0.0, 1.0) * h as f64) as usize).min(h);
+    let mut count = 0u32;
+    for y in y0..y1 {
+        let rs = y * w * 3;
+        for x in 0..w {
+            let i = rs + x * 3;
+            if i + 2 >= frame.pixels.len() {
+                break;
+            }
+            if pred(frame.pixels[i], frame.pixels[i + 1], frame.pixels[i + 2]) {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Saturated red — the background `tui-smoke mouse-live` floods the top half
+/// of the grid with on a wheel-**up** notch (SGR `48;2;255;0;0`).
+///
+/// Tolerant rather than exact so the check survives any future scaling or
+/// gamma in the capture path; the compositor's own chrome (teal desktop,
+/// grey bar) is nowhere near this corner of the cube.
+fn is_wheel_up_red(r: u8, g: u8, b: u8) -> bool {
+    r > 180 && g < 70 && b < 70
+}
+
+/// Saturated blue — the wheel-**down** band (SGR `48;2;0;0;255`).
+fn is_wheel_down_blue(r: u8, g: u8, b: u8) -> bool {
+    b > 180 && r < 70 && g < 70
+}
+
+/// Largest index `<= idx` that is a UTF-8 char boundary of `s`.
+///
+/// Serial transcripts are decoded with `from_utf8_lossy`, so a truncated
+/// or corrupt byte run becomes a 3-byte U+FFFD. Slicing such a string at a
+/// fixed byte offset panics when the offset lands inside one — and a panic
+/// inside this gate's driver closure would skip the QEMU teardown below it
+/// and leak the process. (`str::floor_char_boundary` is still unstable.)
+fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Everything one `clip-smoke --paste` run printed after its sentinel, as
+/// delimited by a unique `anchor` string the caller arranged to be printed
+/// on serial *after* that run finished.
+///
+/// The anchor exists because of a race with a wrong answer, not a flake.
+/// `clip-smoke` emits the sentinel and the clipboard payload as two
+/// separate `serial_print` calls, and the kernel logger emits one complete
+/// record per call — so the payload is *guaranteed* to be on a later serial
+/// line than the sentinel that announces it. A reader that waits for
+/// `CLIP_PASTE:` and then inspects the transcript is therefore reading it
+/// before the payload has arrived, and would report an empty clipboard as a
+/// broker failure. Waiting for something that can only be printed after the
+/// payload — the gate runs `echo-args <anchor>`, which mirrors its argv to
+/// serial — is what makes the read total.
+///
+/// Anchored from the *end* of the transcript rather than by counting runs
+/// from the start: `serial_history` is a rolling window (see
+/// `append_serial_chunk`), so occurrence counts taken minutes apart do not
+/// refer to the same events.
+fn clip_payload_before_anchor<'a>(
+    transcript: &'a str,
+    sentinel: &str,
+    anchor: &str,
+) -> Option<&'a str> {
+    /// The clipboard is capped at `CLIPBOARD_MAX_BYTES` (3900), but nothing
+    /// caps how much unrelated kernel logging interleaves before the
+    /// anchor — and the whole window goes into the failure message. Trim on
+    /// a char boundary: the transcript is `from_utf8_lossy` output, so a
+    /// fixed offset can land inside a 3-byte U+FFFD and panic, which inside
+    /// this gate's driver closure would skip the QEMU teardown below it and
+    /// leak the process.
+    const MAX_WINDOW: usize = 8192;
+    let anchor_at = transcript.rfind(anchor)?;
+    let start = transcript[..anchor_at].rfind(sentinel)? + sentinel.len();
+    let end = floor_char_boundary(transcript, anchor_at.min(start + MAX_WINDOW));
+    transcript.get(start..end.max(start))
+}
+
+/// True when some line of `window` is exactly `want` once trailing
+/// whitespace (and the `\r` a serial transcript may carry) is removed.
+///
+/// Stricter than `window.contains(want)` on purpose: `term`'s selection
+/// copies whole rows and trims trailing blanks, so the row holding the
+/// echoed marker must arrive as a line of its own. A `contains` check would
+/// also pass on the *command* line (`echo M3OS_COPY_ME`) one row above it,
+/// i.e. it cannot tell "the selection captured the output" from "the
+/// selection captured the command that produced it".
+fn window_has_exact_line(window: &str, want: &str) -> bool {
+    window.lines().any(|line| line.trim_end() == want)
+}
+
+/// Phase 112 Track C.2 — headless QMP/PPM proof of the scrollback viewport,
+/// the selection/clipboard round trip, and the wheel's two destinations.
+///
+/// A serial `Wait` proves a program ran, not that the screen scrolled or a
+/// highlight painted, so every assertion here is on the composited
+/// framebuffer or on a sentinel an independent client printed.
+///
+/// Arms, in order:
+///
+/// 1. **Scrollback**: fill well past one page with `dmesg`, Shift+PageUp,
+///    and assert the frame *changed* — i.e. rows that had scrolled off are
+///    on screen again. Then type an ordinary printable key and assert the
+///    frame is back at the live tail. Both halves are asserted: that the
+///    frame moved off the scrolled-back view *and* that where it moved to
+///    is the tail frame captured before the page-up. The keystroke is a
+///    bare `x`, not Return, because Return's echoed newline scrolls the
+///    primary region — and `scroll_region_up` snaps the viewport on any
+///    primary scroll, so a Return would pass this arm even with the
+///    snap-on-keystroke path deleted.
+/// 2. **Wheel → viewport** (Report-protocol lane only): the same viewport
+///    assertion driven by `send_wheel` against the `usb-tablet` attached
+///    below. On a lane with no Report-protocol pointer this would be inert
+///    by construction — the PS/2 path never carries a wheel — so the gate
+///    always attaches one.
+/// 3. **Selection + clipboard**: drag over known text, which copies on
+///    release, then read the compositor's `ClipboardStore` back from an
+///    **independent** client (`clip-smoke --paste`) and assert the marker
+///    arrived as a *whole line*, not as a substring of the command that
+///    printed it.
+/// 4. **Paste**: Ctrl+Shift+V into a `cat` sink and assert the payload
+///    reached the PTY. The `ESC[200~` / `ESC[201~` framing is *not*
+///    asserted here — see the arm's own comment for why it is not
+///    observable on this lane.
+/// 5. **Wheel → application** (alternate screen): `tui-smoke mouse-live`
+///    takes the alternate screen, enables `?1000h`+`?1006h`, and repaints
+///    a saturated colour band per decoded notch. Asserts the app saw the
+///    report (serial sentinel), that the *right* band painted (hue +
+///    region on the PPM, so up and down are distinguishable), and that the
+///    terminal is left showing its live tail afterwards. Together with arm
+///    2 this is the discrimination that matters: the same injected notch
+///    scrolls `term`'s own viewport when nothing is tracking and reaches
+///    the application when something is.
+/// 6. **Shift-drag override**, run while that app still holds the mouse: an
+///    unshifted drag must produce no local highlight (it belongs to the
+///    application), while a Shift-held drag must select in `term` and land
+///    in the compositor clipboard — the xterm convention, and the only arm
+///    that exercises the compositor's live-modifier stamping.
+#[allow(clippy::zombie_processes)]
+fn cmd_term_polish_smoke(args: &LessRenderProbeArgs) {
+    /// Minimum changed scanlines across the terminal band for a frame to
+    /// count as "the screen content moved". A scrollback page-up rewrites
+    /// essentially every text row; an ignored keystroke changes ~0. 20
+    /// cleanly separates the two, matching the `htop-render-probe`
+    /// threshold.
+    const MIN_CHANGED_SCANLINES: u32 = 20;
+    /// Text selected by the drag and expected to reach the clipboard.
+    const COPY_MARKER: &str = "M3OS_COPY_ME";
+    /// Sentinel `clip-smoke --paste` prints before the clipboard payload.
+    const CLIP_SENTINEL: &str = "CLIP_PASTE:";
+    /// Per-read-back anchors, echoed to serial by `echo-args` after the
+    /// clipboard payload has been printed. Distinct strings so each read
+    /// back is located from the end of the transcript without counting
+    /// runs — `serial_history` is a rolling window, so counts taken minutes
+    /// apart are not comparable.
+    const CLIP_ANCHOR_COPY: &str = "CLIPSYNCA";
+    const CLIP_ANCHOR_SHIFT: &str = "CLIPSYNCB";
+    /// Where the pointer is parked whenever a frame is captured.
+    ///
+    /// The compositor blits its cursor into the frame, so a capture taken
+    /// with the pointer somewhere else differs from its predecessor by the
+    /// cursor's own pixels — enough to trip a "did anything change?"
+    /// threshold on its own. Parking at one fixed spot before every capture
+    /// keeps the cursor out of every diff. The middle of the screen also
+    /// guarantees the pointer is over `term`'s surface, which is what makes
+    /// a wheel notch route there at all (the compositor hit-tests the
+    /// cursor position, not the event).
+    const POINTER_PARK: (i32, i32) = (960, 540);
+    /// How long to wait after a drag's button-release before moving the
+    /// pointer again. QEMU coalesces a motion into a queued event with the
+    /// same button state, so parking too soon rewrites the release's
+    /// coordinate — see the selection arm for the full explanation.
+    const POINTER_RELEASE_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
+    /// Endpoints of the selection drags, in screen pixels — see
+    /// [`qmp::QmpClient::send_pointer_abs`] for why these are literal
+    /// pixels and not QEMU's 0..0x7FFF normalized range.
+    const DRAG_FROM: (i32, i32) = (60, 200);
+    const DRAG_TO: (i32, i32) = (1800, 1000);
+    /// Minimum band pixels of the expected hue for a `mouse-live` repaint to
+    /// count. The probe floods half the grid, which is ~10⁵–10⁶ pixels even
+    /// on a small surface; 20 000 is ~1.5 full-width text rows, far below
+    /// any real repaint and far above the stray red/blue in the compositor's
+    /// own chrome.
+    const MIN_BAND_PIXELS: u32 = 20_000;
+    /// Settle budget for an ordinary capture. Generous for a couple of text
+    /// rows on TCG, and only reached when the screen genuinely will not stop
+    /// moving (see [`capture_settled`]).
+    const SETTLE: std::time::Duration = std::time::Duration::from_secs(8);
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+    let ovmf = find_ovmf();
+    if let Err(e) = std::fs::create_dir_all(&args.out_dir) {
+        eprintln!(
+            "term-daily-driver-smoke: cannot create out dir {}: {e}",
+            args.out_dir.display()
+        );
+        std::process::exit(1);
+    }
+
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let vnc_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&vnc_socket);
+
+    // The wheel arm needs a Report-protocol pointer. QEMU's `usb-mouse` is
+    // Boot-subclass, and the boot decoder discards the wheel byte
+    // (`kernel_core::usb::hid.rs`), so only `usb-tablet` (subclass 0 ->
+    // `decode_pointer_report`) actually delivers `wheel_dy` to term. This
+    // mirrors the device set `usb-report-smoke` uses.
+    let devices = DeviceSet {
+        xhci: true,
+        ..DeviceSet::default()
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, QemuDisplayMode::Headless, devices);
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let mut idx = 0;
+    while idx + 1 < qemu_args.len() {
+        if qemu_args[idx] == "-display" && qemu_args[idx + 1] == "none" {
+            qemu_args[idx + 1] = format!("vnc=unix:{}", vnc_socket.display());
+            break;
+        }
+        idx += 1;
+    }
+    // Drop the Boot-subclass `usb-mouse` the xhci DeviceSet attaches, and
+    // put a Report-protocol `usb-tablet` in its place.
+    //
+    // This is load-bearing, not tidiness. QMP `input-send-event` cannot be
+    // addressed at an input device — its `device` argument names a
+    // *display* device — so with both pointers present QEMU delivers the
+    // wheel to whichever claims the event class, and the Boot-protocol
+    // mouse's 3-byte decoder discards the wheel byte before the guest sees
+    // it (`kernel_core::usb::hid`). Leaving exactly one pointer on the bus
+    // is the only way to guarantee the notch lands on the Report-protocol
+    // path that actually carries `wheel_dy`.
+    let mut i = 0;
+    while i + 1 < qemu_args.len() {
+        if qemu_args[i] == "-device" && qemu_args[i + 1].starts_with("usb-mouse") {
+            qemu_args.drain(i..=i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    qemu_args.push("-device".to_string());
+    qemu_args.push("usb-tablet,bus=xhci0.0".to_string());
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+    qemu_args.push("-vga".to_string());
+    qemu_args.push("std".to_string());
+
+    println!(
+        "term-daily-driver-smoke: launching QEMU with qemu-xhci + usb-tablet (timeout {}s, qmp {})",
+        args.timeout_secs,
+        qmp_socket.display()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+
+    let result: Result<(), String> = (|| {
+        let step = std::time::Duration::from_secs(args.timeout_secs.min(180));
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "display_server: registered as 'display.input-owner'",
+            step,
+            global_start,
+            global_timeout,
+        )?;
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "TERM_SMOKE:prompt-ready",
+            step,
+            global_start,
+            global_timeout,
+        )?;
+        println!("term-daily-driver-smoke: term prompt is ready");
+
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+        println!("term-daily-driver-smoke: QMP handshake complete");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Park the pointer once, up front: every capture in this gate is
+        // compared against another capture, and the compositor's cursor is
+        // part of the frame. See POINTER_PARK.
+        q.send_pointer_abs(POINTER_PARK.0, POINTER_PARK.1)
+            .map_err(|e| format!("park pointer: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // ---- Arm 1: scrollback viewport ------------------------------
+        // `dmesg` emits hundreds of lines, so the early ones are long gone
+        // from the 25-row live grid and can only come back from the ring.
+        q.type_text("dmesg\n")
+            .map_err(|e| format!("type dmesg: {e}"))?;
+        // Wait until dmesg has finished painting: while output is still
+        // scrolling, snap-to-bottom would undo a Shift+PageUp instantly.
+        let live_tail = capture_settled(
+            &mut q,
+            &args.out_dir,
+            "10-live-tail",
+            std::time::Duration::from_secs(45),
+        )?;
+
+        // Shift+PageUp pages the viewport into history.
+        q.press_chord(&["shift", "pgup"], 30)
+            .map_err(|e| format!("shift+pgup: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let scrolled = capture_term_frame(&mut q, &args.out_dir, "11-scrolled-back")?;
+        let scrolled_rows = changed_rows_in_band(&live_tail, &scrolled, 0.0, 1.0);
+        println!(
+            "term-daily-driver-smoke: shift+pgup changed {scrolled_rows} scanlines vs the live tail"
+        );
+        if scrolled_rows < MIN_CHANGED_SCANLINES {
+            return Err(format!(
+                "scrollback arm: Shift+PageUp changed only {scrolled_rows} scanlines \
+                 (min {MIN_CHANGED_SCANLINES}); the viewport did not show evicted rows"
+            ));
+        }
+
+        // A keystroke that reaches the shell must snap the viewport back to
+        // the live tail. `x` rather than Return: an ordinary printable key
+        // puts bytes on the PTY without scrolling the primary region, so
+        // the snap can only come from the keystroke path itself. Return's
+        // echoed newline scrolls, and `scroll_region_up` snaps on any
+        // primary scroll — which would make this arm pass even with the
+        // snap-on-keystroke code deleted.
+        q.press_key("x", 30).map_err(|e| format!("press x: {e}"))?;
+        let snapped = capture_settled(&mut q, &args.out_dir, "12-snapped-back", SETTLE)?;
+        let still_scrolled = changed_rows_in_band(&scrolled, &snapped, 0.0, 1.0);
+        let tail_drift = changed_rows_in_band(&live_tail, &snapped, 0.0, 1.0);
+        println!(
+            "term-daily-driver-smoke: keystroke changed {still_scrolled} scanlines vs the \
+             scrolled frame, {tail_drift} vs the live tail"
+        );
+        if still_scrolled < MIN_CHANGED_SCANLINES {
+            return Err(format!(
+                "scrollback arm: after a keystroke the frame still matches the scrolled-back \
+                 view ({still_scrolled} changed scanlines); snap-to-bottom did not fire"
+            ));
+        }
+        // "It moved" is not "it went home": without this, any repaint at
+        // all — including one that left the viewport parked somewhere else
+        // in history — would satisfy the check above. The snapped frame is
+        // the live-tail frame plus the echoed `x` and the cursor one cell
+        // further right, i.e. inside one text row of drift.
+        if tail_drift > TERM_QUIET_SCANLINES {
+            return Err(format!(
+                "scrollback arm: after a keystroke the frame differs from the live tail by \
+                 {tail_drift} scanlines (max {TERM_QUIET_SCANLINES}); the viewport moved but \
+                 did not snap back to the bottom"
+            ));
+        }
+        // Erase the `x` so the shell is left at a clean prompt.
+        q.press_key("backspace", 30)
+            .map_err(|e| format!("press backspace: {e}"))?;
+
+        // ---- Arm 2: wheel -> viewport (Report-protocol pointer) ------
+        // The pointer has to be over the terminal *before* the baseline is
+        // captured, not just before the notch: the compositor hit-tests the
+        // cursor position rather than the event, so the park is mandatory —
+        // and erasing the cursor from wherever it booted is itself a
+        // multi-scanline change that would otherwise land in this arm's
+        // diff and count as "the wheel scrolled the viewport".
+        //
+        // Coordinates are screen pixels, not QEMU's usual 0..0x7FFF
+        // normalized range. QEMU scales `input-send-event` abs values into
+        // the tablet's logical range, which for `usb-tablet` is 0..0x7FFF
+        // — i.e. pass-through — and `usb-hid` currently injects the
+        // decoded value unscaled (`abs_position = (x, y)` raw). So a value
+        // here arrives at the compositor as that literal pixel. Sending
+        // 0x4000 would land at (16384, 16384), far outside the 1920x1080
+        // framebuffer, hit-test nothing, and silently drop the event.
+        // See the Phase 112 note on the unscaled tablet path.
+        q.send_pointer_abs(POINTER_PARK.0, POINTER_PARK.1)
+            .map_err(|e| format!("park pointer: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let wheel_base = capture_settled(&mut q, &args.out_dir, "20-wheel-base", SETTLE)?;
+        q.send_wheel(5).map_err(|e| format!("wheel up: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let wheel_scrolled = capture_term_frame(&mut q, &args.out_dir, "21-wheel-scrolled")?;
+        let wheel_rows = changed_rows_in_band(&wheel_base, &wheel_scrolled, 0.0, 1.0);
+        println!("term-daily-driver-smoke: wheel-up changed {wheel_rows} scanlines");
+        if wheel_rows < MIN_CHANGED_SCANLINES {
+            return Err(format!(
+                "wheel arm: wheel-up changed only {wheel_rows} scanlines (min \
+                 {MIN_CHANGED_SCANLINES}); the Report-protocol wheel did not reach the viewport"
+            ));
+        }
+        // Return to the live tail for the selection arm, and assert we got
+        // there. Shift+End writes no PTY bytes, so if the frame does not
+        // come back to the pre-wheel baseline the viewport is stuck in
+        // history and every later arm would be selecting evicted rows.
+        q.press_chord(&["shift", "end"], 30)
+            .map_err(|e| format!("shift+end: {e}"))?;
+        let wheel_home = capture_settled(&mut q, &args.out_dir, "22-wheel-home", SETTLE)?;
+        let wheel_home_drift = changed_rows_in_band(&wheel_base, &wheel_home, 0.0, 1.0);
+        println!(
+            "term-daily-driver-smoke: shift+end returned to within {wheel_home_drift} scanlines \
+             of the pre-wheel frame"
+        );
+        if wheel_home_drift > TERM_QUIET_SCANLINES {
+            return Err(format!(
+                "wheel arm: Shift+End left the frame {wheel_home_drift} scanlines from the \
+                 pre-wheel view (max {TERM_QUIET_SCANLINES}); the viewport did not return to \
+                 the live tail"
+            ));
+        }
+
+        // ---- Arm 3: selection + clipboard ----------------------------
+        // Put a known marker on screen, on its own line, then drag across
+        // it. Release copies (copy-on-release).
+        q.type_text(&format!("echo {COPY_MARKER}\n"))
+            .map_err(|e| format!("type marker: {e}"))?;
+        let marker_frame = capture_settled(&mut q, &args.out_dir, "30-marker", SETTLE)?;
+
+        // Drag a tall band across most of the terminal. A Linear selection
+        // covers every row between its endpoints in full, so a tall band
+        // captures the marker line wherever the compositor happens to have
+        // placed term's surface — the gate never has to know the surface
+        // geometry. The rows above and below the marker come along with it,
+        // which is why the assertion below is "one of the copied lines is
+        // exactly the marker" rather than an exact whole-payload compare.
+        q.drag_abs(DRAG_FROM, DRAG_TO)
+            .map_err(|e| format!("drag: {e}"))?;
+        // Let the button-release land before moving the pointer away.
+        //
+        // QEMU's HID device coalesces a motion into an already-queued event
+        // carrying the same button state, so parking immediately after the
+        // drag folds the park coordinate into the pending release. `term`
+        // commits the selection at the release event's own `abs_position`
+        // (`term::mouse`), so the selection would end at POINTER_PARK
+        // instead of DRAG_TO — a *smaller* highlight that still copies text,
+        // which is why this reads as an off-by-half-a-screen flake rather
+        // than an outright failure (384 changed scanlines instead of 816).
+        std::thread::sleep(POINTER_RELEASE_SETTLE);
+        q.send_pointer_abs(POINTER_PARK.0, POINTER_PARK.1)
+            .map_err(|e| format!("re-park pointer: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        let selected = capture_term_frame(&mut q, &args.out_dir, "31-selected")?;
+        let hl_rows = changed_rows_in_band(&marker_frame, &selected, 0.0, 1.0);
+        println!("term-daily-driver-smoke: selection highlight changed {hl_rows} scanlines");
+        // The highlight is an fg/bg swap over every selected cell, i.e. a
+        // solid block across most of the terminal — well clear of the
+        // cursor-blink floor a bare `> 0` would sit on.
+        if hl_rows < MIN_CHANGED_SCANLINES {
+            return Err(format!(
+                "selection arm: the drag changed only {hl_rows} scanlines (min \
+                 {MIN_CHANGED_SCANLINES}); no selection highlight painted"
+            ));
+        }
+
+        // Read the compositor's ClipboardStore back from an INDEPENDENT
+        // client. Copying and pasting in the same client would prove
+        // nothing about the broker.
+        //
+        // The `echo-args` chaser is load-bearing, not decoration: the
+        // payload lands on serial one log record *after* the sentinel, so a
+        // wait that stops at `CLIP_PASTE:` reads a transcript that cannot
+        // contain it yet. `echo-args` mirrors its argv to serial, so the
+        // anchor can only be printed once `clip-smoke` has exited — see
+        // `clip_payload_before_anchor`.
+        q.type_text("/bin/clip-smoke --paste\n")
+            .map_err(|e| format!("type clip-smoke: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        q.type_text(&format!("/bin/echo-args {CLIP_ANCHOR_COPY}\n"))
+            .map_err(|e| format!("type echo-args: {e}"))?;
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            CLIP_ANCHOR_COPY,
+            std::time::Duration::from_secs(30),
+            global_start,
+            global_timeout,
+        )?;
+        let transcript = strip_ansi(&serial_history);
+        let window = clip_payload_before_anchor(&transcript, CLIP_SENTINEL, CLIP_ANCHOR_COPY)
+            .ok_or("clipboard arm: CLIP_PASTE sentinel vanished from the transcript")?;
+        if !window_has_exact_line(window, COPY_MARKER) {
+            return Err(format!(
+                "clipboard arm: the compositor's clipboard has no line equal to the selected \
+                 text {COPY_MARKER:?} (a line merely containing it would be the echoed \
+                 command, not the copied output). Second client read back:\n{}",
+                tail_lines(window, 12)
+            ));
+        }
+        println!(
+            "term-daily-driver-smoke: independent client read {COPY_MARKER:?} back from the \
+             compositor ClipboardStore as a whole line"
+        );
+
+        // ---- Arm 4: paste reaches the PTY ----------------------------
+        // Paste into a bare `cat`, which echoes stdin and never executes
+        // it. This is not cosmetic: a multi-row selection pasted at a
+        // *shell prompt* would run every line in it and take the shell down
+        // with it. (That is precisely the hazard bracketed paste exists to
+        // prevent, and this gate reproduced it before the sink was added.)
+        //
+        // WHAT THIS ARM DOES NOT ASSERT, and why. The `ESC[200~` /
+        // `ESC[201~` framing is emitted only when the *application* has set
+        // `?2004h`, and no program in the image does: a tree-wide grep for
+        // `2004` finds the mode bit in `term::screen`, the framing in
+        // `term::input::wrap_paste`, and nothing else — not `ion`, not the
+        // editor, not `tui-smoke`. So on this lane `wrap_paste` correctly
+        // passes the payload through unframed and there is no framing on
+        // the wire to observe. Nor could the gate read it if there were:
+        // the pasted bytes land on the PTY, whose only sink is the
+        // framebuffer, and a PPM cannot be OCR'd. The framed form is
+        // covered by the `wrap_paste` host tests in `term::input`.
+        //
+        // What this arm owns is the live path — clipboard -> IPC ->
+        // `wrap_paste` -> PTY -> `cat` echo -> glyphs on screen — and, by
+        // asserting the payload rendered at all, the unframed half of the
+        // bracketed-paste contract.
+        q.type_text("cat\n").map_err(|e| format!("type cat: {e}"))?;
+        let cat_base = capture_settled(&mut q, &args.out_dir, "40-cat", SETTLE)?;
+        q.press_chord(&["ctrl", "shift", "v"], 40)
+            .map_err(|e| format!("ctrl+shift+v: {e}"))?;
+        let pasted_frame = capture_settled(
+            &mut q,
+            &args.out_dir,
+            "41-pasted",
+            std::time::Duration::from_secs(12),
+        )?;
+        let paste_rows = changed_rows_in_band(&cat_base, &pasted_frame, 0.0, 1.0);
+        // `term` paints a black background; the compositor's is teal. A
+        // frame with almost no black pixels means term is *gone* from the
+        // screen, not that it painted something new — the difference a
+        // bare "did the frame change?" check cannot see, and the way this
+        // arm silently passed while the shell was actually dying.
+        let black = pasted_frame.black_pixel_ratio();
+        println!(
+            "term-daily-driver-smoke: paste changed {paste_rows} scanlines (term black-ratio {black:.2})"
+        );
+        if black < 0.15 {
+            return Err(format!(
+                "paste arm: the terminal is no longer on screen after the paste \
+                 (black-ratio {black:.2}); the frame changed because term died, not because \
+                 it painted the pasted text"
+            ));
+        }
+        // The offer is the whole tall drag — dozens of rows, each echoed by
+        // `cat`. A one-row change would mean the payload was truncated to
+        // its first line, so hold this to the same floor as the other arms
+        // rather than the `> 0` it used to carry.
+        if paste_rows < MIN_CHANGED_SCANLINES {
+            return Err(format!(
+                "paste arm: Ctrl+Shift+V changed only {paste_rows} scanlines (min \
+                 {MIN_CHANGED_SCANLINES}); the multi-row clipboard offer did not reach the PTY"
+            ));
+        }
+        // Close `cat`'s stdin so it exits cleanly and leaves a live shell.
+        //
+        // Enter first, and it is not cosmetic. The pasted offer does not end
+        // in a newline, so it sits in the line discipline's canonical-mode
+        // edit buffer as a partial line. VEOF (Ctrl+D) on a *non-empty* line
+        // flushes that line to the reader instead of signalling EOF — the
+        // standard tty rule — so a lone Ctrl+D here left `cat` running, and
+        // every later arm typed its command into `cat` instead of the shell.
+        // Enter terminates the partial line; the Ctrl+D that follows then
+        // lands on an empty one and actually closes stdin. (Sending Ctrl+D
+        // twice would also work here but is unsafe in general: on an already
+        // empty line the second one reaches the shell and logs it out.)
+        q.press_key("ret", 30)
+            .map_err(|e| format!("terminate cat's partial line: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        q.press_chord(&["ctrl", "d"], 30)
+            .map_err(|e| format!("close cat stdin: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(800));
+
+        // ---- Arm 5: wheel -> application (alternate screen) ----------
+        // `tui-smoke mouse-live` is the counterpart to arm 2: it takes the
+        // alternate screen, enables `?1000h` + `?1006h` itself, decodes
+        // `term`'s SGR reports, and floods half the grid with a saturated
+        // colour per notch. That gives two independent oracles for the same
+        // event — a serial sentinel proving the *application* decoded the
+        // report, and a hue-plus-region check on the PPM proving it
+        // repainted for the right direction.
+        //
+        // A ported TUI would not do: htop's process list can legitimately
+        // change zero pixels on a scroll, nothing guarantees ncurses turns
+        // mouse tracking on under `TERM=m3os-term`, and pulling a port build
+        // into this gate would cost minutes.
+        q.type_text("/bin/tui-smoke mouse-live\n")
+            .map_err(|e| format!("type tui-smoke: {e}"))?;
+        // Injecting before this sentinel is a race with a wrong answer, not
+        // just a flake: until `?1000h` has reached `term`, a notch is
+        // consumed by term's own scrollback viewport and never reported.
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "TUI_SMOKE:mouse-live:ready",
+            std::time::Duration::from_secs(60),
+            global_start,
+            global_timeout,
+        )?;
+        println!("term-daily-driver-smoke: mouse-live probe is tracking the mouse");
+        let alt_base = capture_settled(&mut q, &args.out_dir, "50-alt-base", SETTLE)?;
+        let base_red = band_pixels_matching(&alt_base, 0.0, 0.5, is_wheel_up_red);
+        let base_blue = band_pixels_matching(&alt_base, 0.5, 1.0, is_wheel_down_blue);
+
+        // One notch, not five: the probe emits one report per event, so the
+        // `up=` / `down=` totals it prints on exit are directly comparable
+        // to what was injected.
+        q.send_wheel(1).map_err(|e| format!("alt wheel up: {e}"))?;
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "TUI_SMOKE:mouse-live:cb=64",
+            std::time::Duration::from_secs(20),
+            global_start,
+            global_timeout,
+        )?;
+        let alt_up = capture_settled(&mut q, &args.out_dir, "51-alt-wheel-up", SETTLE)?;
+        let up_rows = changed_rows_in_band(&alt_base, &alt_up, 0.0, 1.0);
+        let up_red_top = band_pixels_matching(&alt_up, 0.0, 0.5, is_wheel_up_red);
+        let up_red_bottom = band_pixels_matching(&alt_up, 0.5, 1.0, is_wheel_up_red);
+        println!(
+            "term-daily-driver-smoke: wheel-up changed {up_rows} scanlines; band = \
+             {up_red_top} red px in the top half ({up_red_bottom} in the bottom, baseline \
+             {base_red})"
+        );
+        // Coarse check first, so a frame that did not move at all is
+        // reported as such rather than as a colour mismatch.
+        if up_rows < MIN_CHANGED_SCANLINES {
+            return Err(format!(
+                "alt-screen arm: the wheel-up notch changed only {up_rows} scanlines (min \
+                 {MIN_CHANGED_SCANLINES}); the probe decoded the report on serial but nothing \
+                 reached the framebuffer"
+            ));
+        }
+        if up_red_top.saturating_sub(base_red) < MIN_BAND_PIXELS {
+            return Err(format!(
+                "alt-screen arm: the wheel-up repaint left only {up_red_top} saturated-red \
+                 pixels in the top half (baseline {base_red}, min delta {MIN_BAND_PIXELS}); \
+                 the probe reported the notch on serial but the frame does not show its band"
+            ));
+        }
+        // The band is the top half of term's *grid*, which starts a few
+        // pixels below the top of the screen, so a little of it spills past
+        // the screen's midpoint. Requiring the top half to dominate — not
+        // requiring the bottom half to be empty — is what distinguishes a
+        // wheel-up repaint from a wheel-down one without pinning the
+        // compositor's tile geometry.
+        if up_red_top <= up_red_bottom {
+            return Err(format!(
+                "alt-screen arm: the wheel-up band is not in the top half \
+                 ({up_red_top} px top vs {up_red_bottom} px bottom); the app repainted, but \
+                 not for a wheel-up"
+            ));
+        }
+
+        q.send_wheel(-1)
+            .map_err(|e| format!("alt wheel down: {e}"))?;
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "TUI_SMOKE:mouse-live:cb=65",
+            std::time::Duration::from_secs(20),
+            global_start,
+            global_timeout,
+        )?;
+        let alt_down = capture_settled(&mut q, &args.out_dir, "52-alt-wheel-down", SETTLE)?;
+        let down_blue_bottom = band_pixels_matching(&alt_down, 0.5, 1.0, is_wheel_down_blue);
+        let down_blue_top = band_pixels_matching(&alt_down, 0.0, 0.5, is_wheel_down_blue);
+        let down_red_top = band_pixels_matching(&alt_down, 0.0, 0.5, is_wheel_up_red);
+        println!(
+            "term-daily-driver-smoke: wheel-down band = {down_blue_bottom} blue px in the \
+             bottom half ({down_blue_top} in the top, baseline {base_blue}); red left over \
+             {down_red_top}"
+        );
+        if down_blue_bottom.saturating_sub(base_blue) < MIN_BAND_PIXELS {
+            return Err(format!(
+                "alt-screen arm: the wheel-down repaint left only {down_blue_bottom} \
+                 saturated-blue pixels in the bottom half (baseline {base_blue}, min delta \
+                 {MIN_BAND_PIXELS}); the app did not repaint for the downward notch"
+            ));
+        }
+        if down_blue_bottom <= down_blue_top {
+            return Err(format!(
+                "alt-screen arm: the wheel-down band is not in the bottom half \
+                 ({down_blue_bottom} px bottom vs {down_blue_top} px top)"
+            ));
+        }
+        // Each repaint erases the screen first, so the up band must be gone
+        // — the two frames differ in region *and* hue, which is what makes
+        // this pair impossible to satisfy with a single generic repaint.
+        if down_red_top.saturating_sub(base_red) >= MIN_BAND_PIXELS {
+            return Err(format!(
+                "alt-screen arm: the wheel-up band is still on screen after the wheel-down \
+                 notch ({down_red_top} red px, baseline {base_red}); the app is not \
+                 repainting per notch"
+            ));
+        }
+
+        // ---- Arm 6: Shift-drag override ------------------------------
+        // Same surface, same drag, one modifier apart — and the app still
+        // holds the mouse, which is the only state in which the two
+        // outcomes differ. Unshifted, the press/release belong to the
+        // application (`mouse-live` decodes button reports and ignores
+        // anything that is not a wheel pseudo-button, so it paints
+        // nothing); Shift-held, `term` must keep the drag for itself and
+        // paint a selection.
+        //
+        // Both drags are paced edge by edge — see `qmp::GESTURE_STEP_PACING`.
+        // Fired back to back, the guest's single HID poll loop reads the
+        // keyboard's queued Shift *break* before the tablet's queued button
+        // press, so the compositor stamps the whole gesture with no
+        // modifiers and this arm reads a false negative: both drags change
+        // zero scanlines and the failure looks like a missing capability.
+        q.drag_abs(DRAG_FROM, DRAG_TO)
+            .map_err(|e| format!("alt plain drag: {e}"))?;
+        // See the selection arm: park only after the release has landed.
+        std::thread::sleep(POINTER_RELEASE_SETTLE);
+        q.send_pointer_abs(POINTER_PARK.0, POINTER_PARK.1)
+            .map_err(|e| format!("re-park pointer: {e}"))?;
+        let alt_plain_drag = capture_settled(&mut q, &args.out_dir, "53-alt-drag-plain", SETTLE)?;
+        let plain_rows = changed_rows_in_band(&alt_down, &alt_plain_drag, 0.0, 1.0);
+        println!("term-daily-driver-smoke: unshifted drag changed {plain_rows} scanlines");
+        if plain_rows > TERM_QUIET_SCANLINES {
+            return Err(format!(
+                "shift-drag arm: an UNSHIFTED drag changed {plain_rows} scanlines (max \
+                 {TERM_QUIET_SCANLINES}); `term` painted a selection over a mouse-tracking \
+                 application instead of reporting the drag to it"
+            ));
+        }
+
+        q.drag_abs_with_mods(&["shift"], DRAG_FROM, DRAG_TO)
+            .map_err(|e| format!("alt shift drag: {e}"))?;
+        // See the selection arm: park only after the release has landed.
+        std::thread::sleep(POINTER_RELEASE_SETTLE);
+        q.send_pointer_abs(POINTER_PARK.0, POINTER_PARK.1)
+            .map_err(|e| format!("re-park pointer: {e}"))?;
+        let alt_shift_drag = capture_settled(&mut q, &args.out_dir, "54-alt-drag-shift", SETTLE)?;
+        let shift_rows = changed_rows_in_band(&alt_plain_drag, &alt_shift_drag, 0.0, 1.0);
+        println!("term-daily-driver-smoke: shift-drag changed {shift_rows} scanlines");
+        if shift_rows < MIN_CHANGED_SCANLINES {
+            return Err(format!(
+                "shift-drag arm: a SHIFT-held drag changed only {shift_rows} scanlines (min \
+                 {MIN_CHANGED_SCANLINES}); the xterm force-select override did not fire. \
+                 Either the compositor is not stamping live modifiers onto pointer events or \
+                 `term` is not honouring MOD_SHIFT while the app has the mouse"
+            ));
+        }
+
+        // Quit the probe and collect its own tally. `up=1` / `down=1` are
+        // exact: a duplicated or dropped notch fails here rather than
+        // quietly widening what the frame checks above were measuring.
+        q.type_text("q").map_err(|e| format!("type q: {e}"))?;
+        for sentinel in [
+            "TUI_SMOKE:mouse-live:up=1",
+            "TUI_SMOKE:mouse-live:down=1",
+            "TUI_SMOKE:mouse-live:ok",
+        ] {
+            wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                sentinel,
+                std::time::Duration::from_secs(20),
+                global_start,
+                global_timeout,
+            )
+            .map_err(|e| {
+                format!(
+                    "alt-screen arm: {sentinel} never arrived — the probe's own tally \
+                     disagrees with what was injected, or it exited on a \
+                     `TUI_SMOKE:mouse-live:fail` line in the transcript below.\n{e}"
+                )
+            })?;
+        }
+
+        // The probe's teardown leaves the alternate screen, restoring the
+        // primary buffer. Two things must hold afterwards. First, `term` is
+        // still on screen at all.
+        let primary = capture_settled(&mut q, &args.out_dir, "55-primary-restored", SETTLE)?;
+        let primary_black = primary.black_pixel_ratio();
+        if primary_black < 0.15 {
+            return Err(format!(
+                "alt-screen arm: after the probe exited the terminal is not on screen \
+                 (black-ratio {primary_black:.2}); leaving the alternate screen killed it"
+            ));
+        }
+        // Second, the terminal is showing its live tail — nothing left the
+        // viewport parked in history. Shift+End writes no PTY bytes and is
+        // a no-op when the viewport is already home, so a frame that
+        // changes here is a frame that was scrolled back.
+        //
+        // Note what this does and does not prove. `set_view_offset` returns
+        // early on the alternate screen, so a notch *delivered while the
+        // app was tracking* could not have moved the viewport even if term
+        // had also consumed it; that half is what arm 2 plus the `cb=`
+        // sentinels above establish. What this checks is the end state — no
+        // notch leaked into the viewport around the probe's entry or exit,
+        // when the primary buffer was live again.
+        q.press_chord(&["shift", "end"], 30)
+            .map_err(|e| format!("post-probe shift+end: {e}"))?;
+        let primary_home = capture_settled(&mut q, &args.out_dir, "56-primary-live-tail", SETTLE)?;
+        let primary_drift = changed_rows_in_band(&primary, &primary_home, 0.0, 1.0);
+        println!(
+            "term-daily-driver-smoke: restored primary sits {primary_drift} scanlines from its \
+             live tail"
+        );
+        if primary_drift > TERM_QUIET_SCANLINES {
+            return Err(format!(
+                "alt-screen arm: after the probe exited, snapping to the live tail changed \
+                 {primary_drift} scanlines (max {TERM_QUIET_SCANLINES}); the wheel left \
+                 `term`'s own viewport scrolled back instead of going only to the application"
+            ));
+        }
+
+        // The Shift-drag copied on release, so the compositor's offer must
+        // no longer be arm 3's marker. Read it back from the independent
+        // client again, with its own anchor so the window cannot resolve to
+        // the earlier read-back.
+        q.type_text("/bin/clip-smoke --paste\n")
+            .map_err(|e| format!("type clip-smoke: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        q.type_text(&format!("/bin/echo-args {CLIP_ANCHOR_SHIFT}\n"))
+            .map_err(|e| format!("type echo-args: {e}"))?;
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            CLIP_ANCHOR_SHIFT,
+            std::time::Duration::from_secs(30),
+            global_start,
+            global_timeout,
+        )?;
+        let transcript = strip_ansi(&serial_history);
+        let window = clip_payload_before_anchor(&transcript, CLIP_SENTINEL, CLIP_ANCHOR_SHIFT)
+            .ok_or("shift-drag arm: CLIP_PASTE sentinel vanished from the transcript")?;
+        // The alternate screen carries no text of its own — the probe
+        // paints coloured spaces — so the copied rows are blanks. What
+        // matters is that the store was *replaced*: if the Shift-drag had
+        // not copied, arm 3's marker would still be the standing offer.
+        if window_has_exact_line(window, COPY_MARKER) {
+            return Err(format!(
+                "shift-drag arm: the compositor's clipboard still holds arm 3's {COPY_MARKER:?} \
+                 offer, so the Shift-held drag selected on screen but never copied on release. \
+                 Second client read back:\n{}",
+                tail_lines(window, 12)
+            ));
+        }
+        println!(
+            "term-daily-driver-smoke: the Shift-held drag replaced the compositor clipboard offer"
+        );
+        Ok(())
+    })();
+
+    while let Ok(chunk) = rx.try_recv() {
+        append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+    }
+    if !args.keep_qemu {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&qmp_socket);
+        let _ = std::fs::remove_file(&vnc_socket);
+    }
+    let serial_log = args.out_dir.join("serial.log");
+    let _ = std::fs::write(&serial_log, &serial_history);
+
+    match result {
+        Ok(()) => {
+            println!(
+                "term-daily-driver-smoke: PASSED — scrollback viewport (Shift+PageUp, \
+                 Report-protocol wheel, snap-to-bottom asserted against the live-tail frame), \
+                 selection highlight, compositor clipboard round trip read back line-exact by \
+                 an independent client, Ctrl+Shift+V delivering the offer to the PTY, the \
+                 wheel reaching a mouse-tracking application on the alternate screen (per-notch \
+                 hue + region on the PPM, plus the app's own serial tally), and the Shift-drag \
+                 override discriminating from an unshifted drag while that app held the mouse. \
+                 (The ESC[200~ framing itself is NOT asserted: no program in the image enables \
+                 ?2004h, and PTY bytes have no sink but the framebuffer — it is covered by the \
+                 `term::input::wrap_paste` host tests.) Frames in {}",
+                args.out_dir.display()
+            );
+        }
+        Err(msg) => {
+            eprintln!(
+                "term-daily-driver-smoke: FAILED\n{msg}\nFrames + serial log in {}",
+                args.out_dir.display()
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// graphical-boot-smoke — the `graphical_login = true` lane
+// ---------------------------------------------------------------------------
+
+/// `bar`'s Layer-surface height, mirroring `BAR_HEIGHT_PX` in
+/// `userspace/bar/src/main.rs`. The bar anchors to TOP and stretches to the
+/// output width, so rows `0..BAR_BAND_PX` are the bar's exclusive zone on
+/// every output size.
+const BAR_BAND_PX: usize = 48;
+
+/// `display_server`'s `BG_PIXEL` (`0x002B_5A4B`) as RGB. Anything the
+/// compositor has not painted a surface over reads back as this colour, so
+/// "the band is no longer background" is the framebuffer-level proof that a
+/// surface actually composited there.
+const COMPOSITOR_BG_RGB: (u8, u8, u8) = (0x2B, 0x5A, 0x4B);
+
+/// Fraction of pixels in rows `y0..y1` that match `rgb` (within a small
+/// tolerance, so a scaled/blended edge pixel doesn't count as a miss).
+fn band_colour_ratio(frame: &ppm::PpmFrame, y0: usize, y1: usize, rgb: (u8, u8, u8)) -> f64 {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    let y1 = y1.min(h);
+    if w == 0 || y0 >= y1 {
+        return 0.0;
+    }
+    let mut hits = 0usize;
+    let mut total = 0usize;
+    for y in y0..y1 {
+        for x in 0..w {
+            let i = (y * w + x) * 3;
+            if i + 2 >= frame.pixels.len() {
+                break;
+            }
+            let d = (frame.pixels[i] as i32 - rgb.0 as i32).abs()
+                + (frame.pixels[i + 1] as i32 - rgb.1 as i32).abs()
+                + (frame.pixels[i + 2] as i32 - rgb.2 as i32).abs();
+            if d <= 12 {
+                hits += 1;
+            }
+            total += 1;
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        hits as f64 / total as f64
+    }
+}
+
+/// Number of distinct RGB triples in rows `y0..y1`. A painted bar carries a
+/// panel background, workspace cells, an active-workspace highlight and text
+/// glyphs, so it is comfortably polychrome; a band the compositor merely
+/// cleared to background is monochrome. Counting colours rather than asserting
+/// specific hexes keeps the gate from breaking when the bar is re-themed.
+fn band_distinct_colours(frame: &ppm::PpmFrame, y0: usize, y1: usize) -> usize {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    let y1 = y1.min(h);
+    let mut seen = std::collections::HashSet::new();
+    for y in y0..y1.min(h) {
+        for x in 0..w {
+            let i = (y * w + x) * 3;
+            if i + 2 >= frame.pixels.len() {
+                break;
+            }
+            seen.insert((frame.pixels[i], frame.pixels[i + 1], frame.pixels[i + 2]));
+        }
+    }
+    seen.len()
+}
+
+/// `graphical-boot-smoke` — boot the **`graphical_login = true`** lane that
+/// `cargo xtask run-gui` actually takes, drive the greeter login over QMP, and
+/// assert on the composited framebuffer that the Phase 73 desktop daemons came
+/// up and painted.
+///
+/// Why this gate exists: every other harness in this file calls
+/// `create_data_disk(.., graphical_login = false)`. That path stages 36
+/// service confs; the graphical path stages three more — `wallpaper.conf`,
+/// `bar.conf`, `notifyd.conf`, written only when `graphical_login` is set.
+/// init's loaders stop at `MAX_SERVICES` **without a diagnostic**, so when the
+/// ceiling stopped clearing the conf count (Phase 101 raised it to 36 for
+/// `acpid.conf`; Phase 103 then added `powerd.conf` and did not), the
+/// graphical boot silently lost all three daemons — no top bar, no wallpaper,
+/// no notification daemon — while every gate stayed green because the
+/// autologin lane still fit. `init`'s `const _` assertion now catches the
+/// `KNOWN_CONFIGS`-side overflow at build time; this gate catches the
+/// runtime-side one (a conf staged into the ext2 image that init's table has
+/// no room for, which no compile-time check can see) and, beyond mere
+/// startup, proves the bar reaches the screen.
+///
+/// The `SUPER+RETURN` arm at the end is not incidental: the graphical lane
+/// deliberately omits `[autostart]`, so that chord is the *only* way a user
+/// reaches a terminal after a GUI login. If it regresses, `run-gui` becomes
+/// an unusable desktop even with every daemon running.
+#[allow(clippy::zombie_processes)]
+fn cmd_graphical_boot_smoke(args: &LessRenderProbeArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    // Always rebuild the data disk: the graphical conf set is what is under
+    // test, and a disk left by a previous serial-lane run has none of it.
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        true, // graphical_login — the whole point of this gate
+    );
+    let ovmf = find_ovmf();
+    if let Err(e) = std::fs::create_dir_all(&args.out_dir) {
+        eprintln!(
+            "graphical-boot-smoke: cannot create out dir {}: {e}",
+            args.out_dir.display()
+        );
+        std::process::exit(1);
+    }
+
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let vnc_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&vnc_socket);
+
+    let mut qemu_args = qemu_args_with_devices(
+        &uefi_image,
+        &ovmf,
+        QemuDisplayMode::Headless,
+        DeviceSet::default(),
+    );
+    let mut idx = 0;
+    while idx + 1 < qemu_args.len() {
+        if qemu_args[idx] == "-display" && qemu_args[idx + 1] == "none" {
+            qemu_args[idx + 1] = format!("vnc=unix:{}", vnc_socket.display());
+            break;
+        }
+        idx += 1;
+    }
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+    qemu_args.push("-vga".to_string());
+    qemu_args.push("std".to_string());
+    // Mirror `run-gui` exactly: it passes the launch-time boot mode through
+    // `fw_cfg`, which the kernel prefers over the on-disk marker. Both agree
+    // here, but matching the flag keeps this gate on the same code path the
+    // user's command takes rather than a marker-only variant of it.
+    qemu_args.push("-fw_cfg".to_string());
+    qemu_args.push("name=opt/m3os/boot-mode,string=graphical".to_string());
+
+    println!(
+        "graphical-boot-smoke: launching QEMU on the graphical-login lane (timeout {}s, qmp {})",
+        args.timeout_secs,
+        qmp_socket.display()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+
+    let result: Result<(), String> = (|| {
+        let step = std::time::Duration::from_secs(args.timeout_secs.min(180));
+        let wait = |pattern: &str, buf: &mut String, hist: &mut String| -> Result<(), String> {
+            wait_for_serial_pattern(&rx, buf, hist, pattern, step, global_start, global_timeout)
+        };
+
+        // Arm 1 — init must LOAD all three graphical-only daemons. This is the
+        // direct `MAX_SERVICES` guard: an overflow drops the trailing confs
+        // here, before anything is spawned, and prints nothing at all.
+        for svc in ["wallpaper", "bar", "notifyd"] {
+            wait(
+                &format!("init: loaded service '{svc}'"),
+                &mut serial_buf,
+                &mut serial_history,
+            )
+            .map_err(|e| {
+                format!(
+                    "init never loaded the '{svc}' service ({e}). The graphical lane stages three \
+                     more confs than the serial lane; if init's MAX_SERVICES no longer clears the \
+                     number of .conf files staged into /etc/services.d, the trailing ones are \
+                     dropped silently and the desktop comes up with no bar / wallpaper / notifyd."
+                )
+            })?;
+        }
+        println!("graphical-boot-smoke: init loaded wallpaper + bar + notifyd");
+
+        // Arm 2 — and each must actually start and reach its own main().
+        for pat in ["wallpaper: starting", "bar: starting", "notifyd: starting"] {
+            wait(pat, &mut serial_buf, &mut serial_history)
+                .map_err(|e| format!("daemon never started: {pat:?} ({e})"))?;
+        }
+        // On the graphical lane the bar must *defer* — piercing the login
+        // screen with a 48 px panel before authentication is the bug this
+        // handshake was added to prevent.
+        wait(
+            "bar: waiting for login session",
+            &mut serial_buf,
+            &mut serial_history,
+        )
+        .map_err(|e| {
+            format!(
+                "bar did not defer to the greeter ({e}) — on a graphical boot it must wait for \
+                 /run/m3os-current-session before declaring its Layer surface"
+            )
+        })?;
+        println!("graphical-boot-smoke: all three daemons started; bar deferred to the greeter");
+
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+        println!("graphical-boot-smoke: QMP handshake complete");
+
+        // Let the greeter paint before we capture or type at it.
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        // Not `capture_frame`: that shared helper hardcodes a
+        // `less-render-probe:` prefix on its progress line, which would
+        // mislabel this gate's output.
+        let greeter_path = args.out_dir.join("00-greeter.ppm");
+        q.screendump(&greeter_path)
+            .map_err(|e| format!("screendump greeter: {e}"))?;
+        println!("graphical-boot-smoke: captured {}", greeter_path.display());
+
+        // Arm 3 — drive the GUI login exactly as a user would.
+        q.type_text("root").map_err(|e| format!("type user: {e}"))?;
+        q.press_key("ret", 40)
+            .map_err(|e| format!("submit user: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        q.type_text("root")
+            .map_err(|e| format!("type password: {e}"))?;
+        q.press_key("ret", 40)
+            .map_err(|e| format!("submit password: {e}"))?;
+        wait("greeter: auth ok", &mut serial_buf, &mut serial_history)
+            .map_err(|e| format!("greeter did not authenticate root/root ({e})"))?;
+        // The session marker is the greeter->bar handshake; without it the bar
+        // waits forever in `wait_for_session_marker` and never paints.
+        wait(
+            "bar: session active; connecting",
+            &mut serial_buf,
+            &mut serial_history,
+        )
+        .map_err(|e| {
+            format!(
+                "bar never observed the login session ({e}) — greeter authenticated but the \
+                 /run/m3os-current-session handshake did not reach the bar, which polls for it \
+                 with no timeout and would hang here forever"
+            )
+        })?;
+        println!("graphical-boot-smoke: greeter authenticated; bar picked up the session");
+
+        // Arm 4 — the bar must reach the SCREEN, not merely run. Give the
+        // compositor a moment to composite the newly-mapped Layer surface.
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        let desktop_path = args.out_dir.join("01-desktop.ppm");
+        q.screendump(&desktop_path)
+            .map_err(|e| format!("screendump desktop: {e}"))?;
+        println!("graphical-boot-smoke: captured {}", desktop_path.display());
+        let desktop = ppm::read_ppm(&desktop_path)?;
+        let bg_ratio = band_colour_ratio(&desktop, 0, BAR_BAND_PX, COMPOSITOR_BG_RGB);
+        let colours = band_distinct_colours(&desktop, 0, BAR_BAND_PX);
+        if bg_ratio > 0.25 {
+            return Err(format!(
+                "the top {BAR_BAND_PX} px are still {:.0}% compositor background — the bar \
+                 process is running but its surface never composited to the screen",
+                bg_ratio * 100.0
+            ));
+        }
+        if colours < 4 {
+            return Err(format!(
+                "the top {BAR_BAND_PX} px hold only {colours} distinct colour(s) — something \
+                 painted the band but it carries no workspace cells / glyphs, so the bar did not \
+                 render its widgets"
+            ));
+        }
+        println!(
+            "graphical-boot-smoke: bar band is {:.1}% background with {colours} distinct colours",
+            bg_ratio * 100.0
+        );
+
+        // Arm 5 — the graphical lane omits `[autostart]` by design, so
+        // SUPER+RETURN is the only route to a terminal after login.
+        q.press_chord(&["meta_l", "ret"], 60)
+            .map_err(|e| format!("super+return: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        let term_path = args.out_dir.join("02-term-spawned.ppm");
+        q.screendump(&term_path)
+            .map_err(|e| format!("screendump term: {e}"))?;
+        println!("graphical-boot-smoke: captured {}", term_path.display());
+        let with_term = ppm::read_ppm(&term_path)?;
+        // Compare the desktop body (below the bar) before and after the chord.
+        let body_changed = changed_rows_in_band(
+            &desktop,
+            &with_term,
+            BAR_BAND_PX as f64 / desktop.height as f64,
+            1.0,
+        );
+        if body_changed < 100 {
+            return Err(format!(
+                "SUPER+RETURN changed only {body_changed} scanlines below the bar — no terminal \
+                 window appeared. The graphical lane ships no [autostart], so this chord is the \
+                 only way to reach a shell after a GUI login"
+            ));
+        }
+        println!(
+            "graphical-boot-smoke: SUPER+RETURN spawned a window ({body_changed} scanlines changed)"
+        );
+        Ok(())
+    })();
+
+    while let Ok(chunk) = rx.try_recv() {
+        append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+    }
+    if !args.keep_qemu {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&qmp_socket);
+        let _ = std::fs::remove_file(&vnc_socket);
+    }
+    let serial_log = args.out_dir.join("serial.log");
+    let _ = std::fs::write(&serial_log, &serial_history);
+
+    match result {
+        Ok(()) => {
+            println!(
+                "graphical-boot-smoke: PASSED — the graphical-login lane boots with wallpaper + \
+                 bar + notifyd loaded and started (the MAX_SERVICES overflow guard), the bar \
+                 defers to the greeter and picks up the session marker after a root/root GUI \
+                 login, its Layer surface composites over the top {BAR_BAND_PX} px with real \
+                 widgets, and SUPER+RETURN still spawns a terminal onto the otherwise-empty \
+                 desktop. Frames in {}",
+                args.out_dir.display()
+            );
+        }
+        Err(msg) => {
+            eprintln!(
+                "graphical-boot-smoke: FAILED\n{msg}\nFrames + serial log in {}",
+                args.out_dir.display()
+            );
+            std::process::exit(1);
         }
     }
 }
@@ -39740,6 +41504,189 @@ mod tests {
 
     fn string_args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| part.to_string()).collect()
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 112 Track C.2 — term-daily-driver-smoke helpers
+    // -----------------------------------------------------------------
+
+    /// Every QMP/PPM probe shares one arg parser, so the per-command
+    /// defaults have to survive it: two gates writing `serial.log` into the
+    /// same directory means the second one to run destroys the evidence the
+    /// first one left behind.
+    #[test]
+    fn probe_arg_defaults_are_per_command() {
+        let term = parse_probe_args_with_defaults(
+            &[],
+            "term-daily-driver-smoke",
+            480,
+            "m3os-term-daily-driver-smoke",
+        )
+        .expect("empty args parse");
+        assert_eq!(term.timeout_secs, 480);
+        assert_eq!(
+            term.out_dir.file_name().unwrap(),
+            "m3os-term-daily-driver-smoke"
+        );
+        assert!(!term.keep_qemu);
+
+        // The legacy wrapper keeps the old defaults for the four probes
+        // that still call it.
+        let legacy = parse_less_render_probe_args(&[]).expect("empty args parse");
+        assert_eq!(legacy.timeout_secs, 240);
+        assert_eq!(
+            legacy.out_dir.file_name().unwrap(),
+            "m3os-less-render-probe"
+        );
+
+        // Explicit flags still win over both defaults.
+        let overridden = parse_probe_args_with_defaults(
+            &string_args(&["--timeout", "60", "--out", "/tmp/x", "--keep-qemu"]),
+            "term-daily-driver-smoke",
+            480,
+            "m3os-term-daily-driver-smoke",
+        )
+        .expect("flags parse");
+        assert_eq!(overridden.timeout_secs, 60);
+        assert_eq!(overridden.out_dir, PathBuf::from("/tmp/x"));
+        assert!(overridden.keep_qemu);
+
+        // An unknown flag names the command the user typed, not whichever
+        // probe happens to own the parser.
+        let err = parse_probe_args_with_defaults(
+            &string_args(&["--nope"]),
+            "term-daily-driver-smoke",
+            480,
+            "d",
+        )
+        .expect_err("unknown flag rejected");
+        assert!(err.contains("term-daily-driver-smoke"), "{err}");
+    }
+
+    /// The bug this window exists to kill: `clip-smoke` prints its sentinel
+    /// and its payload as two `serial_print` calls, so the payload is
+    /// always a *later* serial line. A reader that stops at the sentinel
+    /// reads a transcript that does not contain the payload yet — the
+    /// anchor is what makes the read total.
+    #[test]
+    fn clip_payload_window_runs_from_the_sentinel_to_the_anchor() {
+        let transcript = "[INFO] [userspace] CLIP_PASTE:\n\
+                          [INFO] [userspace] stale run\n\
+                          [INFO] [userspace] echo-args: argv[1]=CLIPSYNCA\n\
+                          [INFO] [userspace] CLIP_PASTE:\n\
+                          [INFO] [userspace] noise\n\
+                          M3OS_COPY_ME\n\
+                          tail row\n\
+                          [INFO] [userspace] echo-args: argv[1]=CLIPSYNCB\n";
+        let window = clip_payload_before_anchor(transcript, "CLIP_PASTE:", "CLIPSYNCB")
+            .expect("anchored window");
+        assert!(window.contains("M3OS_COPY_ME"));
+        // The window starts at the LAST sentinel before its anchor, so an
+        // earlier read-back's payload cannot leak into this one's verdict.
+        assert!(
+            !window.contains("stale run"),
+            "window ran past the preceding read back: {window:?}"
+        );
+        // The earlier anchor still selects the earlier run.
+        let earlier = clip_payload_before_anchor(transcript, "CLIP_PASTE:", "CLIPSYNCA")
+            .expect("earlier window");
+        assert!(earlier.contains("stale run"));
+        assert!(!earlier.contains("M3OS_COPY_ME"));
+        // Without the anchor there is no window at all: "not printed yet"
+        // must not be mistaken for "not in the clipboard".
+        assert!(
+            clip_payload_before_anchor("[INFO] CLIP_PASTE:\n", "CLIP_PASTE:", "CLIPSYNCA")
+                .is_none()
+        );
+    }
+
+    /// A transcript is `from_utf8_lossy` output, so a corrupt byte run
+    /// becomes a 3-byte U+FFFD. The window's length cap must land on a char
+    /// boundary — a panic here would skip the gate's QEMU teardown and leak
+    /// the process.
+    #[test]
+    fn clip_payload_window_cap_lands_on_a_char_boundary() {
+        let mut transcript = String::from("CLIP_PASTE:");
+        // Fill past the 8 KiB cap with a multi-byte char so that *some*
+        // offset in the region is guaranteed to be a non-boundary.
+        for _ in 0..5000 {
+            transcript.push('\u{FFFD}');
+        }
+        transcript.push_str("CLIPSYNCA");
+        let window = clip_payload_before_anchor(&transcript, "CLIP_PASTE:", "CLIPSYNCA")
+            .expect("anchored window");
+        assert!(window.len() <= 8192);
+        assert!(window.chars().all(|c| c == '\u{FFFD}'));
+
+        assert_eq!(floor_char_boundary("aé", 2), 1);
+        assert_eq!(floor_char_boundary("aé", 3), 3);
+        assert_eq!(floor_char_boundary("abc", 99), 3);
+    }
+
+    /// `contains` cannot tell the copied *output* row from the command row
+    /// that produced it — both contain the marker. Whole-line equality can.
+    #[test]
+    fn window_exact_line_rejects_a_substring_only_match() {
+        assert!(window_has_exact_line("a\nM3OS_COPY_ME\nb", "M3OS_COPY_ME"));
+        // Trailing whitespace / CR from the serial transcript is not a
+        // mismatch; a prefix (the shell's echo of the command) is.
+        assert!(window_has_exact_line("M3OS_COPY_ME  \r\n", "M3OS_COPY_ME"));
+        assert!(!window_has_exact_line(
+            "$ echo M3OS_COPY_ME\n",
+            "M3OS_COPY_ME"
+        ));
+        assert!(!window_has_exact_line("", "M3OS_COPY_ME"));
+    }
+
+    /// Build a frame whose top half is saturated red and bottom half
+    /// saturated blue — the two bands `tui-smoke mouse-live` paints.
+    fn two_band_frame(width: u32, height: u32) -> ppm::PpmFrame {
+        let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for _ in 0..width {
+                if y < height / 2 {
+                    pixels.extend_from_slice(&[255, 0, 0]);
+                } else {
+                    pixels.extend_from_slice(&[0, 0, 255]);
+                }
+            }
+        }
+        ppm::PpmFrame {
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    /// A scanline diff can see that the app repainted but not *which* notch
+    /// it repainted for; the hue-in-a-band count is what separates the two.
+    #[test]
+    fn band_pixel_counts_separate_the_wheel_bands() {
+        let frame = two_band_frame(10, 20);
+        assert_eq!(band_pixels_matching(&frame, 0.0, 0.5, is_wheel_up_red), 100);
+        assert_eq!(band_pixels_matching(&frame, 0.5, 1.0, is_wheel_up_red), 0);
+        assert_eq!(
+            band_pixels_matching(&frame, 0.5, 1.0, is_wheel_down_blue),
+            100
+        );
+        assert_eq!(
+            band_pixels_matching(&frame, 0.0, 0.5, is_wheel_down_blue),
+            0
+        );
+
+        // The compositor's own chrome must not read as either band: teal
+        // desktop, grey bar, black terminal.
+        for (r, g, b) in [(0u8, 128u8, 128u8), (60, 60, 60), (0, 0, 0)] {
+            assert!(!is_wheel_up_red(r, g, b), "{r},{g},{b}");
+            assert!(!is_wheel_down_blue(r, g, b), "{r},{g},{b}");
+        }
+        // A degenerate frame counts nothing rather than panicking.
+        let empty = ppm::PpmFrame {
+            width: 0,
+            height: 0,
+            pixels: Vec::new(),
+        };
+        assert_eq!(band_pixels_matching(&empty, 0.0, 1.0, is_wheel_up_red), 0);
     }
 
     #[test]

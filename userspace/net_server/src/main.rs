@@ -77,7 +77,6 @@ enum HandleState {
     Unbound,
     Bound,
     Connected,
-    Closed,
 }
 
 #[derive(Clone, Copy)]
@@ -163,9 +162,7 @@ impl HandleTable {
     }
 
     fn is_port_bound(&self, port: u16) -> bool {
-        self.bound_ports[..self.bound_count]
-            .iter()
-            .any(|&p| p == port)
+        self.bound_ports[..self.bound_count].contains(&port)
     }
 
     fn bind_port(&mut self, port: u16) -> bool {

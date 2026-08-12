@@ -137,7 +137,7 @@ pub fn render_login_ui(state: &LoginUiState<'_>, pixels: &mut [u32], width: u32,
     if state.password_len > 0 {
         let max_glyphs = ((field_w as usize) - 16) / (GLYPH_W as usize);
         let stars = state.password_len.min(max_glyphs);
-        let mask: String = core::iter::repeat('*').take(stars).collect();
+        let mask: String = "*".repeat(stars);
         draw_text(
             pixels,
             width,
@@ -224,6 +224,13 @@ fn fill_rect(pixels: &mut [u32], width: u32, x: u32, y: u32, w: u32, h: u32, col
     }
 }
 
+/// Software text blit: `(destination pixels + stride, origin, string, colours,
+/// font)`. Same shape as `fill_rect` above and as `desktop_client`'s blit
+/// primitives — the greeter runs before the compositor exists, so it rasterises
+/// into the raw framebuffer itself rather than through `desktop_client`.
+/// Bundling the destination into a canvas type would add a construction at each
+/// of the 8 call sites in this file, all of which splat the same locals.
+#[allow(clippy::too_many_arguments)]
 fn draw_text(
     pixels: &mut [u32],
     width: u32,

@@ -135,6 +135,10 @@ const KBD_EVENT_PULL: u64 = 2;
 
 /// Reply label from kbd_server when `KBD_EVENT_PULL` finds no event.
 /// Distinct from `u64::MAX` (IPC transport error).
+// The empty-queue path is detected by the label *not* equalling
+// `KBD_EVENT_PULL` (see the pull loop), so this symbol is never read directly;
+// kept to document the kbd_server reply-label wire ABI alongside its sibling.
+#[allow(dead_code)]
 const KBD_EVENT_NONE: u64 = 3;
 
 /// Wire size of a serialised `KeyEvent` (bytes).

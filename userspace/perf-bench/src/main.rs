@@ -54,7 +54,7 @@ fn main(_args: &[&str]) -> i32 {
 
     let elapsed_ns = t1.saturating_sub(t0);
     let elapsed_ms = elapsed_ns / 1_000_000;
-    let ns_per = if ITERS > 0 { elapsed_ns / ITERS } else { 0 };
+    let ns_per = elapsed_ns.checked_div(ITERS).unwrap_or(0);
 
     write_str(STDOUT_FILENO, "PERF_BENCH:elapsed_ms=");
     write_u64(STDOUT_FILENO, elapsed_ms);

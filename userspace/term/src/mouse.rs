@@ -25,18 +25,49 @@
 //!   `\x1b[<Pb;Px;Py m` (lowercase `m`) for release. Numbers are
 //!   decimal, not offset-by-32.
 //!
+//! The wheel is reported as a *pseudo-button* in the same forms, per
+//! the xterm convention every other emulator follows: wheel-up is
+//! button 64, wheel-down 65 (66/67 would be the horizontal pair, but
+//! no producer in this tree emits `wheel_dx`). A wheel notch is always
+//! a press — there is no release edge for it, so SGR wheel reports end
+//! in upper-case `M` and X10 (a press-only mode) gets the notch too.
+//!
 //! The reporter clamps coordinates into `(1, 1)..=(cols, rows)`.
 //! No allocation per event.
 
 use kernel_core::input::events::{PointerButton, PointerEvent};
 
 /// Phase 69 Track E — maximum encoded length of one mouse report.
-/// SGR form `\x1b[<Pb;Px;Py M` has 16 bytes when `Pb=255`, `Px=1023`,
-/// `Py=1023` (we use a generous bound).
+/// The longest form is SGR (`\x1b[<Pb;Px;Py M`): a 3-byte introducer,
+/// a `Pb` of at most 2 digits (real buttons clamp to 31, the wheel
+/// pseudo-buttons are 64/65), two `u16` coordinates of at most 5 digits
+/// each, two separators and the terminator — 18 bytes worst case. The
+/// bound is deliberately generous.
 pub const MAX_BYTES: usize = 24;
 
+/// xterm wheel pseudo-button indices. The wheel is reported through the
+/// same button field as the real buttons, distinguished by bit 6; 66/67
+/// are the horizontal (tilt) pair, which nothing in this tree produces.
+pub const WHEEL_UP: u16 = 64;
+pub const WHEEL_DOWN: u16 = 65;
+
 /// Inline byte buffer returned by [`MouseReporter::encode`].
-#[derive(Clone, Copy)]
+/// Phase 112 Track A.4 — what the main loop should do with one pointer
+/// event, as decided by [`MouseReporter::classify`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerAction {
+    /// Forward these bytes to the PTY — the application is tracking the
+    /// mouse and this was a button edge or a wheel notch.
+    Report(MouseBytes),
+    /// Move `term`'s own scrollback viewport by this many rows; positive
+    /// is toward older history.
+    ScrollView(isize),
+    /// Nothing to do (a motion-only sample, or a pointer event carrying
+    /// neither a button edge nor a wheel delta).
+    Ignore,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MouseBytes {
     buf: [u8; MAX_BYTES],
     len: usize,
@@ -231,6 +262,57 @@ impl MouseReporter {
         self.encoding = e;
     }
 
+    /// Phase 112 Track A.4 — decide what one pointer event should do.
+    ///
+    /// This is the whole pointer policy in one host-testable place, so the
+    /// binary's event loop stays a three-arm match. The order matters:
+    ///
+    /// 1. An application that has grabbed the mouse gets button *and*
+    ///    wheel events reported to it — `encode` turns a wheel notch into
+    ///    the xterm 64/65 pseudo-button, so `less`/`htop`/`tmux` scroll
+    ///    their own panes instead of `term` scrolling behind them.
+    /// 2. Otherwise a wheel event scrolls `term`'s own scrollback
+    ///    viewport (`wheel_dy` positive = wheel-up = older history).
+    /// 3. Anything else is ignored.
+    ///
+    /// `wheel_rows` is the rows-per-notch step the caller wants.
+    pub fn classify(
+        &self,
+        event: &PointerEvent,
+        cols: u16,
+        rows: u16,
+        wheel_rows: isize,
+    ) -> PointerAction {
+        if let Some(bytes) = self.encode(event, cols, rows) {
+            return PointerAction::Report(bytes);
+        }
+        // The wheel drives the viewport only when the app has not grabbed
+        // the mouse — the xterm convention. When it has, `encode` above
+        // already returned the 64/65 pseudo-button report and we never get
+        // here; the explicit tracking check keeps that split legible (and
+        // fail-safe) rather than relying on the earlier return.
+        if !self.tracking_enabled()
+            && matches!(event.button, PointerButton::None)
+            && event.wheel_dy != 0
+        {
+            return PointerAction::ScrollView(event.wheel_dy as isize * wheel_rows);
+        }
+        PointerAction::Ignore
+    }
+
+    /// Phase 112 Track A.4 — `true` when the application has grabbed the
+    /// mouse (any tracking mode other than [`TrackingMode::Disabled`]).
+    ///
+    /// [`MouseReporter::encode`] returns `None` both when tracking is off
+    /// *and* for an event with nothing to report (a motion-only sample),
+    /// so the main loop cannot use its return value alone to decide
+    /// whether a wheel event is free to drive the scrollback viewport.
+    /// This accessor disambiguates: the wheel scrolls history only when
+    /// the app is *not* tracking, matching xterm.
+    pub fn tracking_enabled(&self) -> bool {
+        !matches!(self.tracking, TrackingMode::Disabled)
+    }
+
     /// Disable reporting. Resets tracking to [`TrackingMode::Disabled`]
     /// and encoding to its default ([`EncodingMode::Legacy`]).
     pub fn disable(&mut self) {
@@ -240,10 +322,10 @@ impl MouseReporter {
 
     /// Encode `event` to a stack-bounded byte buffer suitable for
     /// writing to the PTY primary fd. Returns `None` when tracking
-    /// is disabled or when the event is a motion-only sample (no
-    /// button edge) — Phase 69 ships mouse tracking that responds
-    /// to button press / release only. True motion-mouse tracking
-    /// (`?1002` / `?1003`) is deferred.
+    /// is disabled or when there is nothing to report — a motion-only
+    /// sample carrying neither a button edge nor a wheel delta. True
+    /// motion-mouse tracking (`?1002` / `?1003`) is deferred, so a
+    /// button-less event only reports when it is a wheel notch.
     ///
     /// `cols` and `rows` are the cell-grid dimensions; coordinates
     /// are clamped into `1..=cols` / `1..=rows`.
@@ -251,13 +333,23 @@ impl MouseReporter {
         if matches!(self.tracking, TrackingMode::Disabled) {
             return None;
         }
+        // The index is `u16` because the wheel pseudo-buttons live above
+        // the real ones: xterm sets bit 6 for wheel notches, so wheel-up is
+        // 64 and wheel-down 65 (66/67 are the horizontal pair, unused here
+        // — nothing in this tree produces `wheel_dx`). A notch has no
+        // release edge, so it is always encoded as a press.
         let (button_index, is_release) = match event.button {
-            PointerButton::Down(i) => (i, false),
-            PointerButton::Up(i) => (i, true),
-            PointerButton::None => return None,
+            PointerButton::Down(i) => (u16::from(i), false),
+            PointerButton::Up(i) => (u16::from(i), true),
+            PointerButton::None => match event.wheel_dy {
+                dy if dy > 0 => (WHEEL_UP, false),
+                dy if dy < 0 => (WHEEL_DOWN, false),
+                _ => return None,
+            },
         };
         // X10 ships press events only; release is dropped regardless
-        // of the encoding-mode the caller picked.
+        // of the encoding-mode the caller picked. A wheel notch is never
+        // a release, so X10 reports it like every other press-only mode.
         if matches!(self.tracking, TrackingMode::X10) && is_release {
             return None;
         }
@@ -266,20 +358,42 @@ impl MouseReporter {
         match self.encoding {
             EncodingMode::Legacy => {
                 // X10 form: \x1b[M  Cb Cx Cy   (1-based + 32 offset)
-                let cb_value = if is_release { 3u8 } else { button_index.min(2) };
+                //
+                // The legacy `Cb` is a single byte with a 2-bit button
+                // field, so real buttons clamp to 0..=2 (left/middle/right)
+                // — anything higher would alias onto the release code. The
+                // wheel indices are not in that field: they carry bit 6, so
+                // 64/65 pass through and land on Cb bytes 96/97. The `223`
+                // ceiling only keeps `Cb + 32` inside a byte; no real index
+                // reaches it.
+                let cb_value = if is_release {
+                    3
+                } else if button_index >= WHEEL_UP {
+                    button_index.min(223)
+                } else {
+                    button_index.min(2)
+                };
                 out.push(0x1b);
                 out.push(b'[');
                 out.push(b'M');
-                out.push(cb_value.wrapping_add(32));
+                out.push((cb_value + 32) as u8);
                 out.push((px.min(223) as u8).wrapping_add(32));
                 out.push((py.min(223) as u8).wrapping_add(32));
             }
             EncodingMode::Sgr => {
                 // SGR form: \x1b[<Pb;Px;Py M  (press) or m (release).
+                // `Pb` is decimal here, so the wheel indices need no
+                // special encoding — only an exemption from the clamp that
+                // keeps a stray real-button index inside xterm's range.
+                let pb = if button_index >= WHEEL_UP {
+                    button_index
+                } else {
+                    button_index.min(31)
+                };
                 out.push(0x1b);
                 out.push(b'[');
                 out.push(b'<');
-                out.push_decimal(button_index.min(31) as u32);
+                out.push_decimal(pb as u32);
                 out.push(b';');
                 out.push_decimal(px as u32);
                 out.push(b';');
@@ -297,14 +411,16 @@ impl MouseReporter {
 /// project into the cell grid by dividing by the renderer's glyph
 /// dimensions (`GLYPH_W` / `GLYPH_H`).
 fn compute_cell_position(event: &PointerEvent, cols: u16, rows: u16) -> (u16, u16) {
-    // MUST match `term::display::CELL_WIDTH` / `CELL_HEIGHT`.
-    // The `display` module is gated behind the `os-binary` feature
-    // so we duplicate the literals here; mismatching them would
-    // misproject pointer pixels onto the cell grid. The reporter is
-    // bounded by the cell grid regardless; an off-by-one cell at
-    // the grid boundary is harmless.
-    const GLYPH_W: u16 = 16;
-    const GLYPH_H: u16 = 32;
+    // Phase 112 Track B.1 — read the real cell size from the crate root.
+    //
+    // These used to be private `16` / `32` literals here, duplicated
+    // because the `display` module is `os-binary`-gated. Phase 73 changed
+    // the actual cell to 24×48 and this copy was missed, so every
+    // reported mouse position was projected onto a grid 1.5× too fine.
+    // The constants now live in the ungated crate root precisely so this
+    // cannot happen again.
+    const GLYPH_W: u16 = crate::CELL_WIDTH as u16;
+    const GLYPH_H: u16 = crate::CELL_HEIGHT as u16;
     let (px_x, px_y) = match event.abs_position {
         Some((x, y)) => (x.max(0) as u32, y.max(0) as u32),
         None => (0, 0),
@@ -321,11 +437,16 @@ mod tests {
     use super::*;
     use kernel_core::input::events::{ModifierState, PointerButton, PointerEvent};
 
-    // Mirror the literals in `compute_cell_position`. Tests use
-    // these so the cell-coord assertions stay readable when the
-    // pixel inputs are derived from `cell × CELL_*`.
-    const CELL_W_PX: i32 = 16;
-    const CELL_H_PX: i32 = 32;
+    // Tests derive pixel inputs as `cell × CELL_*` so the cell-coord
+    // assertions stay readable.
+    //
+    // Phase 112 Track B.1 — these were hardcoded `16` / `32`, mirroring
+    // the stale private literals in `compute_cell_position`. Because both
+    // copies were wrong in the same way, the tests passed while real mouse
+    // reporting was off by 1.5 cells. They now reference the single
+    // production constant, so the fixture cannot drift from the code again.
+    const CELL_W_PX: i32 = crate::CELL_WIDTH as i32;
+    const CELL_H_PX: i32 = crate::CELL_HEIGHT as i32;
 
     fn press(button: u8, x: i32, y: i32) -> PointerEvent {
         PointerEvent {
@@ -498,5 +619,173 @@ mod tests {
         assert_eq!(r.tracking(), TrackingMode::Normal);
         assert_eq!(r.encoding(), EncodingMode::Sgr);
         assert_eq!(r.mode(), Mode::Sgr);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 112 Track A.4 — wheel → scrollback viewport
+    // -----------------------------------------------------------------
+
+    /// A wheel-notch event: no button edge, non-zero `wheel_dy`. This is
+    /// the exact shape the `usb-hid` Report-protocol decoder injects
+    /// (`PointerEvent { button: None, wheel_dy: p.wheel, .. }`).
+    fn wheel(dy: i32) -> PointerEvent {
+        PointerEvent {
+            timestamp_ms: 0,
+            dx: 0,
+            dy: 0,
+            abs_position: None,
+            button: PointerButton::None,
+            wheel_dx: 0,
+            wheel_dy: dy,
+            modifiers: ModifierState(0),
+        }
+    }
+
+    /// A.4 acceptance: with mouse reporting **off**, a wheel notch maps to
+    /// a viewport scroll of `wheel_dy * wheel_rows`, positive = older.
+    #[test]
+    fn wheel_scrolls_viewport_when_app_is_not_tracking() {
+        let r = MouseReporter::new();
+        assert!(!r.tracking_enabled(), "reporter starts disabled");
+
+        assert_eq!(
+            r.classify(&wheel(1), 80, 25, 3),
+            PointerAction::ScrollView(3),
+            "wheel-up scrolls toward older history"
+        );
+        assert_eq!(
+            r.classify(&wheel(-1), 80, 25, 3),
+            PointerAction::ScrollView(-3),
+            "wheel-down scrolls back toward the live tail"
+        );
+        // The step is the caller's to choose.
+        assert_eq!(
+            r.classify(&wheel(2), 80, 25, 1),
+            PointerAction::ScrollView(2)
+        );
+    }
+
+    /// A wheel notch at a known cell — the reporter projects
+    /// `abs_position` onto the grid for wheel reports exactly as it does
+    /// for button edges, so the fixture has to carry one.
+    fn wheel_at(dy: i32, x: i32, y: i32) -> PointerEvent {
+        let mut e = wheel(dy);
+        e.abs_position = Some((x, y));
+        e
+    }
+
+    /// A.4 acceptance: once the application grabs the mouse, the wheel is
+    /// the app's — the viewport must not move (the xterm convention) and
+    /// the notch is forwarded as the 64/65 pseudo-button instead.
+    #[test]
+    fn wheel_reports_to_the_app_instead_of_scrolling_the_viewport() {
+        let mut r = MouseReporter::new();
+        r.set_tracking(TrackingMode::Normal);
+        r.set_encoding(EncodingMode::Sgr);
+        assert!(r.tracking_enabled());
+        match r.classify(&wheel_at(1, 10 * CELL_W_PX, 5 * CELL_H_PX), 80, 25, 3) {
+            PointerAction::Report(bytes) => assert_eq!(bytes.as_slice(), b"\x1b[<64;11;6M"),
+            other => panic!("tracking app must receive the wheel, got {other:?}"),
+        }
+    }
+
+    /// Wheel-up / wheel-down under `(Normal, Sgr)` — the combination every
+    /// modern TUI negotiates (`?1000h ?1006h`). Both notches are presses,
+    /// so both terminate in upper-case `M`; there is no release edge for a
+    /// wheel in xterm, VTE, kitty, alacritty or foot.
+    #[test]
+    fn sgr_wheel_reports_pseudo_buttons_64_and_65() {
+        let mut r = MouseReporter::new();
+        r.enable(Mode::Sgr);
+        let up = r
+            .encode(&wheel_at(1, 10 * CELL_W_PX, 5 * CELL_H_PX), 80, 25)
+            .expect("wheel-up reports under tracking");
+        assert_eq!(up.as_slice(), b"\x1b[<64;11;6M");
+        let down = r
+            .encode(&wheel_at(-1, 10 * CELL_W_PX, 5 * CELL_H_PX), 80, 25)
+            .expect("wheel-down reports under tracking");
+        assert_eq!(down.as_slice(), b"\x1b[<65;11;6M");
+    }
+
+    /// Wheel under `(Normal, Legacy)` — an app that enabled `?1000h` but
+    /// never `?1006h`. `Cb = index + 32`, so 64/65 become bytes 96/97
+    /// (`\x60` / `\x61`); the coordinate bytes keep the usual `+32`.
+    #[test]
+    fn legacy_wheel_reports_cb_96_and_97() {
+        let mut r = MouseReporter::new();
+        r.enable(Mode::ButtonEvent);
+        let up = r
+            .encode(&wheel_at(1, 10 * CELL_W_PX, 5 * CELL_H_PX), 80, 25)
+            .expect("wheel-up reports under tracking");
+        // Cb = 64+32 = 96 = 0x60 = b'`'. Cx = 11+32 = 43 = b'+'.
+        // Cy = 6+32 = 38 = b'&'.
+        assert_eq!(up.as_slice(), b"\x1b[M\x60\x2b\x26");
+        let down = r
+            .encode(&wheel_at(-1, 10 * CELL_W_PX, 5 * CELL_H_PX), 80, 25)
+            .expect("wheel-down reports under tracking");
+        // Cb = 65+32 = 97 = 0x61 = b'a'.
+        assert_eq!(down.as_slice(), b"\x1b[M\x61\x2b\x26");
+    }
+
+    /// X10 (`?9`) is press-only, and a wheel notch *is* a press — the
+    /// release guard never fires for it, so the notch still reaches the
+    /// app in the mode that drops button releases.
+    #[test]
+    fn x10_wheel_still_reports() {
+        let mut r = MouseReporter::new();
+        r.enable(Mode::X10);
+        let up = r
+            .encode(&wheel_at(1, 10 * CELL_W_PX, 5 * CELL_H_PX), 80, 25)
+            .expect("x10 is press-only and a wheel notch is a press");
+        assert_eq!(up.as_slice(), b"\x1b[M`+&");
+    }
+
+    /// A wheel-less, button-less sample must stay silent even while the
+    /// app tracks: `wheel_dy == 0` is the PS/2 lane's every motion packet,
+    /// and reporting it would flood the PTY with phantom notches.
+    #[test]
+    fn zero_wheel_delta_reports_nothing_while_tracking() {
+        let mut r = MouseReporter::new();
+        r.set_tracking(TrackingMode::Normal);
+        r.set_encoding(EncodingMode::Sgr);
+        assert!(r.encode(&wheel(0), 80, 25).is_none());
+        assert_eq!(r.classify(&wheel(0), 80, 25, 3), PointerAction::Ignore);
+    }
+
+    /// Every emitted report must fit the inline buffer with room to spare,
+    /// including the widest wheel form at the far corner of a large grid.
+    #[test]
+    fn wheel_report_fits_max_bytes() {
+        let mut r = MouseReporter::new();
+        r.enable(Mode::Sgr);
+        let bytes = r
+            .encode(
+                &wheel_at(-1, u16::MAX as i32 * CELL_W_PX, u16::MAX as i32 * CELL_H_PX),
+                u16::MAX,
+                u16::MAX,
+            )
+            .expect("wheel-down reports under tracking");
+        assert_eq!(bytes.as_slice(), b"\x1b[<65;65535;65535M");
+        assert!(bytes.len() <= MAX_BYTES, "len {} > MAX_BYTES", bytes.len());
+    }
+
+    /// A.4 acceptance: button edges are still reported unchanged — the
+    /// classifier must not have stolen the pre-Phase-112 behaviour.
+    #[test]
+    fn button_edges_still_report_to_the_application() {
+        let mut r = MouseReporter::new();
+        r.set_tracking(TrackingMode::Normal);
+        let ev = press(0, CELL_W_PX, CELL_H_PX);
+        let expected = r.encode(&ev, 80, 25).expect("button edge encodes");
+        assert_eq!(r.classify(&ev, 80, 25, 3), PointerAction::Report(expected));
+    }
+
+    /// A.4 acceptance: a PS/2-only lane never produces a wheel delta, so
+    /// the classifier is inert there — `wheel_dy == 0` yields `Ignore`,
+    /// not a zero-row scroll that would still dirty the viewport.
+    #[test]
+    fn zero_wheel_delta_is_ignored_not_a_zero_scroll() {
+        let r = MouseReporter::new();
+        assert_eq!(r.classify(&wheel(0), 80, 25, 3), PointerAction::Ignore);
     }
 }

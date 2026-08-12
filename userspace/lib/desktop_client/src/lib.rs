@@ -19,8 +19,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use kernel_core::display::protocol::{
-    BufferId, ClientMessage, KeyboardInteractivity, Layer, LayerConfig, MimeTag, PROTOCOL_VERSION,
-    Rect, ServerMessage, SurfaceId, SurfaceRole,
+    BufferId, CLIPBOARD_REPLY_BUF_LEN, ClientMessage, KeyboardInteractivity, Layer, LayerConfig,
+    MimeTag, PROTOCOL_VERSION, Rect, ServerMessage, SurfaceId, SurfaceRole, clipboard_reply_span,
 };
 use kernel_core::input::events::KeyEvent;
 use kernel_core::session::font::{BasicBitmapFont, FontProvider, Glyph};
@@ -32,12 +32,14 @@ const LABEL_CLIENT_EVENT_PULL: u64 = 3;
 const VERB_ENCODE_BUF_LEN: usize = 128;
 
 /// Phase 105 Track B — the largest clipboard offer carried in one IPC
-/// bulk. The frame + bytes must fit under the protocol's
-/// `MAX_FRAME_BODY_LEN` (4096) `decode_message` guard; 3900 leaves room
-/// for the 13-byte frame and a safety margin. Text clipboards are far
-/// smaller in practice; multi-frame transfer for larger blobs is a
-/// documented follow-up.
-pub const CLIPBOARD_MAX_BYTES: usize = 3900;
+/// bulk.
+///
+/// Phase 112 Track B.2 moved the definition to
+/// `kernel_core::display::protocol`, beside the `MAX_FRAME_BODY_LEN` bound
+/// it is derived from, so `term` can honour the same cap without taking a
+/// dependency on this crate. Re-exported here so existing callers are
+/// unaffected.
+pub use kernel_core::display::protocol::CLIPBOARD_MAX_BYTES;
 
 /// Connection to `display_server`. Wraps an IPC handle plus a single
 /// surface id; clients that need more than one surface hold multiple
@@ -221,6 +223,14 @@ impl DisplayConnection {
     /// `None` when the clipboard is empty or the request fails. The
     /// compositor answers synchronously with `[ClipboardData frame][bytes]`
     /// staged as the reply bulk.
+    ///
+    /// A reply is rejected outright — never truncated — if it announces
+    /// more bytes than this client's transport buffer and the copy-side
+    /// cap allow, or more bytes than actually arrived in the bulk; see
+    /// [`kernel_core::display::protocol::clipboard_reply_span`] for the
+    /// exact rule. This is the reader `clip-smoke --paste` uses to verify
+    /// the compositor clipboard round-trip, so a truncated reply here must
+    /// fail the check rather than quietly hand back a short prefix.
     pub fn get_clipboard(&self) -> Option<Vec<u8>> {
         let msg = ClientMessage::RequestClipboard {
             mime_tag: MimeTag::TextPlainUtf8,
@@ -231,7 +241,7 @@ impl DisplayConnection {
         if reply == u64::MAX {
             return None;
         }
-        let mut buf = [0u8; CLIPBOARD_MAX_BYTES + 16];
+        let mut buf = [0u8; CLIPBOARD_REPLY_BUF_LEN];
         let got = syscall_lib::ipc_take_pending_bulk(&mut buf);
         if got == 0 || got == u64::MAX {
             return None;
@@ -246,11 +256,8 @@ impl DisplayConnection {
         if len == 0 {
             return None; // empty clipboard
         }
-        let end = (consumed + len).min(got);
-        if end <= consumed {
-            return None;
-        }
-        Some(buf[consumed..end].to_vec())
+        let (start, end) = clipboard_reply_span(consumed, len, got)?;
+        Some(buf[start..end].to_vec())
     }
 
     /// Phase 105 Track C — capture the composited screen into an owned
@@ -407,6 +414,16 @@ pub fn fill(pixels: &mut [u32], color: u32) {
 }
 
 /// Fill an axis-aligned rectangle.
+//
+// The software-rasterizer primitives below all take the classic blit
+// signature: destination surface (`pixels` + its `stride`/`height`
+// geometry), the target rectangle, then the paint. Callers splat these
+// straight out of a `SharedSurface`'s fields, so folding them into a
+// `Canvas`/`Rect` pair would add two constructions at each of ~60 call
+// sites across every compositor client for no readability gain — and
+// the argument order is the one every framebuffer blit in the tree
+// already uses.
+#[allow(clippy::too_many_arguments)]
 pub fn fill_rect(
     pixels: &mut [u32],
     stride: u32,
@@ -437,6 +454,8 @@ pub fn fill_rect(
 }
 
 /// Draw a 1-pixel border around a rectangle.
+// Blit signature — see the note on `fill_rect`.
+#[allow(clippy::too_many_arguments)]
 pub fn stroke_rect(
     pixels: &mut [u32],
     stride: u32,
@@ -459,6 +478,8 @@ pub fn stroke_rect(
 /// Draw an ASCII string with the bundled 8×16 bitmap font at native
 /// scale. Returns the rendered width in pixels. Codepoints outside
 /// ASCII fall back to the centred-dot glyph.
+// Blit signature — see the note on `fill_rect`.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_text(
     pixels: &mut [u32],
     stride: u32,
@@ -477,6 +498,8 @@ pub fn draw_text(
 /// Used by HiDPI surfaces (1080p+) so the text matches the
 /// framebuffer's higher pixel density. Returns the rendered width
 /// in pixels (`8 * scale * text.len()` if nothing clipped).
+// Blit signature — see the note on `fill_rect`.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_text_scaled(
     pixels: &mut [u32],
     stride: u32,
@@ -505,6 +528,8 @@ pub fn draw_text_scaled(
     cx - x
 }
 
+// Blit signature — see the note on `fill_rect`.
+#[allow(clippy::too_many_arguments)]
 fn draw_glyph_alpha(
     pixels: &mut [u32],
     stride: u32,

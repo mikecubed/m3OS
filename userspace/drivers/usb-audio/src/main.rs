@@ -141,12 +141,12 @@ impl UsbSink {
                 data.clear();
                 data.extend_from_slice(chunk);
             }
-            match usb_call(self.usb_ep, &req) {
-                Some(UsbReply::TransferComplete { transferred, .. }) => {
-                    sent += transferred;
-                }
-                // Dropped interval / transport hiccup — keep streaming.
-                _ => {}
+            // Anything other than a completion is a dropped interval /
+            // transport hiccup — keep streaming.
+            if let Some(UsbReply::TransferComplete { transferred, .. }) =
+                usb_call(self.usb_ep, &req)
+            {
+                sent += transferred;
             }
         }
         self.frames_consumed += (sent as u64) / BYTES_PER_FRAME;

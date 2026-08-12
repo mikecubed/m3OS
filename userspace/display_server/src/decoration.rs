@@ -70,6 +70,12 @@ pub struct RoundedCornerMask {
     alpha: Vec<u8>,
 }
 
+// Only `new` has a caller: `main.rs` pre-computes the mask at startup and holds
+// it as `_decoration_mask`, because the per-frame corner pass that would read it
+// is a documented Phase 73 follow-up. The read side (`radius` / `is_disabled` /
+// `sample` / `apply`) is therefore complete but unreached, and is what that pass
+// will call — the same reason `DropShadow` below is built but never blitted.
+#[allow(dead_code)]
 impl RoundedCornerMask {
     /// Build a mask of the given radius. `radius == 0` returns an empty
     /// mask that disables the pass.
@@ -189,6 +195,11 @@ impl RoundedCornerMask {
 /// blur_radius` border on each side. Each cell stores the shadow's
 /// alpha contribution at that offset. The compose loop blits the
 /// shadow before the window itself, offset by `shadow_offset_x/y`.
+/// Nothing constructs one yet — the compose loop has no shadow blit, so this is
+/// the pre-computed half of the same deferred decoration pass documented on
+/// [`RoundedCornerMask`]. Kept whole (the falloff table is the expensive,
+/// easy-to-get-wrong part) rather than deleted and re-derived later.
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct DropShadow {
     pub width: u32,
@@ -203,6 +214,8 @@ pub struct DropShadow {
     pub pixels: Vec<u32>,
 }
 
+// Unreached along with the type itself — see the note on `DropShadow` above.
+#[allow(dead_code)]
 impl DropShadow {
     /// Pre-compute the shadow for a window of `(w, h)` pixels.
     ///
@@ -227,7 +240,7 @@ impl DropShadow {
         let inner_t = pad;
         let inner_b = pad + height as usize - 1;
         let max_dist = blur_radius as i64;
-        let color_a = ((color >> 24) & 0xFF) as u32;
+        let color_a = (color >> 24) & 0xFF;
         let color_rgb = color & 0x00FF_FFFF;
         for y in 0..buf_h {
             for x in 0..buf_w {

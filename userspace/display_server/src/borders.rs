@@ -36,8 +36,15 @@ impl BorderConfig {
         }
     }
 
-    /// Disabled-border config — width zero, colours zero. Used when
-    /// the config file explicitly sets `width = 0`.
+    /// Disabled-border config — width zero, colours zero.
+    ///
+    /// The config path reaches the same state by parsing `width = 0` into an
+    /// otherwise-default `BorderConfig` rather than swapping this whole value
+    /// in, so nothing calls it today. Kept as the named counterpart to
+    /// `defaults()` — it is what a caller that wants "borders off" without a
+    /// config file should use, and it keeps the disabled encoding (width AND
+    /// colours zeroed) stated in one place instead of implied at a call site.
+    #[allow(dead_code)]
     pub const fn disabled() -> Self {
         Self {
             width: 0,
@@ -137,7 +144,7 @@ fn fill_solid<O: FramebufferOwner>(
     for _ in 0..pixel_count {
         buf.extend_from_slice(pixel);
     }
-    let stride = (rect.w as u32).saturating_mul(bpp as u32);
+    let stride = rect.w.saturating_mul(bpp as u32);
     owner.write_pixels(rect, &buf, stride)?;
     Ok(1)
 }

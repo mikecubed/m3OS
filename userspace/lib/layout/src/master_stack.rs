@@ -69,13 +69,9 @@ fn clamp_ratio(ratio: f32) -> f32 {
     if ratio.is_nan() {
         return DEFAULT_MASTER_RATIO;
     }
-    if ratio < MIN_MASTER_RATIO {
-        MIN_MASTER_RATIO
-    } else if ratio > MAX_MASTER_RATIO {
-        MAX_MASTER_RATIO
-    } else {
-        ratio
-    }
+    // NaN is already routed to the default above, so `clamp`'s NaN
+    // caveat cannot bite here; MIN < MAX are compile-time constants.
+    ratio.clamp(MIN_MASTER_RATIO, MAX_MASTER_RATIO)
 }
 
 impl TiledLayoutPolicy for MasterStackLayout {

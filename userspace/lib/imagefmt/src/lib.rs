@@ -260,7 +260,7 @@ fn inflate_zlib(data: &[u8], expected_len: usize) -> Result<Vec<u8>, ImageError>
     if (cmf & 0x0F) != 8 {
         return Err(ImageError::Unsupported);
     }
-    if (cmf as u16 * 256 + flg as u16) % 31 != 0 {
+    if !(cmf as u16 * 256 + flg as u16).is_multiple_of(31) {
         return Err(ImageError::Corrupt);
     }
     if (flg & 0x20) != 0 {
@@ -827,8 +827,8 @@ mod tests {
         // out_h = 200 * 1024 / 320 = 640.
         // off_y = (768 - 640) / 2 = 64.
         // Verify top row is letterbox (zero).
-        for x in 0..dst_w as usize {
-            assert_eq!(dst[x], 0, "top letterbox row");
+        for px in dst.iter().take(dst_w as usize) {
+            assert_eq!(*px, 0, "top letterbox row");
         }
         // Verify middle row is fully painted.
         let mid = 64usize + 320usize; // any row inside [64..704)

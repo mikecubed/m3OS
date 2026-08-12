@@ -66,31 +66,6 @@ pub struct UserInfo {
 
 extern crate alloc;
 
-/// Parse /etc/passwd to find a user entry.
-fn find_user(passwd: &[u8], username: &[u8]) -> Option<UserInfo> {
-    for line in passwd.split(|&b| b == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let fields = split_colon(line)?;
-        if fields[0] == username {
-            let uid = parse_u32(fields[2])?;
-            let gid = parse_u32(fields[3])?;
-            let uname = core::str::from_utf8(fields[0]).ok()?;
-            let home = core::str::from_utf8(fields[5]).ok()?;
-            let shell = core::str::from_utf8(fields[6]).ok()?;
-            return Some(UserInfo {
-                username: alloc::string::String::from(uname),
-                uid,
-                gid,
-                home: alloc::string::String::from(home),
-                shell: alloc::string::String::from(shell),
-            });
-        }
-    }
-    None
-}
-
 /// Split a line on ':' into exactly 7 fields.
 fn split_colon(line: &[u8]) -> Option<[&[u8]; 7]> {
     let mut fields = [&[] as &[u8]; 7];

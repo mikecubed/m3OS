@@ -18,11 +18,28 @@
 //!     and surface-buffer transport (pure-logic cores already in
 //!     `kernel-core::input::mouse`, `kernel-core::display::frame_tick`,
 //!     `kernel-core::display::buffer`).
-#![no_std]
-#![no_main]
-#![feature(alloc_error_handler)]
+//!
+//! `cfg(not(test))` gates protect the OS-only crate attributes, the
+//! `_start` entry point, the `BrkAllocator` and the panic / alloc-error
+//! lang items so `cargo test -p display_server --target
+//! x86_64-unknown-linux-gnu` builds the crate as an ordinary `std` test
+//! binary (`std` then supplies those lang items). The `cfg(not(test))`
+//! build is unchanged.
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
+#![cfg_attr(not(test), feature(alloc_error_handler))]
+// `_start`/`program_main` — the only reachability root this binary has — is
+// `cfg(not(test))`, so under the test cfg rustc's reachability analysis
+// starts from the `#[test]` fns alone and reports essentially every
+// production item as dead. That signal is meaningless here, so it is
+// silenced for the test cfg only; the OS build
+// (`cargo clippy --target x86_64-m3os.json`) keeps full `dead_code`
+// enforcement, which is the lane that actually ships.
+#![cfg_attr(test, allow(dead_code))]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 mod animation;
 mod borders;
@@ -37,15 +54,21 @@ mod keybind;
 mod surface;
 mod workspace;
 
+// Only the `cfg(not(test))` alloc-error handler needs `Layout`.
+#[cfg(not(test))]
 use core::alloc::Layout;
 use kernel_core::display::clipboard::ClipboardStore;
 use kernel_core::display::fb_owner::FramebufferOwner;
-use kernel_core::display::protocol::{Rect, ServerMessage, SurfaceId, SurfaceRole};
+use kernel_core::display::protocol::{
+    CLIPBOARD_DATA_BODY_LEN, FRAME_HEADER_SIZE, Rect, ServerMessage, SurfaceId, SurfaceRole,
+};
 use kernel_core::display::stats::FrameStatsRing;
 use kernel_core::input::bind_table::{BindTable, GrabState};
 use kernel_core::input::dispatch::SurfaceGeometry;
 use syscall_lib::IpcMessage;
 use syscall_lib::STDOUT_FILENO;
+// Only the `cfg(not(test))` `#[global_allocator]` names `BrkAllocator`.
+#[cfg(not(test))]
 use syscall_lib::heap::BrkAllocator;
 
 use crate::client::{FatalReason, InboundFrame, dispatch};
@@ -110,9 +133,14 @@ use crate::fb::KernelFramebufferOwner;
 use crate::input::{InputEffect, InputWiring};
 use crate::surface::SurfaceRegistry;
 
+// The `brk`-backed allocator and the alloc-error lang item exist only in
+// the OS build; under `cfg(test)` the host test harness links `std`,
+// which already provides both.
+#[cfg(not(test))]
 #[global_allocator]
 static ALLOCATOR: BrkAllocator = BrkAllocator::new();
 
+#[cfg(not(test))]
 #[alloc_error_handler]
 fn alloc_error(_layout: Layout) -> ! {
     syscall_lib::write_str(STDOUT_FILENO, "display_server: alloc error\n");
@@ -130,6 +158,9 @@ fn alloc_error(_layout: Layout) -> ! {
 /// teal background.
 pub const BG_PIXEL: u32 = 0x002B_5A4Bu32;
 
+// `_start` is the ring-3 ELF entry point; under `cfg(test)` the test
+// harness supplies `main` instead.
+#[cfg(not(test))]
 syscall_lib::entry_point_with_env!(program_main);
 
 /// Phase 56 Track F.2 — debug-crash gate. The dispatcher consults this
@@ -788,7 +819,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             compose_ctx.force_full_repaint_clearing_background();
         }
         if let Some(focused_id) = focused
-            && outcome.destroyed.iter().any(|id| *id == focused_id)
+            && outcome.destroyed.contains(&focused_id)
         {
             focused = None;
             publish_focus_changed(&mut control_subs, focused, null_subscriber_sender);
@@ -924,9 +955,17 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                     mime_tag: tag,
                     len: bytes.len() as u32,
                 };
-                // Frame (9 bytes) + the offer bytes into one reply buffer.
-                let mut reply = alloc::vec::Vec::with_capacity(16 + bytes.len());
-                let mut frame = [0u8; 16];
+                // Frame (`FRAME_HEADER_SIZE + CLIPBOARD_DATA_BODY_LEN` = 9
+                // bytes) + the offer bytes into one reply buffer. Sized off
+                // the real `ClipboardData` frame constants rather than a
+                // locally duplicated `16`, so this can't under-size the
+                // buffer and silently drop the reply (`encode` returning
+                // `Err(Truncated)`, no bulk staged, both clients seeing a
+                // rejected reply) if the frame body ever grows.
+                let mut reply = alloc::vec::Vec::with_capacity(
+                    FRAME_HEADER_SIZE + CLIPBOARD_DATA_BODY_LEN + bytes.len(),
+                );
+                let mut frame = [0u8; FRAME_HEADER_SIZE + CLIPBOARD_DATA_BODY_LEN];
                 if let Ok(n) = hdr.encode(&mut frame) {
                     reply.extend_from_slice(&frame[..n]);
                     reply.extend_from_slice(bytes);
@@ -1172,10 +1211,8 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                         }
                         rendered_surfaces.insert(*sid);
                     }
-                    Some(prev) if prev != *rect => {
-                        if !slide_in_flight {
-                            animation_engine.animate_move(*sid, prev, *rect);
-                        }
+                    Some(prev) if prev != *rect && !slide_in_flight => {
+                        animation_engine.animate_move(*sid, prev, *rect);
                     }
                     _ => {}
                 }
@@ -1457,15 +1494,19 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         for effect in effects {
             match effect {
                 InputEffect::Outbound(target, msg) => {
-                    // E.3 seam: extract the pointer's `abs_position`
-                    // from any `Pointer` message the dispatcher
-                    // emitted, and forward it to the next compose
-                    // call's cursor blit.
-                    if let kernel_core::display::protocol::ServerMessage::Pointer(ev) = msg
-                        && let Some(abs) = ev.abs_position
-                    {
-                        pointer_position = abs;
-                    }
+                    // NB: the compositor must never read its own cursor
+                    // position back out of a client-bound `Pointer`
+                    // message. That message carries *surface-local*
+                    // coordinates (rebased onto the hit surface's origin
+                    // by the input wiring), while `pointer_position`
+                    // feeds the cursor blit and the next pass's hit-test,
+                    // which both work in output coordinates — taking it
+                    // back would drag the cursor toward the top-left by
+                    // the surface origin on every event. The authoritative
+                    // update is `InputEffect::CursorMoved` below, which
+                    // is emitted unconditionally, including when the
+                    // pointer is over no surface at all.
+                    //
                     // Phase 56 C.5 close-out — push the dispatcher's
                     // `Outbound` message onto the per-client queue.
                     // The client drains it via `LABEL_CLIENT_EVENT_PULL`
@@ -1817,6 +1858,11 @@ fn serve_one_control_request(
 /// The Phase 56 close-out wires this from `serve_one_control_request`
 /// using the new `SYS_IPC_TRY_RECV_MSG` syscall to multiplex frame-tick
 /// driving and control-endpoint serving in the same single-threaded loop.
+///
+/// The parameter list is `control::dispatch_command`'s, minus the decoded
+/// command this function decodes itself — see the rationale there. Bundling
+/// here without bundling there would just add a pack/unpack step.
+#[allow(clippy::too_many_arguments)]
 fn serve_control_iter<F, I>(
     bulk: &[u8],
     client: control::ClientId,
@@ -1906,7 +1952,6 @@ where
 /// success, or `0` if even the error event won't fit in `reply_buf`.
 /// `0` lets the caller send a label-only reply so the client at
 /// least observes a roundtrip.
-#[allow(dead_code)]
 fn encode_event_or_drop(
     evt: &kernel_core::display::control::ControlEvent,
     reply_buf: &mut [u8],
@@ -2134,8 +2179,7 @@ impl RecentFrames {
     /// scanners see the failing frame at the bottom and its predecessor
     /// just above it.
     fn dump(&self) {
-        let mut age = 0;
-        for offset in 0..RECENT_FRAMES_CAP {
+        for (age, offset) in (0..RECENT_FRAMES_CAP).enumerate() {
             let idx = (self.next + offset) % RECENT_FRAMES_CAP;
             if let Some(entry) = &self.entries[idx] {
                 syscall_lib::write_str(STDOUT_FILENO, "display_server:   recent[-");
@@ -2154,7 +2198,6 @@ impl RecentFrames {
                 syscall_lib::write_str(STDOUT_FILENO, recent_outcome_name(entry.outcome));
                 syscall_lib::write_str(STDOUT_FILENO, "\n");
             }
-            age += 1;
         }
     }
 }
@@ -2670,6 +2713,15 @@ fn run_autostart(entries: &[alloc::string::String]) {
 /// Phase 72 — execute a typed `KeybindAction` against the live
 /// compositor state. Each arm is a small state-machine step the
 /// main loop folds into its existing focus / publish helpers.
+///
+/// Seven of the eight parameters are `&mut` borrows of *disjoint* locals in
+/// `program_main`'s event loop — workspace manager, bind stack, focus slot,
+/// subscription registry, client event queue, compose context — plus the
+/// immutable config. They are separate parameters precisely so the borrow
+/// checker can see they do not alias; folding them into one struct would make
+/// every arm below borrow the whole struct mutably and force the loop to
+/// reconstruct it each iteration, for no readability gain at the one call site.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_keybind_action(
     action: keybind::KeybindAction,
     workspace_mgr: &mut workspace::WorkspaceManager,
@@ -2684,18 +2736,18 @@ fn dispatch_keybind_action(
     match action {
         KeybindAction::SwitchWorkspace(n) => {
             let idx = (n.saturating_sub(1)) as usize;
-            if let Ok(transition) = workspace_mgr.switch_workspace(idx) {
-                if transition.switched {
-                    syscall_lib::write_str(STDOUT_FILENO, "display_server: workspace switched to ");
-                    write_u32(n as u32);
-                    syscall_lib::write_str(STDOUT_FILENO, "\n");
-                    // Pick focus from the new workspace; falls back
-                    // to None if it is empty.
-                    *focused = workspace_mgr.next_focus(None);
-                    publish_focus_changed(control_subs, *focused, null_subscriber_sender);
-                    compose_ctx.invalidate_arrangement_cache();
-                    compose_ctx.force_full_repaint_clearing_background();
-                }
+            if let Ok(transition) = workspace_mgr.switch_workspace(idx)
+                && transition.switched
+            {
+                syscall_lib::write_str(STDOUT_FILENO, "display_server: workspace switched to ");
+                write_u32(n as u32);
+                syscall_lib::write_str(STDOUT_FILENO, "\n");
+                // Pick focus from the new workspace; falls back
+                // to None if it is empty.
+                *focused = workspace_mgr.next_focus(None);
+                publish_focus_changed(control_subs, *focused, null_subscriber_sender);
+                compose_ctx.invalidate_arrangement_cache();
+                compose_ctx.force_full_repaint_clearing_background();
             }
         }
         KeybindAction::MoveToWorkspace(n) => {
@@ -2831,13 +2883,13 @@ fn dispatch_keybind_action(
                 // mode active — the user might press H/J/K/L after
                 // focusing a window. Log a one-line warning so the
                 // failure mode is visible.
-                if let Err(other) = result.as_ref() {
-                    if !matches!(other, layout::LayoutError::Unsupported) {
-                        syscall_lib::write_str(
-                            STDOUT_FILENO,
-                            "display_server: resize keystroke ignored (no focused window?)\n",
-                        );
-                    }
+                if let Err(other) = result.as_ref()
+                    && !matches!(other, layout::LayoutError::Unsupported)
+                {
+                    syscall_lib::write_str(
+                        STDOUT_FILENO,
+                        "display_server: resize keystroke ignored (no focused window?)\n",
+                    );
                 }
                 // On a successful resize the policy state changed under
                 // the same id set, so the arrangement cache would
@@ -3123,6 +3175,8 @@ fn publish_to_subscribers_workspace(subs: &mut control::ControlSubscriptions, wo
     );
 }
 
+// `std` owns `panic_impl` in the host test build.
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     syscall_lib::write_str(STDOUT_FILENO, "display_server: PANIC\n");

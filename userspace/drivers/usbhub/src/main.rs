@@ -317,12 +317,12 @@ fn write_u32_dec(n: u32) {
 fn hub_ports_have_change(usb_ep: u32, slot_id: u8, nports: u8) -> bool {
     for port in 1..=nports {
         let setup = setup_to_bytes(get_port_status(port));
-        if let Some(st) = control(usb_ep, slot_id, setup, 4) {
-            if st.len() >= 4 {
-                let change_word = u16::from_le_bytes([st[2], st[3]]);
-                if change_word != 0 {
-                    return true;
-                }
+        if let Some(st) = control(usb_ep, slot_id, setup, 4)
+            && st.len() >= 4
+        {
+            let change_word = u16::from_le_bytes([st[2], st[3]]);
+            if change_word != 0 {
+                return true;
             }
         }
     }
@@ -520,20 +520,6 @@ fn enumerate_hub(usb_ep: u32, notice: &AttachNotice) -> Option<u8> {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Hub daemon main — Phase 92 Track A / Phase 100 Track D.3.
-///
-/// Logs [`BOOT_LOG_MARKER`], waits on the `usb` service, walks the `NextAttach`
-/// cursor for a `CLASS_HUB` interface, and drives each hub through its descriptor
-/// read + per-port `PORT_POWER`/`PORT_RESET` bring-up. Exits cleanly when no hub
-/// is present (the common machine) so init's `on-failure` policy marks the
-/// service stopped rather than looping.
-///
-/// Phase 100 Track D.3: after initial enumeration, enters a steady-state
-/// port-monitoring loop with adaptive backoff so the walker no longer pins a
-/// core at idle. Full notification-driven port-status changes (using the hub's
-/// interrupt-IN endpoint for status-change notifications) are deferred to
-/// Phase 103 (USB runtime power management).
-#[cfg(not(test))]
 /// One full `NextAttach` walk collecting hub-class interfaces. Returns the hubs
 /// found plus whether the walk was cut short by a server **timeout** (busy —
 /// retry) rather than reaching the end of the attach table.
@@ -566,6 +552,24 @@ fn enumerate_hubs_once(usb_ep: u32) -> (Vec<AttachNotice>, bool) {
     }
 }
 
+/// Hub daemon main — Phase 92 Track A / Phase 100 Track D.3.
+///
+/// Logs [`BOOT_LOG_MARKER`], waits on the `usb` service, walks the `NextAttach`
+/// cursor for a `CLASS_HUB` interface, and drives each hub through its descriptor
+/// read + per-port `PORT_POWER`/`PORT_RESET` bring-up. Exits cleanly when no hub
+/// is present (the common machine) so init's `on-failure` policy marks the
+/// service stopped rather than looping.
+///
+/// Phase 100 Track D.3: after initial enumeration, enters a steady-state
+/// port-monitoring loop with adaptive backoff so the walker no longer pins a
+/// core at idle. Full notification-driven port-status changes (using the hub's
+/// interrupt-IN endpoint for status-change notifications) are deferred to
+/// Phase 103 (USB runtime power management).
+///
+/// Gated `not(test)`: this is the `entry_point!` target and its body is pure
+/// syscall plumbing (`STDOUT_FILENO`, the `usb` IPC service, the control-transfer
+/// helpers), none of which exists in a host `std` test build.
+#[cfg(not(test))]
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, BOOT_LOG_MARKER);
 
@@ -644,7 +648,7 @@ fn program_main(_args: &[&str]) -> i32 {
         // within the smoke window — it never would while the C_PORT_CONNECTION
         // re-enumeration bug was live) and then periodically thereafter.
         if consecutive_idle == 1
-            || (consecutive_idle > 0 && consecutive_idle % HUB_IDLE_LOG_EVERY == 0)
+            || (consecutive_idle > 0 && consecutive_idle.is_multiple_of(HUB_IDLE_LOG_EVERY))
         {
             syscall_lib::write_str(STDOUT_FILENO, "USB_HUB:idle ticks=");
             write_u32_dec(consecutive_idle);
@@ -729,7 +733,13 @@ mod tests {
     fn hub_backoff_grows_after_threshold() {
         let base = hub_next_backoff_ns(0);
         let grown = hub_next_backoff_ns(4);
-        assert!(grown >= base, "backoff must be non-decreasing");
+        // Strictly greater, not `>=`: the point of the backoff is that an idle
+        // hub polls *less* often, so a curve flattened to a constant is the
+        // regression this test exists to catch — and `>=` would pass for it.
+        assert!(
+            grown > base,
+            "backoff must grow once the idle threshold is crossed: {base} -> {grown}"
+        );
     }
 
     #[test]

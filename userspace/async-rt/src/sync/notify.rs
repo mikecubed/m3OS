@@ -22,6 +22,12 @@ pub struct Notify {
     signalled: Cell<bool>,
 }
 
+impl Default for Notify {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Notify {
     /// Create a new `Notify` in the unsignalled state.
     pub fn new() -> Self {

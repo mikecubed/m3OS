@@ -318,14 +318,16 @@ fn read_dir_into(dir_path: &[u8], prefix: &[u8], out: &mut Vec<String>) {
             while nz < name_end && buf[nz] != 0 {
                 nz += 1;
             }
-            if let Ok(name) = core::str::from_utf8(&buf[name_start..nz]) {
-                if name != "." && name != ".." && !name.is_empty() {
-                    let mut full = String::with_capacity(prefix_str.len() + 1 + name.len());
-                    full.push_str(prefix_str);
-                    full.push('/');
-                    full.push_str(name);
-                    out.push(full);
-                }
+            if let Ok(name) = core::str::from_utf8(&buf[name_start..nz])
+                && name != "."
+                && name != ".."
+                && !name.is_empty()
+            {
+                let mut full = String::with_capacity(prefix_str.len() + 1 + name.len());
+                full.push_str(prefix_str);
+                full.push('/');
+                full.push_str(name);
+                out.push(full);
             }
             off += reclen;
         }

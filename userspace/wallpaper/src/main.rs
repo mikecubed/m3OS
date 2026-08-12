@@ -194,10 +194,8 @@ fn load_config() -> WallpaperConfig {
             None => continue,
         };
         match k {
-            "path" => {
-                if !v.is_empty() {
-                    cfg.path = Some(v.to_string());
-                }
+            "path" if !v.is_empty() => {
+                cfg.path = Some(v.to_string());
             }
             "fallback_color" => {
                 let hex = v.trim_start_matches("0x").trim_start_matches('#');

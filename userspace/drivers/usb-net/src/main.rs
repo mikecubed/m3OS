@@ -345,10 +345,10 @@ fn scan_once(usb_ep: u32) -> Option<CdcDevice> {
             Some(UsbReply::Attach {
                 notice: Some(notice),
             }) => {
-                if notice.attached {
-                    if let Some(dev) = try_bind(usb_ep, &notice, cursor) {
-                        return Some(dev);
-                    }
+                if notice.attached
+                    && let Some(dev) = try_bind(usb_ep, &notice, cursor)
+                {
+                    return Some(dev);
                 }
                 if cursor == u8::MAX {
                     return None;

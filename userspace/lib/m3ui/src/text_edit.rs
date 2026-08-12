@@ -36,6 +36,12 @@ impl TextBuffer {
     }
 
     /// A buffer seeded with `s`, cursor at the end.
+    //
+    // `should_implement_trait` wants `core::str::FromStr`, but that trait
+    // is `Result`-returning and this conversion cannot fail — every call
+    // site would have to unwrap an `Infallible` error for no gain. The
+    // inherent name is kept because it reads correctly at the call site.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> TextBuffer {
         let chars: Vec<char> = s.chars().collect();
         let cursor = chars.len();

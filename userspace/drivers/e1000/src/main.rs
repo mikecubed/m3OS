@@ -108,12 +108,11 @@ fn find_e1000() -> Option<driver_runtime::DeviceCapKey> {
     )
     .ok()?;
     for key in candidates {
-        if let Ok((vendor, device)) = driver_runtime::read_vendor_device(key) {
-            if vendor == kernel_core::nic_ids::VENDOR_INTEL
-                && kernel_core::nic_ids::is_e1000(device)
-            {
-                return Some(key);
-            }
+        if let Ok((vendor, device)) = driver_runtime::read_vendor_device(key)
+            && vendor == kernel_core::nic_ids::VENDOR_INTEL
+            && kernel_core::nic_ids::is_e1000(device)
+        {
+            return Some(key);
         }
     }
     None

@@ -54,6 +54,16 @@ mod boot;
 mod control;
 mod init_proxy;
 mod recover;
+// Phase 64a moved the stop motion out of this process and into init (see
+// `SupervisorBackend::stop` below): init owns the supervised children, so only
+// it can set `restart_policy = Never` before signalling and actually reap. That
+// left `runtime`'s syscall adapters — the only production implementations of
+// the `lifecycle::{KernelClock, SignalSink, Reaper}` seams — with no caller,
+// while the host-tested state machine they back is still live. Keep them
+// wired-but-unused rather than deleting the seam's production half: an
+// init-delegation fallback or the deferred-reply event loop the module doc
+// describes would use them unchanged.
+#[allow(dead_code)]
 mod runtime;
 
 // Phase 64: pure-logic types (`Pid`, `ServiceState`, `ServiceTable`)
@@ -281,7 +291,7 @@ mod init_backend {
     //! is missing.
 
     use kernel_core::session_supervisor::{SupervisorBackend, SupervisorError, SupervisorReply};
-    use session_manager::init_status::{InitServiceState, init_service_name};
+    use session_manager::init_status::init_service_name;
     use session_manager::table::{Pid, ServiceState, ServiceTable};
 
     use crate::init_proxy;
@@ -437,11 +447,11 @@ mod init_backend {
             const STATUS_POLL_NS: u32 = 500_000_000;
             let mut observed_terminal = false;
             for _ in 0..STATUS_POLL_ITERS {
-                if let Some(status) = init_proxy::read_service_status(init_name) {
-                    if status.state.is_terminal() {
-                        observed_terminal = true;
-                        break;
-                    }
+                if let Some(status) = init_proxy::read_service_status(init_name)
+                    && status.state.is_terminal()
+                {
+                    observed_terminal = true;
+                    break;
                 }
                 let _ = syscall_lib::nanosleep_for(0, STATUS_POLL_NS);
             }
@@ -637,7 +647,7 @@ mod init_backend {
                 if timeout_ms == 0 {
                     break;
                 }
-                let _ = syscall_lib::nanosleep_for(0, (AWAIT_POLL_MS as u32) * 1_000_000);
+                let _ = syscall_lib::nanosleep_for(0, AWAIT_POLL_MS * 1_000_000);
             }
             Ok(SupervisorReply::ReadyState { ready: false })
         }

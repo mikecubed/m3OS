@@ -420,7 +420,8 @@ fn decode_scan(
     for my in 0..mcus_y {
         for mx in 0..mcus_x {
             // Restart handling.
-            if restart_interval != 0 && mcu_count != 0 && mcu_count % restart_interval == 0 {
+            if restart_interval != 0 && mcu_count != 0 && mcu_count.is_multiple_of(restart_interval)
+            {
                 // Expect an RSTn marker; skip it and reset predictors.
                 skip_restart(&mut br)?;
                 for c in components.iter_mut() {

@@ -152,7 +152,7 @@ pub fn process_sed(input: &[u8], cmd: &SedCmd, quiet: bool) -> Vec<u8> {
                 }
             }
             SedCmd::DeleteRange { start, end } => {
-                if !(line_no >= *start && line_no <= *end) && !quiet {
+                if !quiet && (line_no < *start || line_no > *end) {
                     result.extend_from_slice(line);
                     result.push(b'\n');
                 }

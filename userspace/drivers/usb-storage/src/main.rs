@@ -1698,7 +1698,7 @@ fn discover_storage_devices(usb_ep: u32) -> Vec<(AttachNotice, u8)> {
     let mut best: Vec<(AttachNotice, u8)> = Vec::new();
     let mut stable = 0u32;
 
-    for attempt in 0..MAX_POLLS {
+    for _ in 0..MAX_POLLS {
         let mut current: Vec<(AttachNotice, u8)> = Vec::new();
         let mut cursor = 0u8;
         loop {

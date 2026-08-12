@@ -32,6 +32,42 @@ use serde_json::{Value, json};
 /// hanging the probe forever on a wedged guest.
 pub const DEFAULT_CMD_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Gap left between the individual edges of a pointer gesture
+/// ([`QmpClient::drag_abs_with_mods`] and everything built on it).
+///
+/// This is load-bearing for any *modifier-qualified* gesture, and the
+/// reason is a guest-side polling race rather than anything QEMU does
+/// wrong. QMP `input-send-event` delivers each edge faithfully, but the
+/// keyboard and the pointer are two independent USB interrupt-IN
+/// endpoints, and the guest's `usb-hid` daemon drains them from one poll
+/// loop — one report per device per tick. QEMU's `usb-tablet` hands out
+/// its queued motion/button reports one per poll, while `usb-kbd` drains
+/// its whole scancode queue in a couple of polls. Fire the twelve edges
+/// of a `shift`-held drag back to back and the keyboard timeline runs
+/// *ahead* of the pointer timeline: the guest reads the Shift make, then
+/// the first motion report, then the Shift **break** — which was sent
+/// last, but is already queued — and only then the button press and the
+/// remaining motion. Empirically (headless repro on the
+/// `term-daily-driver-smoke` lane) the release edge lands between the
+/// first `MoveAbs` and the button-down, so `display_server` stamps the
+/// entire drag with *no* modifiers and `term`'s Shift-drag override never
+/// fires.
+///
+/// Pacing every edge fixes it: each step is consumed before the next is
+/// queued, so the two device timelines cannot invert. The value must
+/// exceed the guest poller's worst-case sleep — `usb-hid` backs off to
+/// `kernel_core::input::hid_poll::HID_POLL_MAX_IDLE_NS` (100 ms) when
+/// idle, and only snaps back to its 5 ms cadence once a report arrives —
+/// so the *first* edge of a gesture can sit in QEMU's queue for up to
+/// 100 ms before anyone looks at it. 150 ms clears that with margin on
+/// TCG. Cost is ~2 s per 13-step drag, which the gate's budget absorbs.
+///
+/// Applied uniformly, including to unmodified drags: arm 6 of
+/// `term-daily-driver-smoke` compares an unshifted drag against a
+/// Shift-held one, and that comparison is only honest if the two
+/// gestures differ *only* in the modifier.
+pub const GESTURE_STEP_PACING: Duration = Duration::from_millis(150);
+
 /// One QMP client. Wraps the underlying `UnixStream` plus a buffered
 /// reader. Dropping closes the socket; QEMU treats that as a benign
 /// monitor disconnect.
@@ -198,6 +234,28 @@ impl QmpClient {
         Ok(())
     }
 
+    /// Press *or* release a single PS/2 key by QEMU `qcode` name, as one
+    /// half of a make/break pair.
+    ///
+    /// [`Self::press_key`] and [`Self::press_chord`] both go through
+    /// `send-key`, which synthesises the release for you — so neither can
+    /// leave a key held down across *other* events. That is exactly what a
+    /// modifier-qualified pointer gesture needs: the compositor stamps its
+    /// live keyboard-modifier snapshot onto every pointer event it
+    /// delivers, so `term`'s Shift-drag override and Alt block-select are
+    /// only reachable if Shift/Alt is physically down while the button and
+    /// motion events arrive. `input-send-event`'s `key` event carries an
+    /// explicit `down` flag and does not synthesise the other edge, which
+    /// is what makes the hold possible.
+    ///
+    /// Every `true` must be paired with a matching `false` — a leaked
+    /// key-down stays latched in the guest's modifier state for the rest
+    /// of the run and corrupts every later arm.
+    pub fn send_key_state(&mut self, qcode: &str, down: bool) -> Result<(), QmpError> {
+        let _ = self.execute("input-send-event", key_state_args(qcode, down))?;
+        Ok(())
+    }
+
     /// Inject a relative pointer motion into the guest via QMP
     /// `input-send-event`. Drives the emulated `usb-mouse` (QEMU routes the
     /// pointer event through its input subsystem to the active mouse device).
@@ -219,18 +277,129 @@ impl QmpClient {
     /// `input-send-event`. QEMU routes `abs` events to a device that registered
     /// absolute axes — the emulated `usb-tablet` — so this drives the
     /// Report-Protocol pointer path (Phase 92b B.2) distinct from the relative
-    /// `usb-mouse`. Values are in QEMU's normalized 0..0x7FFF absolute range.
+    /// `usb-mouse`.
+    ///
+    /// `x` / `y` are **screen pixels**, not the 0..0x7FFF normalized range the
+    /// name "absolute" usually implies. QEMU maps an `input-send-event` abs
+    /// value into the target device's logical axis range, and `usb-tablet`'s
+    /// logical range *is* 0..0x7FFF — so the mapping is the identity and the
+    /// literal number here reaches the device. m3OS's `usb-hid` then reports
+    /// the decoded value unscaled (`abs_position = (x, y)` raw), so the
+    /// compositor hit-tests against exactly what was passed. Sending 0x4000
+    /// would land at (16384, 16384): outside any real framebuffer, hitting no
+    /// surface, and the event is silently dropped.
     pub fn send_pointer_abs(&mut self, x: i32, y: i32) -> Result<(), QmpError> {
-        let _ = self.execute(
-            "input-send-event",
-            json!({
-                "events": [
-                    {"type": "abs", "data": {"axis": "x", "value": x}},
-                    {"type": "abs", "data": {"axis": "y", "value": y}},
-                ]
-            }),
-        )?;
+        let _ = self.execute("input-send-event", abs_move_args(x, y))?;
         Ok(())
+    }
+
+    /// Phase 112 Track C.1 — press or release a pointer button in the
+    /// guest via QMP `input-send-event`.
+    ///
+    /// `button` is a QEMU button name (`"left"`, `"middle"`, `"right"`).
+    /// Press and release are separate calls so a caller can hold the
+    /// button down across intervening motion events — which is exactly
+    /// what a selection drag is, and why [`Self::press_key`]-style
+    /// press-and-release-in-one would not work here.
+    pub fn send_button(&mut self, button: &str, down: bool) -> Result<(), QmpError> {
+        let _ = self.execute("input-send-event", button_event_args(button, down))?;
+        Ok(())
+    }
+
+    /// Phase 112 Track C.1 — inject `|notches|` wheel events via QMP
+    /// `input-send-event`. Positive `notches` is wheel-**up**, matching
+    /// the `PointerEvent::wheel_dy` convention the guest sees.
+    ///
+    /// QEMU models a wheel notch as a button press+release of the
+    /// pseudo-buttons `wheel-up` / `wheel-down`, so each notch is two
+    /// events. A wheel only reaches the guest through a Report-protocol
+    /// pointer (`usb-tablet`); the PS/2 path never carries one.
+    pub fn send_wheel(&mut self, notches: i32) -> Result<(), QmpError> {
+        for _ in 0..notches.unsigned_abs() {
+            let _ = self.execute("input-send-event", wheel_notch_args(notches))?;
+        }
+        Ok(())
+    }
+
+    /// Phase 112 Track C.1 — drag from one absolute position to another
+    /// with the left button held: press, a few interpolated motion
+    /// samples, release.
+    ///
+    /// The intermediate samples matter — `term` extends a selection on
+    /// motion events, so a press followed immediately by a release at a
+    /// different spot would select nothing. Coordinates are screen pixels
+    /// (see [`Self::send_pointer_abs`] for why the tablet path takes them
+    /// literally).
+    pub fn drag_abs(&mut self, from: (i32, i32), to: (i32, i32)) -> Result<(), QmpError> {
+        self.drag_abs_with_mods(&[], from, to)
+    }
+
+    /// [`Self::drag_abs`] with one or more modifier keys held down for the
+    /// whole gesture — press the modifiers, run the drag, release them.
+    ///
+    /// `mods` is a list of QEMU qcodes (`&["shift"]`, `&["alt"]`,
+    /// `&["ctrl", "shift"]`). They go down before the button press and come
+    /// back up after the release, so every button and motion event in
+    /// between is stamped by the compositor with those modifiers — which is
+    /// what selects `term`'s Shift-drag override (force a selection even
+    /// while the application has mouse reporting on) and Alt block-select.
+    ///
+    /// Every step is separated by [`GESTURE_STEP_PACING`] — see that
+    /// constant for why a back-to-back gesture cannot hold a modifier
+    /// even though QEMU delivers every edge exactly as asked.
+    ///
+    /// The release half runs **even when the drag fails**. A modifier left
+    /// latched in the guest is not a local failure: it silently corrupts
+    /// every subsequent arm of the same gate run (a held Shift turns the
+    /// next `type_text` into uppercase, the next wheel into a page scroll,
+    /// and so on), so an error in the body must not skip the cleanup. The
+    /// body's error is the one reported; a cleanup error only surfaces when
+    /// the body succeeded.
+    pub fn drag_abs_with_mods(
+        &mut self,
+        mods: &[&str],
+        from: (i32, i32),
+        to: (i32, i32),
+    ) -> Result<(), QmpError> {
+        let plan = modifier_drag_plan(mods, from, to);
+        // Prologue and body share a fate: if a modifier press fails, the
+        // gesture would not be the one the caller asked for, so don't drag.
+        let mut outcome = Ok(());
+        for step in plan.prologue.iter().chain(&plan.body) {
+            if let Err(e) = self.run_gesture_step(step) {
+                outcome = Err(e);
+                break;
+            }
+        }
+        // Unconditionally run the whole epilogue, including releases for
+        // modifiers whose press never landed: a key-up for a key that is
+        // not down is a no-op in the guest's modifier tracking, whereas
+        // skipping one that *is* down leaks it. The extra release is the
+        // strictly safer side.
+        for step in &plan.epilogue {
+            if let Err(e) = self.run_gesture_step(step)
+                && outcome.is_ok()
+            {
+                outcome = Err(e);
+            }
+        }
+        outcome
+    }
+
+    /// Dispatch one [`GestureStep`] to the injection method that speaks it,
+    /// then wait [`GESTURE_STEP_PACING`] so the guest observes this edge
+    /// before the next one is queued behind it.
+    fn run_gesture_step(&mut self, step: &GestureStep) -> Result<(), QmpError> {
+        let sent = match step {
+            GestureStep::Key { qcode, down } => self.send_key_state(qcode, *down),
+            GestureStep::MoveAbs { x, y } => self.send_pointer_abs(*x, *y),
+            GestureStep::Button { button, down } => self.send_button(button, *down),
+        };
+        // Pace even after a failed step: a partially-emitted gesture still
+        // has edges in flight, and the epilogue that follows must not race
+        // them either.
+        std::thread::sleep(GESTURE_STEP_PACING);
+        sent
     }
 
     /// Type a literal ASCII string, one PS/2 keypress per character.
@@ -418,6 +587,157 @@ const DIGIT_QCODES: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "
 /// or reboot.
 static QMP_SOCKET_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Phase 112 Track C.1 — build the `input-send-event` argument object for
+/// one pointer-button edge. Split out from
+/// [`QmpClient::send_button`] so the wire shape is assertable without a
+/// live QEMU socket.
+pub fn button_event_args(button: &str, down: bool) -> Value {
+    json!({
+        "events": [
+            {"type": "btn", "data": {"down": down, "button": button}}
+        ]
+    })
+}
+
+/// Phase 112 Track C.1 — build the `input-send-event` argument object for
+/// a single wheel notch. Positive `notches` selects `wheel-up`, negative
+/// `wheel-down`; the magnitude is the caller's loop count, not part of
+/// this payload (QEMU models one notch as a press+release pair).
+pub fn wheel_notch_args(notches: i32) -> Value {
+    let button = if notches >= 0 {
+        "wheel-up"
+    } else {
+        "wheel-down"
+    };
+    json!({
+        "events": [
+            {"type": "btn", "data": {"down": true, "button": button}},
+            {"type": "btn", "data": {"down": false, "button": button}},
+        ]
+    })
+}
+
+/// Phase 112 Track C.1 — build the `input-send-event` argument object for
+/// one key edge. Unlike `send-key`, this event carries an explicit `down`
+/// flag and emits only the edge asked for, so a modifier can stay held
+/// across intervening pointer events. Split out from
+/// [`QmpClient::send_key_state`] so the wire shape is assertable without a
+/// live QEMU socket.
+pub fn key_state_args(qcode: &str, down: bool) -> Value {
+    json!({
+        "events": [
+            {"type": "key", "data": {"down": down, "key": {"type": "qcode", "data": qcode}}}
+        ]
+    })
+}
+
+/// One step of a pointer gesture, in the vocabulary [`QmpClient`]'s
+/// injection methods speak.
+///
+/// A gesture is described as a list of these rather than as raw JSON so
+/// [`QmpClient::run_gesture_step`] drives it through the same typed methods a
+/// hand-written gate arm would call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GestureStep {
+    /// One keyboard edge — a modifier going down or coming back up.
+    Key { qcode: String, down: bool },
+    /// An absolute pointer move, in screen pixels.
+    MoveAbs { x: i32, y: i32 },
+    /// One pointer-button edge.
+    Button { button: String, down: bool },
+}
+
+/// The `input-send-event` `arguments` object a step puts on the wire.
+///
+/// Mirrors [`QmpClient::run_gesture_step`]'s dispatch: that method routes each
+/// variant to the injection method which builds the same object. Keep the two
+/// matches in step — this one is what lets a host test assert the exact bytes
+/// of an ordered gesture without a live QEMU socket.
+impl From<&GestureStep> for Value {
+    fn from(step: &GestureStep) -> Value {
+        match step {
+            GestureStep::Key { qcode, down } => key_state_args(qcode, *down),
+            GestureStep::MoveAbs { x, y } => abs_move_args(*x, *y),
+            GestureStep::Button { button, down } => button_event_args(button, *down),
+        }
+    }
+}
+
+/// The ordered step sequence a modifier-held drag puts on the wire, split
+/// into the three groups [`QmpClient::drag_abs_with_mods`] treats
+/// differently.
+///
+/// Keeping the ordering in one pure function — rather than inline in the
+/// executor — is what lets a host test assert it. Order is the whole
+/// contract here: a drag that releases its modifier before the button
+/// release still *emits* every event, but the compositor stamps the release
+/// with no modifiers and `term` sees a plain drag.
+pub struct DragPlan {
+    /// Modifier key-downs, in the order the caller listed them.
+    pub prologue: Vec<GestureStep>,
+    /// The gesture itself: park, button down, interpolated motion, button up.
+    pub body: Vec<GestureStep>,
+    /// Modifier key-ups, in reverse press order (innermost released first,
+    /// mirroring how a human lets go of a chord).
+    pub epilogue: Vec<GestureStep>,
+}
+
+/// Phase 112 Track C.1 — build the step sequence for a left-button drag
+/// from `from` to `to` with `mods` held down throughout.
+///
+/// The body parks the pointer first so the button press lands at `from`
+/// rather than wherever the pointer happened to be, then walks `STEPS`
+/// interpolated samples to `to`: `term` extends a selection on motion, so
+/// the intermediate samples are what make the selection cover the span
+/// instead of collapsing to a point. Coordinates are screen pixels (see
+/// [`QmpClient::send_pointer_abs`]).
+pub fn modifier_drag_plan(mods: &[&str], from: (i32, i32), to: (i32, i32)) -> DragPlan {
+    const STEPS: i32 = 8;
+    let key = |qc: &&str, down: bool| GestureStep::Key {
+        qcode: (*qc).to_string(),
+        down,
+    };
+    let button = |down: bool| GestureStep::Button {
+        button: "left".to_string(),
+        down,
+    };
+
+    let prologue = mods.iter().map(|qc| key(qc, true)).collect();
+    let epilogue = mods.iter().rev().map(|qc| key(qc, false)).collect();
+
+    let mut body: Vec<GestureStep> = Vec::with_capacity(STEPS as usize + 3);
+    body.push(GestureStep::MoveAbs {
+        x: from.0,
+        y: from.1,
+    });
+    body.push(button(true));
+    for step in 1..=STEPS {
+        body.push(GestureStep::MoveAbs {
+            x: from.0 + (to.0 - from.0) * step / STEPS,
+            y: from.1 + (to.1 - from.1) * step / STEPS,
+        });
+    }
+    body.push(button(false));
+
+    DragPlan {
+        prologue,
+        body,
+        epilogue,
+    }
+}
+
+/// Build the `input-send-event` argument object for one absolute pointer
+/// move. Shared by [`QmpClient::send_pointer_abs`] and
+/// [`modifier_drag_plan`] so the two cannot drift apart.
+fn abs_move_args(x: i32, y: i32) -> Value {
+    json!({
+        "events": [
+            {"type": "abs", "data": {"axis": "x", "value": x}},
+            {"type": "abs", "data": {"axis": "y", "value": y}},
+        ]
+    })
+}
+
 /// Allocate a fresh QMP socket path for the current `xtask` run.
 /// The path is *not* created; we hand it to QEMU which `bind`s it,
 /// and the connect helper waits for the listener to come up. See
@@ -483,5 +803,191 @@ mod tests {
         let b = fresh_socket_path();
         assert_ne!(a, b);
         assert!(a.to_string_lossy().contains("m3os-xtask-qmp-"));
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 112 Track C.1 — pointer button / wheel injection
+    // -----------------------------------------------------------------
+
+    /// C.1 acceptance: a button edge is one `btn` event carrying the
+    /// button name and the press/release flag.
+    #[test]
+    fn button_event_wire_shape() {
+        let down = button_event_args("left", true);
+        assert_eq!(
+            down,
+            json!({"events": [{"type": "btn", "data": {"down": true, "button": "left"}}]})
+        );
+        let up = button_event_args("left", false);
+        assert_eq!(up["events"][0]["data"]["down"], json!(false));
+        // Middle-click is the other button the selection path may use.
+        assert_eq!(
+            button_event_args("middle", true)["events"][0]["data"]["button"],
+            json!("middle")
+        );
+    }
+
+    /// C.1 acceptance: a wheel notch is a press+release pair of QEMU's
+    /// `wheel-up` / `wheel-down` pseudo-buttons, with the direction taken
+    /// from the sign.
+    #[test]
+    fn wheel_notch_wire_shape_and_direction() {
+        let up = wheel_notch_args(1);
+        let events = up["events"].as_array().expect("events array");
+        assert_eq!(events.len(), 2, "one notch is a press + a release");
+        assert_eq!(events[0]["data"]["button"], json!("wheel-up"));
+        assert_eq!(events[0]["data"]["down"], json!(true));
+        assert_eq!(events[1]["data"]["button"], json!("wheel-up"));
+        assert_eq!(events[1]["data"]["down"], json!(false));
+
+        let down = wheel_notch_args(-3);
+        assert_eq!(
+            down["events"][0]["data"]["button"],
+            json!("wheel-down"),
+            "negative notches scroll down"
+        );
+
+        // Zero is treated as up; `send_wheel` loops |notches| times, so a
+        // zero-notch call emits nothing at all.
+        assert_eq!(
+            wheel_notch_args(0)["events"][0]["data"]["button"],
+            json!("wheel-up")
+        );
+    }
+
+    /// A held modifier is one `key` event per edge, with the qcode nested
+    /// under `key` (not flat like the `btn` events) and the `down` flag
+    /// carrying the edge. `send-key` cannot express this — it always
+    /// synthesises the release — which is why the helper exists.
+    #[test]
+    fn key_state_wire_shape() {
+        assert_eq!(
+            key_state_args("shift", true),
+            json!({"events": [
+                {"type": "key", "data": {"down": true, "key": {"type": "qcode", "data": "shift"}}}
+            ]})
+        );
+        assert_eq!(
+            key_state_args("alt", false),
+            json!({"events": [
+                {"type": "key", "data": {"down": false, "key": {"type": "qcode", "data": "alt"}}}
+            ]})
+        );
+    }
+
+    /// The exact ordered wire sequence a successful
+    /// [`QmpClient::drag_abs_with_mods`] emits: prologue, body, epilogue.
+    fn emitted_args(plan: &DragPlan) -> Vec<Value> {
+        plan.prologue
+            .iter()
+            .chain(&plan.body)
+            .chain(&plan.epilogue)
+            .map(Value::from)
+            .collect()
+    }
+
+    /// The modifier must go down before the button press and come up only
+    /// after the button release — a plan that releases it early still emits
+    /// every event, but the compositor stamps the button-up with no
+    /// modifiers and `term` never sees the Shift-drag override.
+    #[test]
+    fn modifier_drag_holds_the_modifier_across_the_whole_gesture() {
+        let plan = modifier_drag_plan(&["shift"], (10, 20), (90, 100));
+        let seq = emitted_args(&plan);
+        // 1 modifier down + park + button down + 8 motion samples
+        // + button up + 1 modifier up.
+        assert_eq!(seq.len(), 13, "sequence: {seq:#?}");
+
+        assert_eq!(seq[0], key_state_args("shift", true), "modifier down first");
+        assert_eq!(seq[1], abs_move_args(10, 20), "park at the drag origin");
+        assert_eq!(
+            seq[2],
+            button_event_args("left", true),
+            "button down after the modifier"
+        );
+        // Motion samples interpolate to the endpoint; the last one lands
+        // exactly on `to` so the selection reaches the requested cell.
+        assert_eq!(seq[3], abs_move_args(20, 30));
+        assert_eq!(seq[10], abs_move_args(90, 100), "last sample hits `to`");
+        assert_eq!(
+            seq[11],
+            button_event_args("left", false),
+            "button up before the modifier"
+        );
+        assert_eq!(seq[12], key_state_args("shift", false), "modifier up last");
+    }
+
+    /// The release half is a mirror of the press half, so a chord unwinds
+    /// innermost-first the way a human lets go of one.
+    #[test]
+    fn modifier_drag_releases_a_chord_in_reverse_press_order() {
+        let plan = modifier_drag_plan(&["ctrl", "shift"], (0, 0), (8, 8));
+        assert_eq!(
+            plan.prologue.iter().map(Value::from).collect::<Vec<_>>(),
+            vec![key_state_args("ctrl", true), key_state_args("shift", true)]
+        );
+        assert_eq!(
+            plan.epilogue.iter().map(Value::from).collect::<Vec<_>>(),
+            vec![
+                key_state_args("shift", false),
+                key_state_args("ctrl", false)
+            ]
+        );
+    }
+
+    /// `drag_abs` is the no-modifier case of the same plan, so an unqualified
+    /// drag must emit exactly the pointer events and nothing else — no stray
+    /// key edges that would perturb the guest's modifier state.
+    #[test]
+    fn unmodified_drag_emits_no_key_events() {
+        let plan = modifier_drag_plan(&[], (60, 200), (1800, 1000));
+        assert!(plan.prologue.is_empty());
+        assert!(plan.epilogue.is_empty());
+        let seq = emitted_args(&plan);
+        assert_eq!(seq.len(), 11, "park + down + 8 samples + up");
+        assert!(
+            seq.iter()
+                .all(|args| args["events"][0]["type"] != json!("key")),
+            "an unqualified drag must not touch the keyboard"
+        );
+        assert_eq!(seq[0], abs_move_args(60, 200));
+        assert_eq!(seq[10], button_event_args("left", false));
+    }
+
+    /// The gesture pacing must outlast the guest HID poller's worst-case
+    /// sleep, or a modifier-qualified drag silently degrades into an
+    /// unmodified one (see [`GESTURE_STEP_PACING`] for the full race).
+    ///
+    /// `usb-hid` backs off to `HID_POLL_MAX_IDLE_NS` = 100 ms when idle and
+    /// only returns to its 5 ms cadence after a report lands, so the first
+    /// edge of a gesture can wait a full 100 ms to be read. `xtask` does not
+    /// depend on `kernel-core`, so the bound is restated here — if that
+    /// backoff cap is ever raised, this test is the tripwire.
+    #[test]
+    fn gesture_pacing_outlasts_the_guest_hid_poll_backoff() {
+        /// `kernel_core::input::hid_poll::HID_POLL_MAX_IDLE_NS`, in ms.
+        const GUEST_HID_MAX_IDLE: Duration = Duration::from_millis(100);
+        assert!(
+            GESTURE_STEP_PACING > GUEST_HID_MAX_IDLE,
+            "a gesture step must outlive the guest's {GUEST_HID_MAX_IDLE:?} idle poll \
+             backoff, else the guest can read a later edge before an earlier one; \
+             GESTURE_STEP_PACING is {GESTURE_STEP_PACING:?}"
+        );
+    }
+
+    /// A 13-step Shift-drag costs 13 pacing gaps. Keep that visible: three
+    /// drags is the whole gesture budget `term-daily-driver-smoke` spends,
+    /// and a pacing bump that pushes it past a few seconds would start
+    /// competing with the gate's own timeout rather than with the guest's
+    /// poll loop.
+    #[test]
+    fn a_paced_drag_stays_within_a_few_seconds() {
+        let plan = modifier_drag_plan(&["shift"], (60, 200), (1800, 1000));
+        let steps = plan.prologue.len() + plan.body.len() + plan.epilogue.len();
+        assert_eq!(steps, 13);
+        assert!(
+            GESTURE_STEP_PACING * (steps as u32) < Duration::from_secs(4),
+            "a single paced drag must stay well under the per-arm settle budget"
+        );
     }
 }

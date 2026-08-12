@@ -401,10 +401,11 @@ fn decode_message(bulk: &[u8]) -> Result<ClientMessage, ProtocolError> {
     Ok(msg)
 }
 
-// NB: a `#[cfg(test)]` host-side test module previously lived here, but
-// `display_server` is a `no_std` + `no_main` binary crate and cannot be
-// compiled with the std `test` harness. Future C.5 work that wants
-// host-runnable dispatcher tests should split the pure-logic dispatch
-// surface (this file's `dispatch` + `decode_message`) into a small
-// library crate. Until then, the dispatcher is exercised end-to-end by
-// the Phase 56 G.1 regression test running under QEMU.
+// NB: a `#[cfg(test)]` host-side test module previously lived here and was
+// removed because the crate's ungated `no_std` / `no_main` attributes made
+// it uncompilable under the std `test` harness. That is no longer true —
+// `main.rs` now carries the `cfg_attr(not(test), ..)` treatment, so
+// `cargo test -p display_server --target x86_64-unknown-linux-gnu` builds
+// this file as an ordinary std test binary. Dispatcher tests can be added
+// back here directly; the end-to-end path stays covered by the Phase 56
+// G.1 regression test running under QEMU.

@@ -64,7 +64,7 @@ pub const MASTER_GAIN_UNITY_Q15: u16 = 0x8000;
 /// Per-channel mix state. Public for tests and FFI introspection;
 /// production callers never construct one directly — they go through
 /// [`Mixer::set_channel`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ChannelState {
     samples_ptr: *const u8,
     samples_len: usize,
@@ -101,27 +101,6 @@ pub struct ChannelState {
 
 unsafe impl Send for ChannelState {}
 unsafe impl Sync for ChannelState {}
-
-impl Default for ChannelState {
-    fn default() -> Self {
-        Self {
-            samples_ptr: core::ptr::null(),
-            samples_len: 0,
-            cursor: 0,
-            inc: 0,
-            left_vol: 0,
-            right_vol: 0,
-            active: false,
-            loop_enabled: false,
-            fade_out_remaining: 0,
-            fade_out_total: 0,
-            vol_ramp_remaining: 0,
-            vol_ramp_total: 0,
-            prev_left_vol: 0,
-            prev_right_vol: 0,
-        }
-    }
-}
 
 impl ChannelState {
     /// `true` if this channel is currently playing a sample.

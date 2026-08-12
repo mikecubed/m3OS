@@ -179,8 +179,8 @@ fn serve(sock: i32, tracee: i32) {
         if n <= 0 {
             return;
         }
-        for i in 0..n as usize {
-            match reader.feed(rxbuf[i]) {
+        for &byte in &rxbuf[..n as usize] {
+            match reader.feed(byte) {
                 Some(RspEvent::Packet(len)) => {
                     // ACK the packet, then dispatch its (owned) payload.
                     let _ = write(sock, b"+");
@@ -324,10 +324,10 @@ fn write_one_register(tracee: i32, rest: &[u8]) {
         if let Some(v) = read_u64_le_hex(val_hex, 0) {
             regs[idx] = v;
         }
-    } else if idx == 17 {
-        if let Some(ef) = read_u32_le_hex(val_hex, 0) {
-            regs[REG_RFLAGS] = (regs[REG_RFLAGS] & !0xFFFF_FFFF) | ef as u64;
-        }
+    } else if idx == 17
+        && let Some(ef) = read_u32_le_hex(val_hex, 0)
+    {
+        regs[REG_RFLAGS] = (regs[REG_RFLAGS] & !0xFFFF_FFFF) | ef as u64;
     }
     setregs(tracee, &regs);
 }

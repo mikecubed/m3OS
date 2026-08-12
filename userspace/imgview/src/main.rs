@@ -76,7 +76,6 @@ fn log(msg: &str) {
 /// A successfully decoded image plus its display metadata.
 struct Image {
     name: String,
-    fmt: &'static str,
     w: u32,
     h: u32,
     pixels: Vec<u32>,
@@ -218,7 +217,6 @@ fn program_main(args: &[&str]) -> i32 {
             Ok((fmt, w, h, pixels)) => {
                 let img = Image {
                     name: name.clone(),
-                    fmt,
                     w,
                     h,
                     pixels,

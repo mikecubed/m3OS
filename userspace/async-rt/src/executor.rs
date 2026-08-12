@@ -164,11 +164,12 @@ impl Executor {
     /// Re-scan all tasks for woken state and add to run queue.
     fn requeue_woken(&mut self) {
         for i in 0..self.high_water {
-            if let Some(slot) = self.tasks.get(i) {
-                if slot.header.is_woken() && !slot.header.is_queued() {
-                    slot.header.mark_queued();
-                    self.run_queue.push_back(i);
-                }
+            if let Some(slot) = self.tasks.get(i)
+                && slot.header.is_woken()
+                && !slot.header.is_queued()
+            {
+                slot.header.mark_queued();
+                self.run_queue.push_back(i);
             }
         }
     }

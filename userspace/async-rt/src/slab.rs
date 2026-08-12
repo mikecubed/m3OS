@@ -10,6 +10,12 @@ pub struct Slab<T> {
     len: usize,
 }
 
+impl<T> Default for Slab<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> Slab<T> {
     /// Create a new empty slab.
     pub const fn new() -> Self {

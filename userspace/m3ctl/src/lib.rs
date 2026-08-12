@@ -462,7 +462,7 @@ pub fn parse_verb(verb: &str, args: &[&str]) -> Result<ParsedVerb, ParseError> {
         // per-service `ServiceStates` reply; the bare form continues
         // to return the session-wide `SessionState` for back-compat.
         "session-state" => {
-            if args.iter().any(|a| *a == "--detailed") {
+            if args.contains(&"--detailed") {
                 Ok(ParsedVerb::Session(ControlVerb::SessionStateDetailed))
             } else {
                 Ok(ParsedVerb::Session(ControlVerb::SessionState))
@@ -637,11 +637,7 @@ pub fn parse_verb(verb: &str, args: &[&str]) -> Result<ParsedVerb, ParseError> {
                     "move-to-workspace: n must be 1..=9",
                 ));
             }
-            let follow = if args.iter().any(|a| *a == "--follow") {
-                1
-            } else {
-                0
-            };
+            let follow = if args.contains(&"--follow") { 1 } else { 0 };
             Ok(ParsedVerb::Display(ControlCommand::MoveToWorkspace {
                 n,
                 follow,

@@ -537,11 +537,11 @@ mod os_binary {
             let n = syscall_lib::ipc_take_pending_bulk(reply_buf);
             if n != u64::MAX && n > 0 {
                 let used = n as usize;
-                if let Ok((ev, _)) = decode_event(&reply_buf[..used]) {
-                    if !matches!(ev, ControlEvent::Ack) {
-                        print_event(&ev);
-                        continue;
-                    }
+                if let Ok((ev, _)) = decode_event(&reply_buf[..used])
+                    && !matches!(ev, ControlEvent::Ack)
+                {
+                    print_event(&ev);
+                    continue;
                 }
             }
             // Empty queue / Ack — back off so we don't pin the CPU.
